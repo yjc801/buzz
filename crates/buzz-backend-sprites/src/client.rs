@@ -165,6 +165,10 @@ pub struct SpritesClient {
     /// The same host with a WebSocket scheme.
     ws_base: String,
     token: String,
+    /// Where the token came from — named in authentication errors, because
+    /// "which of the three sources produced this rejected token" is the
+    /// first thing anyone needs to know.
+    credential_source: &'static str,
     started: Instant,
 }
 
@@ -178,7 +182,9 @@ impl SpritesClient {
             .ok()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "https://api.sprites.dev".to_string());
-        Ok(Self::with_base(base.trim_end_matches('/').to_string(), credential.token))
+        let mut client = Self::with_base(base.trim_end_matches('/').to_string(), credential.token);
+        client.credential_source = credential.source;
+        Ok(client)
     }
 
     /// Used directly by tests to point at a local stub server.
@@ -200,8 +206,40 @@ impl SpritesClient {
             base,
             ws_base,
             token,
+            credential_source: "unknown",
             started: Instant::now(),
         }
+    }
+
+    /// Turn an authentication rejection into an error that names the source
+    /// that supplied the credential and the way out of it. The keychain arm
+    /// gets its own sentence: the sprite CLI stores a wrapped credential
+    /// that the API does not accept as a bearer token, so "log in again"
+    /// would be advice that cannot work.
+    fn auth_error(&self, status: u16) -> Option<SubstrateError> {
+        if status != 401 && status != 403 {
+            return None;
+        }
+        let detail = match self.credential_source {
+            "keychain" => {
+                "the token stored by the sprite CLI (macOS keychain) was rejected. That \
+                 entry is not always an API token the Sprites API accepts. Create an API \
+                 token at https://sprites.dev/account and set SPRITE_TOKEN in the \
+                 environment Buzz Desktop is launched from"
+            }
+            "env:SPRITE_TOKEN" => {
+                "SPRITE_TOKEN was rejected — it may be expired, revoked, or for a \
+                 different organization. Create a fresh token at https://sprites.dev/account"
+            }
+            "env:SPRITES_TOKEN" => {
+                "SPRITES_TOKEN was rejected — it may be expired, revoked, or for a \
+                 different organization. Create a fresh token at https://sprites.dev/account"
+            }
+            _ => "the Sprites API rejected this credential",
+        };
+        Some(SubstrateError(format!(
+            "Fly Sprites refused the request ({status}): {detail}."
+        )))
     }
 
     fn rest(&self, path: &str) -> String {
@@ -260,7 +298,9 @@ impl Substrate for SpritesClient {
         }
         if !response.status().is_success() {
             let (status, body) = Self::error_body(response).await;
-            return Err(SubstrateError(format!("GET sprite returned {status}: {body}")));
+            return Err(self
+                .auth_error(status)
+                .unwrap_or_else(|| SubstrateError(format!("GET sprite returned {status}: {body}"))));
         }
         let value = response
             .json::<serde_json::Value>()
@@ -330,7 +370,9 @@ impl Substrate for SpritesClient {
                     message
                 },
             }),
-            _ => Err(SubstrateError(format!("POST sprite returned {status}: {body}"))),
+            _ => Err(self
+                .auth_error(status)
+                .unwrap_or_else(|| SubstrateError(format!("POST sprite returned {status}: {body}")))),
         }
     }
 
@@ -345,7 +387,9 @@ impl Substrate for SpritesClient {
             .map_err(|e| SubstrateError(format!("PUT url_settings failed: {e}")))?;
         if !response.status().is_success() {
             let (status, body) = Self::error_body(response).await;
-            return Err(SubstrateError(format!("PUT url_settings returned {status}: {body}")));
+            return Err(self.auth_error(status).unwrap_or_else(|| {
+                SubstrateError(format!("PUT url_settings returned {status}: {body}"))
+            }));
         }
         Ok(())
     }
@@ -360,7 +404,9 @@ impl Substrate for SpritesClient {
             .map_err(|e| SubstrateError(format!("GET sessions failed: {e}")))?;
         if !response.status().is_success() {
             let (status, body) = Self::error_body(response).await;
-            return Err(SubstrateError(format!("GET sessions returned {status}: {body}")));
+            return Err(self.auth_error(status).unwrap_or_else(|| {
+                SubstrateError(format!("GET sessions returned {status}: {body}"))
+            }));
         }
         let value = response
             .json::<serde_json::Value>()
@@ -611,6 +657,28 @@ mod tests {
         assert_eq!(meta.status, "warm");
         assert_eq!(meta.labels.len(), 1);
         assert_eq!(meta.url_auth.as_deref(), Some("sprite"));
+    }
+
+    /// An authentication rejection must name the source that produced the
+    /// credential and a way forward — "401" alone sends a Finder-launched
+    /// desktop user hunting through three possible sources.
+    #[test]
+    fn auth_errors_name_their_source_and_a_remedy() {
+        let mut client = SpritesClient::with_base("https://api.sprites.dev".into(), "t".into());
+
+        client.credential_source = "keychain";
+        let SubstrateError(message) = client.auth_error(401).expect("401 should map");
+        assert!(message.contains("sprite CLI"), "{message}");
+        assert!(message.contains("SPRITE_TOKEN"), "{message}");
+        assert!(message.contains("sprites.dev/account"), "{message}");
+
+        client.credential_source = "env:SPRITE_TOKEN";
+        let SubstrateError(message) = client.auth_error(403).expect("403 should map");
+        assert!(message.contains("SPRITE_TOKEN was rejected"), "{message}");
+
+        // Everything else keeps its own diagnosis.
+        assert!(client.auth_error(404).is_none());
+        assert!(client.auth_error(500).is_none());
     }
 
     #[test]

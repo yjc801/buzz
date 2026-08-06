@@ -13,11 +13,13 @@
 // their consumers.
 #![allow(dead_code)]
 
+mod client;
 mod config;
 mod credentials;
 mod env;
 mod intent;
 mod naming;
+mod substrate;
 mod wire;
 
 use std::io::Read;

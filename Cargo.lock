@@ -940,14 +940,17 @@ dependencies = [
 name = "buzz-backend-sprites"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "hex",
  "nostr",
  "rand 0.10.1",
+ "reqwest 0.13.4",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "tokio-tungstenite 0.29.0",
 ]
 
 [[package]]

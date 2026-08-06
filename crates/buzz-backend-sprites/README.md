@@ -13,10 +13,17 @@ cargo build --release -p buzz-backend-sprites
 install -m 755 target/release/buzz-backend-sprites ~/.local/bin/
 ```
 
-Then pick **Sprites** as an agent's backend in Buzz Desktop. Credentials come
-from the ambient environment, never from the agent's configuration: set
-`SPRITE_TOKEN`, or run `sprite login` and let the provider read the CLI's
-keychain entry.
+Then pick **Sprites** as an agent's backend in Buzz Desktop.
+
+Credentials come from the ambient environment, never from the agent's
+configuration (spec I2). The provider looks for `SPRITE_TOKEN`, then
+`SPRITES_TOKEN`, then the sprite CLI's keychain entry — but **prefer an API
+token**: create one at [sprites.dev/account](https://sprites.dev/account) and
+export `SPRITE_TOKEN` in the environment Buzz Desktop launches from. The
+keychain arm exists because a Finder-launched desktop inherits almost no
+environment, but on current CLI versions the stored credential is wrapped and
+the API rejects it as a bearer token; when that happens the provider says so,
+names the source, and points at the fix rather than reporting a bare 401.
 
 ## Configuration
 

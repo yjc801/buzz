@@ -319,6 +319,10 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Sprites backend provider: same shape — pure decision layers over a
+        # scripted fake substrate and a fake clock. Its live tests are gated
+        # on BUZZ_SPRITES_LIVE=1 and skip themselves here.
+        cargo nextest run -p buzz-backend-sprites
     else
         ./scripts/run-tests.sh unit
     fi

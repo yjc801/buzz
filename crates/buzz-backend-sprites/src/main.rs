@@ -13,6 +13,7 @@
 // their consumers.
 #![allow(dead_code)]
 
+mod classify;
 mod client;
 mod config;
 mod credentials;
@@ -21,6 +22,7 @@ mod intent;
 mod launcher;
 mod naming;
 mod provision;
+mod reconcile;
 mod substrate;
 mod wire;
 
@@ -122,7 +124,7 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
     // One generation for this operation's first attempt; the reconciler mints
     // its own per attempt and restamps the correlator to match.
     let generation = naming::new_generation();
-    let _env = env::build_env(
+    let env = env::build_env(
         &request.agent,
         env::AuthoritativeInputs {
             generation: &generation,
@@ -132,10 +134,9 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
 
     // Credentials resolve before any network I/O so a missing login fails
     // with the actionable message, not a connection error.
-    let _credential = credentials::resolve(cfg.org.as_deref())?;
+    let client = client::SpritesClient::connect(&cfg)?;
 
-    let _ = identity.sprite_name();
-    Err("the sprites reconciler is not implemented yet".to_string())
+    reconcile::deploy(&client, &identity, &cfg, env).await
 }
 
 #[cfg(test)]

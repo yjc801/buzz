@@ -212,11 +212,18 @@ pub async fn ensure(
         ("install launcher", launcher::LAUNCHER_PATH, launcher::LAUNCHER_SH),
         ("install probe", launcher::PROBE_PATH, launcher::PROBE_SH),
     ] {
+        // Write-chmod-rename rather than `install -m 755 /dev/stdin`:
+        // install(1) fails with "No such file or directory" when its
+        // destination already exists (a reprovision — the case a first
+        // install never exercises). The rename is also atomic, so a
+        // concurrent probe never reads a half-written script.
         run_step(
             substrate,
             sprite,
             name,
-            &sh(&format!("install -m 755 /dev/stdin {path}")),
+            &sh(&format!(
+                "cat > {path}.tmp && chmod 755 {path}.tmp && mv {path}.tmp {path}"
+            )),
             Some(content.as_bytes().to_vec()),
             Duration::from_secs(30),
         )

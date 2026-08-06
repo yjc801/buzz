@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 # Explicit rustls dep with the ring provider — required to install the
 # process-level CryptoProvider at startup. Without it this binary panics on its

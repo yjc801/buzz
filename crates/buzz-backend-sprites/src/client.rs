@@ -541,7 +541,7 @@ fn sprite_meta(value: &serde_json::Value) -> SpriteMeta {
 impl SpritesClient {
     /// Test-only cleanup. Deliberately NOT on the `Substrate` trait — the
     /// reconciler must remain unable to express a delete.
-    async fn delete_sprite(&self, name: &str) -> Result<(), SubstrateError> {
+    pub(crate) async fn delete_sprite(&self, name: &str) -> Result<(), SubstrateError> {
         let response = self
             .http
             .delete(self.rest(&format!("/sprites/{name}")))

@@ -15,6 +15,8 @@
 
 mod config;
 mod credentials;
+mod env;
+mod intent;
 mod naming;
 mod wire;
 
@@ -113,25 +115,16 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
     // not a failed connection (§Deploy State Machine step 0).
     let identity = naming::AgentIdentity::from_nsec(&request.agent.private_key_nsec)?;
 
-    // Owner rule (§Launch data): without an auth tag or a resolved owner the
-    // harness cannot match `!shutdown` — refuse before any mutation. This
-    // check moves into the env builder alongside the rest of §Launch data;
-    // it lives here only until that module lands.
-    let auth_tag = request.agent.auth_tag.as_deref().map(str::trim).filter(|t| !t.is_empty());
-    let owner = request
-        .agent
-        .launch
-        .as_ref()
-        .and_then(|l| l.owner_pubkey.as_deref())
-        .map(str::trim)
-        .filter(|o| !o.is_empty());
-    if auth_tag.is_none() && owner.is_none() {
-        return Err(
-            "deploy refused: neither auth_tag nor launch.owner_pubkey resolved — \
-             without an owner the agent cannot honor !shutdown"
-                .to_string(),
-        );
-    }
+    // One generation for this operation's first attempt; the reconciler mints
+    // its own per attempt and restamps the correlator to match.
+    let generation = naming::new_generation();
+    let _env = env::build_env(
+        &request.agent,
+        env::AuthoritativeInputs {
+            generation: &generation,
+            inactivity_seconds: cfg.inactivity_seconds,
+        },
+    )?;
 
     // Credentials resolve before any network I/O so a missing login fails
     // with the actionable message, not a connection error.

@@ -145,3 +145,82 @@ fn the_full_desktop_payload_is_accepted() {
         "the full payload was rejected before credential resolution: {error}"
     );
 }
+
+/// The respond-to matrix, driven through the built binary.
+///
+/// The env builder runs before credential resolution in `deploy_agent`, so
+/// under the harness's poisoned credentials the error string *is* the
+/// ordering assertion: "Sprites API credential" means the gate passed and we
+/// reached resolution, anything else means we refused first. A test asserting
+/// only `ok: false` would pass on the credential error and prove nothing.
+///
+/// The cases are applied to the real full-launch request so each one differs
+/// from a known-good deploy in exactly the field under test.
+#[test]
+fn the_respond_to_gate_matches_the_harness_acceptance_surface() {
+    let key_a = "a".repeat(64);
+    let padded_upper = format!("  {}  ", "A".repeat(64));
+    // (name, respond_to, allowlist, must reach credential resolution)
+    let cases: Vec<(&str, &str, Option<Vec<String>>, bool)> = vec![
+        ("allowlist + []", "allowlist", Some(vec![]), false),
+        ("allowlist + absent", "allowlist", None, false),
+        (
+            "allowlist + junk",
+            "allowlist",
+            Some(vec!["beefcafe".into()]),
+            false,
+        ),
+        ("unparseable mode", "npub1abc", None, false),
+        ("padded mode", " allowlist ", None, false),
+        (
+            "allowlist + two valid",
+            "allowlist",
+            Some(vec![key_a.clone(), "b".repeat(64)]),
+            true,
+        ),
+        (
+            "owner-only + junk list",
+            "owner-only",
+            Some(vec!["beefcafe".into()]),
+            true,
+        ),
+        (
+            "allowlist + padded upper",
+            "allowlist",
+            Some(vec![padded_upper]),
+            true,
+        ),
+        ("nobody", "nobody", None, true),
+        ("anyone", "anyone", None, true),
+    ];
+
+    let base: serde_json::Value =
+        serde_json::from_str(&read("deploy-full-launch.request.json")).unwrap();
+
+    for (name, mode, allowlist, reaches_credentials) in cases {
+        let mut request = base.clone();
+        let agent = &mut request["agent"];
+        agent["respond_to"] = serde_json::json!(mode);
+        agent["respond_to_allowlist"] = match &allowlist {
+            Some(list) => serde_json::json!(list),
+            None => serde_json::Value::Null,
+        };
+
+        let (stdout, code) = run(&request.to_string());
+        assert_eq!(code, 0, "{name}: provider did not exit cleanly");
+        let response: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let error = response["error"].as_str().unwrap_or_default();
+        let reached = error.contains("Sprites API credential");
+
+        assert_eq!(
+            reached, reaches_credentials,
+            "{name}: expected reaches_credentials={reaches_credentials}, got error: {error}"
+        );
+        if !reaches_credentials {
+            assert!(
+                error.contains("deploy refused"),
+                "{name}: refused, but not by the gate: {error}"
+            );
+        }
+    }
+}

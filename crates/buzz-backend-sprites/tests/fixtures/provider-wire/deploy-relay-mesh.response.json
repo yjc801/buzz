@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "error": "deploy refused: this agent is configured for shared compute (relay-mesh), which runs on the relay rather than in a sprite. Switch the agent to a local runtime before deploying it to Fly Sprites."
+}

@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "error": "private_key_nsec is not a decodable nsec1 key"
+}

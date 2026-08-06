@@ -109,6 +109,26 @@ mod tests {
         );
     }
 
+    /// The first task lease is a startup requirement, not fire-and-forget:
+    /// without it a quiet sprite hibernates (~30s) before the 60s refresh
+    /// loop's first retry, freezing that loop and stranding a "running"
+    /// agent. The failure path must exit before the exec so the probe reads
+    /// stopped and the deploy reports the truth.
+    #[test]
+    fn the_first_task_lease_is_required_before_the_exec() {
+        assert!(
+            LAUNCHER_SH.contains("could not take the keep-awake task lease"),
+            "no mandatory first-lease failure path in the launcher"
+        );
+        let fail = LAUNCHER_SH
+            .find("exit 4")
+            .expect("no failing exit for the first task lease");
+        let exec = LAUNCHER_SH
+            .rfind(r#"exec "$BUZZ/bin/buzz-acp""#)
+            .expect("no harness exec");
+        assert!(fail < exec, "the lease failure path must precede the exec");
+    }
+
     #[test]
     fn argv_carries_only_public_identity() {
         let argv = launcher_argv(&"a".repeat(64), "cafe0001");

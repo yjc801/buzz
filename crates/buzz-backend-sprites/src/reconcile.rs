@@ -10,6 +10,10 @@
 //!   express a delete, so no row can reach for one.
 //! - **Zero mutation on the live row.** A running agent is observed and
 //!   returned, never touched — not even to re-assert URL privacy.
+//! - **No mutation without the deploy lease.** Provision and Start require
+//!   the sprite-wide lease, and the observation that authorizes them is
+//!   re-made after acquiring it, so concurrent deploys of one agent
+//!   serialize instead of interleaving writes.
 
 use crate::classify::{classify, Action, Observation};
 use crate::config::{ProviderConfig, AGENT_HOME};
@@ -39,6 +43,32 @@ pub async fn deploy(
     identity: &AgentIdentity,
     cfg: &ProviderConfig,
     env_map: BTreeMap<String, String>,
+) -> Result<String, String> {
+    // The sprite-wide fence: both mutating actions (Provision, Start) run
+    // under an in-sprite deploy lease taken with this call's token, so two
+    // concurrent deploys against the same *existing* sprite — the case the
+    // create-race handling cannot see — never interleave provisioning, and
+    // the observation that authorizes a start is always made while the
+    // fence is held. The token is provider-minted hex, safe to embed in
+    // the lease scripts.
+    let lease_token = crate::naming::new_generation();
+    let mut lease_held = false;
+    let result = deploy_loop(substrate, identity, cfg, env_map, &lease_token, &mut lease_held).await;
+    if lease_held {
+        // Best-effort: a failure leaves the lease to its TTL, which the
+        // fence already tolerates (a crashed deploy never releases either).
+        let _ = provision::release_lease(substrate, &identity.sprite_name(), &lease_token).await;
+    }
+    result
+}
+
+async fn deploy_loop(
+    substrate: &impl Substrate,
+    identity: &AgentIdentity,
+    cfg: &ProviderConfig,
+    env_map: BTreeMap<String, String>,
+    lease_token: &str,
+    lease_held: &mut bool,
 ) -> Result<String, String> {
     let sprite_name = identity.sprite_name();
     let mut attempt_started = false;
@@ -90,12 +120,26 @@ pub async fn deploy(
             // runs when a decision could depend on it.
             let resolved = provision::resolve(substrate, &sprite_name, cfg).await?;
             let recorded = provision::recorded_fingerprint(substrate, &sprite_name).await?;
-            (
-                probe,
-                sessions,
-                recorded.map(|f| f.as_str().to_string()),
-                resolved.fingerprint().as_str().to_string(),
-            )
+            let desired = resolved.fingerprint().as_str().to_string();
+            let mut recorded = recorded.map(|f| f.as_str().to_string());
+            // A matching fingerprint is only a fast path (the intent doc's
+            // rule: evidence over recollection). Before it can lead to a
+            // Start, the installed sprig must still hash to what
+            // install-time recorded; a failure — deleted, truncated, or
+            // replaced binary — reads as divergence, and the full-provision
+            // path repairs it. Gated on exactly the conditions under which
+            // `classify` could answer Start, so ordinary polling iterations
+            // never pay the extra exec.
+            if recorded.as_deref() == Some(desired.as_str())
+                && !attempt_started
+                && !adopted_winner
+                && sessions.is_empty()
+                && probe.as_ref().is_some_and(ProbeReport::stopped)
+                && !provision::spot_check(substrate, &sprite_name).await?
+            {
+                recorded = None;
+            }
+            (probe, sessions, recorded, desired)
         } else {
             (None, Vec::new(), None, String::new())
         };
@@ -111,7 +155,23 @@ pub async fn deploy(
         };
 
         // --- Act ---------------------------------------------------------
-        match classify(&observation) {
+        let action = classify(&observation);
+
+        // The fence gate: no mutating action without the deploy lease. On
+        // acquisition the loop deliberately re-observes instead of acting —
+        // the observation that authorizes a provision or start must itself
+        // be made under the fence, or a rival's writes could land between
+        // the read and the act. NoOp/Observe paths never take the lease, so
+        // a live agent's sprite is never written to.
+        if matches!(action, Action::Provision | Action::Start) && !*lease_held {
+            match provision::acquire_lease(substrate, &sprite_name, lease_token).await? {
+                provision::LeaseAttempt::Acquired => *lease_held = true,
+                provision::LeaseAttempt::HeldByAnother => substrate.sleep(POLL_INTERVAL).await,
+            }
+            continue;
+        }
+
+        match action {
             Action::NoOp { agent_id } => return Ok(agent_id),
 
             Action::Observe { .. } => substrate.sleep(POLL_INTERVAL).await,
@@ -177,7 +237,7 @@ pub async fn deploy(
                 }
                 provisioned = true;
                 let resolved = provision::resolve(substrate, &sprite_name, cfg).await?;
-                provision::ensure(substrate, &sprite_name, &resolved).await?;
+                provision::ensure(substrate, &sprite_name, &resolved, lease_token).await?;
                 // URL privacy is asserted at create and re-asserted here —
                 // provision is the only place this binding writes to a
                 // sprite it did not just create, and never on the live row.

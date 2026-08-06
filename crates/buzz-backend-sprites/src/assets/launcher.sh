@@ -57,7 +57,26 @@ hb() {
     curl -sf --unix-socket /.sprite/api.sock \
         -H 'Content-Type: application/json' "$@" >/dev/null
 }
-hb -X PUT http://sprite/v1/tasks/buzz-agent -d '{"expire":"5m"}' || true
+
+# The FIRST hold is mandatory, not best-effort: idle detection can pause a
+# quiet sprite in ~30s, while the refresh loop below wakes only every 60s.
+# A transient failure papered over here becomes a sprite that hibernates
+# with a "running" agent inside — and a paused retry loop that can never
+# save it. Bounded retries, then fail the start loudly: the flock releases
+# on exit, the probe reads stopped, and the deploy reports startup failure
+# instead of success.
+held=""
+for _ in 1 2 3 4 5; do
+    if hb -X PUT http://sprite/v1/tasks/buzz-agent -d '{"expire":"5m"}'; then
+        held=1
+        break
+    fi
+    sleep 2
+done
+if [ -z "$held" ]; then
+    echo "launcher: could not take the keep-awake task lease" >&2
+    exit 4
+fi
 (
     trap 'hb -X DELETE http://sprite/v1/tasks/buzz-agent || true' EXIT HUP TERM INT
     while sleep 60; do

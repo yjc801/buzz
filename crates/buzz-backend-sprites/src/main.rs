@@ -132,6 +132,14 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
         },
     )?;
 
+    // The launch gate, still before any substrate contact: a command the
+    // sprite cannot run after provisioning is refused here, not discovered
+    // as an exec failure after the deploy already mutated the sprite.
+    provision::require_provisioned_command(
+        &cfg,
+        request.agent.launch.as_ref().and_then(|l| l.command.as_deref()),
+    )?;
+
     // Credentials resolve before any network I/O so a missing login fails
     // with the actionable message, not a connection error.
     let client = client::SpritesClient::connect(&cfg)?;

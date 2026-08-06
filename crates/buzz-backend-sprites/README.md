@@ -36,6 +36,12 @@ names the source, and points at the fix rather than reporting a bare 401.
 | `install_claude_adapter` | true | provision `@agentclientprotocol/claude-agent-acp` |
 | `install_codex_adapter` | true | provision `@agentclientprotocol/codex-acp` |
 
+The agent's launch command must be one the sprite can actually run after
+provisioning: `buzz-agent` (always installed, via the sprig multicall), or
+`claude-agent-acp` / `codex-acp` when their install flags are on. Anything
+else — including Goose, which the sprite base image does not ship — is
+refused at deploy time, before the sprite is touched.
+
 ## [L3] Conformance — how this binding realizes the contract
 
 The spec (`docs/remote-agents.md`, §Conformance item 6) requires every binding
@@ -87,7 +93,11 @@ traffic, exec sessions, and tasks. A paused agent is unreachable, since nothing
 external would ever wake it. The launcher therefore holds a Tasks-API lease
 (5 minutes, refreshed every 60 seconds) for as long as the harness lives, and
 releases it when the harness exits — a crash costs at most one lease period of
-compute.
+compute. The *first* hold is mandatory: idle detection can pause a quiet
+sprite in about 30 seconds, faster than the 60-second refresh loop could
+recover, so the launcher retries the initial acquisition briefly and
+otherwise fails the start — the deploy then reports a startup failure
+instead of success for an agent that would hibernate unreachable.
 
 **Secrets.** The agent's key travels as WebSocket *data* (exec stdin frames)
 into a `/dev/shm` file — RAM-backed, mode 0600, named for the attempt — which
@@ -104,7 +114,14 @@ step of a provision. A checkpoint restore therefore rolls the artifacts and
 their record back together, which a control-plane label could not do. A
 changed configuration or an upgraded provider moves the fingerprint and
 reprovisions on the agent's next start; a *running* agent is never disturbed,
-so edits take effect on its next generation.
+so edits take effect on its next generation. A matching fingerprint is only a
+fast path: before it can authorize a start, the installed sprig binary must
+still hash to what install-time recorded, and a failure reprovisions.
+Concurrent deploys of one agent serialize through an in-sprite deploy lease
+(TTL 420 s, refreshed at every provision step) held from before the first
+mutation until after the outcome, so two deploys — even with different
+desired configurations — never interleave writes to the shared artifact
+paths, and the observation that authorizes a start is made under the fence.
 
 **Nothing is destroyed.** This provider never deletes a sprite or kills a
 session — on a persistent VM, every stale property is re-appliable in place.

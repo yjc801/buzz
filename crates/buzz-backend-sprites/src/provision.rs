@@ -7,6 +7,11 @@
 //! intent file is written **last**, atomically, so a crash mid-provision
 //! reads as divergence (→ full reprovision) rather than as done.
 //!
+//! Mutation is fenced: every `ensure` step runs under the sprite-wide deploy
+//! lease (see [`acquire_lease`]), so two concurrent deploys of one agent —
+//! including ones with *different* desired intents against the same existing
+//! sprite — never interleave writes to the shared artifact paths.
+//!
 //! Deliberately absent in v1: git credential-helper wiring. The sprig
 //! multicall ships `git-credential-nostr`/`git-sign-nostr` personalities
 //! (symlinked below) and the harness owns its own git configuration; a
@@ -22,6 +27,121 @@ use std::time::Duration;
 /// user's home (`config::AGENT_HOME`).
 const BUZZ_DIR: &str = "/home/sprite/.buzz";
 const INTENT_PATH: &str = "/home/sprite/.buzz/provision-intent";
+
+/// The sprite-wide deploy lease. Two deploys of the same agent that both
+/// find an existing, stopped sprite share every provisioning path — the
+/// tarball, the adapter tree, the `*.tmp` staging names, the intent record —
+/// and interleaved writes can pair runtime B with fingerprint A. The
+/// create-race fence (`adopted_winner`) cannot cover this: no create
+/// happens. So both mutating actions run under a lease recorded in-sprite:
+/// `deploy.lease` holds `<token> <unix-expiry>`, every read-modify-write of
+/// it happens under `flock` on the (stable-inode) lock file, and every
+/// provision step re-verifies and refreshes the lease before running.
+const LEASE_PATH: &str = "/home/sprite/.buzz/deploy.lease";
+const LEASE_LOCK_PATH: &str = "/home/sprite/.buzz/deploy.lease.lock";
+
+/// Lease TTL. It must outlive the longest single provision step (npm's 300s
+/// cap) because refreshes happen at step *boundaries*: a TTL shorter than a
+/// step would let a contender break the lease mid-step. A crashed deploy's
+/// lease self-clears after this long — within a later deploy's 600s budget.
+const LEASE_TTL_SECS: u64 = 420;
+
+/// The exit code lease scripts use for "the lease belongs to someone else"
+/// (EX_TEMPFAIL) — distinct from 0 (ours) and from real failures.
+const LEASE_CONTENDED_EXIT: i32 = 75;
+
+/// Outcome of one lease acquisition attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseAttempt {
+    Acquired,
+    HeldByAnother,
+}
+
+/// Take (or renew) the deploy lease for `token`.
+///
+/// `token` is provider-minted hex (`naming::new_generation`) — never user
+/// input — which is what makes interpolating it into the script safe.
+/// Succeeds if the lease is free, expired, or already ours; reports
+/// `HeldByAnother` for a live foreign lease (including a contender holding
+/// the flock mid-step).
+pub async fn acquire_lease(
+    substrate: &impl Substrate,
+    sprite: &str,
+    token: &str,
+) -> Result<LeaseAttempt, String> {
+    let script = format!(
+        "# take the deploy lease\n\
+         set -eu\n\
+         mkdir -p {BUZZ_DIR}\n\
+         exec 9>{LEASE_LOCK_PATH}\n\
+         flock -w 10 9 || exit {LEASE_CONTENDED_EXIT}\n\
+         tok=; exp=0\n\
+         if [ -f {LEASE_PATH} ]; then read -r tok exp < {LEASE_PATH} || true; fi\n\
+         case \"$exp\" in *[!0-9]*|\"\") exp=0;; esac\n\
+         now=$(date +%s)\n\
+         if [ -n \"$tok\" ] && [ \"$tok\" != {token} ] && [ \"$now\" -lt \"$exp\" ]; then exit {LEASE_CONTENDED_EXIT}; fi\n\
+         printf \"%s %s\\n\" {token} $((now + {LEASE_TTL_SECS})) > {LEASE_PATH}\n"
+    );
+    let result = run_step(
+        substrate,
+        sprite,
+        "take the deploy lease",
+        &sh(&script),
+        None,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if result.exit_code == LEASE_CONTENDED_EXIT {
+        return Ok(LeaseAttempt::HeldByAnother);
+    }
+    expect_ok(result)?;
+    Ok(LeaseAttempt::Acquired)
+}
+
+/// Release the deploy lease if it is still ours. Best-effort by contract:
+/// a failure here leaves the lease to its TTL, which the fence already
+/// tolerates (a crashed deploy never releases either).
+pub async fn release_lease(
+    substrate: &impl Substrate,
+    sprite: &str,
+    token: &str,
+) -> Result<(), String> {
+    let script = format!(
+        "# release the deploy lease\n\
+         exec 9>{LEASE_LOCK_PATH}\n\
+         flock -w 10 9 || exit 0\n\
+         tok=\n\
+         read -r tok _ < {LEASE_PATH} 2>/dev/null || true\n\
+         if [ \"$tok\" = {token} ]; then rm -f {LEASE_PATH}; fi\n"
+    );
+    run_step(
+        substrate,
+        sprite,
+        "release the deploy lease",
+        &sh(&script),
+        None,
+        Duration::from_secs(60),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Prefix a provision step so it (a) holds the flock for the step's whole
+/// duration, (b) refuses to run unless the lease is still ours, and
+/// (c) refreshes the expiry. Deliberately free of single quotes: the
+/// reconciler tests' fake substrate recognizes the intent-record step by its
+/// first single-quoted token, which must stay the fingerprint.
+fn lease_guard(token: &str, script: &str) -> String {
+    format!(
+        "exec 9>{LEASE_LOCK_PATH}\n\
+         flock -w 30 9 || exit {LEASE_CONTENDED_EXIT}\n\
+         tok=\n\
+         read -r tok _ < {LEASE_PATH} 2>/dev/null || true\n\
+         [ \"$tok\" = {token} ] || exit {LEASE_CONTENDED_EXIT}\n\
+         printf \"%s %s\\n\" {token} $(($(date +%s) + {LEASE_TTL_SECS})) > {LEASE_PATH}\n\
+         {script}"
+    )
+}
 
 /// The sprite architectures sprig publishes musl builds for.
 fn sprig_arch(uname_m: &str) -> Result<&'static str, String> {
@@ -135,13 +255,67 @@ pub async fn spot_check(substrate: &impl Substrate, sprite: &str) -> Result<bool
     Ok(matches!(result, Ok(r) if r.exit_code == 0))
 }
 
+/// The agent commands a provisioned sprite can actually exec: the sprig
+/// multicall's agent personality (always installed), plus each ACP adapter's
+/// npm bin when its install flag is on. Anything else — notably `goose`,
+/// which the base image does not ship — would let the deploy mutate the
+/// sprite and then die at the harness's spawn, so it is refused **before**
+/// any substrate contact. Refusal, never remapping: the launch contract
+/// forbids a provider-side rewrite of what the desktop resolved.
+pub fn require_provisioned_command(
+    cfg: &ProviderConfig,
+    command: Option<&str>,
+) -> Result<(), String> {
+    match command.map(str::trim).filter(|c| !c.is_empty()) {
+        Some("buzz-agent") => Ok(()),
+        Some(adapter @ ("claude-agent-acp" | "codex-acp")) => {
+            let enabled = match adapter {
+                "claude-agent-acp" => cfg.install_claude_adapter,
+                _ => cfg.install_codex_adapter,
+            };
+            if enabled {
+                return Ok(());
+            }
+            let flag = match adapter {
+                "claude-agent-acp" => "install_claude_adapter",
+                _ => "install_codex_adapter",
+            };
+            Err(format!(
+                "deploy refused: launch command {adapter:?} is an ACP adapter \
+                 this deploy's configuration does not provision \
+                 (provider_config.{flag} is false) — enable it, or switch the \
+                 agent's runtime, and deploy again"
+            ))
+        }
+        Some(other) => Err(format!(
+            "deploy refused: launch command {other:?} is not provisioned in a \
+             sprite. This binding provisions buzz-agent, plus claude-agent-acp \
+             and codex-acp when their install flags are on; the base image \
+             ships no other agent runtime, so the deploy would alter the \
+             sprite and then fail at startup. Switch the agent to a \
+             provisioned runtime."
+        )),
+        None => Err(
+            "deploy refused: the deploy carried no launch command, and the \
+             harness's built-in default (goose) is not provisioned in a \
+             sprite. Update Buzz Desktop to a version that resolves the \
+             launch contract, or set the agent's runtime to buzz-agent, \
+             claude-agent-acp, or codex-acp."
+                .to_string(),
+        ),
+    }
+}
+
 /// The full provision: layout, sprig (download → verify → extract →
 /// personality links → record binary digest), adapters, assets, and the
-/// intent record last.
+/// intent record last. Every step runs under [`lease_guard`] for
+/// `lease_token`, so the caller must hold the deploy lease
+/// ([`acquire_lease`]) before calling.
 pub async fn ensure(
     substrate: &impl Substrate,
     sprite: &str,
     resolved: &Resolved,
+    lease_token: &str,
 ) -> Result<(), String> {
     let t = &resolved.template;
 
@@ -149,7 +323,10 @@ pub async fn ensure(
         substrate,
         sprite,
         "create layout",
-        &sh(&format!("mkdir -p {BUZZ_DIR}/bin {BUZZ_DIR}/adapters")),
+        &sh(&lease_guard(
+            lease_token,
+            &format!("mkdir -p {BUZZ_DIR}/bin {BUZZ_DIR}/adapters"),
+        )),
         None,
         Duration::from_secs(30),
     )
@@ -159,20 +336,32 @@ pub async fn ensure(
     // Download and verify against the resolved pin BEFORE extraction: the
     // tarball is what runs with the agent's private key, and a movable
     // release tag alone is not acceptable provenance.
+    //
+    // The URL rides as `$1`, never interpolated into the script: its
+    // `sprig_version` component is config-controlled, and Rust's debug
+    // quoting does not neutralize `$()`/backtick substitution inside bash
+    // double quotes. (`config::parse` also refuses non-tag characters in the
+    // version — two independent layers.)
     let url = sprig_url(&t.sprig_version, resolved.arch);
     run_step(
         substrate,
         sprite,
         "install sprig",
-        &sh(&format!(
-            "set -e; cd /tmp; curl -fsSL --retry 2 -o sprig.tgz {url:?}; \
-             echo '{sha}  sprig.tgz' | sha256sum -c --quiet -; \
-             tar xzf sprig.tgz -C {BUZZ_DIR}/bin; rm -f sprig.tgz; \
-             cd {BUZZ_DIR}/bin; \
-             for link in rg tree buzz git-credential-nostr git-sign-nostr; do ln -sf sprig \"$link\"; done; \
-             sha256sum sprig > {BUZZ_DIR}/sprig.sha256",
-            sha = t.sprig_sha256,
-        )),
+        &sh_arg(
+            &lease_guard(
+                lease_token,
+                &format!(
+                    "set -e; cd /tmp; curl -fsSL --retry 2 -o sprig.tgz -- \"$1\"; \
+                     echo '{sha}  sprig.tgz' | sha256sum -c --quiet -; \
+                     tar xzf sprig.tgz -C {BUZZ_DIR}/bin; rm -f sprig.tgz; \
+                     cd {BUZZ_DIR}/bin; \
+                     for link in rg tree buzz git-credential-nostr git-sign-nostr; do ln -sf sprig \"$link\"; done; \
+                     sha256sum sprig > {BUZZ_DIR}/sprig.sha256",
+                    sha = t.sprig_sha256,
+                ),
+            ),
+            &url,
+        ),
         None,
         Duration::from_secs(180),
     )
@@ -197,9 +386,12 @@ pub async fn ensure(
             substrate,
             sprite,
             "install adapters",
-            &sh(&format!(
-                "npm install --no-fund --no-audit --prefix {BUZZ_DIR}/adapters {}",
-                adapters.join(" ")
+            &sh(&lease_guard(
+                lease_token,
+                &format!(
+                    "npm install --no-fund --no-audit --prefix {BUZZ_DIR}/adapters {}",
+                    adapters.join(" ")
+                ),
             )),
             None,
             Duration::from_secs(300),
@@ -221,8 +413,9 @@ pub async fn ensure(
             substrate,
             sprite,
             name,
-            &sh(&format!(
-                "cat > {path}.tmp && chmod 755 {path}.tmp && mv {path}.tmp {path}"
+            &sh(&lease_guard(
+                lease_token,
+                &format!("cat > {path}.tmp && chmod 755 {path}.tmp && mv {path}.tmp {path}"),
             )),
             Some(content.as_bytes().to_vec()),
             Duration::from_secs(30),
@@ -237,9 +430,12 @@ pub async fn ensure(
         substrate,
         sprite,
         "record provision intent",
-        &sh(&format!(
-            "printf %s '{fp}' > {INTENT_PATH}.tmp && mv {INTENT_PATH}.tmp {INTENT_PATH}",
-            fp = resolved.fingerprint().as_str()
+        &sh(&lease_guard(
+            lease_token,
+            &format!(
+                "printf %s '{fp}' > {INTENT_PATH}.tmp && mv {INTENT_PATH}.tmp {INTENT_PATH}",
+                fp = resolved.fingerprint().as_str()
+            ),
         )),
         None,
         Duration::from_secs(30),
@@ -252,6 +448,18 @@ pub async fn ensure(
 
 fn sh(script: &str) -> Vec<String> {
     vec!["bash".to_string(), "-c".to_string(), script.to_string()]
+}
+
+/// `bash -c <script> bash <arg>` — the argument reaches the script verbatim
+/// as `$1`, with no shell evaluation of its content anywhere.
+fn sh_arg(script: &str, arg: &str) -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "bash".to_string(),
+        arg.to_string(),
+    ]
 }
 
 async fn run_step(
@@ -271,6 +479,16 @@ async fn run_step(
 fn expect_ok(result: crate::substrate::ExecResult) -> Result<(), String> {
     if result.exit_code == 0 {
         return Ok(());
+    }
+    if result.exit_code == LEASE_CONTENDED_EXIT {
+        // Only reachable from a guarded step: this deploy stalled past the
+        // lease TTL and another deploy of the same agent took over.
+        return Err(
+            "the deploy lease changed hands mid-provision — another deploy of \
+             this agent took over after this one stalled past the lease TTL. \
+             Nothing further was changed by this call; start the agent again."
+                .to_string(),
+        );
     }
     // stderr tail only — enough to act on, small enough to stay readable.
     let tail: String = result
@@ -334,15 +552,36 @@ mod tests {
                 }
             };
 
-            // Full provision (sprig download + verify + assets + intent).
+            // Full provision (sprig download + verify + assets + intent),
+            // under the deploy lease the reconciler would hold.
+            let lease = "cafe4242";
+            assert_eq!(
+                acquire_lease(&client, &name, lease).await.unwrap(),
+                LeaseAttempt::Acquired,
+                "fresh sprite refused the deploy lease"
+            );
+            // The fence itself: a different token must be turned away while
+            // the lease is live, and admitted once it is released.
+            assert_eq!(
+                acquire_lease(&client, &name, "ffff0000").await.unwrap(),
+                LeaseAttempt::HeldByAnother,
+                "a live foreign lease was not contended"
+            );
             let resolved = resolve(&client, &name, &cfg).await.unwrap();
-            ensure(&client, &name, &resolved).await.unwrap();
+            ensure(&client, &name, &resolved, lease).await.unwrap();
             assert_eq!(
                 recorded_fingerprint(&client, &name).await.unwrap(),
                 Some(resolved.fingerprint()),
                 "intent file not recorded"
             );
             assert!(spot_check(&client, &name).await.unwrap(), "sprig digest check");
+            release_lease(&client, &name, lease).await.unwrap();
+            assert_eq!(
+                acquire_lease(&client, &name, "ffff0000").await.unwrap(),
+                LeaseAttempt::Acquired,
+                "a released lease was not re-acquirable"
+            );
+            release_lease(&client, &name, "ffff0000").await.unwrap();
 
             // Swap the harness for a stub with the same comm so the
             // lifecycle runs without a relay. `buzz-acp` is a symlink into
@@ -472,5 +711,47 @@ mod tests {
     #[test]
     fn baked_shas_differ_per_arch() {
         assert_ne!(baked_sha_for("x86_64"), baked_sha_for("aarch64"));
+    }
+
+    /// The launch gate: only commands provisioning actually makes runnable
+    /// pass, and every refusal names what to change. A command outside the
+    /// set (goose, custom paths) must be refused BEFORE any mutation — the
+    /// alternative is a deploy that alters the sprite and then dies at the
+    /// harness's spawn, indistinguishable from a platform fault.
+    #[test]
+    fn the_launch_gate_admits_only_provisioned_commands() {
+        let cfg = crate::config::parse(&serde_json::Value::Null).unwrap();
+
+        // The sprig agent personality is always installed; padding is noise.
+        assert!(require_provisioned_command(&cfg, Some("buzz-agent")).is_ok());
+        assert!(require_provisioned_command(&cfg, Some("  buzz-agent  ")).is_ok());
+        // Both adapters default on.
+        assert!(require_provisioned_command(&cfg, Some("claude-agent-acp")).is_ok());
+        assert!(require_provisioned_command(&cfg, Some("codex-acp")).is_ok());
+
+        // A disabled adapter's bin will not exist — the refusal names the flag.
+        let no_adapters = crate::config::parse(&serde_json::json!({
+            "install_claude_adapter": false,
+            "install_codex_adapter": false,
+        }))
+        .unwrap();
+        let err = require_provisioned_command(&no_adapters, Some("claude-agent-acp")).unwrap_err();
+        assert!(err.contains("install_claude_adapter"), "{err}");
+        let err = require_provisioned_command(&no_adapters, Some("codex-acp")).unwrap_err();
+        assert!(err.contains("install_codex_adapter"), "{err}");
+        // …but buzz-agent still deploys with both adapters off.
+        assert!(require_provisioned_command(&no_adapters, Some("buzz-agent")).is_ok());
+
+        // Nothing else is provisioned — goose included.
+        let err = require_provisioned_command(&cfg, Some("goose")).unwrap_err();
+        assert!(err.contains("\"goose\""), "{err}");
+        assert!(err.contains("deploy refused"), "{err}");
+
+        // No command at all falls through to the harness default (goose),
+        // which fails identically — refuse with the upgrade path named.
+        for absent in [None, Some(""), Some("   ")] {
+            let err = require_provisioned_command(&cfg, absent).unwrap_err();
+            assert!(err.contains("no launch command"), "{err}");
+        }
     }
 }

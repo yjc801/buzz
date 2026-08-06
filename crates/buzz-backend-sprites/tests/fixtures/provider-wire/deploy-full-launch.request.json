@@ -3,7 +3,7 @@
   "request_id": "req-6",
   "agent": {
     "agent_args": [],
-    "agent_command": "goose",
+    "agent_command": "claude-agent-acp",
     "auth_tag": "tag-1",
     "env_vars": {
       "USER_KEY": "user-value"
@@ -13,7 +13,7 @@
       "args": [
         "acp"
       ],
-      "command": "goose",
+      "command": "claude-agent-acp",
       "env": {
         "GOOSE_MODEL": "gpt-5",
         "GOOSE_PROVIDER": "openai",

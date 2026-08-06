@@ -27,6 +27,13 @@ struct FakeState {
     /// Sprite to report after a create call returns `AlreadyExists` —
     /// the rival that won the race.
     sprite_after_create: Option<SpriteMeta>,
+    /// Exit codes for successive deploy-lease acquisitions; the last entry
+    /// repeats. Empty = every acquisition succeeds.
+    lease_acquire_script: Vec<i32>,
+    lease_acquire_index: usize,
+    /// When true, the sprig spot-check fails until a provision re-records
+    /// the intent (emulating a repair of the broken artifact).
+    spot_check_fails: bool,
 }
 
 struct Fake {
@@ -72,12 +79,21 @@ fn script_kind(argv: &[String]) -> &'static str {
         return "probe";
     }
     let joined = argv.join(" ");
-    if joined.contains("uname") {
+    if joined.contains("# take the deploy lease") {
+        "lease-acquire"
+    } else if joined.contains("# release the deploy lease") {
+        "lease-release"
+    } else if joined.contains("uname") {
         "uname"
     } else if joined.contains("provision-intent") && joined.contains("cat") {
         "read-intent"
     } else if joined.contains("/dev/shm/buzz-agent.") {
         "stage-env"
+    } else if joined.contains("sha256sum") && !joined.contains("curl") {
+        // The sprig spot check: hash verification without a download. The
+        // install-sprig provision step also runs sha256sum, but always
+        // alongside curl, so it stays in the default branch.
+        "spot-check"
     } else {
         "provision-step"
     }
@@ -169,6 +185,27 @@ impl Substrate for Fake {
             "uname" => ok("x86_64\n".to_string()),
             "read-intent" => ok(state.recorded_intent.clone().unwrap_or_default()),
             "stage-env" => ok(String::new()),
+            "lease-acquire" => {
+                let script = state.lease_acquire_script.clone();
+                let exit_code = if script.is_empty() {
+                    0
+                } else {
+                    let i = state.lease_acquire_index.min(script.len() - 1);
+                    state.lease_acquire_index += 1;
+                    script[i]
+                };
+                Ok(ExecResult {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+            "lease-release" => ok(String::new()),
+            "spot-check" => Ok(ExecResult {
+                exit_code: i32::from(state.spot_check_fails),
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
             _ => {
                 if state.provision_fails {
                     return Ok(ExecResult {
@@ -187,6 +224,9 @@ impl Substrate for Fake {
                         .and_then(|(_, rest)| rest.split_once('\'').map(|(fp, _)| fp))
                     {
                         state.recorded_intent = Some(fp.to_string());
+                        // A fresh provision repairs whatever the spot check
+                        // was failing on.
+                        state.spot_check_fails = false;
                     }
                 }
                 ok(String::new())
@@ -335,6 +375,37 @@ fn matching_intent_starts_without_reprovisioning() {
         "reprovisioned despite a matching fingerprint: {:?}",
         fake.calls()
     );
+    // …but the fast path is corroborated, never trusted: the recorded
+    // fingerprint only authorizes the start together with a passing hash
+    // check of the installed sprig (evidence over recollection).
+    assert!(
+        fake.calls().iter().any(|c| c == "run:spot-check"),
+        "the matching-fingerprint path skipped the integrity check: {:?}",
+        fake.calls()
+    );
+}
+
+/// The fast path's integrity check has teeth: a matching fingerprint whose
+/// sprig binary no longer hashes clean reads as divergence and takes the
+/// full-provision path before any start.
+#[test]
+fn a_failed_spot_check_reprovisions_before_starting() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        recorded_intent: Some(desired_intent()),
+        spot_check_fails: true,
+        probe_script: vec![stopped_probe()],
+        probe_after_start: Some(started_probe()),
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    let calls = fake.calls();
+    let provision = calls
+        .iter()
+        .position(|c| c == "run:provision-step")
+        .expect("a failed spot check did not reprovision");
+    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
+    assert!(provision < start, "started on a corrupted runtime: {calls:?}");
 }
 
 /// Row 5: a diverged fingerprint reprovisions before starting.
@@ -593,6 +664,103 @@ fn a_failed_provision_reports_and_does_not_start() {
     assert!(
         !fake.calls().iter().any(|c| c.starts_with("start_detached")),
         "started on failed provisioning"
+    );
+}
+
+/// The sprite-wide fence: both mutating actions run under the deploy lease,
+/// taken once (then held across provision AND start) and released only after
+/// the terminal outcome — so the observe-before-start also happens fenced.
+#[test]
+fn provisioning_and_start_run_under_the_deploy_lease() {
+    let fake = Fake::new(FakeState {
+        sprite: None,
+        probe_script: vec![stopped_probe()],
+        probe_after_start: Some(started_probe()),
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    let calls = fake.calls();
+    let acquire = calls
+        .iter()
+        .position(|c| c == "run:lease-acquire")
+        .expect("provisioning ran without taking the deploy lease");
+    let provision = calls.iter().position(|c| c == "run:provision-step").unwrap();
+    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
+    assert!(acquire < provision && provision < start, "{calls:?}");
+    assert_eq!(
+        calls.iter().filter(|c| *c == "run:lease-acquire").count(),
+        1,
+        "the lease should be held across provision and start, not re-taken: {calls:?}"
+    );
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("run:lease-release"),
+        "the lease must outlive the final confirmation: {calls:?}"
+    );
+}
+
+/// A lease held by a concurrent deploy defers this one instead of racing it
+/// — the existing-sprite case the create-race fence cannot see. Once the
+/// holder finishes, this deploy proceeds normally.
+#[test]
+fn a_held_lease_defers_provisioning_until_it_frees() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        recorded_intent: Some("stale-fingerprint".into()),
+        probe_script: vec![stopped_probe()],
+        probe_after_start: Some(started_probe()),
+        lease_acquire_script: vec![75, 75, 0],
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    let calls = fake.calls();
+    assert_eq!(
+        calls.iter().filter(|c| *c == "run:lease-acquire").count(),
+        3,
+        "{calls:?}"
+    );
+    let last_acquire = calls.iter().rposition(|c| c == "run:lease-acquire").unwrap();
+    let first_mutation = calls.iter().position(|c| c == "run:provision-step").unwrap();
+    assert!(
+        last_acquire < first_mutation,
+        "provisioned while the lease was foreign: {calls:?}"
+    );
+}
+
+/// A lease that never frees blocks this deploy to its deadline with zero
+/// mutation — the fence's fail-safe half: never provision on top of a
+/// holder that might still be writing.
+#[test]
+fn a_lease_that_never_frees_blocks_the_deploy_without_mutation() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        recorded_intent: Some("stale-fingerprint".into()),
+        probe_script: vec![stopped_probe()],
+        lease_acquire_script: vec![75],
+        ..Default::default()
+    });
+    let err = run(&fake).unwrap_err();
+    assert!(err.contains("startup not confirmed within the deadline"), "{err}");
+    assert!(fake.mutating_calls().is_empty(), "{:?}", fake.mutating_calls());
+}
+
+/// The lease is released on failure too, so a failed attempt does not fence
+/// out the owner's retry for a full TTL.
+#[test]
+fn the_lease_is_released_when_the_deploy_fails() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        recorded_intent: Some("stale".into()),
+        probe_script: vec![stopped_probe()],
+        provision_fails: true,
+        ..Default::default()
+    });
+    assert!(run(&fake).is_err());
+    assert_eq!(
+        fake.calls().last().map(String::as_str),
+        Some("run:lease-release"),
+        "{:?}",
+        fake.calls()
     );
 }
 

@@ -64,6 +64,7 @@ fn responses_match_their_fixtures() {
         "deploy-no-owner",
         "deploy-relay-mesh",
         "deploy-relay-mesh-padded",
+        "deploy-unprovisioned-command",
     ];
     // The list must cover every response fixture on disk. A literal array is
     // never empty, so `!is_empty()` would assert nothing; what can actually go

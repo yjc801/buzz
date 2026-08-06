@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "error": "deploy refused: launch command \"goose\" is not provisioned in a sprite. This binding provisions buzz-agent, plus claude-agent-acp and codex-acp when their install flags are on; the base image ships no other agent runtime, so the deploy would alter the sprite and then fail at startup. Switch the agent to a provisioned runtime."
+}

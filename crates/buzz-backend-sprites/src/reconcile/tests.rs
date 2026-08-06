@@ -31,6 +31,10 @@ struct FakeState {
     /// repeats. Empty = every acquisition succeeds.
     lease_acquire_script: Vec<i32>,
     lease_acquire_index: usize,
+    /// Exit codes for successive pre-start lease confirmations; the last
+    /// entry repeats. Empty = every confirmation succeeds.
+    lease_confirm_script: Vec<i32>,
+    lease_confirm_index: usize,
     /// When true, the sprig spot-check fails until a provision re-records
     /// the intent (emulating a repair of the broken artifact).
     spot_check_fails: bool,
@@ -81,6 +85,8 @@ fn script_kind(argv: &[String]) -> &'static str {
     let joined = argv.join(" ");
     if joined.contains("# take the deploy lease") {
         "lease-acquire"
+    } else if joined.contains("# confirm the deploy lease") {
+        "lease-confirm"
     } else if joined.contains("# release the deploy lease") {
         "lease-release"
     } else if joined.contains("uname") {
@@ -192,6 +198,21 @@ impl Substrate for Fake {
                 } else {
                     let i = state.lease_acquire_index.min(script.len() - 1);
                     state.lease_acquire_index += 1;
+                    script[i]
+                };
+                Ok(ExecResult {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+            "lease-confirm" => {
+                let script = state.lease_confirm_script.clone();
+                let exit_code = if script.is_empty() {
+                    0
+                } else {
+                    let i = state.lease_confirm_index.min(script.len() - 1);
+                    state.lease_confirm_index += 1;
                     script[i]
                 };
                 Ok(ExecResult {
@@ -687,6 +708,13 @@ fn provisioning_and_start_run_under_the_deploy_lease() {
     let provision = calls.iter().position(|c| c == "run:provision-step").unwrap();
     let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
     assert!(acquire < provision && provision < start, "{calls:?}");
+    // The in-memory flag is not trusted at the start boundary: ownership is
+    // re-confirmed against the durable lease immediately before the launch.
+    let confirm = calls
+        .iter()
+        .position(|c| c == "run:lease-confirm")
+        .expect("started without re-confirming the lease");
+    assert!(provision < confirm && confirm < start, "{calls:?}");
     assert_eq!(
         calls.iter().filter(|c| *c == "run:lease-acquire").count(),
         1,
@@ -742,6 +770,47 @@ fn a_lease_that_never_frees_blocks_the_deploy_without_mutation() {
     let err = run(&fake).unwrap_err();
     assert!(err.contains("startup not confirmed within the deadline"), "{err}");
     assert!(fake.mutating_calls().is_empty(), "{:?}", fake.mutating_calls());
+}
+
+/// The durable lease outranks the in-memory flag: when the pre-start
+/// confirmation finds the lease no longer ours (a successor claimed it past
+/// the TTL), the observation is discarded — no start — and the loop drops
+/// back to acquisition, starting only after the fence is re-established and
+/// re-confirmed.
+#[test]
+fn a_lost_lease_discards_the_observation_and_reacquires_before_start() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        recorded_intent: Some(desired_intent()),
+        probe_script: vec![stopped_probe()],
+        probe_after_start: Some(started_probe()),
+        // First pre-start confirmation fails (ownership changed); after the
+        // loop re-acquires, the second succeeds.
+        lease_confirm_script: vec![75, 0],
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    let calls = fake.calls();
+    assert_eq!(
+        calls.iter().filter(|c| *c == "run:lease-acquire").count(),
+        2,
+        "losing the lease must force a re-acquisition: {calls:?}"
+    );
+    // Exactly one start, and only after the second (successful) confirm —
+    // never on the strength of the failed one.
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("start_detached")).count(),
+        1,
+        "{calls:?}"
+    );
+    let last_confirm = calls.iter().rposition(|c| c == "run:lease-confirm").unwrap();
+    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
+    assert!(last_confirm < start, "{calls:?}");
+    assert_eq!(
+        calls.iter().filter(|c| *c == "run:lease-confirm").count(),
+        2,
+        "{calls:?}"
+    );
 }
 
 /// The lease is released on failure too, so a failed attempt does not fence

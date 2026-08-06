@@ -129,6 +129,26 @@ mod tests {
         assert!(fail < exec, "the lease failure path must precede the exec");
     }
 
+    /// The keep-awake task is generation-scoped. With a shared name, a
+    /// predecessor's sleeping heartbeat child can wake after its harness
+    /// exited, and its EXIT trap then deletes the *successor's* hold —
+    /// which the successor won't refresh for up to 60s, longer than the
+    /// ~30s quiet-idle window. One fixed URL definition carrying ${GEN},
+    /// referenced everywhere else, makes a second fixed-name task
+    /// operation impossible to add unnoticed.
+    #[test]
+    fn the_keep_awake_task_is_generation_scoped() {
+        assert!(
+            LAUNCHER_SH.contains("/v1/tasks/buzz-agent-${GEN}"),
+            "the task name must carry the generation"
+        );
+        assert_eq!(
+            LAUNCHER_SH.matches("/v1/tasks/").count(),
+            1,
+            "every task operation must go through the one generation-scoped URL"
+        );
+    }
+
     #[test]
     fn argv_carries_only_public_identity() {
         let argv = launcher_argv(&"a".repeat(64), "cafe0001");

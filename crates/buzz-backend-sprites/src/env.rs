@@ -253,7 +253,12 @@ pub fn build_env(
     // The harness and MCP binaries are resolved against the *provisioned*
     // PATH inside the sprite. A host path forwarded from the desktop is
     // guaranteed absent there (§Launch data, host-resolved values).
-    if let Some(command) = launch.command.as_deref().filter(|c| !c.is_empty()) {
+    //
+    // Stored TRIMMED — the same rule as every identity component: the
+    // launch gate validates the trimmed command, and a validator and writer
+    // that disagree about the value would let "  buzz-agent  " pass the
+    // gate and then make the harness spawn a filename containing spaces.
+    if let Some(command) = launch.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         env.insert("BUZZ_ACP_AGENT_COMMAND".into(), command.to_string());
     }
     if !launch.args.is_empty() {
@@ -515,6 +520,25 @@ mod tests {
             }));
             assert!(build(&agent).is_err(), "accepted non-POSIX key {bad:?}");
         }
+    }
+
+    /// The stored-value half of the launch gate: the gate validates the
+    /// TRIMMED command, so the trimmed form must be what the harness
+    /// receives — padding that survived to `BUZZ_ACP_AGENT_COMMAND` would
+    /// pass validation and then spawn a filename containing spaces.
+    #[test]
+    fn agent_command_is_stored_trimmed() {
+        let agent = payload_json(serde_json::json!({
+            "launch": {"command": "  buzz-agent  ", "owner_pubkey": "beef"}
+        }));
+        let env = build(&agent).unwrap();
+        assert_eq!(env["BUZZ_ACP_AGENT_COMMAND"], "buzz-agent");
+
+        // Whitespace-only collapses to absent, matching the gate's reading.
+        let agent = payload_json(serde_json::json!({
+            "launch": {"command": "   ", "owner_pubkey": "beef"}
+        }));
+        assert!(!build(&agent).unwrap().contains_key("BUZZ_ACP_AGENT_COMMAND"));
     }
 
     #[test]

@@ -53,6 +53,14 @@ printf '%s' "$GEN" >"$BUZZ/agent.gen"
 # the agent) running. 5m expiry refreshed every 60s; if the harness dies
 # without cleanup the task self-expires and the sprite pauses — the crash
 # story costs at most five minutes of compute.
+#
+# The task is scoped to THIS generation: a predecessor's heartbeat child can
+# sleep through its harness's exit and wake after a successor has started,
+# and with a shared name its EXIT trap would delete the successor's hold —
+# up to ~30s of quiet idle before the successor's first 60s refresh. Own
+# generation, own task: cleanup can only ever remove this attempt's hold,
+# and an orphaned task self-expires in one lease period.
+TASK_URL="http://sprite/v1/tasks/buzz-agent-${GEN}"
 hb() {
     curl -sf --unix-socket /.sprite/api.sock \
         -H 'Content-Type: application/json' "$@" >/dev/null
@@ -67,7 +75,7 @@ hb() {
 # instead of success.
 held=""
 for _ in 1 2 3 4 5; do
-    if hb -X PUT http://sprite/v1/tasks/buzz-agent -d '{"expire":"5m"}'; then
+    if hb -X PUT "$TASK_URL" -d '{"expire":"5m"}'; then
         held=1
         break
     fi
@@ -78,12 +86,12 @@ if [ -z "$held" ]; then
     exit 4
 fi
 (
-    trap 'hb -X DELETE http://sprite/v1/tasks/buzz-agent || true' EXIT HUP TERM INT
+    trap 'hb -X DELETE "$TASK_URL" || true' EXIT HUP TERM INT
     while sleep 60; do
         # After the exec below, PID $SELF *is* the harness (comm buzz-acp).
         # Anything else means it exited or was replaced: release the hold.
         [ "$(cat /proc/$SELF/comm 2>/dev/null)" = "buzz-acp" ] || exit 0
-        hb -X PUT http://sprite/v1/tasks/buzz-agent -d '{"expire":"5m"}' || true
+        hb -X PUT "$TASK_URL" -d '{"expire":"5m"}' || true
     done
 ) &
 

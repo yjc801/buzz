@@ -98,6 +98,40 @@ pub async fn acquire_lease(
     Ok(LeaseAttempt::Acquired)
 }
 
+/// Re-verify — and refresh — a lease this call believes it holds. `false`
+/// means ownership changed since the last refresh: the token was overwritten
+/// by a successor, or the file was released. Either way any observation made
+/// under the old fence is stale and must be discarded.
+///
+/// Deliberately NOT `acquire_lease`: an *absent* lease file here is failure,
+/// not free-to-take. Absence after we held the lease means a successor
+/// acquired (post-TTL), mutated, and released — reacquiring would bless an
+/// observation that predates the successor's writes.
+pub async fn confirm_lease(
+    substrate: &impl Substrate,
+    sprite: &str,
+    token: &str,
+) -> Result<bool, String> {
+    let script = format!(
+        "# confirm the deploy lease\n{}",
+        lease_guard(token, "true")
+    );
+    let result = run_step(
+        substrate,
+        sprite,
+        "confirm the deploy lease",
+        &sh(&script),
+        None,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if result.exit_code == LEASE_CONTENDED_EXIT {
+        return Ok(false);
+    }
+    expect_ok(result)?;
+    Ok(true)
+}
+
 /// Release the deploy lease if it is still ours. Best-effort by contract:
 /// a failure here leaves the lease to its TTL, which the fence already
 /// tolerates (a crashed deploy never releases either).

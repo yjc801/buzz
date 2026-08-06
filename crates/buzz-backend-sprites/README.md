@@ -91,9 +91,11 @@ before anything else happens.
 to the relay is *outbound*, and sprite idle detection counts only inbound
 traffic, exec sessions, and tasks. A paused agent is unreachable, since nothing
 external would ever wake it. The launcher therefore holds a Tasks-API lease
-(5 minutes, refreshed every 60 seconds) for as long as the harness lives, and
-releases it when the harness exits — a crash costs at most one lease period of
-compute. The *first* hold is mandatory: idle detection can pause a quiet
+(5 minutes, refreshed every 60 seconds, named for the attempt's generation)
+for as long as the harness lives, and releases it when the harness exits — a
+crash costs at most one lease period of compute. The generation-scoped name
+means a predecessor's late-waking heartbeat can only ever delete its *own*
+attempt's hold, never a successor's. The *first* hold is mandatory: idle detection can pause a quiet
 sprite in about 30 seconds, faster than the 60-second refresh loop could
 recover, so the launcher retries the initial acquisition briefly and
 otherwise fails the start — the deploy then reports a startup failure
@@ -122,6 +124,10 @@ Concurrent deploys of one agent serialize through an in-sprite deploy lease
 mutation until after the outcome, so two deploys — even with different
 desired configurations — never interleave writes to the shared artifact
 paths, and the observation that authorizes a start is made under the fence.
+The lease's in-memory state is never trusted at the start boundary: ownership
+is re-confirmed against the durable lease immediately before the launch, and
+a lease that changed hands — or was released by a successor — discards the
+observation and re-enters the loop rather than starting on stale evidence.
 
 **Nothing is destroyed.** This provider never deletes a sprite or kills a
 session — on a persistent VM, every stale property is re-appliable in place.

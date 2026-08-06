@@ -254,6 +254,19 @@ async fn deploy_loop(
             }
 
             Action::Start => {
+                // `lease_held` is in-memory truth; the durable lease expires
+                // after its TTL. If anything above stalled past it, a
+                // successor may have acquired the fence and provisioned —
+                // so re-confirm (and refresh) ownership immediately before
+                // the one mutating step `ensure`'s per-step guards cannot
+                // cover. A failed confirmation means the observation that
+                // chose Start predates a successor's writes: discard it and
+                // re-enter the loop, which re-acquires and re-observes.
+                if !provision::confirm_lease(substrate, &sprite_name, lease_token).await? {
+                    *lease_held = false;
+                    substrate.sleep(POLL_INTERVAL).await;
+                    continue;
+                }
                 attempt_started = true;
                 // Fresh generation per attempt: the env file's name, the
                 // lifecycle correlator, and the probe's `gen` are one

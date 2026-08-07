@@ -100,7 +100,20 @@ export function resolveManagedAgentChannelId(
   );
 
   if (relayAgent?.channelIds?.length) {
-    return relayAgent.channelIds[0];
+    // The profile's id list is ordered by the relay, not by writability —
+    // an archived id listed first must not sink the shutdown when a usable
+    // channel follows. Take the first id that resolves to a channel the
+    // caller can actually address (known, not archived); an id the caller
+    // cannot see is one they cannot write to either. When none qualifies,
+    // fall through to the membership scan below instead of returning a
+    // write the relay will reject.
+    const addressable = relayAgent.channelIds.find((id) => {
+      const listed = context.channels.find((channel) => channel.id === id);
+      return listed !== undefined && !listed.archivedAt;
+    });
+    if (addressable) {
+      return addressable;
+    }
   }
 
   // The relay-agents entry is the only source above, and it routinely lacks
@@ -127,8 +140,10 @@ export function resolveManagedAgentChannelId(
     return null;
   }
 
+  // Same writability rule as both paths above: an archived channel cannot
+  // carry the shutdown, so it neither matches nor makes a name ambiguous.
   const matches = context.channels.filter(
-    (channel) => channel.name === channelName,
+    (channel) => channel.name === channelName && !channel.archivedAt,
   );
   return matches.length === 1 ? matches[0].id : null;
 }

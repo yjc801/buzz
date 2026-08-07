@@ -497,6 +497,60 @@ test("channel membership resolves when the relay entry has no channel ids", () =
   assert.equal(resolved, "theirs");
 });
 
+test("an archived channel id never routes the shutdown either", () => {
+  // The direct channelIds path had the same hole as the membership
+  // fallback: the relay orders the id list without regard to writability,
+  // so an archived id listed first sank the shutdown.
+  const a = remote();
+  const archived = { ...channel("arch", []), archivedAt: 123 };
+  const active = channel("act", []);
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [archived, active],
+      relayAgents: [
+        { pubkey: a.pubkey, channelIds: ["arch", "act"], channels: [] },
+      ],
+    }),
+    "act",
+  );
+
+  // Every listed id archived or unresolvable → fall through to the
+  // membership scan rather than returning a doomed write.
+  const membered = channel("membered", [a.pubkey]);
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [archived, membered],
+      relayAgents: [
+        { pubkey: a.pubkey, channelIds: ["arch", "ghost"], channels: [] },
+      ],
+    }),
+    "membered",
+  );
+
+  // The name fallback obeys the same rule: an archived channel neither
+  // matches a unique name nor makes one ambiguous.
+  const namedArchived = { ...channel("general", []), archivedAt: 123 };
+  const namedActive = { ...channel("general-2", []), name: "general" };
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [namedArchived],
+      relayAgents: [
+        { pubkey: a.pubkey, channelIds: [], channels: ["general"] },
+      ],
+    }),
+    null,
+  );
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [namedArchived, namedActive],
+      relayAgents: [
+        { pubkey: a.pubkey, channelIds: [], channels: ["general"] },
+      ],
+    }),
+    "general-2",
+  );
+});
+
 test("an archived membership never routes the shutdown", () => {
   // The relay rejects writes to archived channels, and useChannelsQuery
   // sorts by type/name — so an archived membership can sort ahead of a

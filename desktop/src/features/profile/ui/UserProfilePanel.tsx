@@ -84,6 +84,7 @@ import {
   resolveProfileDisplayName,
   truncatePubkey,
   type UserProfilePanelProps,
+  useControllablePanelState,
   useRetainedPersona,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useProfileDmAction } from "@/features/profile/ui/useProfileDmAction";
@@ -129,30 +130,15 @@ export function UserProfilePanel({
   const isSplitLayout = layout === "split";
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
-  const [internalView, setInternalView] =
-    React.useState<ProfilePanelView>("summary");
-  const view = controlledView ?? internalView;
-  const setView = React.useCallback(
-    (nextView: ProfilePanelView, options?: { replace?: boolean }) => {
-      if (onViewChange) {
-        onViewChange(nextView, options);
-        return;
-      }
-      setInternalView(nextView);
-    },
-    [onViewChange],
+  const [view, setView] = useControllablePanelState<ProfilePanelView>(
+    controlledView,
+    onViewChange,
+    "summary",
   );
-  const [internalTab, setInternalTab] = React.useState<ProfilePanelTab>("info");
-  const tab = controlledTab ?? internalTab;
-  const setTab = React.useCallback(
-    (nextTab: ProfilePanelTab, options?: { replace?: boolean }) => {
-      if (onTabChange) {
-        onTabChange(nextTab, options);
-        return;
-      }
-      setInternalTab(nextTab);
-    },
-    [onTabChange],
+  const [tab, setTab] = useControllablePanelState<ProfilePanelTab>(
+    controlledTab,
+    onTabChange,
+    "info",
   );
   const [editAgentOpen, setEditAgentOpen] = React.useState(false);
   const [editAgentFocus, setEditAgentFocus] = React.useState<
@@ -348,7 +334,26 @@ export function UserProfilePanel({
     isOwner === true &&
     resolvedPersona !== undefined &&
     managedAgent === undefined;
+  // The hook owns the whole lifecycle-safety surface: action-time channel
+  // resolution, the unresolved-presence hold, and pending state that spans
+  // the full provider restart (which runs mostly outside any mutation).
+  const {
+    handleAgentPrimaryAction,
+    handleAgentRestart,
+    lifecycleActionsBlocked,
+  } = useAgentLifecycleActions({
+    channels: channelsQuery.data,
+    refetchChannels: channelsQuery.refetch,
+    managedAgent,
+    presenceResolved: presenceQuery.data !== undefined,
+    presenceStatus,
+    relayAgents: relayAgentsQuery.data,
+    startManagedAgent: startAgentMutation.mutateAsync,
+    stopManagedAgent: stopAgentMutation.mutateAsync,
+  });
+
   const isAgentActionPending =
+    lifecycleActionsBlocked ||
     createAgentMutation.isPending ||
     updateManagedAgentMutation.isPending ||
     startAgentMutation.isPending ||
@@ -450,15 +455,6 @@ export function UserProfilePanel({
       relayAgentsQuery.refetch,
     ],
   );
-
-  const { handleAgentPrimaryAction, handleAgentRestart } =
-    useAgentLifecycleActions({
-      channels: channelsQuery.data,
-      managedAgent,
-      relayAgents: relayAgentsQuery.data,
-      startManagedAgent: startAgentMutation.mutateAsync,
-      stopManagedAgent: stopAgentMutation.mutateAsync,
-    });
 
   const handleInstantiateAgent = React.useCallback(async () => {
     if (!resolvedPersona) return;

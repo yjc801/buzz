@@ -344,8 +344,15 @@ pub async fn get_presence(
     }
 
     // Presence is published as kind:20001 ephemeral events. Query the most
-    // recent per author. Some relays don't retain ephemeral events — we
-    // best-effort and return what we get.
+    // recent per author.
+    //
+    // A failed query PROPAGATES rather than collapsing to an empty map: an
+    // empty result must mean "the relay answered and holds no presence for
+    // these pubkeys" — the provider-restart flow uses exactly that reading
+    // to decide an agent's harness is gone, and a swallowed outage would
+    // make a live agent look stopped and turn its restart into a silent
+    // no-op deploy. Display callers tolerate the error: the presence query
+    // keeps its last data and retries on its poll interval.
     let events = query_relay(
         &state,
         &[serde_json::json!({
@@ -354,7 +361,7 @@ pub async fn get_presence(
         })],
     )
     .await
-    .unwrap_or_default();
+    .map_err(|e| format!("presence lookup failed: {e}"))?;
 
     let mut latest: HashMap<String, (u64, PresenceStatus)> = HashMap::new();
     for ev in &events {

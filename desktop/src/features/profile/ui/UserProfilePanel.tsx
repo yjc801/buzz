@@ -348,7 +348,33 @@ export function UserProfilePanel({
     isOwner === true &&
     resolvedPersona !== undefined &&
     managedAgent === undefined;
+  const {
+    handleAgentPrimaryAction,
+    handleAgentRestart,
+    isLifecycleActionPending,
+  } = useAgentLifecycleActions({
+    managedAgent,
+    presenceStatus,
+    relayAgents: relayAgentsQuery.data,
+    // Resolved at action time: a fast click before the channels query
+    // settles must not fail shutdown routing with "not in any channel".
+    resolveChannels: React.useCallback(async () => {
+      if (channelsQuery.data) {
+        return channelsQuery.data;
+      }
+      return (await channelsQuery.refetch()).data ?? [];
+      // Depend on the stable pieces, not the query object — it is a fresh
+      // reference every render and would defeat the handlers' memoization.
+    }, [channelsQuery.data, channelsQuery.refetch]),
+    startManagedAgent: startAgentMutation.mutateAsync,
+    stopManagedAgent: stopAgentMutation.mutateAsync,
+  });
+
+  // isLifecycleActionPending spans the whole provider restart — the
+  // !shutdown send and the presence wait run outside any mutation, and
+  // mutation pending alone would re-enable Restart/Deploy mid-flow.
   const isAgentActionPending =
+    isLifecycleActionPending ||
     createAgentMutation.isPending ||
     updateManagedAgentMutation.isPending ||
     startAgentMutation.isPending ||
@@ -450,16 +476,6 @@ export function UserProfilePanel({
       relayAgentsQuery.refetch,
     ],
   );
-
-  const { handleAgentPrimaryAction, handleAgentRestart } =
-    useAgentLifecycleActions({
-      channels: channelsQuery.data,
-      managedAgent,
-      presenceStatus,
-      relayAgents: relayAgentsQuery.data,
-      startManagedAgent: startAgentMutation.mutateAsync,
-      stopManagedAgent: stopAgentMutation.mutateAsync,
-    });
 
   const handleInstantiateAgent = React.useCallback(async () => {
     if (!resolvedPersona) return;

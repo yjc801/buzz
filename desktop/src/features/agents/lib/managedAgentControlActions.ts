@@ -152,9 +152,30 @@ export async function startManagedAgentWithRules({
 /// strict no-op that returns the existing id, so deploying while the old
 /// harness still runs "restarts" nothing. Presence is the only liveness
 /// signal a remote harness has, and a clean shutdown clears it within
-/// seconds; the timeout covers a harness that ignores the command.
-const REMOTE_SHUTDOWN_WAIT_MS = 90_000;
+/// seconds.
+///
+/// The bound must also outlast STALE presence: a harness that crashed
+/// uncleanly leaves its last "online" in Redis for the full presence TTL —
+/// `buzz-pubsub PRESENCE_TTL_SECS` = 180s (3× the 60s heartbeat) — and a
+/// crash right after a heartbeat pins that worst case. A shorter wait made
+/// that agent unrestartable: shutdown goes to nobody, the poll always
+/// expires, and only the TTL's remainder ever clears it. 210s = the full
+/// TTL plus margin, so stale presence is guaranteed to expire (or a live
+/// harness to answer) within one wait; the timeout then really does mean
+/// "something is still alive and ignoring shutdown".
+const REMOTE_SHUTDOWN_WAIT_MS = 210_000;
 const REMOTE_SHUTDOWN_POLL_MS = 2_000;
+
+/// Offline presence is published BEFORE the harness finishes dying:
+/// `buzz-acp` sets presence offline and then still runs its relay teardown
+/// for up to ~5s (a 2s offline-publish bound, then a 5s-bounded graceful
+/// relay shutdown) with the process alive the whole time. A process-probing
+/// provider that deploys inside that window sees the old harness and
+/// no-ops. Wait out double the harness's own bound after presence clears
+/// before deploying. (A true fresh-generation proof needs the deploy
+/// response to distinguish no-op from started, which the provider wire
+/// contract does not carry today.)
+const REMOTE_POST_OFFLINE_GRACE_MS = 10_000;
 
 const waitMs = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -168,6 +189,10 @@ async function waitForRemoteHarnessExit(
   const attempts = Math.ceil(REMOTE_SHUTDOWN_WAIT_MS / REMOTE_SHUTDOWN_POLL_MS);
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await delay(REMOTE_SHUTDOWN_POLL_MS);
+    // A missing entry on a RESOLVED lookup is a successful observation of
+    // "no presence record" — `get_presence` propagates relay failures as
+    // rejections rather than collapsing them to an empty map, so an outage
+    // aborts the restart here instead of counting as an exit.
     const presence = (await fetchPresence([agent.pubkey]))[pubkey];
     if (!isManagedAgentLive(agent, presence)) {
       return;
@@ -209,6 +234,12 @@ export async function respawnManagedAgentWithRules({
   // whether there is a harness to stop, and the redeploy must wait for it
   // to actually die (see waitForRemoteHarnessExit). A dead remote agent
   // skips straight to the deploy.
+  //
+  // A rejected presence lookup rejects the whole restart, on the pre-check
+  // and in the poll alike: `get_presence` propagates relay failures, so
+  // only a RESOLVED lookup with no live entry means "no harness". Treating
+  // an outage's empty answer as stopped would skip the shutdown and turn
+  // the restart into an idempotent live deploy that restarts nothing.
   if (agent.backend.type === "provider") {
     const presence = (await fetchPresence([agent.pubkey]))[
       normalizePubkey(agent.pubkey)
@@ -222,6 +253,10 @@ export async function respawnManagedAgentWithRules({
         stopManagedAgent,
       });
       await waitForRemoteHarnessExit(agent, fetchPresence, delay);
+      // Presence clears BEFORE the harness finishes dying (see
+      // REMOTE_POST_OFFLINE_GRACE_MS) — deploying now could still find
+      // the old process and no-op. Wait out the teardown window.
+      await delay(REMOTE_POST_OFFLINE_GRACE_MS);
       onStopped?.();
     }
     await startManagedAgent(agent.pubkey);
@@ -234,6 +269,39 @@ export async function respawnManagedAgentWithRules({
   }
 
   await startManagedAgent(agent.pubkey);
+}
+
+/// Run `worker` over `items` with at most `limit` in flight, settling every
+/// item. Exists for bulk provider respawns: each one holds a mandatory
+/// post-offline grace, so a serial loop over N agents pays N × grace even
+/// when every agent is healthy — while unbounded fan-out would burst
+/// presence queries and deploys. Failures are isolated per item and
+/// reported in item order.
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<Array<{ error?: unknown; value?: R }>> {
+  const results: Array<{ error?: unknown; value?: R }> = new Array(
+    items.length,
+  );
+  let nextIndex = 0;
+  const lanes = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        try {
+          results[index] = { value: await worker(items[index]) };
+        } catch (error) {
+          results[index] = { error };
+        }
+      }
+    },
+  );
+  await Promise.all(lanes);
+  return results;
 }
 
 export async function stopManagedAgentWithRules({

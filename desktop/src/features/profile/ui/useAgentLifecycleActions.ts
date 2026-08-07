@@ -16,29 +16,41 @@ import type {
 } from "@/shared/api/types";
 
 export function useAgentLifecycleActions({
-  channels,
   managedAgent,
   presenceStatus,
   relayAgents,
+  resolveChannels,
   startManagedAgent,
   stopManagedAgent,
 }: {
-  channels: readonly Channel[] | undefined;
   managedAgent: ManagedAgent | undefined;
   /** Live axis for a remote agent — its control plane cannot report it. */
   presenceStatus?: PresenceStatus | null;
   relayAgents: readonly RelayAgent[] | undefined;
+  /** Channel context resolved AT ACTION TIME (refetching when the query has
+   * not settled) — a render-time snapshot fails a fast click with "not in
+   * any channel" for an agent that is plainly in one. */
+  resolveChannels: () => Promise<readonly Channel[]>;
   startManagedAgent: (pubkey: string) => Promise<unknown>;
   stopManagedAgent: (pubkey: string) => Promise<unknown>;
 }) {
+  // A provider restart spends most of its life OUTSIDE any mutation (the
+  // !shutdown send and the presence wait), so mutation isPending alone
+  // leaves the controls clickable mid-restart — free to bypass the fence
+  // or launch a concurrent deploy. This flag spans each handler's whole
+  // run; the panel folds it into its pending computation.
+  const [isLifecycleActionPending, setLifecycleActionPending] =
+    React.useState(false);
+
   const handleAgentPrimaryAction = React.useCallback(async () => {
     if (!managedAgent) return;
 
+    setLifecycleActionPending(true);
     try {
       if (isManagedAgentLive(managedAgent, presenceStatus)) {
         const result = await stopManagedAgentWithRules({
           agent: managedAgent,
-          channels: channels ?? [],
+          channels: await resolveChannels(),
           relayAgents: relayAgents ?? [],
           stopManagedAgent,
         });
@@ -62,12 +74,14 @@ export function useAgentLifecycleActions({
       toast.error(
         error instanceof Error ? error.message : "Agent action failed.",
       );
+    } finally {
+      setLifecycleActionPending(false);
     }
   }, [
-    channels,
     managedAgent,
     presenceStatus,
     relayAgents,
+    resolveChannels,
     startManagedAgent,
     stopManagedAgent,
   ]);
@@ -75,10 +89,11 @@ export function useAgentLifecycleActions({
   const handleAgentRestart = React.useCallback(async () => {
     if (!managedAgent) return;
 
+    setLifecycleActionPending(true);
     try {
       await respawnManagedAgentWithRules({
         agent: managedAgent,
-        channels: channels ?? [],
+        channels: await resolveChannels(),
         relayAgents: relayAgents ?? [],
         startManagedAgent,
         stopManagedAgent,
@@ -89,14 +104,20 @@ export function useAgentLifecycleActions({
       toast.error(
         error instanceof Error ? error.message : "Agent restart failed.",
       );
+    } finally {
+      setLifecycleActionPending(false);
     }
   }, [
-    channels,
     managedAgent,
     relayAgents,
+    resolveChannels,
     startManagedAgent,
     stopManagedAgent,
   ]);
 
-  return { handleAgentPrimaryAction, handleAgentRestart };
+  return {
+    handleAgentPrimaryAction,
+    handleAgentRestart,
+    isLifecycleActionPending,
+  };
 }

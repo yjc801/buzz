@@ -187,9 +187,13 @@ export function useManagedAgentActions() {
         (candidate) => candidate.pubkey === pubkey,
       );
       if (!agent) return;
+      // Channel context at action time: a fast click before the channels
+      // query settles must not fail the live-provider shutdown with "not
+      // in any channel" (same rule as handleStop).
+      const channels = await getChannelsForAction();
       await respawnManagedAgentWithRules({
         agent,
-        channels: channelsQuery.data ?? [],
+        channels,
         relayAgents: relayAgentsQuery.data ?? [],
         startManagedAgent: startMutation.mutateAsync,
         stopManagedAgent: stopMutation.mutateAsync,

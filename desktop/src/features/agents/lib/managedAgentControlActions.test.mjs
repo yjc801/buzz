@@ -5,6 +5,7 @@ import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
   isManagedAgentLive,
+  mapWithConcurrency,
   resolveManagedAgentChannelId,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
@@ -198,8 +199,8 @@ test("test_provider_respawn_shuts_down_waits_for_offline_then_deploys", async ()
     relayAgents: [],
     // Live at the pre-check, still live on the first poll, then gone.
     fetchPresence: presenceSequence(a, ["online", "online", "offline"]),
-    delay: async () => {
-      events.push("wait");
+    delay: async (ms) => {
+      events.push(`wait:${ms}`);
     },
     stopProviderAgent: async ({ preferredChannelId }) => {
       events.push(`shutdown:${preferredChannelId}`);
@@ -216,11 +217,120 @@ test("test_provider_respawn_shuts_down_waits_for_offline_then_deploys", async ()
     },
   });
 
+  // The final wait is the post-offline grace: buzz-acp publishes offline
+  // and then keeps the process alive through its bounded relay teardown
+  // (~5s), so deploying at first offline sight can still no-op.
   assert.deepEqual(
     events,
-    ["shutdown:here", "wait", "wait", "onStopped", "deploy"],
-    "deploy must come after presence clears, never race the old harness",
+    [
+      "shutdown:here",
+      "wait:2000",
+      "wait:2000",
+      "wait:10000",
+      "onStopped",
+      "deploy",
+    ],
+    "deploy must wait out the post-offline teardown window, never race the old harness",
   );
+});
+
+test("test_provider_respawn_precheck_lookup_failure_aborts", async () => {
+  // get_presence propagates relay failures; a rejected pre-check must abort
+  // the restart — treating the unknown as "stopped" would skip the shutdown
+  // and turn the restart into an idempotent live deploy that did nothing.
+  const a = remote();
+  const events = [];
+
+  await assert.rejects(
+    respawnManagedAgentWithRules({
+      agent: a,
+      fetchPresence: async () => {
+        throw new Error("presence lookup failed: relay unreachable");
+      },
+      stopProviderAgent: async () => {
+        events.push("shutdown");
+        return {};
+      },
+      startManagedAgent: async () => {
+        events.push("deploy");
+      },
+      stopManagedAgent: async () => {},
+    }),
+    /presence lookup failed/,
+  );
+
+  assert.deepEqual(events, [], "unknown presence must fail, not deploy");
+});
+
+test("test_provider_respawn_poll_lookup_failure_aborts_before_deploy", async () => {
+  // The same rule mid-wait: an outage during polling is not exit evidence.
+  const a = remote();
+  const events = [];
+  let lookups = 0;
+
+  await assert.rejects(
+    respawnManagedAgentWithRules({
+      agent: a,
+      fetchPresence: async () => {
+        lookups += 1;
+        if (lookups === 1) {
+          return { [a.pubkey.toLowerCase()]: "online" };
+        }
+        throw new Error("presence lookup failed: relay unreachable");
+      },
+      delay: async () => {},
+      stopProviderAgent: async () => {
+        events.push("shutdown");
+        return {};
+      },
+      startManagedAgent: async () => {
+        events.push("deploy");
+      },
+      stopManagedAgent: async () => {},
+      onStopped: () => {
+        events.push("onStopped");
+      },
+    }),
+    /presence lookup failed/,
+  );
+
+  assert.deepEqual(
+    events,
+    ["shutdown"],
+    "an outage mid-wait aborts the restart; no deploy, no onStopped",
+  );
+});
+
+test("mapWithConcurrency bounds in-flight work and isolates failures in order", async () => {
+  const items = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  let inFlight = 0;
+  let peak = 0;
+
+  const results = await mapWithConcurrency(items, 3, async (n) => {
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    inFlight -= 1;
+    if (n % 4 === 3) {
+      throw new Error(`boom ${n}`);
+    }
+    return n * 2;
+  });
+
+  assert.ok(peak <= 3, `in-flight exceeded the bound: ${peak}`);
+  assert.ok(peak > 1, `never actually ran concurrently: ${peak}`);
+  assert.equal(results.length, items.length);
+  for (const [index, n] of items.entries()) {
+    if (n % 4 === 3) {
+      assert.match(results[index].error.message, /boom/);
+    } else {
+      assert.equal(results[index].value, n * 2);
+    }
+  }
+
+  // A limit above the item count must not spawn phantom lanes.
+  const single = await mapWithConcurrency([7], 8, async (n) => n + 1);
+  assert.equal(single[0].value, 8);
 });
 
 test("test_provider_respawn_dead_agent_deploys_without_shutdown", async () => {

@@ -6,6 +6,7 @@ import {
   useStopManagedAgentMutation,
 } from "@/features/agents/hooks";
 import {
+  mapWithConcurrency,
   respawnManagedAgentWithRules,
   isManagedAgentActive,
   isManagedAgentLive,
@@ -48,6 +49,11 @@ const EMPTY_AGENT_CONTEXT = {
   channels: [],
   relayAgents: [],
 } as const;
+
+/** In-flight cap for bulk respawns: enough lanes that N healthy provider
+ * respawns cost ~⌈N/4⌉ grace periods instead of N, small enough not to
+ * burst presence queries and deploys at the relay/provider. */
+const BULK_RESPAWN_CONCURRENCY = 4;
 
 export function useMembersSidebarActions({
   channelId,
@@ -209,24 +215,55 @@ export function useMembersSidebarActions({
   }
 
   async function handleRespawnAll() {
-    await runBulkAgentAction({
-      action: async (agent) => {
-        await respawnManagedAgentWithRules({
-          agent,
-          ...EMPTY_AGENT_CONTEXT,
-          preferredChannelId: channelId,
-          startManagedAgent: startManagedAgentMutation.mutateAsync,
-          stopManagedAgent: stopManagedAgentMutation.mutateAsync,
-          onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),
-        });
-        return undefined;
-      },
-      actionKey: "bulk-respawn",
-      agents: controllableManagedBots,
-      failureMessage: "Failed to respawn agent.",
-      successMessage: (count) =>
-        `Spawned or respawned ${formatCountLabel(count, "agent", "agents")}.`,
-    });
+    // Bounded parallelism, unlike the serial stop/remove bulks: every live
+    // provider respawn holds a mandatory post-offline grace, so a serial
+    // loop pays N × grace even when every agent is healthy. Each agent
+    // still runs its own full fence (shutdown → presence wait → grace →
+    // deploy); only the agents run concurrently, and failures stay
+    // per-agent.
+    clearActionFeedback();
+    setActiveActionKey("bulk-respawn");
+    try {
+      const results = await mapWithConcurrency(
+        controllableManagedBots,
+        BULK_RESPAWN_CONCURRENCY,
+        (agent) =>
+          respawnManagedAgentWithRules({
+            agent,
+            ...EMPTY_AGENT_CONTEXT,
+            preferredChannelId: channelId,
+            startManagedAgent: startManagedAgentMutation.mutateAsync,
+            stopManagedAgent: stopManagedAgentMutation.mutateAsync,
+            onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),
+          }),
+      );
+
+      const failures = results.flatMap((result, index) =>
+        "error" in result && result.error !== undefined
+          ? [
+              {
+                error:
+                  result.error instanceof Error
+                    ? result.error.message
+                    : "Failed to respawn agent.",
+                name: controllableManagedBots[index].name,
+              },
+            ]
+          : [],
+      );
+      const successCount = results.length - failures.length;
+      if (successCount > 0) {
+        setActionNoticeMessage(
+          `Spawned or respawned ${formatCountLabel(successCount, "agent", "agents")}.`,
+        );
+      }
+      const failureSummary = formatFailureSummary(failures);
+      if (failureSummary) {
+        setActionErrorMessage(failureSummary);
+      }
+    } finally {
+      setActiveActionKey(null);
+    }
   }
 
   async function handleStopAll() {

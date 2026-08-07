@@ -1026,7 +1026,7 @@ async fn query_events_authed(
         .await;
     }
 
-    if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await {
+    if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await? {
         return Ok(Json(Value::Array(presence_events)));
     }
 
@@ -1970,19 +1970,12 @@ pub async fn workflow_webhook(
     ))
 }
 
-/// If all filters target kind:20001 or kind:40902 with authors, synthesize
-/// presence from Redis instead of querying the DB (ephemeral events are never
-/// stored, and kind:40902 snapshots are relay-generated on demand).
-///
-/// Returns `Some(events)` if handled, `None` to fall through to normal query.
-async fn synthesize_presence(
-    state: &AppState,
-    tenant: &buzz_core::tenant::TenantContext,
-    filters: &[nostr::Filter],
-) -> Option<Vec<Value>> {
+/// The author pubkeys of a pure presence query: every filter targets
+/// kind:20001 or kind:40902 with a non-empty author list. `None` means the
+/// query is not a presence query and must fall through to the normal path.
+fn presence_query_pubkeys(filters: &[nostr::Filter]) -> Option<Vec<nostr::PublicKey>> {
     use buzz_core::kind::{KIND_PRESENCE_SNAPSHOT, KIND_PRESENCE_UPDATE};
 
-    // Only intercept if every filter targets kind:20001 or 40902 with authors.
     let mut all_pubkeys: Vec<nostr::PublicKey> = Vec::new();
     for filter in filters {
         let kinds = filter.kinds.as_ref()?;
@@ -1997,9 +1990,33 @@ async fn synthesize_presence(
         }
         all_pubkeys.extend(authors.iter().copied());
     }
+    Some(all_pubkeys)
+}
+
+/// If all filters target kind:20001 or kind:40902 with authors, synthesize
+/// presence from Redis instead of querying the DB (ephemeral events are never
+/// stored, and kind:40902 snapshots are relay-generated on demand).
+///
+/// Returns `Ok(Some(events))` if handled, `Ok(None)` to fall through to the
+/// normal query. A presence-store failure is an ERROR, never an empty
+/// success: an empty answer asserts "nobody here is present", and clients
+/// now act on that — the provider-restart flow reads it as "the harness is
+/// gone" and deploys, which against a live-but-unreadable agent silently
+/// no-ops. Callers that only display presence tolerate the error by keeping
+/// their last data.
+async fn synthesize_presence(
+    state: &AppState,
+    tenant: &buzz_core::tenant::TenantContext,
+    filters: &[nostr::Filter],
+) -> Result<Option<Vec<Value>>, (StatusCode, Json<Value>)> {
+    use buzz_core::kind::KIND_PRESENCE_UPDATE;
+
+    let Some(mut all_pubkeys) = presence_query_pubkeys(filters) else {
+        return Ok(None);
+    };
 
     if all_pubkeys.is_empty() {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
     // Dedup pubkeys.
@@ -2011,10 +2028,16 @@ async fn synthesize_presence(
         .pubsub
         .get_presence_bulk(tenant, &all_pubkeys)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::warn!("presence lookup failed: {e}");
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "presence is temporarily unavailable",
+            )
+        })?;
 
     if presence_map.is_empty() {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
     // Synthesize kind:20001 events signed by the relay.
@@ -2025,21 +2048,35 @@ async fn synthesize_presence(
 
     let mut events = Vec::with_capacity(presence_map.len());
     for (pubkey_hex, status) in &presence_map {
-        // Build a synthetic event: relay-signed, content = status, p-tag = subject.
-        let tags = vec![nostr::Tag::parse(["p", pubkey_hex]).ok()?];
+        // Build a synthetic event: relay-signed, content = status, p-tag =
+        // subject. A build/signing failure is a server fault, not a reason
+        // to claim nobody is present.
+        let tags = vec![nostr::Tag::parse(["p", pubkey_hex]).map_err(|e| {
+            tracing::warn!("presence event tag build failed: {e}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not synthesize presence",
+            )
+        })?];
         let event =
             nostr::EventBuilder::new(nostr::Kind::Custom(KIND_PRESENCE_UPDATE as u16), status)
                 .tags(tags)
                 .custom_created_at(nostr::Timestamp::from(now))
                 .sign_with_keys(&state.relay_keypair)
-                .ok()?;
+                .map_err(|e| {
+                    tracing::warn!("presence event signing failed: {e}");
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not synthesize presence",
+                    )
+                })?;
 
         if let Ok(v) = serde_json::to_value(&event) {
             events.push(v);
         }
     }
 
-    Some(events)
+    Ok(Some(events))
 }
 
 // ── Moderation queue reads (L6 — Quinn) ───────────────────────────────────────
@@ -2295,6 +2332,46 @@ mod tests {
         ];
 
         assert!(!has_mixed_search_filters(&filters));
+    }
+
+    /// The presence-interception discriminator: only pure presence queries
+    /// (every filter exactly one presence kind, with authors) are answered
+    /// from Redis. Anything else must fall through to the normal query path
+    /// — intercepting it would silently answer a data query from the
+    /// presence store. (The other half of the contract — a presence-store
+    /// failure surfaces as an error response, never as HTTP 200 + `[]`,
+    /// because clients read the empty success as "nobody is present" and
+    /// the provider-restart flow acts on it — is enforced by
+    /// `synthesize_presence`'s signature: the Redis lookup propagates via
+    /// `?` and only a successful lookup can produce a `Some` result.)
+    #[test]
+    fn presence_queries_are_recognized_and_everything_else_falls_through() {
+        let author = Keys::generate().public_key();
+        let presence = nostr::Filter::new()
+            .kind(Kind::Custom(buzz_core::kind::KIND_PRESENCE_UPDATE as u16))
+            .author(author);
+        assert_eq!(
+            presence_query_pubkeys(std::slice::from_ref(&presence)),
+            Some(vec![author])
+        );
+
+        // No authors → not interceptable.
+        let authorless =
+            nostr::Filter::new().kind(Kind::Custom(buzz_core::kind::KIND_PRESENCE_UPDATE as u16));
+        assert_eq!(presence_query_pubkeys(&[authorless]), None);
+
+        // A non-presence kind anywhere poisons the whole batch.
+        let mixed = vec![
+            presence,
+            nostr::Filter::new().kind(Kind::TextNote).author(author),
+        ];
+        assert_eq!(presence_query_pubkeys(&mixed), None);
+
+        // No kinds at all → fall through.
+        assert_eq!(
+            presence_query_pubkeys(&[nostr::Filter::new().author(author)]),
+            None
+        );
     }
 
     #[test]

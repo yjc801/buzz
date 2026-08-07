@@ -43,6 +43,26 @@ rm -f -- "$ENVF"
 
 export PATH="$BUZZ/bin:$BUZZ/adapters/node_modules/.bin:$PATH"
 
+# Git auth for the relay's git server (NIP-98), mirroring the local spawn:
+# ephemeral GIT_CONFIG_* env vars, no filesystem writes, and SCOPED to the
+# relay's git URL — an unscoped helper would answer for every remote,
+# github.com included. The helper path is image-local by
+# requirement (a forwarded host path could not exist here); the agent's
+# NOSTR_PRIVATE_KEY is already in the authoritative env tier.
+if [ -n "${BUZZ_RELAY_URL:-}" ] && [ -x "$BUZZ/bin/git-credential-nostr" ]; then
+    RELAY_HTTP=${BUZZ_RELAY_URL%/}
+    case "$RELAY_HTTP" in
+        wss://*) RELAY_HTTP="https://${RELAY_HTTP#wss://}" ;;
+        ws://*)  RELAY_HTTP="http://${RELAY_HTTP#ws://}" ;;
+    esac
+    export GIT_TERMINAL_PROMPT=0
+    export GIT_CONFIG_COUNT=2
+    export GIT_CONFIG_KEY_0="credential.${RELAY_HTTP}/git.helper"
+    export GIT_CONFIG_VALUE_0="$BUZZ/bin/git-credential-nostr"
+    export GIT_CONFIG_KEY_1="credential.${RELAY_HTTP}/git.useHttpPath"
+    export GIT_CONFIG_VALUE_1=true
+fi
+
 # Breadcrumbs for the probe: our PID (stable across exec) and generation.
 SELF=$$
 echo "$SELF" >"$BUZZ/agent.pid"

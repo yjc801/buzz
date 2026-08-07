@@ -376,8 +376,18 @@ pub async fn ensure(
     // quoting does not neutralize `$()`/backtick substitution inside bash
     // double quotes. (`config::parse` also refuses non-tag characters in the
     // version — two independent layers.)
+    //
+    // The digest check is also the most likely provision failure in normal
+    // operation, because `sprig-latest` is a rolling release: Block
+    // re-publishes it and this provider's baked pin goes stale. `sha256sum`
+    // reports that as "1 computed checksum did NOT match", which says
+    // nothing about which artifact, which pin, or what to do — so the
+    // mismatch is caught here and re-explained.
     let url = sprig_url(&t.sprig_version, resolved.arch);
-    run_step(
+    let digest_mismatch = |result: &crate::substrate::ExecResult| {
+        result.stderr.contains("did NOT match") || result.stdout.contains("did NOT match")
+    };
+    let sprig_step = run_step(
         substrate,
         sprite,
         "install sprig",
@@ -399,8 +409,21 @@ pub async fn ensure(
         None,
         Duration::from_secs(180),
     )
-    .await
-    .and_then(expect_ok)?;
+    .await?;
+    if sprig_step.exit_code != 0 && digest_mismatch(&sprig_step) {
+        return Err(format!(
+            "the sprig runtime downloaded from release {version:?} does not match the \
+             expected digest {sha}. This is what a re-published release looks like: \
+             {version:?} is a rolling tag, so the bytes moved and this provider's \
+             baked pin is stale. Nothing was installed. Fix it by setting \
+             provider_config.sprig_sha256 to the digest published alongside the \
+             release (its .sha256 file, for {arch}), or by updating the provider.",
+            version = t.sprig_version,
+            sha = t.sprig_sha256,
+            arch = resolved.arch,
+        ));
+    }
+    expect_ok(sprig_step)?;
 
     let mut adapters = Vec::new();
     if t.install_claude_adapter {
@@ -787,5 +810,26 @@ mod tests {
             let err = require_provisioned_command(&cfg, absent).unwrap_err();
             assert!(err.contains("no launch command"), "{err}");
         }
+    }
+
+    /// A stale pin is the most likely provision failure in normal operation
+    /// (`sprig-latest` is rolling), and `sha256sum`'s own words —
+    /// "1 computed checksum did NOT match" — name neither the artifact, the
+    /// pin, nor the remedy. Recognizing the mismatch is what lets the
+    /// provider re-explain it, so the recognizer gets a test.
+    #[test]
+    fn a_digest_mismatch_is_recognized_from_either_stream() {
+        let mismatch = |stdout: &str, stderr: &str| {
+            let r = crate::substrate::ExecResult {
+                exit_code: 1,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            };
+            r.stderr.contains("did NOT match") || r.stdout.contains("did NOT match")
+        };
+        assert!(mismatch("", "sha256sum: WARNING: 1 computed checksum did NOT match"));
+        assert!(mismatch("sha256sum: WARNING: 1 computed checksum did NOT match", ""));
+        // An unrelated failure keeps its own diagnosis.
+        assert!(!mismatch("", "curl: (22) The requested URL returned error: 404"));
     }
 }

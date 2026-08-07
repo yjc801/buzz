@@ -13,6 +13,7 @@ import { getManagedAgentPrimaryActionLabel } from "@/features/agents/lib/managed
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { ManagedAgentLogPanel } from "@/features/agents/ui/ManagedAgentLogPanel";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
+import { isManagedAgentLive } from "@/features/agents/lib/managedAgentControlActions";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import type { ProfileActivityAgent } from "@/features/profile/lib/profileActivityAgent";
@@ -359,12 +360,13 @@ export function ProfileSummaryView({
           agentActionDisabled={isAgentActionPending}
           agentActionLabel={
             isOwner === true && managedAgent
-              ? getManagedAgentPrimaryActionLabel(managedAgent)
+              ? getManagedAgentPrimaryActionLabel(managedAgent, presenceStatus)
               : undefined
           }
           agentActionLive={
-            managedAgent?.status === "running" ||
-            managedAgent?.status === "deployed"
+            managedAgent
+              ? isManagedAgentLive(managedAgent, presenceStatus)
+              : false
           }
           onAgentPrimaryAction={
             isOwner === true && managedAgent
@@ -372,10 +374,11 @@ export function ProfileSummaryView({
               : undefined
           }
           onAgentRestart={
-            isOwner === true &&
-            managedAgent?.backend.type === "local" &&
-            (managedAgent.status === "running" ||
-              managedAgent.status === "deployed")
+            // Restart is shutdown-then-start, and both halves exist for a
+            // provider agent (shutdown over the relay, start = a fresh
+            // deploy). Excluding providers left a remote agent with no way
+            // back once its harness died.
+            isOwner === true && managedAgent && isManagedAgentLive(managedAgent, presenceStatus)
               ? handleAgentRestart
               : undefined
           }

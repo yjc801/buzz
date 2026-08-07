@@ -3,6 +3,7 @@ import type {
   Channel,
   ManagedAgent,
   PresenceLookup,
+  PresenceStatus,
   RelayAgent,
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -31,13 +32,51 @@ export type ManagedAgentActionResult = {
   noticeMessage?: string;
 };
 
+/// Control-plane axis: does the agent's *infrastructure* exist?
+///
+/// For a provider agent `deployed` means a deploy returned a
+/// `backend_agent_id`, and nothing ever clears it — there is no undeploy
+/// operation, and the remote VM deliberately outlives the harness process.
+/// So this answers "is there something out there", never "is it running".
+/// Grouping, sorting and session panels want exactly that.
 export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
   return agent.status === "running" || agent.status === "deployed";
 }
 
-export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
+/// Live axis: is the harness actually running *right now*?
+///
+/// For a remote agent this is presence and only presence — the same signal
+/// the backend documents as the live axis, and the only one a remote
+/// harness can report. Using the control-plane axis here is what made a
+/// dead remote agent unrecoverable: its status stayed `deployed` forever,
+/// so the controls offered Shutdown for an agent that was not running and
+/// never offered Deploy.
+///
+/// A local agent has no presence requirement — the desktop owns its
+/// process, and `running` is first-hand knowledge.
+export function isManagedAgentLive(
+  agent: Pick<ManagedAgent, "status" | "backend">,
+  presence?: PresenceStatus | null,
+) {
   if (agent.backend.type === "provider") {
-    return isManagedAgentActive(agent) ? "Shutdown" : "Deploy";
+    return presence === "online" || presence === "away";
+  }
+  return isManagedAgentActive(agent);
+}
+
+/// Label for the primary control.
+///
+/// Deploy is offered whenever a remote agent is not live, which is safe
+/// because deploy is idempotent: the provider converges to at-most-one
+/// instance and treats an already-running agent as a strict no-op that
+/// returns the existing id. Offering it costs one round trip in the worst
+/// case; withholding it strands the agent.
+export function getManagedAgentPrimaryActionLabel(
+  agent: ManagedAgent,
+  presence?: PresenceStatus | null,
+) {
+  if (agent.backend.type === "provider") {
+    return isManagedAgentLive(agent, presence) ? "Shutdown" : "Deploy";
   }
 
   if (isManagedAgentActive(agent)) {
@@ -62,6 +101,21 @@ export function resolveManagedAgentChannelId(
 
   if (relayAgent?.channelIds?.length) {
     return relayAgent.channelIds[0];
+  }
+
+  // The relay-agents entry is the only source above, and it routinely lacks
+  // channel ids — which made Stop fail with "not in any channel" for agents
+  // the UI was simultaneously showing as members of two. Any channel that
+  // lists the agent as a member is a valid place to address it, so fall back
+  // to that before giving up.
+  const agentPubkey = normalizePubkey(agent.pubkey);
+  const membered = context.channels.find((channel) =>
+    channel.memberPubkeys?.some(
+      (member) => normalizePubkey(member) === agentPubkey,
+    ),
+  );
+  if (membered) {
+    return membered.id;
   }
 
   const channelName = relayAgent?.channels?.[0];

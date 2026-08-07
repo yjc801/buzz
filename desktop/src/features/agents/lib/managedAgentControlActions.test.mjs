@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  getManagedAgentPrimaryActionLabel,
+  isManagedAgentActive,
+  isManagedAgentLive,
+  resolveManagedAgentChannelId,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
@@ -164,5 +168,108 @@ test("test_respawn_onStopped_fires_before_start_resolves", async () => {
     events,
     ["stop", "onStopped", "start"],
     "onStopped must fire after stop resolves and before start is called",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The two axes. A remote agent's control plane says whether infrastructure
+// exists; only presence says whether the harness is running. Conflating them
+// stranded dead remote agents: status stays "deployed" forever (nothing
+// clears backend_agent_id — there is no undeploy), so the controls offered
+// Shutdown for a dead agent and never offered Deploy.
+// ---------------------------------------------------------------------------
+
+const remote = (overrides = {}) =>
+  agent({
+    backend: { type: "provider", id: "sprites", config: {} },
+    backendAgentId: "buzz-agent-abc123",
+    status: "deployed",
+    ...overrides,
+  });
+
+test("a deployed remote agent is 'active' but not 'live' without presence", () => {
+  const a = remote();
+  assert.equal(isManagedAgentActive(a), true, "infrastructure exists");
+  assert.equal(isManagedAgentLive(a, "offline"), false, "harness is not running");
+  assert.equal(isManagedAgentLive(a, undefined), false, "no presence = not live");
+});
+
+test("presence decides liveness for a remote agent", () => {
+  for (const status of ["online", "away"]) {
+    assert.equal(isManagedAgentLive(remote(), status), true, status);
+  }
+  for (const status of ["offline", undefined, null]) {
+    assert.equal(isManagedAgentLive(remote(), status), false, String(status));
+  }
+});
+
+test("a local agent's liveness ignores presence — the desktop owns its process", () => {
+  assert.equal(isManagedAgentLive(agent({ status: "running" }), "offline"), true);
+  assert.equal(isManagedAgentLive(agent({ status: "stopped" }), "online"), false);
+});
+
+test("a dead remote agent offers Deploy, a live one offers Shutdown", () => {
+  assert.equal(getManagedAgentPrimaryActionLabel(remote(), "offline"), "Deploy");
+  assert.equal(getManagedAgentPrimaryActionLabel(remote(), undefined), "Deploy");
+  assert.equal(getManagedAgentPrimaryActionLabel(remote(), "online"), "Shutdown");
+  assert.equal(getManagedAgentPrimaryActionLabel(remote(), "away"), "Shutdown");
+});
+
+test("local agent labels are unchanged", () => {
+  assert.equal(getManagedAgentPrimaryActionLabel(agent({ status: "running" })), "Stop");
+  assert.equal(getManagedAgentPrimaryActionLabel(agent({ status: "stopped" })), "Restart Agent");
+  assert.equal(getManagedAgentPrimaryActionLabel(agent({ status: "idle" })), "Start Agent");
+});
+
+// ---------------------------------------------------------------------------
+// Channel resolution for !shutdown. The relay-agents entry routinely carries
+// no channel ids, which made Stop throw "not in any channel" for an agent the
+// UI was simultaneously showing as a member of two.
+// ---------------------------------------------------------------------------
+
+const channel = (id, memberPubkeys = []) => ({
+  id,
+  name: id,
+  channelType: "standard",
+  visibility: "public",
+  description: "",
+  topic: null,
+  purpose: null,
+  memberCount: memberPubkeys.length,
+  memberPubkeys,
+  lastMessageAt: null,
+  archivedAt: null,
+  participants: [],
+  participantPubkeys: [],
+  isMember: true,
+  ttlSeconds: null,
+  ttlDeadline: null,
+});
+
+test("channel membership resolves when the relay entry has no channel ids", () => {
+  const a = remote();
+  const resolved = resolveManagedAgentChannelId(a, {
+    channels: [channel("other", []), channel("theirs", [a.pubkey])],
+    relayAgents: [{ pubkey: a.pubkey, channelIds: [], channels: [] }],
+  });
+  assert.equal(resolved, "theirs");
+});
+
+test("the preferred channel still wins, and an unknown agent still resolves to null", () => {
+  const a = remote();
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [channel("theirs", [a.pubkey])],
+      preferredChannelId: "viewing",
+      relayAgents: [],
+    }),
+    "viewing",
+  );
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [channel("someone-elses", ["ff".repeat(32)])],
+      relayAgents: [],
+    }),
+    null,
   );
 });

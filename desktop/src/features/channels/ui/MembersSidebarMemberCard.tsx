@@ -267,6 +267,7 @@ export function MembersSidebarMemberCard({
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
+          presenceStatus={presenceStatus}
           memberIsBot={memberIsBot}
           moderationState={moderationState}
           onBan={onBan}
@@ -297,6 +298,7 @@ function MemberActionsMenu({
   member,
   memberIsBot,
   moderationState,
+  presenceStatus,
   onBan,
   onChangeRole,
   onEditRespondTo,
@@ -317,6 +319,8 @@ function MemberActionsMenu({
   member: ChannelMember;
   memberIsBot: boolean;
   moderationState?: MemberModerationState;
+  /** Live axis for a remote agent — its status alone cannot report it. */
+  presenceStatus?: PresenceStatus | null;
   onBan: (member: ChannelMember) => void;
   onChangeRole: (member: ChannelMember, role: string) => void;
   onEditRespondTo?: (agent: ManagedAgent) => void;
@@ -370,7 +374,7 @@ function MemberActionsMenu({
                 : getManagedAgentActionIcon(managedAgent)}
               {pairAction
                 ? MANAGED_AGENT_PAIR_ACTION_LABELS[pairAction]
-                : getManagedAgentPrimaryActionLabel(managedAgent)}
+                : getManagedAgentPrimaryActionLabel(managedAgent, presenceStatus)}
             </DropdownMenuItem>
             {onEditRespondTo ? (
               <DropdownMenuItem

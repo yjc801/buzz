@@ -40,7 +40,9 @@ mod frame {
         /// unknown stream ids (forward compatibility).
         Ignored,
         /// The first text frame — carries the session id.
-        SessionInfo { session_id: String },
+        SessionInfo {
+            session_id: String,
+        },
     }
 
     pub fn encode_stdin(data: &[u8]) -> Vec<u8> {
@@ -80,12 +82,9 @@ mod frame {
                 None => Incoming::Ignored,
             },
             // TTY sessions deliver the exit as a JSON text frame.
-            Some("exit") => Incoming::Exit(
-                value
-                    .get("exit_code")
-                    .and_then(|c| c.as_u64())
-                    .unwrap_or(0) as u8,
-            ),
+            Some("exit") => {
+                Incoming::Exit(value.get("exit_code").and_then(|c| c.as_u64()).unwrap_or(0) as u8)
+            }
             _ => Incoming::Ignored,
         }
     }
@@ -96,8 +95,14 @@ mod frame {
 
         #[test]
         fn binary_frames_decode_by_stream_id() {
-            assert_eq!(decode_binary(&[STDOUT, b'h', b'i']), Incoming::Stdout(b"hi".to_vec()));
-            assert_eq!(decode_binary(&[STDERR, b'e']), Incoming::Stderr(b"e".to_vec()));
+            assert_eq!(
+                decode_binary(&[STDOUT, b'h', b'i']),
+                Incoming::Stdout(b"hi".to_vec())
+            );
+            assert_eq!(
+                decode_binary(&[STDERR, b'e']),
+                Incoming::Stderr(b"e".to_vec())
+            );
             assert_eq!(decode_binary(&[EXIT, 143]), Incoming::Exit(143));
             assert_eq!(decode_binary(&[EXIT]), Incoming::Exit(0));
             assert_eq!(decode_binary(&[9, 1]), Incoming::Ignored);
@@ -114,11 +119,22 @@ mod frame {
         fn text_frames_parse_session_info_and_exit() {
             assert_eq!(
                 decode_text(r#"{"type":"session_info","tty":true,"session_id":"705"}"#),
-                Incoming::SessionInfo { session_id: "705".into() }
+                Incoming::SessionInfo {
+                    session_id: "705".into()
+                }
             );
-            assert_eq!(decode_text(r#"{"type":"exit","exit_code":143}"#), Incoming::Exit(143));
-            assert_eq!(decode_text(r#"{"type":"port_opened","port":8080}"#), Incoming::Ignored);
-            assert_eq!(decode_text("control:{\"type\":\"keepalive\"}"), Incoming::Ignored);
+            assert_eq!(
+                decode_text(r#"{"type":"exit","exit_code":143}"#),
+                Incoming::Exit(143)
+            );
+            assert_eq!(
+                decode_text(r#"{"type":"port_opened","port":8080}"#),
+                Incoming::Ignored
+            );
+            assert_eq!(
+                decode_text("control:{\"type\":\"keepalive\"}"),
+                Incoming::Ignored
+            );
             assert_eq!(decode_text("not json"), Incoming::Ignored);
         }
     }
@@ -298,9 +314,9 @@ impl Substrate for SpritesClient {
         }
         if !response.status().is_success() {
             let (status, body) = Self::error_body(response).await;
-            return Err(self
-                .auth_error(status)
-                .unwrap_or_else(|| SubstrateError(format!("GET sprite returned {status}: {body}"))));
+            return Err(self.auth_error(status).unwrap_or_else(|| {
+                SubstrateError(format!("GET sprite returned {status}: {body}"))
+            }));
         }
         let value = response
             .json::<serde_json::Value>()
@@ -341,7 +357,10 @@ impl Substrate for SpritesClient {
         }
 
         let (status, body) = Self::error_body(response).await;
-        let code = body.get("error").and_then(|e| e.as_str()).unwrap_or_default();
+        let code = body
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or_default();
         let message = body
             .get("message")
             .and_then(|m| m.as_str())
@@ -370,9 +389,9 @@ impl Substrate for SpritesClient {
                     message
                 },
             }),
-            _ => Err(self
-                .auth_error(status)
-                .unwrap_or_else(|| SubstrateError(format!("POST sprite returned {status}: {body}")))),
+            _ => Err(self.auth_error(status).unwrap_or_else(|| {
+                SubstrateError(format!("POST sprite returned {status}: {body}"))
+            })),
         }
     }
 
@@ -419,14 +438,21 @@ impl Substrate for SpritesClient {
                 sessions
                     .iter()
                     .map(|s| SessionMeta {
-                        id: s.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        id: s
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         command: s
                             .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string(),
                         tty: s.get("tty").and_then(|v| v.as_bool()).unwrap_or(false),
-                        is_active: s.get("is_active").and_then(|v| v.as_bool()).unwrap_or(false),
+                        is_active: s
+                            .get("is_active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     })
                     .collect()
             })
@@ -448,7 +474,9 @@ impl Substrate for SpritesClient {
             // mandatory EOF frame — without it the process waits forever.
             if let Some(data) = stdin {
                 stream
-                    .send(tungstenite::Message::Binary(frame::encode_stdin(&data).into()))
+                    .send(tungstenite::Message::Binary(
+                        frame::encode_stdin(&data).into(),
+                    ))
                     .await
                     .map_err(|e| SubstrateError(format!("could not stream stdin: {e}")))?;
             }
@@ -545,7 +573,9 @@ impl Substrate for SpritesClient {
         };
         tokio::time::timeout(Duration::from_secs(30), work)
             .await
-            .map_err(|_| SubstrateError("detached spawn timed out waiting for session_info".into()))?
+            .map_err(|_| {
+                SubstrateError("detached spawn timed out waiting for session_info".into())
+            })?
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -559,7 +589,11 @@ impl Substrate for SpritesClient {
 
 fn sprite_meta(value: &serde_json::Value) -> SpriteMeta {
     SpriteMeta {
-        name: value.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        name: value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
         status: value
             .get("status")
             .and_then(|v| v.as_str())
@@ -613,9 +647,20 @@ mod tests {
     /// is the only URL source, so pinning it here pins the client.
     #[test]
     fn exec_urls_never_carry_env() {
-        let argv = vec!["bash".to_string(), "-c".to_string(), "env SECRET=x".to_string()];
-        let url = exec_url("wss://api.sprites.dev", "s", &argv, Some("/home/sprite"), true, false)
-            .unwrap();
+        let argv = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "env SECRET=x".to_string(),
+        ];
+        let url = exec_url(
+            "wss://api.sprites.dev",
+            "s",
+            &argv,
+            Some("/home/sprite"),
+            true,
+            false,
+        )
+        .unwrap();
         assert!(!url.contains("env="), "env leaked into the URL: {url}");
         assert!(url.contains("tty=true") && url.contains("detachable=true"));
         assert!(url.contains("stdin=false"));
@@ -721,7 +766,11 @@ mod tests {
                 panic!("expected Created, got {created:?}");
             };
             assert_eq!(meta.labels, labels, "labels did not round-trip on create");
-            let fetched = client.get_sprite(&name).await.unwrap().expect("gone after create");
+            let fetched = client
+                .get_sprite(&name)
+                .await
+                .unwrap()
+                .expect("gone after create");
             assert_eq!(fetched.labels, labels, "labels did not round-trip on GET");
             assert_eq!(fetched.url_auth.as_deref(), Some("sprite"));
 
@@ -733,7 +782,11 @@ mod tests {
             let result = client
                 .run(
                     &name,
-                    &["sh".into(), "-c".into(), "cat; echo tail; echo err >&2".into()],
+                    &[
+                        "sh".into(),
+                        "-c".into(),
+                        "cat; echo tail; echo err >&2".into(),
+                    ],
                     Some(b"stdin-bytes\n".to_vec()),
                     Duration::from_secs(60),
                 )
@@ -745,7 +798,12 @@ mod tests {
 
             // Exit codes survive the frame protocol.
             let failing = client
-                .run(&name, &["sh".into(), "-c".into(), "exit 7".into()], None, Duration::from_secs(30))
+                .run(
+                    &name,
+                    &["sh".into(), "-c".into(), "exit 7".into()],
+                    None,
+                    Duration::from_secs(30),
+                )
                 .await
                 .unwrap();
             assert_eq!(failing.exit_code, 7);

@@ -138,7 +138,11 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
     // as an exec failure after the deploy already mutated the sprite.
     provision::require_provisioned_command(
         &cfg,
-        request.agent.launch.as_ref().and_then(|l| l.command.as_deref()),
+        request
+            .agent
+            .launch
+            .as_ref()
+            .and_then(|l| l.command.as_deref()),
     )?;
 
     // Credentials resolve before any network I/O so a missing login fails

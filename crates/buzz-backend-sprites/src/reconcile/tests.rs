@@ -301,7 +301,10 @@ fn config() -> ProviderConfig {
 
 fn env_map() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    env.insert("BUZZ_RELAY_URL".to_string(), "wss://relay.example".to_string());
+    env.insert(
+        "BUZZ_RELAY_URL".to_string(),
+        "wss://relay.example".to_string(),
+    );
     env.insert(env::START_NONCE_KEY.to_string(), "gen00000".to_string());
     env
 }
@@ -407,7 +410,10 @@ fn the_digest_is_resolved_at_most_once_per_deploy() {
     });
     assert_eq!(run(&fake).unwrap(), identity().sprite_name());
     assert_eq!(
-        fake.calls().iter().filter(|c| *c == "run:fetch-digest").count(),
+        fake.calls()
+            .iter()
+            .filter(|c| *c == "run:fetch-digest")
+            .count(),
         1,
         "{:?}",
         fake.calls()
@@ -426,14 +432,32 @@ fn cold_path_creates_provisions_starts_and_confirms() {
     });
     assert_eq!(run(&fake).unwrap(), identity().sprite_name());
     let calls = fake.calls();
-    assert_eq!(calls.iter().filter(|c| c.starts_with("create_sprite")).count(), 1);
-    assert_eq!(calls.iter().filter(|c| c.starts_with("start_detached")).count(), 1);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.starts_with("create_sprite"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.starts_with("start_detached"))
+            .count(),
+        1
+    );
     assert_eq!(calls.iter().filter(|c| *c == "run:stage-env").count(), 1);
     // The env file is staged BEFORE the session starts, or the launcher
     // would source a file that does not exist.
     let stage = calls.iter().position(|c| c == "run:stage-env").unwrap();
-    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
-    assert!(stage < start, "env staged after the session started: {calls:?}");
+    let start = calls
+        .iter()
+        .position(|c| c.starts_with("start_detached"))
+        .unwrap();
+    assert!(
+        stage < start,
+        "env staged after the session started: {calls:?}"
+    );
 }
 
 /// Row 6: a provisioned, stopped sprite starts without reprovisioning.
@@ -481,8 +505,14 @@ fn a_failed_spot_check_reprovisions_before_starting() {
         .iter()
         .position(|c| c == "run:provision-step")
         .expect("a failed spot check did not reprovision");
-    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
-    assert!(provision < start, "started on a corrupted runtime: {calls:?}");
+    let start = calls
+        .iter()
+        .position(|c| c.starts_with("start_detached"))
+        .unwrap();
+    assert!(
+        provision < start,
+        "started on a corrupted runtime: {calls:?}"
+    );
 }
 
 /// Row 5: a diverged fingerprint reprovisions before starting.
@@ -497,8 +527,14 @@ fn diverged_intent_reprovisions_then_starts() {
     });
     assert_eq!(run(&fake).unwrap(), identity().sprite_name());
     let calls = fake.calls();
-    let provision = calls.iter().position(|c| c == "run:provision-step").unwrap();
-    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
+    let provision = calls
+        .iter()
+        .position(|c| c == "run:provision-step")
+        .unwrap();
+    let start = calls
+        .iter()
+        .position(|c| c.starts_with("start_detached"))
+        .unwrap();
     assert!(provision < start, "started before provisioning: {calls:?}");
 }
 
@@ -509,7 +545,10 @@ fn an_unverified_sprite_is_a_hard_error_with_zero_mutation() {
     for labels in [
         vec![],
         vec!["buzz.block.xyz/managed-by=buzz-backend-sprites".to_string()],
-        vec![format!("buzz.block.xyz/agent-pubkey-full={}", "f".repeat(64))],
+        vec![format!(
+            "buzz.block.xyz/agent-pubkey-full={}",
+            "f".repeat(64)
+        )],
     ] {
         let fake = Fake::new(FakeState {
             sprite: Some(SpriteMeta {
@@ -524,7 +563,11 @@ fn an_unverified_sprite_is_a_hard_error_with_zero_mutation() {
         let err = run(&fake).unwrap_err();
         assert!(err.contains("not created by this provider"), "{err}");
         assert!(err.contains("Nothing was changed"), "{err}");
-        assert!(fake.mutating_calls().is_empty(), "{:?}", fake.mutating_calls());
+        assert!(
+            fake.mutating_calls().is_empty(),
+            "{:?}",
+            fake.mutating_calls()
+        );
     }
 }
 
@@ -543,7 +586,10 @@ fn a_dead_attempt_reports_and_never_restarts_in_the_same_call() {
     assert!(err.contains("exited during startup"), "{err}");
     assert!(err.contains("Nothing was retried"), "{err}");
     assert_eq!(
-        fake.calls().iter().filter(|c| c.starts_with("start_detached")).count(),
+        fake.calls()
+            .iter()
+            .filter(|c| c.starts_with("start_detached"))
+            .count(),
         1,
         "started more than once: {:?}",
         fake.calls()
@@ -569,12 +615,19 @@ fn deadline_expiry_reports_without_destroying_anything() {
         ..Default::default()
     });
     let err = run(&fake).unwrap_err();
-    assert!(err.contains("startup not confirmed within the deadline"), "{err}");
+    assert!(
+        err.contains("startup not confirmed within the deadline"),
+        "{err}"
+    );
     assert!(err.contains("running"), "no sprite status in: {err}");
     assert!(err.contains("lock=held"), "no probe tokens in: {err}");
     assert!(err.contains("Nothing was removed"), "{err}");
     assert!(fake.state.borrow().elapsed >= DEADLINE);
-    assert!(fake.mutating_calls().is_empty(), "{:?}", fake.mutating_calls());
+    assert!(
+        fake.mutating_calls().is_empty(),
+        "{:?}",
+        fake.mutating_calls()
+    );
 }
 
 /// A missing probe report is never permission to start: the loop polls to
@@ -612,7 +665,10 @@ fn a_create_conflict_adopts_the_verified_winner() {
     });
     assert_eq!(run(&fake).unwrap(), identity().sprite_name());
     assert_eq!(
-        fake.calls().iter().filter(|c| c.starts_with("create_sprite")).count(),
+        fake.calls()
+            .iter()
+            .filter(|c| c.starts_with("create_sprite"))
+            .count(),
         1,
         "the loser created twice: {:?}",
         fake.calls()
@@ -657,9 +713,15 @@ fn a_vanished_sprite_after_our_create_reports_once() {
         ..Default::default()
     });
     let err = run(&fake).unwrap_err();
-    assert!(err.contains("disappeared after this deploy created it"), "{err}");
+    assert!(
+        err.contains("disappeared after this deploy created it"),
+        "{err}"
+    );
     assert_eq!(
-        fake.calls().iter().filter(|c| c.starts_with("create_sprite")).count(),
+        fake.calls()
+            .iter()
+            .filter(|c| c.starts_with("create_sprite"))
+            .count(),
         1
     );
 }
@@ -678,7 +740,10 @@ fn the_create_race_loser_does_not_provision_the_winner() {
         ..Default::default()
     });
     let err = run(&fake).unwrap_err();
-    assert!(err.contains("startup not confirmed within the deadline"), "{err}");
+    assert!(
+        err.contains("startup not confirmed within the deadline"),
+        "{err}"
+    );
     assert_eq!(
         fake.mutating_calls(),
         vec!["create_sprite:".to_string() + &identity().sprite_name()],
@@ -701,7 +766,10 @@ fn creation_rate_limit_waits_then_creates() {
     });
     assert_eq!(run(&fake).unwrap(), identity().sprite_name());
     assert_eq!(
-        fake.calls().iter().filter(|c| c.starts_with("create_sprite")).count(),
+        fake.calls()
+            .iter()
+            .filter(|c| c.starts_with("create_sprite"))
+            .count(),
         2,
         "the rate-limited attempt should not have counted"
     );
@@ -761,8 +829,14 @@ fn provisioning_and_start_run_under_the_deploy_lease() {
         .iter()
         .position(|c| c == "run:lease-acquire")
         .expect("provisioning ran without taking the deploy lease");
-    let provision = calls.iter().position(|c| c == "run:provision-step").unwrap();
-    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
+    let provision = calls
+        .iter()
+        .position(|c| c == "run:provision-step")
+        .unwrap();
+    let start = calls
+        .iter()
+        .position(|c| c.starts_with("start_detached"))
+        .unwrap();
     assert!(acquire < provision && provision < start, "{calls:?}");
     // The in-memory flag is not trusted at the start boundary: ownership is
     // re-confirmed against the durable lease immediately before the launch.
@@ -803,8 +877,14 @@ fn a_held_lease_defers_provisioning_until_it_frees() {
         3,
         "{calls:?}"
     );
-    let last_acquire = calls.iter().rposition(|c| c == "run:lease-acquire").unwrap();
-    let first_mutation = calls.iter().position(|c| c == "run:provision-step").unwrap();
+    let last_acquire = calls
+        .iter()
+        .rposition(|c| c == "run:lease-acquire")
+        .unwrap();
+    let first_mutation = calls
+        .iter()
+        .position(|c| c == "run:provision-step")
+        .unwrap();
     assert!(
         last_acquire < first_mutation,
         "provisioned while the lease was foreign: {calls:?}"
@@ -824,8 +904,15 @@ fn a_lease_that_never_frees_blocks_the_deploy_without_mutation() {
         ..Default::default()
     });
     let err = run(&fake).unwrap_err();
-    assert!(err.contains("startup not confirmed within the deadline"), "{err}");
-    assert!(fake.mutating_calls().is_empty(), "{:?}", fake.mutating_calls());
+    assert!(
+        err.contains("startup not confirmed within the deadline"),
+        "{err}"
+    );
+    assert!(
+        fake.mutating_calls().is_empty(),
+        "{:?}",
+        fake.mutating_calls()
+    );
 }
 
 /// The durable lease outranks the in-memory flag: when the pre-start
@@ -855,12 +942,21 @@ fn a_lost_lease_discards_the_observation_and_reacquires_before_start() {
     // Exactly one start, and only after the second (successful) confirm —
     // never on the strength of the failed one.
     assert_eq!(
-        calls.iter().filter(|c| c.starts_with("start_detached")).count(),
+        calls
+            .iter()
+            .filter(|c| c.starts_with("start_detached"))
+            .count(),
         1,
         "{calls:?}"
     );
-    let last_confirm = calls.iter().rposition(|c| c == "run:lease-confirm").unwrap();
-    let start = calls.iter().position(|c| c.starts_with("start_detached")).unwrap();
+    let last_confirm = calls
+        .iter()
+        .rposition(|c| c == "run:lease-confirm")
+        .unwrap();
+    let start = calls
+        .iter()
+        .position(|c| c.starts_with("start_detached"))
+        .unwrap();
     assert!(last_confirm < start, "{calls:?}");
     assert_eq!(
         calls.iter().filter(|c| *c == "run:lease-confirm").count(),

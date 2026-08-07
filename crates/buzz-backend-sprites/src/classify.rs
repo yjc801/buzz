@@ -185,7 +185,9 @@ mod tests {
         let p = probe(true, "buzz-acp");
         assert_eq!(
             classify(&observation(Some(&s), Some(&p), &[])),
-            Action::NoOp { agent_id: s.name.clone() }
+            Action::NoOp {
+                agent_id: s.name.clone()
+            }
         );
     }
 
@@ -216,7 +218,10 @@ mod tests {
     fn row6_provisioned_and_stopped_starts() {
         let s = sprite();
         let p = probe(false, "");
-        assert_eq!(classify(&observation(Some(&s), Some(&p), &[])), Action::Start);
+        assert_eq!(
+            classify(&observation(Some(&s), Some(&p), &[])),
+            Action::Start
+        );
     }
 
     /// Row 7c: both mixed states are transient — the launcher's pre-exec
@@ -227,7 +232,10 @@ mod tests {
         let s = sprite();
         for p in [probe(true, "bash"), probe(false, "buzz-acp")] {
             assert!(
-                matches!(classify(&observation(Some(&s), Some(&p), &[])), Action::Observe { .. }),
+                matches!(
+                    classify(&observation(Some(&s), Some(&p), &[])),
+                    Action::Observe { .. }
+                ),
                 "mixed state {p:?} did not poll"
             );
         }
@@ -324,14 +332,19 @@ mod tests {
             Action::Create,
             Action::Provision,
             Action::Start,
-            Action::NoOp { agent_id: "x".into() },
+            Action::NoOp {
+                agent_id: "x".into(),
+            },
             Action::Observe { reason: "x" },
             Action::ReportStartupFailure,
         ];
         for v in &variants {
             let name = format!("{v:?}");
             for destructive in ["Delete", "Destroy", "Kill", "Remove"] {
-                assert!(!name.contains(destructive), "{name} names a destructive action");
+                assert!(
+                    !name.contains(destructive),
+                    "{name} names a destructive action"
+                );
             }
         }
     }

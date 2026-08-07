@@ -52,9 +52,13 @@ pub enum CreateOutcome {
     /// raced contender; the caller re-reads and verifies before adopting.
     AlreadyExists,
     /// Structured rate limit with the server's own retry hint.
-    CreationRateLimited { retry_after: Duration },
+    CreationRateLimited {
+        retry_after: Duration,
+    },
     /// The org's concurrent-sprite cap; needs user action, not retries.
-    ConcurrentLimit { message: String },
+    ConcurrentLimit {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

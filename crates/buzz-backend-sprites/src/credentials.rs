@@ -43,9 +43,9 @@ const FAIL_REMEDY: &str = "Run `sprite login` (stores the token in the macOS key
 /// Resolve a credential from the real process environment, home directory,
 /// and keychain.
 pub fn resolve(org_override: Option<&str>) -> Result<Credential, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("could not resolve a Sprites API credential: HOME is unset. {FAIL_REMEDY}"))?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        format!("could not resolve a Sprites API credential: HOME is unset. {FAIL_REMEDY}")
+    })?;
     resolve_with(
         |key| std::env::var(key).ok(),
         &home,
@@ -62,7 +62,10 @@ fn resolve_with(
     org_override: Option<&str>,
     lookup: impl Fn(&KeyringEntry) -> Option<String>,
 ) -> Result<Credential, String> {
-    for (var, source) in [("SPRITE_TOKEN", "env:SPRITE_TOKEN"), ("SPRITES_TOKEN", "env:SPRITES_TOKEN")] {
+    for (var, source) in [
+        ("SPRITE_TOKEN", "env:SPRITE_TOKEN"),
+        ("SPRITES_TOKEN", "env:SPRITES_TOKEN"),
+    ] {
         if let Some(value) = env(var) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
@@ -122,7 +125,11 @@ fn keyring_entry(home: &Path, org_override: Option<&str>) -> Option<KeyringEntry
         .unwrap_or("https://api.sprites.dev");
     let org = match org_override {
         Some(org) => org.to_string(),
-        None => root.get("current_selection")?.get("org")?.as_str()?.to_string(),
+        None => root
+            .get("current_selection")?
+            .get("org")?
+            .as_str()?
+            .to_string(),
     };
 
     // Newer split layout: a per-user config file. Its path comes from the
@@ -136,15 +143,15 @@ fn keyring_entry(home: &Path, org_override: Option<&str>) -> Option<KeyringEntry
             .get("users")
             .and_then(|users| users.as_array())
             .and_then(|users| {
-                users.iter().find(|u| {
-                    u.get("id").and_then(|id| id.as_str()) == Some(user_id)
-                })
+                users
+                    .iter()
+                    .find(|u| u.get("id").and_then(|id| id.as_str()) == Some(user_id))
             })
             .and_then(|u| u.get("config_path"))
             .and_then(|p| p.as_str())
             .map(PathBuf::from);
-        let path = pointed
-            .unwrap_or_else(|| home.join(".sprites/users").join(format!("{user_id}.json")));
+        let path =
+            pointed.unwrap_or_else(|| home.join(".sprites/users").join(format!("{user_id}.json")));
         let user: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
         Some(user)
@@ -306,7 +313,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let err = resolve_with(no_env, &dir, None, no_keychain).unwrap_err();
-        for needle in ["SPRITE_TOKEN", "SPRITES_TOKEN", "~/.sprites", "sprite login"] {
+        for needle in [
+            "SPRITE_TOKEN",
+            "SPRITES_TOKEN",
+            "~/.sprites",
+            "sprite login",
+        ] {
             assert!(err.contains(needle), "missing {needle}: {err}");
         }
         std::fs::remove_dir_all(&dir).unwrap();

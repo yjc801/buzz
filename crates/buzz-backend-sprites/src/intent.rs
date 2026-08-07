@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn recorded_values_compare_verbatim_after_trim() {
         let fp = template().fingerprint();
-        assert_eq!(Fingerprint::from_recorded(&format!("  {}\n", fp.as_str())), fp);
+        assert_eq!(
+            Fingerprint::from_recorded(&format!("  {}\n", fp.as_str())),
+            fp
+        );
         assert_ne!(Fingerprint::from_recorded("garbage"), fp);
         // A malformed record is divergence, not an error — a different
         // provider version wrote it, and divergence triggers reprovision.

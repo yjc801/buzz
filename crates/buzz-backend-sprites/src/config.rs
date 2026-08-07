@@ -164,8 +164,8 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
     // either a URL-shape escape (`/`, `?`, `#`) or shell-active (`$`,
     // backtick, quotes, spaces) — and this field is the one provision input
     // an agent's owner types freely.
-    let sprig_version = optional_string(cfg, "sprig_version")?
-        .unwrap_or_else(|| DEFAULT_SPRIG_VERSION.to_string());
+    let sprig_version =
+        optional_string(cfg, "sprig_version")?.unwrap_or_else(|| DEFAULT_SPRIG_VERSION.to_string());
     if !sprig_version
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -178,7 +178,10 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
 
     let sprig_sha256 = optional_string(cfg, "sprig_sha256")?;
     if let Some(sha) = &sprig_sha256 {
-        if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        if sha.len() != 64
+            || !sha
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         {
             return Err(format!(
                 "provider_config.sprig_sha256 {sha:?} is not a SHA-256 digest: \
@@ -271,7 +274,10 @@ mod tests {
 
     #[test]
     fn refuses_indefinite_lifetime() {
-        for zero in [json!({"inactivity_seconds": 0}), json!({"inactivity_seconds": "0"})] {
+        for zero in [
+            json!({"inactivity_seconds": 0}),
+            json!({"inactivity_seconds": "0"}),
+        ] {
             let err = parse(&zero).unwrap_err();
             assert!(err.contains("indefinite lifetime"), "{err}");
             assert!(err.contains("positive number"), "{err}");
@@ -283,15 +289,21 @@ mod tests {
     #[test]
     fn inactivity_accepts_number_string_and_blank() {
         assert_eq!(
-            parse(&json!({"inactivity_seconds": 900})).unwrap().inactivity_seconds,
+            parse(&json!({"inactivity_seconds": 900}))
+                .unwrap()
+                .inactivity_seconds,
             Some(900)
         );
         assert_eq!(
-            parse(&json!({"inactivity_seconds": "900"})).unwrap().inactivity_seconds,
+            parse(&json!({"inactivity_seconds": "900"}))
+                .unwrap()
+                .inactivity_seconds,
             Some(900)
         );
         assert_eq!(
-            parse(&json!({"inactivity_seconds": ""})).unwrap().inactivity_seconds,
+            parse(&json!({"inactivity_seconds": ""}))
+                .unwrap()
+                .inactivity_seconds,
             Some(DEFAULT_INACTIVITY_SECONDS)
         );
         let err = parse(&json!({"inactivity_seconds": "soon"})).unwrap_err();
@@ -307,7 +319,9 @@ mod tests {
     fn sprig_version_must_be_release_tag_shaped() {
         for good in ["sprig-latest", "v1.2.3", "sprig_v0.2.0-rc.1"] {
             assert_eq!(
-                parse(&json!({"sprig_version": good})).unwrap().sprig_version,
+                parse(&json!({"sprig_version": good}))
+                    .unwrap()
+                    .sprig_version,
                 good
             );
         }
@@ -341,8 +355,9 @@ mod tests {
 
     #[test]
     fn adapter_flags_accept_bool_and_string_forms() {
-        let cfg = parse(&json!({"install_claude_adapter": false, "install_codex_adapter": "false"}))
-            .unwrap();
+        let cfg =
+            parse(&json!({"install_claude_adapter": false, "install_codex_adapter": "false"}))
+                .unwrap();
         assert!(!cfg.install_claude_adapter);
         assert!(!cfg.install_codex_adapter);
         let err = parse(&json!({"install_claude_adapter": "yes"})).unwrap_err();

@@ -37,8 +37,7 @@ const CLAUDE_SETTINGS_PATH: &str = "/home/sprite/.claude/settings.json";
 /// is on. Chosen to restore what the Sprites image's own default mode
 /// intended: a coding agent needs a shell, files and fetches, and a list
 /// narrower than its work half-blocks it in ways that read as bugs.
-const PREAPPROVED_TOOLS: [&str; 7] =
-    ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"];
+const PREAPPROVED_TOOLS: [&str; 7] = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"];
 
 /// The sprite-wide deploy lease. Two deploys of the same agent that both
 /// find an existing, stopped sprite share every provisioning path — the
@@ -124,10 +123,7 @@ pub async fn confirm_lease(
     sprite: &str,
     token: &str,
 ) -> Result<bool, String> {
-    let script = format!(
-        "# confirm the deploy lease\n{}",
-        lease_guard(token, "true")
-    );
+    let script = format!("# confirm the deploy lease\n{}", lease_guard(token, "true"));
     let result = run_step(
         substrate,
         sprite,
@@ -224,7 +220,9 @@ async fn fetch_published_digest(
         substrate,
         sprite,
         "read the published digest",
-        &sh(&format!("curl -fsSL --retry 2 {url:?} | awk '{{print $1}}'")),
+        &sh(&format!(
+            "curl -fsSL --retry 2 {url:?} | awk '{{print $1}}'"
+        )),
         None,
         Duration::from_secs(60),
     )
@@ -237,7 +235,10 @@ async fn fetch_published_digest(
         ));
     }
     let digest = result.stdout.trim().to_string();
-    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    if digest.len() != 64
+        || !digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
         return Err(format!(
             "the digest published for release {version:?} ({arch}) is not a SHA-256 \
@@ -531,7 +532,11 @@ pub async fn ensure(
     }
 
     for (name, path, content) in [
-        ("install launcher", launcher::LAUNCHER_PATH, launcher::LAUNCHER_SH),
+        (
+            "install launcher",
+            launcher::LAUNCHER_PATH,
+            launcher::LAUNCHER_SH,
+        ),
         ("install probe", launcher::PROBE_PATH, launcher::PROBE_SH),
     ] {
         // Write-chmod-rename rather than `install -m 755 /dev/stdin`:
@@ -934,7 +939,10 @@ mod tests {
             assert!(!script.contains("\"*\""), "wildcard grant");
             // Atomic replace, never a truncating write on the final path.
             assert!(script.contains("os.replace"), "not atomic: {script}");
-            assert!(!script.contains("\np.write_text"), "truncating write: {script}");
+            assert!(
+                !script.contains("\np.write_text"),
+                "truncating write: {script}"
+            );
         }
     }
 
@@ -978,11 +986,17 @@ mod tests {
         apply(true);
         let granted = read();
         let allow = granted["permissions"]["allow"].as_array().unwrap();
-        assert!(allow.iter().any(|t| t == "mcp__custom"), "foreign entry lost");
+        assert!(
+            allow.iter().any(|t| t == "mcp__custom"),
+            "foreign entry lost"
+        );
         for tool in PREAPPROVED_TOOLS {
             assert!(allow.iter().any(|t| t == tool), "missing {tool}: {granted}");
         }
-        assert_eq!(granted["defaultMode"], "bypassPermissions", "clobbered the image settings");
+        assert_eq!(
+            granted["defaultMode"], "bypassPermissions",
+            "clobbered the image settings"
+        );
         assert!(granted["hooks"].is_object(), "clobbered the image hooks");
 
         apply(false);
@@ -1067,9 +1081,18 @@ mod tests {
             };
             r.stderr.contains("did NOT match") || r.stdout.contains("did NOT match")
         };
-        assert!(mismatch("", "sha256sum: WARNING: 1 computed checksum did NOT match"));
-        assert!(mismatch("sha256sum: WARNING: 1 computed checksum did NOT match", ""));
+        assert!(mismatch(
+            "",
+            "sha256sum: WARNING: 1 computed checksum did NOT match"
+        ));
+        assert!(mismatch(
+            "sha256sum: WARNING: 1 computed checksum did NOT match",
+            ""
+        ));
         // An unrelated failure keeps its own diagnosis.
-        assert!(!mismatch("", "curl: (22) The requested URL returned error: 404"));
+        assert!(!mismatch(
+            "",
+            "curl: (22) The requested URL returned error: 404"
+        ));
     }
 }

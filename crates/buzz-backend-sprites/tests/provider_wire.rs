@@ -96,7 +96,10 @@ fn responses_match_their_fixtures() {
             serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{case}: {e}: {stdout:?}"));
         let expected: serde_json::Value =
             serde_json::from_str(&read(&format!("{case}.response.json"))).unwrap();
-        assert_eq!(actual, expected, "{case}: response drifted from its fixture");
+        assert_eq!(
+            actual, expected,
+            "{case}: response drifted from its fixture"
+        );
     }
 }
 
@@ -112,11 +115,23 @@ fn info_response_carries_the_contract_fields() {
     assert_eq!(info["protocol_version"], 1);
     assert_eq!(info["name"], "sprites");
 
-    let mut keys: Vec<&str> = info.as_object().unwrap().keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = info
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["config_schema", "description", "name", "ok", "protocol_version", "version"],
+        [
+            "config_schema",
+            "description",
+            "name",
+            "ok",
+            "protocol_version",
+            "version"
+        ],
         "the desktop rejects unknown top-level info fields"
     );
 

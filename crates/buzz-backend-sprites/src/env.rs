@@ -295,7 +295,12 @@ pub fn build_env(
     // launch gate validates the trimmed command, and a validator and writer
     // that disagree about the value would let "  buzz-agent  " pass the
     // gate and then make the harness spawn a filename containing spaces.
-    if let Some(command) = launch.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    if let Some(command) = launch
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
         env.insert("BUZZ_ACP_AGENT_COMMAND".into(), command.to_string());
     }
     if !launch.args.is_empty() {
@@ -349,7 +354,10 @@ pub fn build_env(
 pub fn serialize_exports(env: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     for (key, value) in env {
-        debug_assert!(is_posix_env_key(key), "unvalidated key reached the serializer");
+        debug_assert!(
+            is_posix_env_key(key),
+            "unvalidated key reached the serializer"
+        );
         out.push_str("export ");
         out.push_str(key);
         out.push_str("='");
@@ -628,7 +636,9 @@ mod tests {
         let agent = payload_json(serde_json::json!({
             "launch": {"command": "   ", "owner_pubkey": "beef"}
         }));
-        assert!(!build(&agent).unwrap().contains_key("BUZZ_ACP_AGENT_COMMAND"));
+        assert!(!build(&agent)
+            .unwrap()
+            .contains_key("BUZZ_ACP_AGENT_COMMAND"));
     }
 
     #[test]
@@ -723,7 +733,11 @@ mod tests {
         }
         // And the conditionally-written keys with nothing authoritative to
         // say are absent, not spoofed.
-        for absent in ["BUZZ_ACP_AGENT_COMMAND", "BUZZ_ACP_AGENT_ARGS", "BUZZ_ACP_RESPOND_TO"] {
+        for absent in [
+            "BUZZ_ACP_AGENT_COMMAND",
+            "BUZZ_ACP_AGENT_ARGS",
+            "BUZZ_ACP_RESPOND_TO",
+        ] {
             assert!(!env.contains_key(absent), "{absent} survived the clear");
         }
     }

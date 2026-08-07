@@ -21,7 +21,9 @@ use crate::env;
 use crate::launcher::{self, ProbeReport};
 use crate::naming::AgentIdentity;
 use crate::provision;
-use crate::substrate::{CreateOutcome, SessionMeta, SpriteMeta, Substrate, SubstrateError, UrlAuth};
+use crate::substrate::{
+    CreateOutcome, SessionMeta, SpriteMeta, Substrate, SubstrateError, UrlAuth,
+};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -53,7 +55,15 @@ pub async fn deploy(
     // the lease scripts.
     let lease_token = crate::naming::new_generation();
     let mut lease_held = false;
-    let result = deploy_loop(substrate, identity, cfg, env_map, &lease_token, &mut lease_held).await;
+    let result = deploy_loop(
+        substrate,
+        identity,
+        cfg,
+        env_map,
+        &lease_token,
+        &mut lease_held,
+    )
+    .await;
     if lease_held {
         // Best-effort: a failure leaves the lease to its TTL, which the
         // fence already tolerates (a crashed deploy never releases either).

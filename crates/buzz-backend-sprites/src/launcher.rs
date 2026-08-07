@@ -88,7 +88,9 @@ mod tests {
     fn asset_digests_are_stable_hex() {
         for sha in [launcher_sha256(), probe_sha256()] {
             assert_eq!(sha.len(), 64);
-            assert!(sha.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            assert!(sha
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         }
         assert_ne!(launcher_sha256(), probe_sha256());
     }
@@ -101,10 +103,16 @@ mod tests {
             .lines()
             .filter(|l| l.trim_start().starts_with("exec ") && !l.contains("exec 9>"))
             .collect();
-        assert_eq!(exec_lines.len(), 1, "exactly one process-replacing exec: {exec_lines:?}");
+        assert_eq!(
+            exec_lines.len(),
+            1,
+            "exactly one process-replacing exec: {exec_lines:?}"
+        );
         assert!(exec_lines[0].contains("buzz-acp"));
         assert!(
-            LAUNCHER_SH.trim_end().ends_with(r#"exec "$BUZZ/bin/buzz-acp""#),
+            LAUNCHER_SH
+                .trim_end()
+                .ends_with(r#"exec "$BUZZ/bin/buzz-acp""#),
             "the exec must be the launcher's final statement"
         );
     }
@@ -184,8 +192,8 @@ mod tests {
 
     #[test]
     fn probe_report_parses_and_classifies() {
-        let started = ProbeReport::parse(r#"{"lock":"held","comm":"buzz-acp","gen":"cafe0001"}"#)
-            .unwrap();
+        let started =
+            ProbeReport::parse(r#"{"lock":"held","comm":"buzz-acp","gen":"cafe0001"}"#).unwrap();
         assert!(started.started() && !started.stopped());
         assert_eq!(started.gen, "cafe0001");
 
@@ -195,8 +203,8 @@ mod tests {
         // Mixed states are neither: the reconciler keeps polling.
         let pre_exec = ProbeReport::parse(r#"{"lock":"held","comm":"bash","gen":""}"#).unwrap();
         assert!(!pre_exec.started() && !pre_exec.stopped());
-        let torn_down = ProbeReport::parse(r#"{"lock":"free","comm":"buzz-acp","gen":"x"}"#)
-            .unwrap();
+        let torn_down =
+            ProbeReport::parse(r#"{"lock":"free","comm":"buzz-acp","gen":"x"}"#).unwrap();
         assert!(!torn_down.started() && !torn_down.stopped());
     }
 

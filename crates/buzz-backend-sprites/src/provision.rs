@@ -28,6 +28,18 @@ use std::time::Duration;
 const BUZZ_DIR: &str = "/home/sprite/.buzz";
 const INTENT_PATH: &str = "/home/sprite/.buzz/provision-intent";
 
+/// Claude Code's settings inside the sprite. The base image ships this file
+/// with hooks and `defaultMode: bypassPermissions`; provisioning merges
+/// allow rules into it rather than replacing it.
+const CLAUDE_SETTINGS_PATH: &str = "/home/sprite/.claude/settings.json";
+
+/// The tools an agent is pre-approved to use when `preapprove_agent_tools`
+/// is on. Chosen to restore what the Sprites image's own default mode
+/// intended: a coding agent needs a shell, files and fetches, and a list
+/// narrower than its work half-blocks it in ways that read as bugs.
+const PREAPPROVED_TOOLS: [&str; 7] =
+    ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"];
+
 /// The sprite-wide deploy lease. Two deploys of the same agent that both
 /// find an existing, stopped sprite share every provisioning path — the
 /// tarball, the adapter tree, the `*.tmp` staging names, the intent record —
@@ -296,6 +308,7 @@ pub async fn resolve(
             codex_adapter_version: config::CODEX_ADAPTER_VERSION,
             launcher_sha256: launcher::launcher_sha256(),
             probe_sha256: launcher::probe_sha256(),
+            preapprove_agent_tools: cfg.preapprove_agent_tools,
         },
         arch,
     })
@@ -541,6 +554,25 @@ pub async fn ensure(
         .and_then(expect_ok)?;
     }
 
+    // Pre-approve the agent's tools, or the agent cannot act at all: the
+    // harness denies every ACP permission request (there is no approval
+    // path in it) and overrides the mode the image itself ships. Merged
+    // into the existing settings with python3 rather than overwritten —
+    // the base image puts hooks and policy in this file, and clobbering
+    // them would trade one breakage for another.
+    if t.preapprove_agent_tools {
+        run_step(
+            substrate,
+            sprite,
+            "pre-approve the agent's tools",
+            &sh(&lease_guard(lease_token, &preapproval_script())),
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+        .and_then(expect_ok)?;
+    }
+
     // The record comes LAST, atomically: a crash anywhere above leaves no
     // intent file (or the previous one), and either reads as divergence.
     run_step(
@@ -561,6 +593,29 @@ pub async fn ensure(
     .and_then(expect_ok)?;
 
     Ok(())
+}
+
+/// The in-sprite script that pre-approves the agent's tools.
+///
+/// Merges into the image's settings rather than replacing them — the base
+/// image ships hooks and policy in the same file. Shared with the test that
+/// pins those properties, so the assertion covers the script that actually
+/// runs.
+fn preapproval_script() -> String {
+    format!(
+        "python3 - <<'PYEOF'\n\
+         import json, pathlib\n\
+         p = pathlib.Path({settings:?})\n\
+         d = json.loads(p.read_text()) if p.exists() else {{}}\n\
+         allow = d.setdefault('permissions', {{}}).setdefault('allow', [])\n\
+         for t in {tools:?}:\n\
+         \x20   if t not in allow: allow.append(t)\n\
+         p.parent.mkdir(parents=True, exist_ok=True)\n\
+         p.write_text(json.dumps(d, indent=2))\n\
+         PYEOF\n",
+        settings = CLAUDE_SETTINGS_PATH,
+        tools = PREAPPROVED_TOOLS,
+    )
 }
 
 fn sh(script: &str) -> Vec<String> {
@@ -828,6 +883,25 @@ mod tests {
     /// The digest URL is the tarball URL plus `.sha256` — the convention the
     /// release publishes under, and the reference used whenever the owner has
     /// not pinned one.
+    /// The pre-approval step must MERGE into the settings file, never
+    /// replace it: the base image ships hooks and policy in there, and a
+    /// clobber would trade the permission breakage for a different one.
+    /// Also asserts it targets the file Claude Code actually reads.
+    #[test]
+    fn tool_preapproval_merges_into_the_image_settings() {
+        let script = preapproval_script();
+        assert!(script.contains(CLAUDE_SETTINGS_PATH), "wrong settings path");
+        assert!(
+            script.contains("read_text()") && script.contains("setdefault"),
+            "must read and merge, not overwrite: {script}"
+        );
+        for tool in PREAPPROVED_TOOLS {
+            assert!(script.contains(tool), "missing {tool}");
+        }
+        // A blanket wildcard would grant more than the tools named here.
+        assert!(!script.contains("\"*\""), "wildcard grant");
+    }
+
     #[test]
     fn the_published_digest_sits_beside_the_tarball() {
         let tarball = sprig_url("sprig-latest", "x86_64");

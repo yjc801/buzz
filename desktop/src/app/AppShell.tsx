@@ -44,6 +44,7 @@ import { useManagedAgentRuntimeReconciliation } from "@/features/agents/useManag
 import { useAutoRestartPolicy } from "@/features/agents/lib/useAutoRestartPolicy";
 import { usePersonaSync } from "@/features/agents/lib/usePersonaSync";
 import { useAgentObserverIngestion } from "@/features/agents/useAgentObserverIngestion";
+import { useAgentWakeOnMention } from "@/features/agents/useAgentWakeOnMention";
 import { AgentManagementDialogs } from "@/features/agents/ui/AgentManagementDialogs";
 import { RequestedAgentCreateDialogs } from "@/features/agents/ui/RequestedAgentCreateDialogs";
 import {
@@ -194,6 +195,12 @@ export function AppShell() {
   // relay-owned agents join automatically once identity arrives. Adding a
   // guard here would drop managed-agent coverage during startup.
   useAgentObserverIngestion();
+  // A remote agent that has exited cannot be reached by any client — it dials
+  // out to the relay and its substrate never restarts it — so addressing one
+  // from a phone went unanswered until someone clicked Deploy here. Deploy is
+  // idempotent, so a mention can simply trigger it. Not in the huddle window:
+  // that webview runs this same shell and would deploy a second time.
+  useAgentWakeOnMention(!isHuddleRoom);
   // Kind 24200 is relay-ephemeral, so reconciliation runs eagerly (not
   // deferred): seeds kind 24200 for fresh identities, no-ops for explicit
   // opt-outs. Frames before the listener opens are permanently lost.

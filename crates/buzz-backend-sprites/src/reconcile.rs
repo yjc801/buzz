@@ -76,6 +76,12 @@ async fn deploy_loop(
     let mut provisioned = false;
     let mut adopted_winner = false;
     let mut last_probe: Option<ProbeReport> = None;
+    // The resolved provision intent, computed at most once per deploy call
+    // (see [`resolve_once`]). Caching it keeps the desired fingerprint
+    // stable for the whole call: a rolling release republished mid-loop
+    // cannot flip a just-converged sprite back to "diverged" and trip the
+    // one-provision-per-call bound.
+    let mut resolved_intent: Option<provision::Resolved> = None;
     // The generation this call actually started, which is NOT the one the
     // caller's env map carries: the loop mints a fresh token per attempt so
     // the env file name, the harness's lifecycle correlator, and the probe's
@@ -116,12 +122,36 @@ async fn deploy_loop(
                 last_probe = probe.clone();
             }
             let sessions = our_sessions(substrate, &sprite_name, identity).await?;
-            // Resolving the intent needs one exec (`uname -m`), so it only
-            // runs when a decision could depend on it.
-            let resolved = provision::resolve(substrate, &sprite_name, cfg).await?;
-            let recorded = provision::recorded_fingerprint(substrate, &sprite_name).await?;
-            let desired = resolved.fingerprint().as_str().to_string();
-            let mut recorded = recorded.map(|f| f.as_str().to_string());
+            let mut recorded = provision::recorded_fingerprint(substrate, &sprite_name)
+                .await?
+                .map(|f| f.as_str().to_string());
+            // The desired fingerprint costs one exec (`uname -m`) plus —
+            // whenever the owner pinned no digest — an external fetch of
+            // the release's published one. So it is resolved lazily, under
+            // exactly the conditions where `classify` could reach its
+            // recorded-vs-desired comparison: race not lost, an intent on
+            // record, a definitely-stopped probe (which also rules out a
+            // live harness), no lingering session, no spent attempt. Every
+            // earlier classify row answers without it, which keeps a
+            // healthy no-op deploy — and every polling iteration —
+            // independent of GitHub release availability. This gate must
+            // stay in lockstep with `classify`'s row order: a condition
+            // missed here would feed the comparison an empty desired
+            // fingerprint and provision spuriously.
+            let could_compare_intent = !adopted_winner
+                && recorded.is_some()
+                && probe.as_ref().is_some_and(ProbeReport::stopped)
+                && sessions.is_empty()
+                && !attempt_started;
+            let desired = if could_compare_intent {
+                resolve_once(&mut resolved_intent, substrate, &sprite_name, cfg)
+                    .await?
+                    .fingerprint()
+                    .as_str()
+                    .to_string()
+            } else {
+                String::new()
+            };
             // A matching fingerprint is only a fast path (the intent doc's
             // rule: evidence over recollection). Before it can lead to a
             // Start, the installed sprig must still hash to what
@@ -130,11 +160,8 @@ async fn deploy_loop(
             // path repairs it. Gated on exactly the conditions under which
             // `classify` could answer Start, so ordinary polling iterations
             // never pay the extra exec.
-            if recorded.as_deref() == Some(desired.as_str())
-                && !attempt_started
-                && !adopted_winner
-                && sessions.is_empty()
-                && probe.as_ref().is_some_and(ProbeReport::stopped)
+            if could_compare_intent
+                && recorded.as_deref() == Some(desired.as_str())
                 && !provision::spot_check(substrate, &sprite_name).await?
             {
                 recorded = None;
@@ -236,8 +263,9 @@ async fn deploy_loop(
                     ));
                 }
                 provisioned = true;
-                let resolved = provision::resolve(substrate, &sprite_name, cfg).await?;
-                provision::ensure(substrate, &sprite_name, &resolved, lease_token).await?;
+                let resolved =
+                    resolve_once(&mut resolved_intent, substrate, &sprite_name, cfg).await?;
+                provision::ensure(substrate, &sprite_name, resolved, lease_token).await?;
                 // URL privacy is asserted at create and re-asserted here —
                 // provision is the only place this binding writes to a
                 // sprite it did not just create, and never on the live row.
@@ -290,6 +318,26 @@ async fn deploy_loop(
                 substrate.sleep(POLL_INTERVAL).await;
             }
         }
+    }
+}
+
+/// Resolve the provision intent at most once per deploy call.
+///
+/// Resolution is the loop's only step with a dependency outside the sprite:
+/// without an owner-pinned digest it fetches the one the release publishes.
+/// Memoizing it means a release outage cannot fail a deploy that never
+/// needed to provision, repeated polling performs no redundant downloads,
+/// and the desired fingerprint this call provisions is the one it then
+/// compares against.
+async fn resolve_once<'a>(
+    cache: &'a mut Option<provision::Resolved>,
+    substrate: &impl Substrate,
+    sprite: &str,
+    cfg: &ProviderConfig,
+) -> Result<&'a provision::Resolved, String> {
+    match cache {
+        Some(resolved) => Ok(resolved),
+        empty => Ok(empty.insert(provision::resolve(substrate, sprite, cfg).await?)),
     }
 }
 

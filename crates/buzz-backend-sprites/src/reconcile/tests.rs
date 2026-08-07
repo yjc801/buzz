@@ -369,6 +369,51 @@ fn live_agent_is_a_strict_no_op_with_zero_mutation() {
     );
 }
 
+/// The strict no-op must also be independent of the release infrastructure:
+/// no digest fetch, no arch probe. Before the lazy resolve, every
+/// observation of a healthy running agent read the rolling release's
+/// published digest, so a GitHub outage failed deploys whose agent was
+/// already up.
+#[test]
+fn a_live_no_op_never_reads_the_release() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![started_probe()],
+        recorded_intent: Some("anything".into()),
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    for external in ["run:fetch-digest", "run:uname"] {
+        assert!(
+            !fake.calls().iter().any(|c| c == external),
+            "the live no-op touched the release infrastructure ({external}): {:?}",
+            fake.calls()
+        );
+    }
+}
+
+/// The rolling digest is resolved at most once per deploy call. The cold
+/// path spans many observations, and re-resolving on each performed
+/// redundant downloads — worse, a release republished mid-loop could move
+/// the desired fingerprint right after convergence and trip the
+/// one-provision-per-call bound on a sprite this call just converged.
+#[test]
+fn the_digest_is_resolved_at_most_once_per_deploy() {
+    let fake = Fake::new(FakeState {
+        sprite: None,
+        probe_script: vec![stopped_probe()],
+        probe_after_start: Some(started_probe()),
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    assert_eq!(
+        fake.calls().iter().filter(|c| *c == "run:fetch-digest").count(),
+        1,
+        "{:?}",
+        fake.calls()
+    );
+}
+
 /// Rows 1 → 5 → 6 → 7: the cold path creates, provisions, starts, and
 /// confirms — each exactly once.
 #[test]

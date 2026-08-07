@@ -87,6 +87,24 @@ fn identity_component(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// The Codex adapter's launch command, as the launch gate admits it
+/// (`provision::require_provisioned_command`) and as provisioning installs
+/// its npm bin.
+const CODEX_ADAPTER_COMMAND: &str = "codex-acp";
+
+/// The `INITIAL_AGENT_MODE` values the pinned codex-acp parses, mapped from
+/// `provider_config.preapprove_agent_tools`. Codex never reads Claude Code's
+/// settings file — its tool policy is its *mode*, read from this variable at
+/// startup, defaulting to workspace-write "agent" mode. So the flag must be
+/// realized here or it silently does not apply to Codex agents: false would
+/// still edit files and run commands, and true would still leave escalated
+/// operations asking a harness that denies every request. On maps to full
+/// access (approvals never — the Claude realization already grants shell and
+/// network); off maps to read-only, where every edit/exec asks and the
+/// harness's denial makes the agent effectively converse-only.
+const CODEX_MODE_FULL_ACCESS: &str = "agent-full-access";
+const CODEX_MODE_READ_ONLY: &str = "read-only";
+
 /// The harness's `allowlist` gate mode, spelled as the desktop serializes
 /// `RespondTo` (kebab-case) and as `buzz-acp`'s CLI parses it.
 const RESPOND_TO_ALLOWLIST: &str = "allowlist";
@@ -155,6 +173,11 @@ pub struct AuthoritativeInputs<'a> {
     /// Resolved from `provider_config.inactivity_seconds`; `None` when the
     /// indefinite opt-in was chosen (which this version refuses elsewhere).
     pub inactivity_seconds: Option<u64>,
+    /// `provider_config.preapprove_agent_tools`. The Claude realization is
+    /// provisioned state (settings allow rules); the Codex realization is
+    /// environment — `INITIAL_AGENT_MODE`, written as a tier-1 default so
+    /// an explicit value in policy or user env wins.
+    pub preapprove_agent_tools: bool,
 }
 
 /// Resolve the full agent environment.
@@ -171,7 +194,21 @@ pub fn build_env(
 
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
-    // Tier 1 — overridable behavior defaults.
+    // Tier 1 — overridable behavior defaults. The provider's own default —
+    // the Codex realization of `preapprove_agent_tools` (see
+    // [`CODEX_MODE_FULL_ACCESS`]) — is written first, so both the desktop's
+    // policy env and the user's env can override it.
+    if launch.command.as_deref().map(str::trim) == Some(CODEX_ADAPTER_COMMAND) {
+        env.insert(
+            "INITIAL_AGENT_MODE".into(),
+            if auth.preapprove_agent_tools {
+                CODEX_MODE_FULL_ACCESS
+            } else {
+                CODEX_MODE_READ_ONLY
+            }
+            .into(),
+        );
+    }
     env.extend(launch.policy_env.clone());
 
     // Tier 2 — user/layered env. The descriptor already merged
@@ -348,6 +385,7 @@ mod tests {
             AuthoritativeInputs {
                 generation: "gen0001",
                 inactivity_seconds: Some(7200),
+                preapprove_agent_tools: true,
             },
         )
     }
@@ -435,6 +473,58 @@ mod tests {
         let agent = payload_json(serde_json::json!({"env_vars": {"API": "v"}}));
         let env = build(&agent).unwrap();
         assert_eq!(env["API"], "v");
+    }
+
+    /// `preapprove_agent_tools` must reach the Codex runtime too: codex-acp
+    /// never reads Claude Code's settings file — its tool policy is its
+    /// mode, read from INITIAL_AGENT_MODE and defaulting to workspace-write
+    /// "agent". Without this mapping, false still edits files and runs
+    /// commands, and true still leaves escalated operations asking a
+    /// harness that denies every request.
+    #[test]
+    fn codex_launches_carry_the_tool_policy_as_the_initial_mode() {
+        let agent = payload_json(serde_json::json!({
+            "launch": {"command": "codex-acp", "owner_pubkey": "beef"}
+        }));
+        let env = build(&agent).unwrap();
+        assert_eq!(env["INITIAL_AGENT_MODE"], "agent-full-access");
+
+        let env = build_env(
+            &agent,
+            AuthoritativeInputs {
+                generation: "gen0001",
+                inactivity_seconds: Some(7200),
+                preapprove_agent_tools: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(env["INITIAL_AGENT_MODE"], "read-only");
+    }
+
+    /// The mode is a tier-1 default: an explicit INITIAL_AGENT_MODE in the
+    /// user's env wins, matching every other overridable behavior default.
+    /// And it is scoped to the Codex command — other runtimes read their
+    /// policy elsewhere, and a stray variable would be noise at best.
+    #[test]
+    fn the_codex_mode_is_overridable_and_scoped_to_codex() {
+        let agent = payload_json(serde_json::json!({
+            "launch": {
+                "command": "codex-acp",
+                "env": {"INITIAL_AGENT_MODE": "agent"},
+                "owner_pubkey": "beef"
+            }
+        }));
+        assert_eq!(build(&agent).unwrap()["INITIAL_AGENT_MODE"], "agent");
+
+        for other in ["claude-agent-acp", "buzz-agent"] {
+            let agent = payload_json(serde_json::json!({
+                "launch": {"command": other, "owner_pubkey": "beef"}
+            }));
+            assert!(
+                !build(&agent).unwrap().contains_key("INITIAL_AGENT_MODE"),
+                "mode leaked to {other}"
+            );
+        }
     }
 
     #[test]
@@ -595,6 +685,7 @@ mod tests {
             AuthoritativeInputs {
                 generation: "g",
                 inactivity_seconds: None,
+                preapprove_agent_tools: true,
             },
         )
         .unwrap();

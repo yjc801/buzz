@@ -84,6 +84,7 @@ import {
   resolveProfileDisplayName,
   truncatePubkey,
   type UserProfilePanelProps,
+  useControllablePanelState,
   useRetainedPersona,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useProfileDmAction } from "@/features/profile/ui/useProfileDmAction";
@@ -129,30 +130,15 @@ export function UserProfilePanel({
   const isSplitLayout = layout === "split";
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
-  const [internalView, setInternalView] =
-    React.useState<ProfilePanelView>("summary");
-  const view = controlledView ?? internalView;
-  const setView = React.useCallback(
-    (nextView: ProfilePanelView, options?: { replace?: boolean }) => {
-      if (onViewChange) {
-        onViewChange(nextView, options);
-        return;
-      }
-      setInternalView(nextView);
-    },
-    [onViewChange],
+  const [view, setView] = useControllablePanelState<ProfilePanelView>(
+    controlledView,
+    onViewChange,
+    "summary",
   );
-  const [internalTab, setInternalTab] = React.useState<ProfilePanelTab>("info");
-  const tab = controlledTab ?? internalTab;
-  const setTab = React.useCallback(
-    (nextTab: ProfilePanelTab, options?: { replace?: boolean }) => {
-      if (onTabChange) {
-        onTabChange(nextTab, options);
-        return;
-      }
-      setInternalTab(nextTab);
-    },
-    [onTabChange],
+  const [tab, setTab] = useControllablePanelState<ProfilePanelTab>(
+    controlledTab,
+    onTabChange,
+    "info",
   );
   const [editAgentOpen, setEditAgentOpen] = React.useState(false);
   const [editAgentFocus, setEditAgentFocus] = React.useState<
@@ -348,44 +334,26 @@ export function UserProfilePanel({
     isOwner === true &&
     resolvedPersona !== undefined &&
     managedAgent === undefined;
+  // The hook owns the whole lifecycle-safety surface: action-time channel
+  // resolution, the unresolved-presence hold, and pending state that spans
+  // the full provider restart (which runs mostly outside any mutation).
   const {
     handleAgentPrimaryAction,
     handleAgentRestart,
-    isLifecycleActionPending,
+    lifecycleActionsBlocked,
   } = useAgentLifecycleActions({
+    channels: channelsQuery.data,
+    refetchChannels: channelsQuery.refetch,
     managedAgent,
+    presenceResolved: presenceQuery.data !== undefined,
     presenceStatus,
     relayAgents: relayAgentsQuery.data,
-    // Resolved at action time: a fast click before the channels query
-    // settles must not fail shutdown routing with "not in any channel".
-    resolveChannels: React.useCallback(async () => {
-      if (channelsQuery.data) {
-        return channelsQuery.data;
-      }
-      return (await channelsQuery.refetch()).data ?? [];
-      // Depend on the stable pieces, not the query object — it is a fresh
-      // reference every render and would defeat the handlers' memoization.
-    }, [channelsQuery.data, channelsQuery.refetch]),
     startManagedAgent: startAgentMutation.mutateAsync,
     stopManagedAgent: stopAgentMutation.mutateAsync,
   });
 
-  // Provider controls decide Deploy-vs-Shutdown on the live axis, and an
-  // UNRESOLVED presence query renders exactly like offline — on first load
-  // (or a presence 503 before any cache exists) a live agent would offer
-  // Deploy, and clicking it is a silent live no-op. Hold the controls until
-  // the query has resolved; error-with-cached-data still counts (stale
-  // beats unknown), and a resolved empty map is a valid offline answer.
-  const providerPresenceUnresolved =
-    managedAgent?.backend.type === "provider" &&
-    presenceQuery.data === undefined;
-
-  // isLifecycleActionPending spans the whole provider restart — the
-  // !shutdown send and the presence wait run outside any mutation, and
-  // mutation pending alone would re-enable Restart/Deploy mid-flow.
   const isAgentActionPending =
-    providerPresenceUnresolved ||
-    isLifecycleActionPending ||
+    lifecycleActionsBlocked ||
     createAgentMutation.isPending ||
     updateManagedAgentMutation.isPending ||
     startAgentMutation.isPending ||

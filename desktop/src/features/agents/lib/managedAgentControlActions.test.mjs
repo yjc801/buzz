@@ -545,6 +545,12 @@ test("the runtime dot's claim must match reality: 'Running' means the harness ru
   // whose harness died still has status "deployed", so keying the dot on the
   // control-plane axis labelled a dead agent Running — the symptom that sent
   // an owner looking for a Stop button that could not help.
-  assert.equal(isManagedAgentLive(remote({ status: "deployed" }), "offline"), false);
-  assert.equal(isManagedAgentLive(remote({ status: "deployed" }), "online"), true);
+  assert.equal(
+    isManagedAgentLive(remote({ status: "deployed" }), "offline"),
+    false,
+  );
+  assert.equal(
+    isManagedAgentLive(remote({ status: "deployed" }), "online"),
+    true,
+  );
 });

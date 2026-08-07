@@ -154,7 +154,9 @@ function resolveRuntimeTabStatus({
   // The dot claims "Running", so it has to mean the harness is running. For
   // a remote agent that is presence — its status stays `deployed` for the
   // life of the VM, which would leave the dot green over a dead agent.
-  return isManagedAgentLive(managedAgent, presenceStatus) ? "running" : "stopped";
+  return isManagedAgentLive(managedAgent, presenceStatus)
+    ? "running"
+    : "stopped";
 }
 
 function RuntimeTabStatusDot({ status }: { status: RuntimeTabStatus }) {

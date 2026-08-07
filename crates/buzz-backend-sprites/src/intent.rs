@@ -48,6 +48,11 @@ pub struct ProvisionTemplate {
     /// change reprovisions every sprite it reaches.
     pub launcher_sha256: String,
     pub probe_sha256: String,
+    /// Whether provisioning writes the agent's tool pre-approval. Part of
+    /// the fingerprint because turning it on or off changes what is
+    /// written into the sprite — the change must reprovision, exactly like
+    /// an adapter being added or removed.
+    pub preapprove_agent_tools: bool,
 }
 
 impl ProvisionTemplate {
@@ -95,6 +100,7 @@ mod tests {
             codex_adapter_version: "1.1.7",
             launcher_sha256: "b".repeat(64),
             probe_sha256: "c".repeat(64),
+            preapprove_agent_tools: true,
         }
     }
 
@@ -156,6 +162,11 @@ mod tests {
                 t.probe_sha256 = "d".repeat(64);
                 t
             }),
+            ("preapprove_agent_tools", {
+                let mut t = template();
+                t.preapprove_agent_tools = false;
+                t
+            }),
         ];
         for (field, mutated) in mutations {
             assert_ne!(
@@ -192,6 +203,7 @@ mod tests {
             "codex_adapter_version",
             "launcher_sha256",
             "probe_sha256",
+            "preapprove_agent_tools",
         ];
         let mut last = 0;
         for field in expected_order {

@@ -53,6 +53,22 @@ pub struct ProviderConfig {
     pub sprig_sha256: Option<String>,
     pub install_claude_adapter: bool,
     pub install_codex_adapter: bool,
+    /// Pre-approve the agent's own tool use inside its sprite.
+    ///
+    /// The harness answers every ACP permission request with a denial —
+    /// there is no approval path in it at all — and it overrides the mode
+    /// the Sprites image already ships (`defaultMode: bypassPermissions`).
+    /// So without pre-approval an agent cannot run a single tool: not a
+    /// shell, not a file read, not its own git clone. Provisioning writes
+    /// the allow rules that make `dontAsk` mean "run what you were
+    /// permitted" instead of "deny everything".
+    ///
+    /// Default on, because an agent that cannot act is not what anyone
+    /// deploys a coding agent for. Turn it off for an agent that should
+    /// only converse — and note the sprite is a single-tenant VM whose
+    /// shell already exposes the agent's key, so this widens what the
+    /// agent may do, not who may reach it.
+    pub preapprove_agent_tools: bool,
 }
 
 /// Read an optional string field. Empty and whitespace-only collapse to
@@ -173,6 +189,7 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
         sprig_sha256,
         install_claude_adapter: optional_bool(cfg, "install_claude_adapter")?.unwrap_or(true),
         install_codex_adapter: optional_bool(cfg, "install_codex_adapter")?.unwrap_or(true),
+        preapprove_agent_tools: optional_bool(cfg, "preapprove_agent_tools")?.unwrap_or(true),
     })
 }
 
@@ -218,6 +235,12 @@ pub fn config_schema() -> serde_json::Value {
                 "title": "Provision the Codex adapter",
                 "default": true,
                 "description": "npm-installs @agentclientprotocol/codex-acp (pinned) so Codex-runtime agents can run in the sprite."
+            },
+            "preapprove_agent_tools": {
+                "type": "boolean",
+                "title": "Let the agent use its tools",
+                "default": true,
+                "description": "Pre-approves shell, file and fetch tools inside the sprite. Without this the agent cannot run anything at all — the harness denies every permission request and there is nobody to ask. Turn off for a converse-only agent."
             }
         }
     })
@@ -341,7 +364,7 @@ mod tests {
     /// lints field names for credential words; adding a field is a deliberate
     /// act that must update this test.
     #[test]
-    fn schema_declares_exactly_the_six_v1_fields() {
+    fn schema_declares_exactly_the_v1_fields() {
         let schema = config_schema();
         let mut fields: Vec<&str> = schema["properties"]
             .as_object()
@@ -357,6 +380,7 @@ mod tests {
                 "install_claude_adapter",
                 "install_codex_adapter",
                 "org",
+                "preapprove_agent_tools",
                 "sprig_sha256",
                 "sprig_version",
             ]

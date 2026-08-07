@@ -1,4 +1,4 @@
-import { sendChannelMessage } from "@/shared/api/tauri";
+import { getPresence, sendChannelMessage } from "@/shared/api/tauri";
 import type {
   Channel,
   ManagedAgent,
@@ -107,12 +107,16 @@ export function resolveManagedAgentChannelId(
   // channel ids — which made Stop fail with "not in any channel" for agents
   // the UI was simultaneously showing as members of two. Any channel that
   // lists the agent as a member is a valid place to address it, so fall back
-  // to that before giving up.
+  // to that before giving up. Archived channels are excluded: the relay
+  // rejects writes to them, so picking one fails the shutdown even when a
+  // usable membership exists further down the (type/name-sorted) list.
   const agentPubkey = normalizePubkey(agent.pubkey);
-  const membered = context.channels.find((channel) =>
-    channel.memberPubkeys?.some(
-      (member) => normalizePubkey(member) === agentPubkey,
-    ),
+  const membered = context.channels.find(
+    (channel) =>
+      !channel.archivedAt &&
+      channel.memberPubkeys?.some(
+        (member) => normalizePubkey(member) === agentPubkey,
+      ),
   );
   if (membered) {
     return membered.id;
@@ -142,11 +146,52 @@ export async function startManagedAgentWithRules({
   await startManagedAgent(agent.pubkey);
 }
 
+/// How long a provider restart waits for the old harness to leave presence
+/// after `!shutdown`, and how often it looks. The wait is load-bearing, not
+/// politeness: the provider treats a deploy against a live harness as a
+/// strict no-op that returns the existing id, so deploying while the old
+/// harness still runs "restarts" nothing. Presence is the only liveness
+/// signal a remote harness has, and a clean shutdown clears it within
+/// seconds; the timeout covers a harness that ignores the command.
+const REMOTE_SHUTDOWN_WAIT_MS = 90_000;
+const REMOTE_SHUTDOWN_POLL_MS = 2_000;
+
+const waitMs = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function waitForRemoteHarnessExit(
+  agent: ManagedAgent,
+  fetchPresence: (pubkeys: string[]) => Promise<PresenceLookup>,
+  delay: (ms: number) => Promise<void>,
+) {
+  const pubkey = normalizePubkey(agent.pubkey);
+  const attempts = Math.ceil(REMOTE_SHUTDOWN_WAIT_MS / REMOTE_SHUTDOWN_POLL_MS);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await delay(REMOTE_SHUTDOWN_POLL_MS);
+    const presence = (await fetchPresence([agent.pubkey]))[pubkey];
+    if (!isManagedAgentLive(agent, presence)) {
+      return;
+    }
+  }
+  // Fail honestly instead of deploying into a no-op: the shutdown was
+  // sent, and the primary control offers Deploy once presence clears.
+  throw new Error(
+    `Shutdown was sent, but ${agent.name} is still reporting presence. ` +
+      "Deploy it again once it goes offline.",
+  );
+}
+
 export async function respawnManagedAgentWithRules({
   agent,
+  channels = [],
+  preferredChannelId = null,
+  relayAgents = [],
   startManagedAgent,
   stopManagedAgent,
   onStopped,
+  fetchPresence = getPresence,
+  delay = waitMs,
+  stopProviderAgent = stopManagedAgentWithRules,
 }: {
   agent: ManagedAgent;
   startManagedAgent: StartManagedAgent;
@@ -154,8 +199,36 @@ export async function respawnManagedAgentWithRules({
   /** Called after a successful stop and before start begins — use this to
    * clear stale working badges at the right boundary. */
   onStopped?: () => void;
-}) {
-  if (agent.backend.type === "local" && isManagedAgentActive(agent)) {
+  /** Injectable for tests; production always uses the real relay calls. */
+  fetchPresence?: (pubkeys: string[]) => Promise<PresenceLookup>;
+  delay?: (ms: number) => Promise<void>;
+  stopProviderAgent?: typeof stopManagedAgentWithRules;
+} & Partial<ManagedAgentChannelContext>) {
+  // A provider restart is shutdown-then-redeploy, and the shutdown half is
+  // remote: presence — fetched now, not a render-time snapshot — decides
+  // whether there is a harness to stop, and the redeploy must wait for it
+  // to actually die (see waitForRemoteHarnessExit). A dead remote agent
+  // skips straight to the deploy.
+  if (agent.backend.type === "provider") {
+    const presence = (await fetchPresence([agent.pubkey]))[
+      normalizePubkey(agent.pubkey)
+    ];
+    if (isManagedAgentLive(agent, presence)) {
+      await stopProviderAgent({
+        agent,
+        channels,
+        preferredChannelId,
+        relayAgents,
+        stopManagedAgent,
+      });
+      await waitForRemoteHarnessExit(agent, fetchPresence, delay);
+      onStopped?.();
+    }
+    await startManagedAgent(agent.pubkey);
+    return;
+  }
+
+  if (isManagedAgentActive(agent)) {
     await stopManagedAgent(agent.pubkey);
     onStopped?.();
   }

@@ -189,6 +189,8 @@ export function useManagedAgentActions() {
       if (!agent) return;
       await respawnManagedAgentWithRules({
         agent,
+        channels: channelsQuery.data ?? [],
+        relayAgents: relayAgentsQuery.data ?? [],
         startManagedAgent: startMutation.mutateAsync,
         stopManagedAgent: stopMutation.mutateAsync,
         onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),

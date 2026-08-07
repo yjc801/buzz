@@ -17,6 +17,7 @@ import {
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
+  isManagedAgentLive,
 } from "@/features/agents/lib/managedAgentControlActions";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
@@ -371,10 +372,13 @@ function MemberActionsMenu({
             >
               {pairAction
                 ? getPairActionIcon(pairAction)
-                : getManagedAgentActionIcon(managedAgent)}
+                : getManagedAgentActionIcon(managedAgent, presenceStatus)}
               {pairAction
                 ? MANAGED_AGENT_PAIR_ACTION_LABELS[pairAction]
-                : getManagedAgentPrimaryActionLabel(managedAgent, presenceStatus)}
+                : getManagedAgentPrimaryActionLabel(
+                    managedAgent,
+                    presenceStatus,
+                  )}
             </DropdownMenuItem>
             {onEditRespondTo ? (
               <DropdownMenuItem
@@ -505,8 +509,14 @@ function getPairActionIcon(action: ManagedAgentPairAction) {
   return <Play className="h-4 w-4" />;
 }
 
-function getManagedAgentActionIcon(agent: ManagedAgent) {
-  if (isManagedAgentActive(agent)) {
+/// The icon must answer from the same live axis as the label and the click
+/// handler: a deployed-but-dead remote agent whose label reads Deploy must
+/// not carry a stop icon.
+function getManagedAgentActionIcon(
+  agent: ManagedAgent,
+  presence?: PresenceStatus | null,
+) {
+  if (isManagedAgentLive(agent, presence)) {
     return <Square className="h-4 w-4" />;
   }
 

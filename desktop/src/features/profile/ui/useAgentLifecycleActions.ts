@@ -78,6 +78,8 @@ export function useAgentLifecycleActions({
     try {
       await respawnManagedAgentWithRules({
         agent: managedAgent,
+        channels: channels ?? [],
+        relayAgents: relayAgents ?? [],
         startManagedAgent,
         stopManagedAgent,
         onStopped: () => clearActiveTurnsForAgentOnStop(managedAgent.pubkey),
@@ -88,7 +90,13 @@ export function useAgentLifecycleActions({
         error instanceof Error ? error.message : "Agent restart failed.",
       );
     }
-  }, [managedAgent, startManagedAgent, stopManagedAgent]);
+  }, [
+    channels,
+    managedAgent,
+    relayAgents,
+    startManagedAgent,
+    stopManagedAgent,
+  ]);
 
   return { handleAgentPrimaryAction, handleAgentRestart };
 }

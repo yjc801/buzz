@@ -172,6 +172,106 @@ test("test_respawn_onStopped_fires_before_start_resolves", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Provider restart. Deploy against a live harness is a strict no-op that
+// returns the existing id, so a restart that starts immediately after
+// sending !shutdown (or without sending it) "restarts" nothing while the
+// UI reports success. The provider path must shut down, wait for presence
+// to clear, and only then deploy.
+// ---------------------------------------------------------------------------
+
+const presenceSequence = (agentUnderTest, statuses) => {
+  const remaining = [...statuses];
+  return async () => ({
+    [agentUnderTest.pubkey.toLowerCase()]:
+      remaining.length > 1 ? remaining.shift() : remaining[0],
+  });
+};
+
+test("test_provider_respawn_shuts_down_waits_for_offline_then_deploys", async () => {
+  const a = remote();
+  const events = [];
+
+  await respawnManagedAgentWithRules({
+    agent: a,
+    channels: [],
+    preferredChannelId: "here",
+    relayAgents: [],
+    // Live at the pre-check, still live on the first poll, then gone.
+    fetchPresence: presenceSequence(a, ["online", "online", "offline"]),
+    delay: async () => {
+      events.push("wait");
+    },
+    stopProviderAgent: async ({ preferredChannelId }) => {
+      events.push(`shutdown:${preferredChannelId}`);
+      return {};
+    },
+    startManagedAgent: async () => {
+      events.push("deploy");
+    },
+    stopManagedAgent: async () => {
+      throw new Error("provider restart must not use the local stop");
+    },
+    onStopped: () => {
+      events.push("onStopped");
+    },
+  });
+
+  assert.deepEqual(
+    events,
+    ["shutdown:here", "wait", "wait", "onStopped", "deploy"],
+    "deploy must come after presence clears, never race the old harness",
+  );
+});
+
+test("test_provider_respawn_dead_agent_deploys_without_shutdown", async () => {
+  const a = remote();
+  const events = [];
+
+  await respawnManagedAgentWithRules({
+    agent: a,
+    fetchPresence: presenceSequence(a, ["offline"]),
+    stopProviderAgent: async () => {
+      events.push("shutdown");
+      return {};
+    },
+    startManagedAgent: async () => {
+      events.push("deploy");
+    },
+    stopManagedAgent: async () => {
+      events.push("local-stop");
+    },
+  });
+
+  assert.deepEqual(events, ["deploy"], "a dead remote agent skips the stop");
+});
+
+test("test_provider_respawn_fails_honestly_when_presence_never_clears", async () => {
+  const a = remote();
+  let deployed = false;
+  let onStoppedFired = false;
+
+  await assert.rejects(
+    respawnManagedAgentWithRules({
+      agent: a,
+      fetchPresence: presenceSequence(a, ["online"]),
+      delay: async () => {},
+      stopProviderAgent: async () => ({}),
+      startManagedAgent: async () => {
+        deployed = true;
+      },
+      stopManagedAgent: async () => {},
+      onStopped: () => {
+        onStoppedFired = true;
+      },
+    }),
+    /still reporting presence/,
+  );
+
+  assert.ok(!deployed, "deploying into a live harness is the no-op lie");
+  assert.ok(!onStoppedFired, "the harness never stopped — badges stay");
+});
+
+// ---------------------------------------------------------------------------
 // The two axes. A remote agent's control plane says whether infrastructure
 // exists; only presence says whether the harness is running. Conflating them
 // stranded dead remote agents: status stays "deployed" forever (nothing
@@ -190,8 +290,16 @@ const remote = (overrides = {}) =>
 test("a deployed remote agent is 'active' but not 'live' without presence", () => {
   const a = remote();
   assert.equal(isManagedAgentActive(a), true, "infrastructure exists");
-  assert.equal(isManagedAgentLive(a, "offline"), false, "harness is not running");
-  assert.equal(isManagedAgentLive(a, undefined), false, "no presence = not live");
+  assert.equal(
+    isManagedAgentLive(a, "offline"),
+    false,
+    "harness is not running",
+  );
+  assert.equal(
+    isManagedAgentLive(a, undefined),
+    false,
+    "no presence = not live",
+  );
 });
 
 test("presence decides liveness for a remote agent", () => {
@@ -204,21 +312,45 @@ test("presence decides liveness for a remote agent", () => {
 });
 
 test("a local agent's liveness ignores presence — the desktop owns its process", () => {
-  assert.equal(isManagedAgentLive(agent({ status: "running" }), "offline"), true);
-  assert.equal(isManagedAgentLive(agent({ status: "stopped" }), "online"), false);
+  assert.equal(
+    isManagedAgentLive(agent({ status: "running" }), "offline"),
+    true,
+  );
+  assert.equal(
+    isManagedAgentLive(agent({ status: "stopped" }), "online"),
+    false,
+  );
 });
 
 test("a dead remote agent offers Deploy, a live one offers Shutdown", () => {
-  assert.equal(getManagedAgentPrimaryActionLabel(remote(), "offline"), "Deploy");
-  assert.equal(getManagedAgentPrimaryActionLabel(remote(), undefined), "Deploy");
-  assert.equal(getManagedAgentPrimaryActionLabel(remote(), "online"), "Shutdown");
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(remote(), "offline"),
+    "Deploy",
+  );
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(remote(), undefined),
+    "Deploy",
+  );
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(remote(), "online"),
+    "Shutdown",
+  );
   assert.equal(getManagedAgentPrimaryActionLabel(remote(), "away"), "Shutdown");
 });
 
 test("local agent labels are unchanged", () => {
-  assert.equal(getManagedAgentPrimaryActionLabel(agent({ status: "running" })), "Stop");
-  assert.equal(getManagedAgentPrimaryActionLabel(agent({ status: "stopped" })), "Restart Agent");
-  assert.equal(getManagedAgentPrimaryActionLabel(agent({ status: "idle" })), "Start Agent");
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(agent({ status: "running" })),
+    "Stop",
+  );
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(agent({ status: "stopped" })),
+    "Restart Agent",
+  );
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(agent({ status: "idle" })),
+    "Start Agent",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -253,6 +385,30 @@ test("channel membership resolves when the relay entry has no channel ids", () =
     relayAgents: [{ pubkey: a.pubkey, channelIds: [], channels: [] }],
   });
   assert.equal(resolved, "theirs");
+});
+
+test("an archived membership never routes the shutdown", () => {
+  // The relay rejects writes to archived channels, and useChannelsQuery
+  // sorts by type/name — so an archived membership can sort ahead of a
+  // usable one. It must be skipped, not merely deprioritized by luck.
+  const a = remote();
+  const archived = { ...channel("aaa-archived", [a.pubkey]), archivedAt: 123 };
+  const active = channel("zzz-active", [a.pubkey]);
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [archived, active],
+      relayAgents: [{ pubkey: a.pubkey, channelIds: [], channels: [] }],
+    }),
+    "zzz-active",
+  );
+  // Only archived memberships = nowhere to address the agent.
+  assert.equal(
+    resolveManagedAgentChannelId(a, {
+      channels: [archived],
+      relayAgents: [{ pubkey: a.pubkey, channelIds: [], channels: [] }],
+    }),
+    null,
+  );
 });
 
 test("the preferred channel still wins, and an unknown agent still resolves to null", () => {

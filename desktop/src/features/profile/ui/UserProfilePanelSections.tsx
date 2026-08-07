@@ -378,7 +378,9 @@ export function ProfileSummaryView({
             // provider agent (shutdown over the relay, start = a fresh
             // deploy). Excluding providers left a remote agent with no way
             // back once its harness died.
-            isOwner === true && managedAgent && isManagedAgentLive(managedAgent, presenceStatus)
+            isOwner === true &&
+            managedAgent &&
+            isManagedAgentLive(managedAgent, presenceStatus)
               ? handleAgentRestart
               : undefined
           }

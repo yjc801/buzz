@@ -637,6 +637,8 @@ export function MembersSidebar({
       managedAgent?.backend.type === "local" && relayUrl
         ? managedAgentPairAction(managedAgentRuntime)
         : undefined;
+    const presenceStatus =
+      memberPresenceQuery.data?.[member.pubkey.toLowerCase()] ?? null;
     return (
       <div className="content-visibility-auto" key={member.pubkey}>
         <MembersSidebarMemberCard
@@ -666,7 +668,11 @@ export function MembersSidebar({
           }}
           onEditRespondTo={memberIsBot ? setEditRespondToAgent : undefined}
           onManagedAgentAction={(agent) => {
-            void handleAgentLifecycleAction(agent, managedAgentRuntime);
+            void handleAgentLifecycleAction(
+              agent,
+              managedAgentRuntime,
+              presenceStatus,
+            );
           }}
           onOpenProfile={handleOpenProfile}
           onRemoveMember={handleRemoveMember}
@@ -682,9 +688,7 @@ export function MembersSidebar({
               : undefined
           }
           pairAction={pairAction}
-          presenceStatus={
-            memberPresenceQuery.data?.[member.pubkey.toLowerCase()] ?? null
-          }
+          presenceStatus={presenceStatus}
           profileAvatarUrl={memberProfile?.avatarUrl ?? null}
           viewerIsOwner={viewerIsOwner}
         />

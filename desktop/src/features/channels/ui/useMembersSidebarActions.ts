@@ -8,6 +8,7 @@ import {
 import {
   respawnManagedAgentWithRules,
   isManagedAgentActive,
+  isManagedAgentLive,
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
@@ -25,6 +26,7 @@ import type {
   ChannelMember,
   ManagedAgent,
   ManagedAgentRuntimeStatus,
+  PresenceStatus,
 } from "@/shared/api/types";
 
 type UseMembersSidebarActionsOptions = {
@@ -144,6 +146,10 @@ export function useMembersSidebarActions({
   async function handleLifecycleAction(
     agent: ManagedAgent,
     runtime?: ManagedAgentRuntimeStatus,
+    /** Live axis for a remote agent — the same signal that picked the menu
+     * row's label and icon must pick the branch, or an offline agent whose
+     * row reads Deploy would be sent !shutdown. */
+    presenceStatus?: PresenceStatus | null,
   ) {
     clearActionFeedback();
     setActiveActionKey(`agent:${agent.pubkey}`);
@@ -170,7 +176,7 @@ export function useMembersSidebarActions({
         return;
       }
 
-      if (isManagedAgentActive(agent)) {
+      if (isManagedAgentLive(agent, presenceStatus)) {
         await stopManagedAgentWithRules({
           agent,
           ...EMPTY_AGENT_CONTEXT,
@@ -207,6 +213,8 @@ export function useMembersSidebarActions({
       action: async (agent) => {
         await respawnManagedAgentWithRules({
           agent,
+          ...EMPTY_AGENT_CONTEXT,
+          preferredChannelId: channelId,
           startManagedAgent: startManagedAgentMutation.mutateAsync,
           stopManagedAgent: stopManagedAgentMutation.mutateAsync,
           onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),

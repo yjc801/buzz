@@ -15,22 +15,21 @@ use serde_json::json;
 pub const DEFAULT_INACTIVITY_SECONDS: u64 = 7200;
 
 /// The GitHub release tag sprig artifacts are fetched from. `sprig-latest` is
-/// a *rolling* release: Block re-publishes it and the baked digests below go
-/// stale — deliberately, the same way the Kubernetes binding's baked image
-/// digest moves with a provider upgrade (§Deploy State Machine divergence
-/// note). A stale pin fails provision with an error naming the override.
+/// a *rolling* release: upstream re-publishes it on every commit, which is
+/// why nothing here pins its bytes (see the digest note below).
 pub const DEFAULT_SPRIG_VERSION: &str = "sprig-latest";
 
-/// The sprig tarball is what runs holding the agent's private key, so it is
-/// always verified before extraction. What it is verified *against* depends
-/// on the owner: `provider_config.sprig_sha256` when set (provenance — a
-/// digest the owner chose), otherwise the digest the release publishes
-/// beside the tarball (transport integrity — trust rooted in the release).
-///
-/// There is deliberately no compiled-in pin. `sprig-latest` is a rolling tag
-/// that upstream re-publishes on every commit — observed moving twice within
-/// one afternoon — so a baked digest is stale within hours, and every deploy
-/// then fails on a mismatch that says nothing about the artifact.
+// The sprig tarball is what runs holding the agent's private key, so it is
+// always verified before extraction. What it is verified *against* depends on
+// the owner: `provider_config.sprig_sha256` when set (provenance — a digest
+// the owner chose), otherwise the digest the release publishes beside the
+// tarball (transport integrity — trust rooted in the release).
+//
+// There is deliberately no compiled-in pin. `sprig-latest` is a rolling tag
+// that upstream re-publishes on every commit — observed moving twice within
+// one afternoon — so a baked digest is stale within hours, and every deploy
+// then fails on a mismatch that says nothing about the artifact.
+
 /// Pinned npm versions of the ACP adapters provisioned when the corresponding
 /// `install_*_adapter` flag is on. Baked provider state, like the sprig pins.
 pub const CLAUDE_ADAPTER_VERSION: &str = "0.64.0";
@@ -49,7 +48,8 @@ pub struct ProviderConfig {
     /// Always `Some` in v1 — `0` (indefinite) is refused in `parse`.
     pub inactivity_seconds: Option<u64>,
     pub sprig_version: String,
-    /// Overrides the baked digest for the VM's arch. `None` = baked pin.
+    /// A digest the owner demands. `None` = verify against the digest the
+    /// release publishes beside the tarball.
     pub sprig_sha256: Option<String>,
     pub install_claude_adapter: bool,
     pub install_codex_adapter: bool,

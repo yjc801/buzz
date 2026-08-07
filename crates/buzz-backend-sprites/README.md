@@ -32,9 +32,10 @@ names the source, and points at the fix rather than reporting a bare 401.
 | `org` | the sprite CLI's current selection | Sprites organization |
 | `inactivity_seconds` | 7200 | the agent exits after this long with no work; its sprite then hibernates. `0` (indefinite) is refused — see below |
 | `sprig_version` | `sprig-latest` | GitHub release of `block/buzz` the agent runtime comes from |
-| `sprig_sha256` | this provider's baked per-architecture pin | override the runtime digest; your trust decision, since that binary holds the agent's key |
+| `sprig_sha256` | unset | demand this exact runtime digest (provenance — your trust decision, since that binary holds the agent's key). Unset, each download is verified against the digest the release publishes beside it: transport integrity only, trusting whatever the release currently holds — see the trust delta below |
 | `install_claude_adapter` | true | provision `@agentclientprotocol/claude-agent-acp` |
 | `install_codex_adapter` | true | provision `@agentclientprotocol/codex-acp` |
+| `preapprove_agent_tools` | true | let the agent use its tools: Claude Code gets provider-managed shell/file/fetch allow rules, Codex starts in full-access mode. Off = converse-only — the Claude rules are removed and Codex starts read-only, with every escalation denied |
 
 The agent's launch command must be one the sprite can actually run after
 provisioning: `buzz-agent` (always installed, via the sprig multicall), or
@@ -143,10 +144,19 @@ observes whatever the sprite became. Errors quote only machine-readable
 tokens: the probe's own fields, the sprite's status, and structured API error
 codes — never process-composed output, which can echo a secret it was handed.
 
-**Trust delta, stated.** The sprig tarball is digest-pinned, but the sprite's
-base image is Fly's and upgrades outside this provider's control. Anyone with
-sprite access in the organization can read a running agent's memory. The
-organization is the isolation unit.
+**Trust delta, stated.** What the sprig runtime is verified against is the
+owner's choice. Setting `sprig_sha256` demands one exact artifact —
+provenance the owner picked. The default verifies each download against the
+digest published *beside the same release*: that is transport integrity (a
+corrupted or truncated download cannot run), not provenance — trust is
+rooted in the GitHub release, so a re-published `sprig-latest` is trusted
+automatically and its code runs holding the agent's key. There is no
+provider-baked pin: `sprig-latest` is a rolling tag that moves within hours,
+and a baked digest would fail every deploy on a mismatch that says nothing
+about the artifact. Separately, the sprite's base image is Fly's and
+upgrades outside this provider's control. Anyone with sprite access in the
+organization can read a running agent's memory. The organization is the
+isolation unit.
 
 ## Tests
 

@@ -129,6 +129,7 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
         env::AuthoritativeInputs {
             generation: &generation,
             inactivity_seconds: cfg.inactivity_seconds,
+            preapprove_agent_tools: cfg.preapprove_agent_tools,
         },
     )?;
 

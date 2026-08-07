@@ -554,24 +554,33 @@ pub async fn ensure(
         .and_then(expect_ok)?;
     }
 
-    // Pre-approve the agent's tools, or the agent cannot act at all: the
+    // Converge the agent's tool pre-approval — in BOTH directions. On: the
     // harness denies every ACP permission request (there is no approval
-    // path in it) and overrides the mode the image itself ships. Merged
+    // path in it) and overrides the mode the image itself ships, so without
+    // allow rules the agent cannot act at all. Off: the provider-owned
+    // rules must be *removed* — a sprite provisioned under an earlier
+    // `true` still carries them, and treating false as a no-op would leave
+    // a converse-only agent holding shell and write access forever. Merged
     // into the existing settings with python3 rather than overwritten —
     // the base image puts hooks and policy in this file, and clobbering
     // them would trade one breakage for another.
-    if t.preapprove_agent_tools {
-        run_step(
-            substrate,
-            sprite,
-            "pre-approve the agent's tools",
-            &sh(&lease_guard(lease_token, &preapproval_script())),
-            None,
-            Duration::from_secs(60),
-        )
-        .await
-        .and_then(expect_ok)?;
-    }
+    run_step(
+        substrate,
+        sprite,
+        if t.preapprove_agent_tools {
+            "pre-approve the agent's tools"
+        } else {
+            "revoke the agent's tool pre-approval"
+        },
+        &sh(&lease_guard(
+            lease_token,
+            &tool_permission_script(t.preapprove_agent_tools),
+        )),
+        None,
+        Duration::from_secs(60),
+    )
+    .await
+    .and_then(expect_ok)?;
 
     // The record comes LAST, atomically: a crash anywhere above leaves no
     // intent file (or the previous one), and either reads as divergence.
@@ -595,25 +604,45 @@ pub async fn ensure(
     Ok(())
 }
 
-/// The in-sprite script that pre-approves the agent's tools.
+/// The in-sprite script that converges the agent's tool pre-approval to
+/// `grant`: on, the provider-owned allow rules are merged in; off, exactly
+/// those rules are removed, and entries anyone else wrote are untouched.
 ///
 /// Merges into the image's settings rather than replacing them — the base
-/// image ships hooks and policy in the same file. Shared with the test that
-/// pins those properties, so the assertion covers the script that actually
-/// runs.
-fn preapproval_script() -> String {
+/// image ships hooks and policy in the same file. The write goes through a
+/// sibling temp file and an atomic rename, never a truncate-in-place: this
+/// file is durable state, and an interruption mid-write would leave empty or
+/// partial JSON that wedges every later provision at `json.loads`. Shared
+/// with the tests that pin those properties (and execute the script against
+/// a real file), so the assertions cover the script that actually runs.
+fn tool_permission_script(grant: bool) -> String {
+    tool_permission_script_at(CLAUDE_SETTINGS_PATH, grant)
+}
+
+fn tool_permission_script_at(settings: &str, grant: bool) -> String {
     format!(
         "python3 - <<'PYEOF'\n\
-         import json, pathlib\n\
+         import json, os, pathlib\n\
          p = pathlib.Path({settings:?})\n\
+         if not {grant} and not p.exists():\n\
+         \x20   raise SystemExit(0)\n\
          d = json.loads(p.read_text()) if p.exists() else {{}}\n\
-         allow = d.setdefault('permissions', {{}}).setdefault('allow', [])\n\
-         for t in {tools:?}:\n\
-         \x20   if t not in allow: allow.append(t)\n\
+         perms = d.setdefault('permissions', {{}})\n\
+         allow = perms.setdefault('allow', [])\n\
+         tools = {tools:?}\n\
+         if {grant}:\n\
+         \x20   for t in tools:\n\
+         \x20       if t not in allow: allow.append(t)\n\
+         else:\n\
+         \x20   perms['allow'] = [t for t in allow if t not in tools]\n\
          p.parent.mkdir(parents=True, exist_ok=True)\n\
-         p.write_text(json.dumps(d, indent=2))\n\
+         tmp = p.with_name(p.name + '.tmp')\n\
+         tmp.write_text(json.dumps(d, indent=2))\n\
+         if p.exists():\n\
+         \x20   os.chmod(tmp, os.stat(p).st_mode & 0o7777)\n\
+         os.replace(tmp, p)\n\
          PYEOF\n",
-        settings = CLAUDE_SETTINGS_PATH,
+        grant = if grant { "True" } else { "False" },
         tools = PREAPPROVED_TOOLS,
     )
 }
@@ -886,20 +915,90 @@ mod tests {
     /// The pre-approval step must MERGE into the settings file, never
     /// replace it: the base image ships hooks and policy in there, and a
     /// clobber would trade the permission breakage for a different one.
-    /// Also asserts it targets the file Claude Code actually reads.
+    /// Also asserts it targets the file Claude Code actually reads, and
+    /// that the durable file is replaced atomically — a truncate-in-place
+    /// interrupted mid-write leaves invalid JSON that wedges every later
+    /// provision at `json.loads`.
     #[test]
     fn tool_preapproval_merges_into_the_image_settings() {
-        let script = preapproval_script();
-        assert!(script.contains(CLAUDE_SETTINGS_PATH), "wrong settings path");
-        assert!(
-            script.contains("read_text()") && script.contains("setdefault"),
-            "must read and merge, not overwrite: {script}"
-        );
-        for tool in PREAPPROVED_TOOLS {
-            assert!(script.contains(tool), "missing {tool}");
+        for script in [tool_permission_script(true), tool_permission_script(false)] {
+            assert!(script.contains(CLAUDE_SETTINGS_PATH), "wrong settings path");
+            assert!(
+                script.contains("read_text()") && script.contains("setdefault"),
+                "must read and merge, not overwrite: {script}"
+            );
+            for tool in PREAPPROVED_TOOLS {
+                assert!(script.contains(tool), "missing {tool}");
+            }
+            // A blanket wildcard would grant more than the tools named here.
+            assert!(!script.contains("\"*\""), "wildcard grant");
+            // Atomic replace, never a truncating write on the final path.
+            assert!(script.contains("os.replace"), "not atomic: {script}");
+            assert!(!script.contains("\np.write_text"), "truncating write: {script}");
         }
-        // A blanket wildcard would grant more than the tools named here.
-        assert!(!script.contains("\"*\""), "wildcard grant");
+    }
+
+    /// The grant/revoke pair against a real file, executed by the same
+    /// bash-heredoc-python pipeline a sprite runs. Grant merges the provider
+    /// rules without disturbing anything else in the file; revoke removes
+    /// exactly those rules — a sprite provisioned under `true` whose owner
+    /// flips to converse-only must not keep shell access — while entries
+    /// anyone else wrote survive both directions. Revoke against a missing
+    /// file is a clean no-op that creates nothing.
+    #[test]
+    fn tool_permissions_grant_and_revoke_on_a_real_settings_file() {
+        let dir = std::env::temp_dir().join(format!("buzz-sprites-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = dir.join("settings.json");
+        let settings_str = settings.to_str().expect("utf-8 temp path");
+        let apply = |grant: bool| {
+            let status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(tool_permission_script_at(settings_str, grant))
+                .status()
+                .expect("bash not available");
+            assert!(status.success(), "script failed (grant={grant})");
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+
+        // Revoke with no file: nothing to remove, nothing created.
+        apply(false);
+        assert!(!settings.exists(), "revoke created a settings file");
+
+        // The image's file, with its own policy and a foreign allow entry.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"defaultMode":"bypassPermissions","hooks":{"PreToolUse":[]},"permissions":{"allow":["mcp__custom"]}}"#,
+        )
+        .unwrap();
+
+        apply(true);
+        let granted = read();
+        let allow = granted["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|t| t == "mcp__custom"), "foreign entry lost");
+        for tool in PREAPPROVED_TOOLS {
+            assert!(allow.iter().any(|t| t == tool), "missing {tool}: {granted}");
+        }
+        assert_eq!(granted["defaultMode"], "bypassPermissions", "clobbered the image settings");
+        assert!(granted["hooks"].is_object(), "clobbered the image hooks");
+
+        apply(false);
+        let revoked = read();
+        let allow = revoked["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(
+            allow,
+            &[serde_json::json!("mcp__custom")],
+            "revoke must remove exactly the provider rules: {revoked}"
+        );
+        assert_eq!(revoked["defaultMode"], "bypassPermissions");
+        assert!(
+            !dir.join("settings.json.tmp").exists(),
+            "temp sibling left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

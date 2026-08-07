@@ -59,9 +59,14 @@ pub struct ProviderConfig {
     /// there is no approval path in it at all — and it overrides the mode
     /// the Sprites image already ships (`defaultMode: bypassPermissions`).
     /// So without pre-approval an agent cannot run a single tool: not a
-    /// shell, not a file read, not its own git clone. Provisioning writes
-    /// the allow rules that make `dontAsk` mean "run what you were
-    /// permitted" instead of "deny everything".
+    /// shell, not a file read, not its own git clone.
+    ///
+    /// Realized per runtime, because each enforces tool policy in its own
+    /// place: for Claude Code, provisioning converges the settings allow
+    /// rules — written when on, *removed* when off. For Codex, whose
+    /// adapter reads no settings file, the launch env carries
+    /// `INITIAL_AGENT_MODE` (full access when on, read-only when off — see
+    /// `env.rs`). `buzz-agent` has no permission surface to configure.
     ///
     /// Default on, because an agent that cannot act is not what anyone
     /// deploys a coding agent for. Turn it off for an agent that should
@@ -240,7 +245,7 @@ pub fn config_schema() -> serde_json::Value {
                 "type": "boolean",
                 "title": "Let the agent use its tools",
                 "default": true,
-                "description": "Pre-approves shell, file and fetch tools inside the sprite. Without this the agent cannot run anything at all — the harness denies every permission request and there is nobody to ask. Turn off for a converse-only agent."
+                "description": "Pre-approves the agent's tools inside the sprite: Claude Code gets shell/file/fetch allow rules, Codex starts in full-access mode. Without this the agent cannot act — the harness denies every permission request and there is nobody to ask. Turn off for a converse-only agent: the Claude rules are removed and Codex starts read-only."
             }
         }
     })

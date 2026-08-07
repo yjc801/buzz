@@ -21,15 +21,16 @@ pub const DEFAULT_INACTIVITY_SECONDS: u64 = 7200;
 /// note). A stale pin fails provision with an error naming the override.
 pub const DEFAULT_SPRIG_VERSION: &str = "sprig-latest";
 
-/// Digest pins for the sprig tarball, per target arch (verified against the
-/// release's own `.sha256` manifests, 2026-08-06). The tarball is what runs
-/// with the agent's private key, so a movable tag alone is not acceptable —
-/// this is the binding's analog of the Kubernetes image digest pin.
-pub const SPRIG_SHA256_X86_64: &str =
-    "44b0784e97aec9ead17081a3d6e058ecf95e3b09e583b67958673002fcc8a01d";
-pub const SPRIG_SHA256_AARCH64: &str =
-    "213da1c43744c668a5ffb88ccd041ec309e26b27330427205bdbadca5dc6e45e";
-
+/// The sprig tarball is what runs holding the agent's private key, so it is
+/// always verified before extraction. What it is verified *against* depends
+/// on the owner: `provider_config.sprig_sha256` when set (provenance — a
+/// digest the owner chose), otherwise the digest the release publishes
+/// beside the tarball (transport integrity — trust rooted in the release).
+///
+/// There is deliberately no compiled-in pin. `sprig-latest` is a rolling tag
+/// that upstream re-publishes on every commit — observed moving twice within
+/// one afternoon — so a baked digest is stale within hours, and every deploy
+/// then fails on a mismatch that says nothing about the artifact.
 /// Pinned npm versions of the ACP adapters provisioned when the corresponding
 /// `install_*_adapter` flag is on. Baked provider state, like the sprig pins.
 pub const CLAUDE_ADAPTER_VERSION: &str = "0.64.0";
@@ -204,7 +205,7 @@ pub fn config_schema() -> serde_json::Value {
             "sprig_sha256": {
                 "type": "string",
                 "title": "Sprig digest override",
-                "description": "SHA-256 of the sprig tarball for this sprite's architecture. Leave empty for this provider's baked pin; overriding is your trust decision — the runtime holds the agent's private key."
+                "description": "SHA-256 of the sprig tarball for this sprite's architecture. Leave empty to verify against the digest the release publishes. Setting one demands that exact artifact — stronger, but you must update it whenever the release moves."
             },
             "install_claude_adapter": {
                 "type": "boolean",

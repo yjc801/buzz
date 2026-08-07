@@ -6,6 +6,11 @@ use super::*;
 use crate::substrate::ExecResult;
 use std::cell::RefCell;
 
+/// The digest the fake release publishes beside its tarball. The loop reads
+/// this at resolve time, so it is also what the desired fingerprint carries.
+const FAKE_PUBLISHED_DIGEST: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
 /// A scripted sprite: what the fake reports and how it evolves.
 #[derive(Default)]
 struct FakeState {
@@ -89,6 +94,10 @@ fn script_kind(argv: &[String]) -> &'static str {
         "lease-confirm"
     } else if joined.contains("# release the deploy lease") {
         "lease-release"
+    } else if joined.contains(".sha256") && joined.contains("awk") {
+        // Reading the digest the release publishes: curl piped to awk, with
+        // no tarball fetch. The install-sprig step also curls, but extracts.
+        "fetch-digest"
     } else if joined.contains("uname") {
         "uname"
     } else if joined.contains("provision-intent") && joined.contains("cat") {
@@ -189,6 +198,7 @@ impl Substrate for Fake {
                 ok(stdout)
             }
             "uname" => ok("x86_64\n".to_string()),
+            "fetch-digest" => ok(format!("{FAKE_PUBLISHED_DIGEST}\n")),
             "read-intent" => ok(state.recorded_intent.clone().unwrap_or_default()),
             "stage-env" => ok(String::new()),
             "lease-acquire" => {
@@ -318,7 +328,7 @@ fn desired_intent() -> String {
     let template = crate::intent::ProvisionTemplate {
         template_version: crate::intent::TEMPLATE_VERSION,
         sprig_version: crate::config::DEFAULT_SPRIG_VERSION.to_string(),
-        sprig_sha256: crate::config::SPRIG_SHA256_X86_64.to_string(),
+        sprig_sha256: FAKE_PUBLISHED_DIGEST.to_string(),
         install_claude_adapter: true,
         claude_adapter_version: crate::config::CLAUDE_ADAPTER_VERSION,
         install_codex_adapter: true,

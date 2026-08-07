@@ -189,11 +189,51 @@ fn sprig_arch(uname_m: &str) -> Result<&'static str, String> {
     }
 }
 
-fn baked_sha_for(arch: &str) -> &'static str {
-    match arch {
-        "aarch64" => config::SPRIG_SHA256_AARCH64,
-        _ => config::SPRIG_SHA256_X86_64,
+/// Fetch the digest the release publishes next to the tarball.
+///
+/// A compiled-in pin cannot work against `sprig-latest`: it is a rolling tag
+/// that upstream re-publishes on every commit (observed moving twice in one
+/// afternoon), so a baked digest is stale within hours and every deploy fails
+/// on a mismatch that means nothing about the artifact's integrity.
+///
+/// So when the owner has not pinned a digest, the release's own `.sha256` is
+/// the reference — the trust root is the GitHub release rather than this
+/// provider's build, and the check covers transport integrity (a truncated or
+/// corrupted download) rather than provenance. `provider_config.sprig_sha256`
+/// remains the way to demand provenance, and it is honored verbatim.
+async fn fetch_published_digest(
+    substrate: &impl Substrate,
+    sprite: &str,
+    version: &str,
+    arch: &str,
+) -> Result<String, String> {
+    let url = format!("{}.sha256", sprig_url(version, arch));
+    let result = run_step(
+        substrate,
+        sprite,
+        "read the published digest",
+        &sh(&format!("curl -fsSL --retry 2 {url:?} | awk '{{print $1}}'")),
+        None,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if result.exit_code != 0 {
+        return Err(format!(
+            "could not read the digest published for release {version:?} ({arch}): the \
+             release may not exist or may not publish a .sha256 for this architecture. \
+             Set provider_config.sprig_sha256 to verify against a digest you supply."
+        ));
     }
+    let digest = result.stdout.trim().to_string();
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "the digest published for release {version:?} ({arch}) is not a SHA-256 \
+             value. Set provider_config.sprig_sha256 to verify against a digest you \
+             supply."
+        ));
+    }
+    Ok(digest)
 }
 
 fn sprig_url(version: &str, arch: &str) -> String {
@@ -207,6 +247,12 @@ fn sprig_url(version: &str, arch: &str) -> String {
 pub struct Resolved {
     pub template: ProvisionTemplate,
     pub arch: &'static str,
+    /// True when the digest came from `provider_config.sprig_sha256`. A
+    /// mismatch then means a stale pin (actionable by the owner); otherwise
+    /// it means the download did not match what the release published
+    /// alongside it, which is a transport problem or a mid-provision
+    /// re-publish — two different messages.
+    pub pinned: bool,
 }
 
 impl Resolved {
@@ -233,11 +279,13 @@ pub async fn resolve(
     )
     .await?;
     let arch = sprig_arch(&uname.stdout)?;
-    let sprig_sha256 = cfg
-        .sprig_sha256
-        .clone()
-        .unwrap_or_else(|| baked_sha_for(arch).to_string());
+    let pinned = cfg.sprig_sha256.is_some();
+    let sprig_sha256 = match cfg.sprig_sha256.clone() {
+        Some(pin) => pin,
+        None => fetch_published_digest(substrate, sprite, &cfg.sprig_version, arch).await?,
+    };
     Ok(Resolved {
+        pinned,
         template: ProvisionTemplate {
             template_version: TEMPLATE_VERSION,
             sprig_version: cfg.sprig_version.clone(),
@@ -411,17 +459,29 @@ pub async fn ensure(
     )
     .await?;
     if sprig_step.exit_code != 0 && digest_mismatch(&sprig_step) {
-        return Err(format!(
-            "the sprig runtime downloaded from release {version:?} does not match the \
-             expected digest {sha}. This is what a re-published release looks like: \
-             {version:?} is a rolling tag, so the bytes moved and this provider's \
-             baked pin is stale. Nothing was installed. Fix it by setting \
-             provider_config.sprig_sha256 to the digest published alongside the \
-             release (its .sha256 file, for {arch}), or by updating the provider.",
-            version = t.sprig_version,
-            sha = t.sprig_sha256,
-            arch = resolved.arch,
-        ));
+        return Err(if resolved.pinned {
+            format!(
+                "the sprig runtime downloaded from release {version:?} does not match \
+                 provider_config.sprig_sha256 ({sha}). Either the pin is stale — \
+                 {version:?} may be a rolling tag whose bytes moved — or the download \
+                 is not the artifact you pinned. Nothing was installed. Update the pin \
+                 to the digest published for {arch}, or clear it to verify against \
+                 whatever the release publishes.",
+                version = t.sprig_version,
+                sha = t.sprig_sha256,
+                arch = resolved.arch,
+            )
+        } else {
+            format!(
+                "the sprig runtime downloaded from release {version:?} does not match \
+                 the digest published alongside it ({sha}). The download was corrupted, \
+                 or the release was re-published between reading its digest and \
+                 fetching the tarball. Nothing was installed — starting the agent again \
+                 re-reads both.",
+                version = t.sprig_version,
+                sha = t.sprig_sha256,
+            )
+        });
     }
     expect_ok(sprig_step)?;
 
@@ -765,9 +825,16 @@ mod tests {
         );
     }
 
+    /// The digest URL is the tarball URL plus `.sha256` — the convention the
+    /// release publishes under, and the reference used whenever the owner has
+    /// not pinned one.
     #[test]
-    fn baked_shas_differ_per_arch() {
-        assert_ne!(baked_sha_for("x86_64"), baked_sha_for("aarch64"));
+    fn the_published_digest_sits_beside_the_tarball() {
+        let tarball = sprig_url("sprig-latest", "x86_64");
+        assert_eq!(
+            format!("{tarball}.sha256"),
+            "https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz.sha256"
+        );
     }
 
     /// The launch gate: only commands provisioning actually makes runnable

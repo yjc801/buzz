@@ -149,6 +149,30 @@ mod tests {
         );
     }
 
+    /// Relay git auth must be SCOPED to the relay's own URL — a global
+    /// `credential.helper` would offer nostr signatures to github.com and
+    /// every other remote. The helper path must also be image-local: a
+    /// forwarded host path cannot exist inside the sprite.
+    #[test]
+    fn git_credentials_are_relay_scoped_and_image_local() {
+        assert!(
+            LAUNCHER_SH.contains(r#"credential.${RELAY_HTTP}/git.helper"#),
+            "the credential helper is not scoped to the relay URL"
+        );
+        assert!(
+            LAUNCHER_SH.contains(r#"GIT_CONFIG_VALUE_0="$BUZZ/bin/git-credential-nostr""#),
+            "the helper path must resolve inside the sprite"
+        );
+        // A bare `credential.helper` (no URL between `credential.` and the
+        // key) would apply to every remote.
+        assert!(
+            !LAUNCHER_SH.contains("credential.helper"),
+            "a global credential.helper would answer for every remote"
+        );
+        // ws/wss are rewritten to http/https, matching relay_http_base_url.
+        assert!(LAUNCHER_SH.contains("wss://*)") && LAUNCHER_SH.contains("ws://*)"));
+    }
+
     #[test]
     fn argv_carries_only_public_identity() {
         let argv = launcher_argv(&"a".repeat(64), "cafe0001");

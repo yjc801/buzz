@@ -26,9 +26,9 @@ pub const DEFAULT_SPRIG_VERSION: &str = "sprig-latest";
 /// with the agent's private key, so a movable tag alone is not acceptable —
 /// this is the binding's analog of the Kubernetes image digest pin.
 pub const SPRIG_SHA256_X86_64: &str =
-    "bdc2cea8ce4b754070ded93dacbbd27eadb0eb807daa1880156f241e3a6fcfa0";
+    "44b0784e97aec9ead17081a3d6e058ecf95e3b09e583b67958673002fcc8a01d";
 pub const SPRIG_SHA256_AARCH64: &str =
-    "a15544c918fd8e2aa64259e174b7511b422601cecd3e8a83896221d3ee001d0b";
+    "213da1c43744c668a5ffb88ccd041ec309e26b27330427205bdbadca5dc6e45e";
 
 /// Pinned npm versions of the ACP adapters provisioned when the corresponding
 /// `install_*_adapter` flag is on. Baked provider state, like the sprig pins.

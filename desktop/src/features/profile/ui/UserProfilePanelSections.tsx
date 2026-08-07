@@ -9,7 +9,10 @@ import {
 
 import { MemorySection } from "@/features/agent-memory/ui/MemorySection";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import { getManagedAgentPrimaryActionLabel } from "@/features/agents/lib/managedAgentControlActions";
+import {
+  getManagedAgentPrimaryActionLabel,
+  isManagedAgentLive,
+} from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { ManagedAgentLogPanel } from "@/features/agents/ui/ManagedAgentLogPanel";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
@@ -43,7 +46,11 @@ import {
 } from "@/features/profile/ui/UserProfilePrimaryActions";
 import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import { BotIdenticon } from "@/features/messages/ui/BotIdenticon";
-import type { ManagedAgent, RelayAgent } from "@/shared/api/types";
+import type {
+  ManagedAgent,
+  PresenceStatus,
+  RelayAgent,
+} from "@/shared/api/types";
 import type {
   ProfileChannelLink,
   ProfilePanelTab,
@@ -130,9 +137,11 @@ const PROFILE_HERO_PRESENCE_BADGE = {
 function resolveRuntimeTabStatus({
   diagnosticsError,
   managedAgent,
+  presenceStatus,
 }: {
   diagnosticsError: boolean;
   managedAgent: ManagedAgent | undefined;
+  presenceStatus?: PresenceStatus | null;
 }): RuntimeTabStatus | undefined {
   if (diagnosticsError || managedAgent?.lastError) {
     return "error";
@@ -142,11 +151,12 @@ function resolveRuntimeTabStatus({
     return undefined;
   }
 
-  if (managedAgent.status === "running" || managedAgent.status === "deployed") {
-    return "running";
-  }
-
-  return "stopped";
+  // The dot claims "Running", so it has to mean the harness is running. For
+  // a remote agent that is presence — its status stays `deployed` for the
+  // life of the VM, which would leave the dot green over a dead agent.
+  return isManagedAgentLive(managedAgent, presenceStatus)
+    ? "running"
+    : "stopped";
 }
 
 function RuntimeTabStatusDot({ status }: { status: RuntimeTabStatus }) {
@@ -271,6 +281,7 @@ export function ProfileSummaryView({
   const runtimeTabStatus = resolveRuntimeTabStatus({
     diagnosticsError: diagnosticsErrorField !== undefined,
     managedAgent,
+    presenceStatus,
   });
 
   const tabs = React.useMemo(() => {
@@ -359,12 +370,13 @@ export function ProfileSummaryView({
           agentActionDisabled={isAgentActionPending}
           agentActionLabel={
             isOwner === true && managedAgent
-              ? getManagedAgentPrimaryActionLabel(managedAgent)
+              ? getManagedAgentPrimaryActionLabel(managedAgent, presenceStatus)
               : undefined
           }
           agentActionLive={
-            managedAgent?.status === "running" ||
-            managedAgent?.status === "deployed"
+            managedAgent
+              ? isManagedAgentLive(managedAgent, presenceStatus)
+              : false
           }
           onAgentPrimaryAction={
             isOwner === true && managedAgent
@@ -372,10 +384,13 @@ export function ProfileSummaryView({
               : undefined
           }
           onAgentRestart={
+            // Restart is shutdown-then-start, and both halves exist for a
+            // provider agent (shutdown over the relay, start = a fresh
+            // deploy). Excluding providers left a remote agent with no way
+            // back once its harness died.
             isOwner === true &&
-            managedAgent?.backend.type === "local" &&
-            (managedAgent.status === "running" ||
-              managedAgent.status === "deployed")
+            managedAgent &&
+            isManagedAgentLive(managedAgent, presenceStatus)
               ? handleAgentRestart
               : undefined
           }

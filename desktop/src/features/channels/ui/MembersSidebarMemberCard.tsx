@@ -17,6 +17,7 @@ import {
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
+  isManagedAgentLive,
 } from "@/features/agents/lib/managedAgentControlActions";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
@@ -71,6 +72,9 @@ type MembersSidebarMemberCardProps = {
   onUnban: (member: ChannelMember) => void;
   onUntimeout: (member: ChannelMember) => void;
   onViewActivity?: (pubkey: string) => void;
+  /** False until the member presence query has resolved — see
+   * MemberActionsMenu; gates provider lifecycle actions only. */
+  presenceResolved?: boolean;
   presenceStatus?: PresenceStatus | null;
   profileAvatarUrl?: string | null;
   viewerIsOwner: boolean;
@@ -139,6 +143,7 @@ export function MembersSidebarMemberCard({
   onUnban,
   onUntimeout,
   onViewActivity,
+  presenceResolved,
   presenceStatus,
   profileAvatarUrl,
   viewerIsOwner,
@@ -267,6 +272,8 @@ export function MembersSidebarMemberCard({
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
+          presenceResolved={presenceResolved}
+          presenceStatus={presenceStatus}
           memberIsBot={memberIsBot}
           moderationState={moderationState}
           onBan={onBan}
@@ -297,6 +304,8 @@ function MemberActionsMenu({
   member,
   memberIsBot,
   moderationState,
+  presenceResolved,
+  presenceStatus,
   onBan,
   onChangeRole,
   onEditRespondTo,
@@ -317,6 +326,12 @@ function MemberActionsMenu({
   member: ChannelMember;
   memberIsBot: boolean;
   moderationState?: MemberModerationState;
+  /** False until the presence query has RESOLVED. Unresolved renders
+   * exactly like offline, and a provider lifecycle action taken on it
+   * would offer (and no-op) Deploy against a live agent. */
+  presenceResolved?: boolean;
+  /** Live axis for a remote agent — its status alone cannot report it. */
+  presenceStatus?: PresenceStatus | null;
   onBan: (member: ChannelMember) => void;
   onChangeRole: (member: ChannelMember, role: string) => void;
   onEditRespondTo?: (agent: ManagedAgent) => void;
@@ -362,15 +377,22 @@ function MemberActionsMenu({
             {canViewActivity ? <DropdownMenuSeparator /> : null}
             <DropdownMenuItem
               data-testid={`sidebar-agent-action-${member.pubkey}`}
-              disabled={disabled}
+              disabled={
+                disabled ||
+                (managedAgent.backend.type === "provider" &&
+                  presenceResolved === false)
+              }
               onClick={() => onManagedAgentAction(managedAgent)}
             >
               {pairAction
                 ? getPairActionIcon(pairAction)
-                : getManagedAgentActionIcon(managedAgent)}
+                : getManagedAgentActionIcon(managedAgent, presenceStatus)}
               {pairAction
                 ? MANAGED_AGENT_PAIR_ACTION_LABELS[pairAction]
-                : getManagedAgentPrimaryActionLabel(managedAgent)}
+                : getManagedAgentPrimaryActionLabel(
+                    managedAgent,
+                    presenceStatus,
+                  )}
             </DropdownMenuItem>
             {onEditRespondTo ? (
               <DropdownMenuItem
@@ -501,8 +523,14 @@ function getPairActionIcon(action: ManagedAgentPairAction) {
   return <Play className="h-4 w-4" />;
 }
 
-function getManagedAgentActionIcon(agent: ManagedAgent) {
-  if (isManagedAgentActive(agent)) {
+/// The icon must answer from the same live axis as the label and the click
+/// handler: a deployed-but-dead remote agent whose label reads Deploy must
+/// not carry a stop icon.
+function getManagedAgentActionIcon(
+  agent: ManagedAgent,
+  presence?: PresenceStatus | null,
+) {
+  if (isManagedAgentLive(agent, presence)) {
     return <Square className="h-4 w-4" />;
   }
 

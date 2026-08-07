@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Bot, UserRoundPlus, X } from "lucide-react";
+import { UserRoundPlus, X } from "lucide-react";
 import {
   invalidateChannelState,
   useAddChannelMembersMutation,
@@ -40,7 +40,6 @@ import type {
   ManagedAgent,
   UserSearchResult,
 } from "@/shared/api/types";
-import { Button } from "@/shared/ui/button";
 import {
   Dialog,
   DialogClose,
@@ -50,13 +49,16 @@ import {
 } from "@/shared/ui/dialog";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
-import { cn } from "@/shared/lib/cn";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
-import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
   MODAL_SEARCH_INPUT_CLASS,
   MODAL_SEARCH_SHELL_CLASS,
 } from "@/shared/ui/modalSearchStyles";
+import {
+  AddMemberSearchResultRow,
+  formatAddCandidateName,
+  SearchResultSectionTitle,
+} from "./MembersSidebarAddMemberRows";
 import { MembersSidebarMemberCard } from "./MembersSidebarMemberCard";
 import { useManagedAgentRuntimesQuery } from "@/features/agents/managedAgentRuntimeHooks";
 import {
@@ -68,16 +70,6 @@ import { useMembersSidebarActions } from "./useMembersSidebarActions";
 import { useMembersSidebarModeration } from "./useMembersSidebarModeration";
 const MEMBER_ADD_RESULT_LIMIT = 50;
 const MEMBER_SEARCH_MIN_QUERY_LENGTH = 2;
-const MEMBER_ROW_INSET_DIVIDER_CLASS =
-  "after:pointer-events-none after:absolute after:bottom-0 after:left-[3.75rem] after:right-0 after:h-px after:bg-border/60 after:content-[''] last:after:hidden";
-
-function formatAddCandidateName(user: UserSearchResult) {
-  return (
-    user.displayName?.trim() ||
-    user.nip05Handle?.trim() ||
-    truncatePubkey(user.pubkey)
-  );
-}
 type AddMemberSearchCandidate = UserSearchResult & {
   isManagedAgent?: boolean;
   isMember?: boolean;
@@ -626,6 +618,14 @@ export function MembersSidebar({
       managedAgent?.backend.type === "local" && relayUrl
         ? managedAgentPairAction(managedAgentRuntime)
         : undefined;
+    const presenceStatus =
+      memberPresenceQuery.data?.[member.pubkey.toLowerCase()] ?? null;
+    // Undefined data = the presence query has not resolved yet — which is
+    // NOT the same as a resolved "offline" (a missing entry in resolved
+    // data). Provider lifecycle controls must not act on the unresolved
+    // state: it renders exactly like offline and would offer Deploy for a
+    // live agent.
+    const presenceResolved = memberPresenceQuery.data !== undefined;
     return (
       <div className="content-visibility-auto" key={member.pubkey}>
         <MembersSidebarMemberCard
@@ -655,7 +655,11 @@ export function MembersSidebar({
           }}
           onEditRespondTo={memberIsBot ? setEditRespondToAgent : undefined}
           onManagedAgentAction={(agent) => {
-            void handleAgentLifecycleAction(agent, managedAgentRuntime);
+            void handleAgentLifecycleAction(
+              agent,
+              managedAgentRuntime,
+              presenceStatus,
+            );
           }}
           onOpenProfile={handleOpenProfile}
           onRemoveMember={handleRemoveMember}
@@ -671,9 +675,8 @@ export function MembersSidebar({
               : undefined
           }
           pairAction={pairAction}
-          presenceStatus={
-            memberPresenceQuery.data?.[member.pubkey.toLowerCase()] ?? null
-          }
+          presenceResolved={presenceResolved}
+          presenceStatus={presenceStatus}
           profileAvatarUrl={memberProfile?.avatarUrl ?? null}
           viewerIsOwner={viewerIsOwner}
         />
@@ -896,95 +899,5 @@ export function MembersSidebar({
         open={editRespondToAgent !== null}
       />
     </>
-  );
-}
-
-function SearchResultSectionTitle({
-  action,
-  children,
-}: {
-  action?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="sticky top-0 z-10 mr-3 flex min-h-9 items-center gap-2 bg-background/95 px-4 pb-1.5 pt-3 text-xs font-medium text-muted-foreground/75 backdrop-blur supports-[backdrop-filter]:bg-background/80">
-      <span>{children}</span>
-      {action ? <span>{action}</span> : null}
-    </div>
-  );
-}
-
-function AddMemberSearchResultRow({
-  disabled,
-  onSelect,
-  ownerLabel,
-  user,
-}: {
-  disabled: boolean;
-  onSelect: (user: UserSearchResult) => void;
-  ownerLabel?: string | null;
-  user: UserSearchResult;
-}) {
-  return (
-    <div
-      className={cn(
-        "group/add-result relative isolate flex min-h-14 w-full items-center gap-3 px-4 py-3.5 text-left transition-colors duration-150 ease-out hover:bg-muted/40 focus-within:bg-muted/40",
-        MEMBER_ROW_INSET_DIVIDER_CLASS,
-      )}
-      data-testid={`channel-user-search-result-${user.pubkey}`}
-    >
-      <button
-        aria-label={`Select ${formatAddCandidateName(user)}`}
-        className="absolute inset-0 z-0 cursor-pointer focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-        disabled={disabled}
-        onClick={() => onSelect(user)}
-        type="button"
-      />
-      <UserAvatar
-        avatarUrl={user.avatarUrl}
-        className="pointer-events-none relative z-10 h-8 w-8 text-xs shadow-none"
-        displayName={formatAddCandidateName(user)}
-        size="sm"
-      />
-      <div className="pointer-events-none relative z-10 min-w-0 flex-1">
-        {user.isAgent ? (
-          <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate text-sm font-medium tracking-tight">
-                {formatAddCandidateName(user)}
-              </span>
-              <span className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-                <Bot aria-hidden="true" className="h-4 w-4" />
-                agent
-              </span>
-            </div>
-            <span className="block truncate font-mono text-2xs text-muted-foreground">
-              {truncatePubkey(user.pubkey)}
-            </span>
-            {ownerLabel ? (
-              <span className="block truncate text-xs text-muted-foreground">
-                managed by {ownerLabel}
-              </span>
-            ) : null}
-          </div>
-        ) : (
-          <span className="block truncate text-sm font-medium tracking-tight">
-            {formatAddCandidateName(user)}
-          </span>
-        )}
-      </div>
-      <Button
-        className="relative z-20 shrink-0"
-        disabled={disabled}
-        onClick={(event) => {
-          event.stopPropagation();
-          onSelect(user);
-        }}
-        size="sm"
-        type="button"
-      >
-        Add
-      </Button>
-    </div>
   );
 }

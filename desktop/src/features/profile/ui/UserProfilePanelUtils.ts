@@ -357,3 +357,27 @@ export function useRetainedPersona(
       : undefined)
   );
 }
+
+/// Controllable panel state (view/tab): the parent's value + change handler
+/// win when provided; otherwise the panel owns the state internally. One
+/// hook instead of two hand-rolled copies of the same controlled/uncontrolled
+/// dance in the panel body.
+export function useControllablePanelState<T>(
+  controlled: T | undefined,
+  onChange: ((next: T, options?: { replace?: boolean }) => void) | undefined,
+  fallback: T,
+) {
+  const [internal, setInternal] = React.useState<T>(fallback);
+  const value = controlled ?? internal;
+  const set = React.useCallback(
+    (next: T, options?: { replace?: boolean }) => {
+      if (onChange) {
+        onChange(next, options);
+        return;
+      }
+      setInternal(next);
+    },
+    [onChange],
+  );
+  return [value, set] as const;
+}

@@ -370,10 +370,21 @@ export function UserProfilePanel({
     stopManagedAgent: stopAgentMutation.mutateAsync,
   });
 
+  // Provider controls decide Deploy-vs-Shutdown on the live axis, and an
+  // UNRESOLVED presence query renders exactly like offline — on first load
+  // (or a presence 503 before any cache exists) a live agent would offer
+  // Deploy, and clicking it is a silent live no-op. Hold the controls until
+  // the query has resolved; error-with-cached-data still counts (stale
+  // beats unknown), and a resolved empty map is a valid offline answer.
+  const providerPresenceUnresolved =
+    managedAgent?.backend.type === "provider" &&
+    presenceQuery.data === undefined;
+
   // isLifecycleActionPending spans the whole provider restart — the
   // !shutdown send and the presence wait run outside any mutation, and
   // mutation pending alone would re-enable Restart/Deploy mid-flow.
   const isAgentActionPending =
+    providerPresenceUnresolved ||
     isLifecycleActionPending ||
     createAgentMutation.isPending ||
     updateManagedAgentMutation.isPending ||

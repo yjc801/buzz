@@ -639,6 +639,12 @@ export function MembersSidebar({
         : undefined;
     const presenceStatus =
       memberPresenceQuery.data?.[member.pubkey.toLowerCase()] ?? null;
+    // Undefined data = the presence query has not resolved yet — which is
+    // NOT the same as a resolved "offline" (a missing entry in resolved
+    // data). Provider lifecycle controls must not act on the unresolved
+    // state: it renders exactly like offline and would offer Deploy for a
+    // live agent.
+    const presenceResolved = memberPresenceQuery.data !== undefined;
     return (
       <div className="content-visibility-auto" key={member.pubkey}>
         <MembersSidebarMemberCard
@@ -688,6 +694,7 @@ export function MembersSidebar({
               : undefined
           }
           pairAction={pairAction}
+          presenceResolved={presenceResolved}
           presenceStatus={presenceStatus}
           profileAvatarUrl={memberProfile?.avatarUrl ?? null}
           viewerIsOwner={viewerIsOwner}

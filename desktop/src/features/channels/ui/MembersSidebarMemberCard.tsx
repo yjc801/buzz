@@ -72,6 +72,9 @@ type MembersSidebarMemberCardProps = {
   onUnban: (member: ChannelMember) => void;
   onUntimeout: (member: ChannelMember) => void;
   onViewActivity?: (pubkey: string) => void;
+  /** False until the member presence query has resolved — see
+   * MemberActionsMenu; gates provider lifecycle actions only. */
+  presenceResolved?: boolean;
   presenceStatus?: PresenceStatus | null;
   profileAvatarUrl?: string | null;
   viewerIsOwner: boolean;
@@ -140,6 +143,7 @@ export function MembersSidebarMemberCard({
   onUnban,
   onUntimeout,
   onViewActivity,
+  presenceResolved,
   presenceStatus,
   profileAvatarUrl,
   viewerIsOwner,
@@ -268,6 +272,7 @@ export function MembersSidebarMemberCard({
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
+          presenceResolved={presenceResolved}
           presenceStatus={presenceStatus}
           memberIsBot={memberIsBot}
           moderationState={moderationState}
@@ -299,6 +304,7 @@ function MemberActionsMenu({
   member,
   memberIsBot,
   moderationState,
+  presenceResolved,
   presenceStatus,
   onBan,
   onChangeRole,
@@ -320,6 +326,10 @@ function MemberActionsMenu({
   member: ChannelMember;
   memberIsBot: boolean;
   moderationState?: MemberModerationState;
+  /** False until the presence query has RESOLVED. Unresolved renders
+   * exactly like offline, and a provider lifecycle action taken on it
+   * would offer (and no-op) Deploy against a live agent. */
+  presenceResolved?: boolean;
   /** Live axis for a remote agent — its status alone cannot report it. */
   presenceStatus?: PresenceStatus | null;
   onBan: (member: ChannelMember) => void;
@@ -367,7 +377,11 @@ function MemberActionsMenu({
             {canViewActivity ? <DropdownMenuSeparator /> : null}
             <DropdownMenuItem
               data-testid={`sidebar-agent-action-${member.pubkey}`}
-              disabled={disabled}
+              disabled={
+                disabled ||
+                (managedAgent.backend.type === "provider" &&
+                  presenceResolved === false)
+              }
               onClick={() => onManagedAgentAction(managedAgent)}
             >
               {pairAction

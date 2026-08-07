@@ -429,3 +429,12 @@ test("the preferred channel still wins, and an unknown agent still resolves to n
     null,
   );
 });
+
+test("the runtime dot's claim must match reality: 'Running' means the harness runs", () => {
+  // The tab dot renders title="Running" for status "running". A remote agent
+  // whose harness died still has status "deployed", so keying the dot on the
+  // control-plane axis labelled a dead agent Running — the symptom that sent
+  // an owner looking for a Stop button that could not help.
+  assert.equal(isManagedAgentLive(remote({ status: "deployed" }), "offline"), false);
+  assert.equal(isManagedAgentLive(remote({ status: "deployed" }), "online"), true);
+});

@@ -112,6 +112,11 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  # Sprites backend provider: same shape, same reason. Live tests are gated
+  # on BUZZ_SPRITES_LIVE=1 and skip themselves without it.
+  run_test_step "buzz-backend-sprites tests" \
+    cargo test -p buzz-backend-sprites -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

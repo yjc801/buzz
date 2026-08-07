@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "error": "provider_config.inactivity_seconds: 0 (indefinite lifetime) is not supported in this version: no Sprites supervisor can restart crashes without also resurrecting intentional exits, which the spec forbids (I5). Set a positive number of seconds."
+}

@@ -11,12 +11,14 @@ import {
   agentRespondsToAuthor,
   createWakeAttemptState,
   eventAddressesAgent,
+  isConfirmedLivePresence,
   isWakeAttemptDebounced,
   runWakeAttempt,
   selectWakeCandidates,
   shouldWakeAgent,
   WAKE_ATTEMPT_DEBOUNCE_MS,
   WAKE_LIVE_RECHECK_DELAY_MS,
+  WAKE_PRESENCE_FRESH_MS,
 } from "./agentWake.ts";
 
 const OWNER = "a".repeat(64);
@@ -49,8 +51,11 @@ function mention({
   };
 }
 
-// The raw stored modes only apply when the build clamp is known to be off.
-const RAW_ACCESS = { accessOwnerOnly: false };
+// The raw stored modes only apply when the build clamp is known to be off,
+// and candidate selection requires a RESOLVED known-agent baseline. An empty
+// set means "resolved: no other agents are known" — the local-records belt
+// check still applies on top of it.
+const RAW_ACCESS = { accessOwnerOnly: false, knownAgentAuthors: new Set() };
 
 test("respond-to gate mirrors the harness's own author rules", () => {
   assert.equal(
@@ -228,6 +233,48 @@ test("any managed agent as author blocks the wake, not just the candidate", () =
   );
 });
 
+test("a relay-registered agent author is rejected even when unmanaged here", () => {
+  // An agent managed by ANOTHER desktop is not in the local records; only
+  // the known-agent baseline (managed ∪ relay-registered) can veto it.
+  const remoteAgentAuthor = "e".repeat(64);
+  const openLocal = agent({ respondTo: "anyone" });
+  const fromRemoteAgent = mention({ author: remoteAgentAuthor });
+
+  assert.deepEqual(
+    selectWakeCandidates(fromRemoteAgent, [openLocal], {
+      ownerPubkey: OWNER,
+      accessOwnerOnly: false,
+      knownAgentAuthors: new Set([remoteAgentAuthor]),
+    }),
+    [],
+  );
+
+  // Same event with the author absent from the baseline selects normally —
+  // the veto is the baseline, not the mention shape.
+  assert.deepEqual(
+    selectWakeCandidates(fromRemoteAgent, [openLocal], {
+      ownerPubkey: OWNER,
+      accessOwnerOnly: false,
+      knownAgentAuthors: new Set(),
+    }).map((candidate) => candidate.pubkey),
+    [AGENT],
+  );
+});
+
+test("an unresolved known-agent baseline fails closed", () => {
+  // Until the relay-registered set has resolved, an author cannot be vetted
+  // — even the owner's mention must not spend a deploy that could feed a
+  // cross-desktop agent loop.
+  assert.deepEqual(
+    selectWakeCandidates(mention(), [agent()], {
+      ownerPubkey: OWNER,
+      accessOwnerOnly: false,
+      knownAgentAuthors: undefined,
+    }),
+    [],
+  );
+});
+
 test("a stranger cannot wake an owner-only agent, but can wake an open one", () => {
   const fromStranger = mention({ author: STRANGER });
   assert.deepEqual(
@@ -297,10 +344,16 @@ test("a backwards clock counts as debounced", () => {
 /// been deployed by this harness (the last entry repeats; `null` = no
 /// presence record). Once an agent is deployed, its lookups return
 /// `presenceAfterDeploy` — the fresh generation coming up (or `null` for a
-/// deploy that never produces one).
+/// deploy that never produces one). Heartbeat freshness is separate from
+/// status (that separation IS the crashed-harness fix): `heartbeatAge` is
+/// the observed age before this harness deploys the agent (0 = fresh,
+/// `null` = never observed — null, not undefined, so the option survives
+/// destructuring defaults), `heartbeatAgeAfterDeploy` afterwards.
 function wakeHarness({
   presenceScript = [],
   presenceAfterDeploy = "online",
+  heartbeatAge = 0,
+  heartbeatAgeAfterDeploy = 0,
   deployFails = false,
 } = {}) {
   const deployed = [];
@@ -325,6 +378,12 @@ function wakeHarness({
         ? presenceAfterDeploy
         : nextScripted();
       return status == null ? {} : { [key]: status };
+    },
+    heartbeatAgeMs: (pubkey) => {
+      const age = deployedKeys.has(pubkey.toLowerCase())
+        ? heartbeatAgeAfterDeploy
+        : heartbeatAge;
+      return age === null ? undefined : age;
     },
     startManagedAgent: async (pubkey) => {
       deployed.push(pubkey);
@@ -368,6 +427,82 @@ test("a dying harness that still says online is woken once it drops", async () =
   assert.deepEqual(harness.deployed, [AGENT]);
   assert.ok(harness.delays.includes(WAKE_LIVE_RECHECK_DELAY_MS));
   assert.ok(harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
+});
+
+test("a stale online with no observed heartbeat is reconciled by deploying", async () => {
+  // The crashed-harness case: Redis keeps the last "online" for the full
+  // presence TTL, so status samples agree with each other while the agent
+  // is dead. Without a fresh heartbeat observation the attempt must deploy
+  // (a strict no-op if the agent is actually alive) instead of trusting
+  // the store and stranding the mention.
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    heartbeatAge: null,
+  });
+  const onDeployedCalls = [];
+  const result = await runWakeAttempt({
+    agent: agent(),
+    ...harness,
+    onDeployed: () => onDeployedCalls.push(true),
+  });
+
+  assert.equal(result.outcome, "woken");
+  assert.equal(result.reconcile, true);
+  assert.deepEqual(harness.deployed, [AGENT]);
+  // Reconciliation is quiet (the agent is most likely already up) and skips
+  // the teardown fence (a stale record is not a recent offline publish).
+  assert.equal(onDeployedCalls.length, 0);
+  assert.ok(!harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
+});
+
+test("a heartbeat older than the fresh bound is not proof of life", async () => {
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    heartbeatAge: WAKE_PRESENCE_FRESH_MS + 1,
+  });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "woken");
+  assert.equal(result.reconcile, true);
+  assert.deepEqual(harness.deployed, [AGENT]);
+});
+
+test("an unconfirmed reconcile stays quiet but still releases the debounce", async () => {
+  // Status keeps saying online but no heartbeat ever confirms a live
+  // harness. The attempt must not toast an error at the user (the agent is
+  // probably fine and our observation is what is lacking) but must release
+  // its debounce so the next mention can retry.
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    heartbeatAge: null,
+    heartbeatAgeAfterDeploy: null,
+  });
+  const clock = 5_000_000;
+  const attempt = () =>
+    runWakeAttempt({ agent: agent(), ...harness, now: () => clock });
+
+  const first = await attempt();
+  assert.equal(first.outcome, "wake-unconfirmed");
+  assert.equal(first.reconcile, true);
+
+  const second = await attempt();
+  assert.notEqual(second.outcome, "debounced");
+  assert.deepEqual(harness.deployed, [AGENT, AGENT]);
+});
+
+test("confirmed liveness needs both a live status and a fresh heartbeat", () => {
+  assert.equal(isConfirmedLivePresence(agent(), "online", 0), true);
+  assert.equal(
+    isConfirmedLivePresence(agent(), "online", WAKE_PRESENCE_FRESH_MS),
+    true,
+  );
+  assert.equal(
+    isConfirmedLivePresence(agent(), "online", WAKE_PRESENCE_FRESH_MS + 1),
+    false,
+  );
+  assert.equal(isConfirmedLivePresence(agent(), "online", undefined), false);
+  assert.equal(isConfirmedLivePresence(agent(), "offline", 0), false);
+  assert.equal(isConfirmedLivePresence(agent(), undefined, 0), false);
 });
 
 test("an agent that comes up during the teardown fence is left alone", async () => {

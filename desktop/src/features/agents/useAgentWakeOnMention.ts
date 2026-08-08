@@ -3,8 +3,10 @@ import { toast } from "sonner";
 
 import {
   useManagedAgentsQuery,
+  useRelayAgentsQuery,
   useStartManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { mergeKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import {
   createWakeAttemptState,
   runWakeAttempt,
@@ -64,6 +66,13 @@ const SEEN_WAKE_EVENT_LIMIT = 500;
 export function useAgentWakeOnMention(enabled: boolean) {
   const identityQuery = useIdentityQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
+  // The full relay-registered agent set: the author gate must reject agents
+  // managed by OTHER desktops too, or two desktops could keep each other's
+  // agents alive. Direct query rather than `useKnownAgentPubkeys` context:
+  // the gate needs to distinguish "no agents" from "not yet resolved" (the
+  // context collapses both to the empty set), and this hook mounts once, so
+  // the extra observer costs nothing.
+  const relayAgentsQuery = useRelayAgentsQuery();
   // The build's owner-only access clamp. Until it resolves, the wake gate
   // clamps to owner-only — the safe answer under every real policy.
   const accessOwnerOnlyQuery = useAgentAccessOwnerOnlyQuery();
@@ -71,14 +80,26 @@ export function useAgentWakeOnMention(enabled: boolean) {
 
   const ownerPubkey = identityQuery.data?.pubkey ?? "";
   const managedAgents = managedAgentsQuery.data;
+  const relayAgents = relayAgentsQuery.data;
   const accessOwnerOnly = accessOwnerOnlyQuery.data;
+
+  // Known-agent baseline (managed ∪ relay-registered), or undefined while
+  // either source is unresolved — selectWakeCandidates fails closed on
+  // undefined rather than waking for an author it cannot vet.
+  const knownAgentAuthors = React.useMemo(
+    () =>
+      managedAgents !== undefined && relayAgents !== undefined
+        ? mergeKnownAgentPubkeys(managedAgents, relayAgents)
+        : undefined,
+    [managedAgents, relayAgents],
+  );
 
   const seenEventIdsRef = React.useRef<Set<string>>(new Set());
   const wakeStateRef = React.useRef(createWakeAttemptState());
 
   const wakeAgent = React.useEffectEvent(
     async (agent: WakeCandidateAgent, triggerCreatedAt: number) => {
-      const { outcome, error } = await runWakeAttempt({
+      const { outcome, reconcile, error } = await runWakeAttempt({
         agent,
         state: wakeStateRef.current,
         startManagedAgent: (pubkey) =>
@@ -87,27 +108,39 @@ export function useAgentWakeOnMention(enabled: boolean) {
             wakeReplayFloorTs: triggerCreatedAt,
           }),
         // Surface the wake when the deploy is accepted, not two minutes
-        // later when presence convergence settles.
+        // later when presence convergence settles. runWakeAttempt skips
+        // this for reconcile deploys (status said online, freshness
+        // unknown) — the agent is most likely already up.
         onDeployed: () => toast.success(`${agent.name} is waking up`),
       });
 
       // Only a wake the user did not ask for is worth interrupting them
       // about; the quiet outcomes are the common ones (any mention of a
-      // healthy agent lands here) and must stay silent.
+      // healthy agent lands here) and must stay silent. A reconcile
+      // attempt stays quiet even when unconfirmed: its pre-deploy sample
+      // said online, so "never came online" would usually be a false alarm
+      // against a healthy agent whose heartbeat we simply have not seen.
       if (outcome === "deploy-failed") {
         console.error("Wake deploy failed", error);
-        toast.error(
-          `Could not wake ${agent.name}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
+        if (!reconcile) {
+          toast.error(
+            `Could not wake ${agent.name}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
         return;
       }
       if (outcome === "wake-unconfirmed") {
-        console.warn("Wake deploy never reported presence", agent.pubkey);
-        toast.error(
-          `${agent.name} was deployed but never came online — mention it again to retry`,
-        );
+        console.warn("Wake deploy never confirmed a live harness", {
+          pubkey: agent.pubkey,
+          reconcile,
+        });
+        if (!reconcile) {
+          toast.error(
+            `${agent.name} was deployed but never came online — mention it again to retry`,
+          );
+        }
         return;
       }
       if (outcome === "presence-unavailable") {
@@ -125,6 +158,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
     const candidates = selectWakeCandidates(event, managedAgents ?? [], {
       ownerPubkey,
       accessOwnerOnly,
+      knownAgentAuthors,
     });
     for (const candidate of candidates) {
       void wakeAgent(candidate, event.created_at);

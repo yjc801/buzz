@@ -504,6 +504,7 @@ reconnects preserve pending avatar verification work):
 - `resetAvatarPresentations()` — avatar probes, previews, and Retry toasts
 - `resetSidebarRelayConnectionCardState()` — sidebar relay card dismiss state
 - `resetMediaCaches()` — proxy port and relay origin caches
+- `resetPresenceHeartbeatLog()` — observed live-heartbeat times (agent wake freshness)
 - `resetVideoPlayerState()` — video player singleton
 - `resetRenderScopedReactionHydration()` — reaction hydration cache
 - `clearSearchHitEventCache()` — search result event cache

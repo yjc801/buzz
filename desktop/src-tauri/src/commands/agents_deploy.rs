@@ -129,6 +129,11 @@ pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result
 /// subscribe *after* the very message that woke it and never answer it.
 /// Transient by design — it lives only in this deploy's payload, never on
 /// the record, so ordinary deploys carry no floor.
+///
+/// The key is in `RESERVED_ENV_KEYS`, so every user-controllable layer
+/// (global/persona/agent env) strips it before it can reach `launch.env` —
+/// which providers apply AFTER `policy_env` and would otherwise override
+/// this value. This function is therefore the only writer.
 pub(super) fn apply_wake_replay_floor(
     payload: &mut serde_json::Value,
     wake_replay_floor: Option<u64>,

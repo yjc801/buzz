@@ -524,8 +524,7 @@ mod tests {
 
         apply_wake_replay_floor(&mut payload, Some(1_700_000_123));
         assert_eq!(
-            payload["launch"]["policy_env"]["BUZZ_ACP_REPLAY_FLOOR"],
-            "1700000123",
+            payload["launch"]["policy_env"]["BUZZ_ACP_REPLAY_FLOOR"], "1700000123",
             "wake deploys must carry the trigger timestamp as a string env value"
         );
     }

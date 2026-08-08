@@ -147,7 +147,10 @@ mod replay_floor_tests {
 
     #[test]
     fn recent_floor_wins() {
-        assert_eq!(apply_replay_floor(NOW, Some(&(NOW - 90).to_string())), NOW - 90);
+        assert_eq!(
+            apply_replay_floor(NOW, Some(&(NOW - 90).to_string())),
+            NOW - 90
+        );
     }
 
     #[test]

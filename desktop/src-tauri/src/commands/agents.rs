@@ -1013,7 +1013,7 @@ pub async fn create_managed_agent(
                     .iter()
                     .find(|r| r.pubkey == pubkey)
                     .ok_or_else(|| "agent disappeared".to_string())?;
-                build_deploy_payload(&app, &state, rec)?
+                build_deploy_payload(&app, &state, rec, None)?
             };
             match deploy_to_provider(&app, &state, &pubkey, id, config, agent_json, None).await {
                 Ok(()) => spawn_error,
@@ -1061,10 +1061,10 @@ pub async fn create_managed_agent(
     })
 }
 
-/// Data needed for background profile reconciliation after agent start.
 #[tauri::command]
 pub async fn start_managed_agent(
     pubkey: String,
+    wake_replay_floor: Option<u64>, // see `apply_wake_replay_floor`
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ManagedAgentSummary, String> {
@@ -1128,7 +1128,7 @@ pub async fn start_managed_agent(
             StartTarget::Provider {
                 backend: record.backend.clone(),
                 cached_binary_path: record.provider_binary_path.clone(),
-                agent_json: build_deploy_payload(&app, &state, record)?,
+                agent_json: build_deploy_payload(&app, &state, record, wake_replay_floor)?,
             }
         };
 

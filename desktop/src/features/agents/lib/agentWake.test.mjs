@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  KIND_REACTION,
+  KIND_STREAM_MESSAGE_V2,
+} from "@/shared/constants/kinds";
+
+import { REMOTE_POST_OFFLINE_GRACE_MS } from "./managedAgentControlActions.ts";
+import {
   agentRespondsToAuthor,
   createWakeAttemptState,
   eventAddressesAgent,
@@ -10,6 +16,7 @@ import {
   selectWakeCandidates,
   shouldWakeAgent,
   WAKE_ATTEMPT_DEBOUNCE_MS,
+  WAKE_LIVE_RECHECK_DELAY_MS,
 } from "./agentWake.ts";
 
 const OWNER = "a".repeat(64);
@@ -29,42 +36,89 @@ function agent(overrides = {}) {
   };
 }
 
-function mention({ author = OWNER, targets = [AGENT], extraTags = [] } = {}) {
+function mention({
+  author = OWNER,
+  targets = [AGENT],
+  extraTags = [],
+  kind = KIND_STREAM_MESSAGE_V2,
+} = {}) {
   return {
     pubkey: author,
+    kind,
     tags: [...targets.map((target) => ["p", target]), ...extraTags],
   };
 }
 
+// The raw stored modes only apply when the build clamp is known to be off.
+const RAW_ACCESS = { accessOwnerOnly: false };
+
 test("respond-to gate mirrors the harness's own author rules", () => {
   assert.equal(
-    agentRespondsToAuthor(agent({ respondTo: "anyone" }), STRANGER, OWNER),
+    agentRespondsToAuthor(
+      agent({ respondTo: "anyone" }),
+      STRANGER,
+      OWNER,
+      false,
+    ),
     true,
   );
-  assert.equal(agentRespondsToAuthor(agent(), OWNER, OWNER), true);
-  assert.equal(agentRespondsToAuthor(agent(), STRANGER, OWNER), false);
+  assert.equal(agentRespondsToAuthor(agent(), OWNER, OWNER, false), true);
+  assert.equal(agentRespondsToAuthor(agent(), STRANGER, OWNER, false), false);
 
   // Owner unknown (identity not resolved yet) fails closed rather than
   // treating the first author it sees as the owner.
-  assert.equal(agentRespondsToAuthor(agent(), OWNER, undefined), false);
-  assert.equal(agentRespondsToAuthor(agent(), OWNER, ""), false);
+  assert.equal(agentRespondsToAuthor(agent(), OWNER, undefined, false), false);
+  assert.equal(agentRespondsToAuthor(agent(), OWNER, "", false), false);
 
   const allowlisted = agent({
     respondTo: "allowlist",
     respondToAllowlist: [STRANGER.toUpperCase()],
   });
-  assert.equal(agentRespondsToAuthor(allowlisted, STRANGER, OWNER), true);
-  assert.equal(agentRespondsToAuthor(allowlisted, OWNER, OWNER), false);
+  assert.equal(
+    agentRespondsToAuthor(allowlisted, STRANGER, OWNER, false),
+    true,
+  );
+});
+
+test("allowlist admits the owner implicitly, like the harness does", () => {
+  const allowlisted = agent({
+    respondTo: "allowlist",
+    respondToAllowlist: [STRANGER],
+  });
+  assert.equal(agentRespondsToAuthor(allowlisted, OWNER, OWNER, false), true);
+});
+
+test("an owner-only build clamps every stored mode to owner-only", () => {
+  const open = agent({ respondTo: "anyone" });
+  assert.equal(agentRespondsToAuthor(open, STRANGER, OWNER, true), false);
+  assert.equal(agentRespondsToAuthor(open, OWNER, OWNER, true), true);
+
+  const allowlisted = agent({
+    respondTo: "allowlist",
+    respondToAllowlist: [STRANGER],
+  });
+  assert.equal(
+    agentRespondsToAuthor(allowlisted, STRANGER, OWNER, true),
+    false,
+  );
+});
+
+test("an unknown build clamp fails closed to owner-only", () => {
+  // Undefined means the build policy has not resolved yet; the owner is
+  // admitted under every real mode, so owner-only is safe either way.
+  const open = agent({ respondTo: "anyone" });
+  assert.equal(agentRespondsToAuthor(open, STRANGER, OWNER, undefined), false);
+  assert.equal(agentRespondsToAuthor(open, OWNER, OWNER, undefined), true);
 });
 
 test("an unrecognized respond-to mode refuses instead of guessing", () => {
   const future = agent({ respondTo: "mesh-only" });
-  assert.equal(agentRespondsToAuthor(future, OWNER, OWNER), false);
+  assert.equal(agentRespondsToAuthor(future, OWNER, OWNER, false), false);
 });
 
 test("an empty author never passes the gate", () => {
   assert.equal(
-    agentRespondsToAuthor(agent({ respondTo: "anyone" }), "", OWNER),
+    agentRespondsToAuthor(agent({ respondTo: "anyone" }), "", OWNER, false),
     false,
   );
 });
@@ -85,6 +139,7 @@ test("addressing is the p-tag, case-insensitively", () => {
 test("a name in the body is not addressing — only p-tags count", () => {
   const bodyOnly = {
     pubkey: OWNER,
+    kind: KIND_STREAM_MESSAGE_V2,
     tags: [
       ["h", "channel-1"],
       ["e", "some-event"],
@@ -96,6 +151,7 @@ test("a name in the body is not addressing — only p-tags count", () => {
 test("a mention from the owner selects the offline provider agent", () => {
   const candidates = selectWakeCandidates(mention(), [agent()], {
     ownerPubkey: OWNER,
+    ...RAW_ACCESS,
   });
   assert.deepEqual(
     candidates.map((candidate) => candidate.pubkey),
@@ -103,10 +159,26 @@ test("a mention from the owner selects the offline provider agent", () => {
   );
 });
 
+test("only human-visible message kinds can wake — a reaction cannot", () => {
+  // Reactions p-tag the reacted-to author, so an owner reacting to an old
+  // message from the agent would otherwise redeploy it.
+  const reaction = mention({ kind: KIND_REACTION });
+  assert.deepEqual(
+    selectWakeCandidates(reaction, [agent()], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }),
+    [],
+  );
+});
+
 test("local agents are never wake candidates", () => {
   const local = agent({ backend: { type: "local" } });
   assert.deepEqual(
-    selectWakeCandidates(mention(), [local], { ownerPubkey: OWNER }),
+    selectWakeCandidates(mention(), [local], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }),
     [],
   );
 });
@@ -122,7 +194,36 @@ test("an agent's own traffic never wakes it or a p-tagged peer", () => {
   assert.deepEqual(
     selectWakeCandidates(selfAuthored, [agent(), peer], {
       ownerPubkey: OWNER,
+      ...RAW_ACCESS,
     }).map((candidate) => candidate.pubkey),
+    [],
+  );
+});
+
+test("any managed agent as author blocks the wake, not just the candidate", () => {
+  // Agent A p-tags only agent B. B is open to anyone, so an author-vs-self
+  // check alone would wake it and hand the pair a keepalive loop.
+  const openPeer = agent({
+    pubkey: OTHER_AGENT,
+    name: "Alex",
+    respondTo: "anyone",
+  });
+  const fromSibling = mention({ author: AGENT, targets: [OTHER_AGENT] });
+  assert.deepEqual(
+    selectWakeCandidates(fromSibling, [agent(), openPeer], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }),
+    [],
+  );
+
+  // Even a local managed agent's traffic must not wake a provider peer.
+  const localAuthor = agent({ backend: { type: "local" } });
+  assert.deepEqual(
+    selectWakeCandidates(fromSibling, [localAuthor, openPeer], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }),
     [],
   );
 });
@@ -130,7 +231,10 @@ test("an agent's own traffic never wakes it or a p-tagged peer", () => {
 test("a stranger cannot wake an owner-only agent, but can wake an open one", () => {
   const fromStranger = mention({ author: STRANGER });
   assert.deepEqual(
-    selectWakeCandidates(fromStranger, [agent()], { ownerPubkey: OWNER }),
+    selectWakeCandidates(fromStranger, [agent()], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }),
     [],
   );
 
@@ -138,6 +242,7 @@ test("a stranger cannot wake an owner-only agent, but can wake an open one", () 
   assert.deepEqual(
     selectWakeCandidates(fromStranger, [open], {
       ownerPubkey: OWNER,
+      ...RAW_ACCESS,
     }).map((candidate) => candidate.pubkey),
     [AGENT],
   );
@@ -148,7 +253,7 @@ test("one event addressing two agents selects both", () => {
   const candidates = selectWakeCandidates(
     mention({ targets: [AGENT, OTHER_AGENT] }),
     [agent(), peer],
-    { ownerPubkey: OWNER },
+    { ownerPubkey: OWNER, ...RAW_ACCESS },
   );
   assert.deepEqual(
     candidates.map((candidate) => candidate.pubkey),
@@ -188,17 +293,45 @@ test("a backwards clock counts as debounced", () => {
   assert.equal(isWakeAttemptDebounced(now + 60_000, now), true);
 });
 
-function wakeHarness({ presence = "offline", deployFails = false } = {}) {
+/// Presence script: statuses consumed one per lookup for agents that have not
+/// been deployed by this harness (the last entry repeats; `null` = no
+/// presence record). Once an agent is deployed, its lookups return
+/// `presenceAfterDeploy` — the fresh generation coming up (or `null` for a
+/// deploy that never produces one).
+function wakeHarness({
+  presenceScript = [],
+  presenceAfterDeploy = "online",
+  deployFails = false,
+} = {}) {
   const deployed = [];
+  const deployedKeys = new Set();
+  const delays = [];
+  let scriptIndex = 0;
+  const nextScripted = () =>
+    scriptIndex < presenceScript.length
+      ? presenceScript[scriptIndex++]
+      : (presenceScript[presenceScript.length - 1] ?? null);
   return {
     deployed,
+    deployedKeys,
+    delays,
     state: createWakeAttemptState(),
-    fetchPresence: async () => (presence === null ? {} : { [AGENT]: presence }),
+    delay: async (ms) => {
+      delays.push(ms);
+    },
+    fetchPresence: async (pubkeys) => {
+      const key = pubkeys[0].toLowerCase();
+      const status = deployedKeys.has(key)
+        ? presenceAfterDeploy
+        : nextScripted();
+      return status == null ? {} : { [key]: status };
+    },
     startManagedAgent: async (pubkey) => {
       deployed.push(pubkey);
       if (deployFails) {
         throw new Error("provider refused");
       }
+      deployedKeys.add(pubkey.toLowerCase());
       return {};
     },
   };
@@ -210,10 +343,37 @@ test("an offline agent is deployed exactly once", async () => {
 
   assert.equal(result.outcome, "woken");
   assert.deepEqual(harness.deployed, [AGENT]);
+  // The deploy respected the post-offline teardown fence.
+  assert.ok(harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
 });
 
 test("a live agent is left alone — no deploy round trip", async () => {
-  const harness = wakeHarness({ presence: "online" });
+  const harness = wakeHarness({ presenceScript: ["online"] });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "already-live");
+  assert.deepEqual(harness.deployed, []);
+});
+
+test("a dying harness that still says online is woken once it drops", async () => {
+  // Presence is not a generation fence: the first sample races a harness
+  // whose main loop already chose shutdown. The recheck sees the truth and
+  // the wake proceeds through the teardown fence.
+  const harness = wakeHarness({
+    presenceScript: ["online", "offline", "offline"],
+  });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "woken");
+  assert.deepEqual(harness.deployed, [AGENT]);
+  assert.ok(harness.delays.includes(WAKE_LIVE_RECHECK_DELAY_MS));
+  assert.ok(harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
+});
+
+test("an agent that comes up during the teardown fence is left alone", async () => {
+  // Another client's deploy (or a restart finishing) landed while we waited
+  // out the fence — deploying again would be a wasted round trip.
+  const harness = wakeHarness({ presenceScript: ["offline", "online"] });
   const result = await runWakeAttempt({ agent: agent(), ...harness });
 
   assert.equal(result.outcome, "already-live");
@@ -221,7 +381,7 @@ test("a live agent is left alone — no deploy round trip", async () => {
 });
 
 test("a resolved lookup with no entry means offline, and wakes", async () => {
-  const harness = wakeHarness({ presence: null });
+  const harness = wakeHarness({ presenceScript: [null] });
   const result = await runWakeAttempt({ agent: agent(), ...harness });
 
   assert.equal(result.outcome, "woken");
@@ -283,6 +443,9 @@ test("the agent is wakeable again once the debounce window passes", async () => 
     runWakeAttempt({ agent: agent(), ...harness, now: () => clock });
 
   await attempt();
+  // The agent exits again after its first life; otherwise a fresh attempt
+  // correctly reports it already-live.
+  harness.deployedKeys.clear();
   clock += WAKE_ATTEMPT_DEBOUNCE_MS;
   const later = await attempt();
 
@@ -312,6 +475,48 @@ test("a failed deploy reports the error and still holds the debounce", async () 
   });
   assert.equal(second.outcome, "debounced");
   assert.deepEqual(harness.deployed, [AGENT]);
+});
+
+test("a deploy that never reports presence releases the debounce", async () => {
+  // The deploy can strict-no-op against a process that was still dying, or
+  // the fresh harness can fail to boot. Either way the agent is dead; a held
+  // debounce would silence every retry for two minutes.
+  const harness = wakeHarness({ presenceAfterDeploy: null });
+  const clock = 5_000_000;
+  const onDeployedCalls = [];
+  const attempt = () =>
+    runWakeAttempt({
+      agent: agent(),
+      ...harness,
+      now: () => clock,
+      onDeployed: () => onDeployedCalls.push(true),
+    });
+
+  const first = await attempt();
+  assert.equal(first.outcome, "wake-unconfirmed");
+  assert.deepEqual(harness.deployed, [AGENT]);
+  assert.equal(onDeployedCalls.length, 1);
+
+  // Same clock, so a held debounce would return "debounced" — the release
+  // is what lets the next mention retry.
+  const second = await attempt();
+  assert.equal(second.outcome, "wake-unconfirmed");
+  assert.deepEqual(harness.deployed, [AGENT, AGENT]);
+});
+
+test("a wake that converges fires onDeployed before the confirmation", async () => {
+  const harness = wakeHarness();
+  let deployedSignal = false;
+  const result = await runWakeAttempt({
+    agent: agent(),
+    ...harness,
+    onDeployed: () => {
+      deployedSignal = true;
+    },
+  });
+
+  assert.equal(result.outcome, "woken");
+  assert.equal(deployedSignal, true);
 });
 
 test("one agent's debounce does not silence another", async () => {

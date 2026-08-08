@@ -120,11 +120,34 @@ pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result
     Ok(())
 }
 
+/// Inject a wake deploy's replay floor into the launch contract.
+///
+/// `launch.policy_env` is the provider contract for harness environment
+/// (applied below the user env layer). The floor is the `created_at` of the
+/// mention that triggered the wake: cold-start latency routinely exceeds the
+/// harness's 5s startup replay skew, so without it the fresh harness would
+/// subscribe *after* the very message that woke it and never answer it.
+/// Transient by design — it lives only in this deploy's payload, never on
+/// the record, so ordinary deploys carry no floor.
+pub(super) fn apply_wake_replay_floor(
+    payload: &mut serde_json::Value,
+    wake_replay_floor: Option<u64>,
+) {
+    if let Some(floor) = wake_replay_floor {
+        payload["launch"]["policy_env"]["BUZZ_ACP_REPLAY_FLOOR"] =
+            serde_json::Value::String(floor.to_string());
+    }
+}
+
 /// Build the standard agent JSON payload for provider deploy calls.
+///
+/// `wake_replay_floor` is set only when this deploy is a wake-on-mention —
+/// see [`apply_wake_replay_floor`].
 pub(super) fn build_deploy_payload(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
+    wake_replay_floor: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     if let Some(err) = crate::managed_agents::spawn_key_refusal(record) {
         return Err(err);
@@ -161,7 +184,7 @@ pub(super) fn build_deploy_payload(
     let effective_parallelism =
         crate::managed_agents::effective_parallelism(&descriptor.command, record.parallelism);
 
-    Ok(deploy_payload_json(
+    let mut payload = deploy_payload_json(
         record,
         crate::relay::effective_agent_relay_url(
             &record.relay_url,
@@ -176,7 +199,9 @@ pub(super) fn build_deploy_payload(
         },
         merged_user_env,
         launch,
-    ))
+    );
+    apply_wake_replay_floor(&mut payload, wake_replay_floor);
+    Ok(payload)
 }
 
 /// Pure serialization half of [`build_deploy_payload`]. Legacy top-level fields
@@ -473,6 +498,35 @@ mod tests {
         assert_eq!(
             payload["parallelism"], cap,
             "legacy top-level parallelism must match launch.policy_env — both must be {cap}"
+        );
+    }
+
+    /// A wake deploy injects its trigger timestamp into `launch.policy_env`;
+    /// an ordinary deploy leaves the launch contract untouched.
+    #[test]
+    fn wake_replay_floor_is_injected_only_when_present() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
+        let mut payload = serde_json::json!({ "launch": launch });
+
+        apply_wake_replay_floor(&mut payload, None);
+        assert!(
+            payload["launch"]["policy_env"]
+                .get("BUZZ_ACP_REPLAY_FLOOR")
+                .is_none(),
+            "ordinary deploys must not carry a replay floor"
+        );
+
+        apply_wake_replay_floor(&mut payload, Some(1_700_000_123));
+        assert_eq!(
+            payload["launch"]["policy_env"]["BUZZ_ACP_REPLAY_FLOOR"],
+            "1700000123",
+            "wake deploys must carry the trigger timestamp as a string env value"
         );
     }
 }

@@ -8,9 +8,16 @@ import type {
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
 
-export async function startManagedAgent(pubkey: string): Promise<ManagedAgent> {
+export async function startManagedAgent(
+  pubkey: string,
+  /** Unix seconds of the mention that triggered a wake deploy. Carried into
+   * the new harness as its startup replay floor so cold-start latency cannot
+   * drop the very message that woke it. Omitted for ordinary starts. */
+  wakeReplayFloorTs?: number,
+): Promise<ManagedAgent> {
   const response = await invokeTauri<RawManagedAgent>("start_managed_agent", {
     pubkey,
+    wakeReplayFloor: wakeReplayFloorTs ?? null,
   });
   return fromRawManagedAgent(response);
 }

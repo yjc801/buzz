@@ -114,6 +114,65 @@ fn emit_runtime_lifecycle(
     }
 }
 
+/// Max age of an externally supplied replay floor, relative to the startup
+/// watermark. Bounds how much history a stale or corrupted
+/// `BUZZ_ACP_REPLAY_FLOOR` can force back into the first REQ; a floor older
+/// than this is clamped to the bound rather than ignored, so a slow deploy
+/// still replays as much of the missed window as the bound allows.
+const REPLAY_FLOOR_MAX_AGE_SECS: u64 = 900;
+
+/// Floor the startup watermark to a wake deploy's trigger timestamp.
+///
+/// A wake deploy sets `BUZZ_ACP_REPLAY_FLOOR` to the `created_at` of the
+/// mention that caused it. The watermark normally starts at process start,
+/// and the first REQ subtracts only a 5s skew — less than routine cold-start
+/// latency, so without the floor the mention that woke this harness would
+/// fall outside the replay window and never be answered. Unparseable or
+/// future values leave the watermark unchanged.
+fn apply_replay_floor(startup_watermark: u64, floor: Option<&str>) -> u64 {
+    let Some(floor) = floor.and_then(|raw| raw.trim().parse::<u64>().ok()) else {
+        return startup_watermark;
+    };
+    if floor >= startup_watermark {
+        return startup_watermark;
+    }
+    floor.max(startup_watermark.saturating_sub(REPLAY_FLOOR_MAX_AGE_SECS))
+}
+
+#[cfg(test)]
+mod replay_floor_tests {
+    use super::{apply_replay_floor, REPLAY_FLOOR_MAX_AGE_SECS};
+
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn recent_floor_wins() {
+        assert_eq!(apply_replay_floor(NOW, Some(&(NOW - 90).to_string())), NOW - 90);
+    }
+
+    #[test]
+    fn missing_or_garbage_floor_is_ignored() {
+        assert_eq!(apply_replay_floor(NOW, None), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some("")), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some("not-a-number")), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some("-5")), NOW);
+    }
+
+    #[test]
+    fn future_floor_is_ignored() {
+        assert_eq!(apply_replay_floor(NOW, Some(&(NOW + 60).to_string())), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some(&NOW.to_string())), NOW);
+    }
+
+    #[test]
+    fn ancient_floor_is_clamped_to_the_age_bound() {
+        assert_eq!(
+            apply_replay_floor(NOW, Some(&(NOW - 86_400).to_string())),
+            NOW - REPLAY_FLOOR_MAX_AGE_SECS,
+        );
+    }
+}
+
 /// Resolve the agent's owner pubkey at startup.
 ///
 /// Priority:
@@ -1613,6 +1672,16 @@ async fn tokio_main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // A wake deploy passes the triggering mention's timestamp as
+    // BUZZ_ACP_REPLAY_FLOOR (via the provider launch contract). Cold-start
+    // latency routinely exceeds the 5s resubscribe skew, so without this
+    // floor the first REQ would start *after* the very message that woke the
+    // harness and the agent would never answer it. Bounded so a stale or
+    // corrupted floor cannot replay hours of history.
+    let startup_watermark = apply_replay_floor(
+        startup_watermark,
+        std::env::var("BUZZ_ACP_REPLAY_FLOOR").ok().as_deref(),
+    );
 
     let pubkey_hex = config.keys.public_key().to_hex();
 

@@ -21,6 +21,7 @@ import {
 } from "@/shared/lib/trailingDebounce";
 
 import { isDmNotifiableKind } from "./isDmNotifiableKind";
+import { emitLiveChannelEvent } from "./liveChannelEventTap";
 import { refreshChannelsWhenIdle } from "./refreshChannelsWhenIdle";
 
 export type UseLiveChannelUpdatesOptions = {
@@ -240,6 +241,11 @@ export function useLiveChannelUpdates(
       }
       return;
     }
+
+    // Independent consumers (agent wake-on-mention) ride this delivery
+    // instead of opening their own relay subscriptions. Events can repeat
+    // here (mention-filter overlap, reconnect replay); consumers dedup.
+    emitLiveChannelEvent(event);
 
     const isDmChannel = dmChannelMap.has(channelId);
     const isUnreadTriggerKind = isChannelUnreadTriggerKind(

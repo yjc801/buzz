@@ -536,7 +536,15 @@ export function useStartManagedAgentMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (pubkey: string) => startManagedAgent(pubkey),
+    // A bare pubkey keeps the `(pubkey) => Promise` plumbing through the
+    // control actions working; the wake path passes an object to carry the
+    // replay floor of the mention that triggered the deploy.
+    mutationFn: (
+      input: string | { pubkey: string; wakeReplayFloorTs?: number },
+    ) =>
+      typeof input === "string"
+        ? startManagedAgent(input)
+        : startManagedAgent(input.pubkey, input.wakeReplayFloorTs),
     onSuccess: (updated) => {
       queryClient.setQueryData<ManagedAgent[]>(
         managedAgentsQueryKey,

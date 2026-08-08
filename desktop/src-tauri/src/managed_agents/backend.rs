@@ -505,6 +505,9 @@ fn stage_provider(
 }
 
 /// A provider's deploy answer, as much of it as the desktop consumes.
+/// `Debug` because this is the `Ok` type of `provider_deploy`, whose
+/// error-path tests assert through `unwrap_err()`.
+#[derive(Debug)]
 pub struct ProviderDeployOutcome {
     pub agent_id: String,
     /// The provider's own classification of the deploy, when it gives one:

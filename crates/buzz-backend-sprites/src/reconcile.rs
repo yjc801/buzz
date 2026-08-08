@@ -43,12 +43,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// call started the generation now running.
 pub struct Deployed {
     pub agent_id: String,
-    /// True exactly when this call performed the Start — the running
-    /// generation booted from this call's env file, so everything that env
+    /// True exactly when this call performed the Start AND the generation
+    /// observed running at success is the one that Start booted (the
+    /// probe's `gen` names it — env file name, lifecycle correlator, and
+    /// probe `gen` are one identity) — so everything that generation's env
     /// carried (the wake replay floor included) is provably in effect.
     /// False for a strict no-op against a generation some earlier deploy
     /// started — including a concurrent rival's (`adopted_winner`), whose
-    /// env is not ours.
+    /// env is not ours — and false when this call's Start was superseded:
+    /// the deploy lease expires at 420s while this loop may run 600s, so a
+    /// successor can start ITS generation and a stale call must not vouch
+    /// for a floor that successor never adopted.
     pub fresh_generation: bool,
 }
 
@@ -222,14 +227,25 @@ async fn deploy_loop(
         }
 
         match action {
-            // Every success returns through NoOp, so `attempt_started` at
-            // this moment is the whole fresh-generation answer: true means
-            // the generation observed running is the one this call started.
+            // Every success returns through NoOp, but `attempt_started`
+            // alone is NOT the fresh-generation answer: it stays true after
+            // this call's Start even if the observed running harness is a
+            // successor's (the deploy lease expires at 420s, this loop may
+            // run 600s). The claim is therefore fenced by identity: only a
+            // running probe whose `gen` equals the generation this call
+            // started proves the floor-bearing env is in effect. Fail
+            // closed — no probe, no started generation, or a mismatch all
+            // report false (unproven, never a guess).
             Action::NoOp { agent_id } => {
+                let fresh_generation = attempt_started
+                    && match (attempt_generation.as_deref(), probe.as_ref()) {
+                        (Some(started), Some(running)) => running.gen == started,
+                        _ => false,
+                    };
                 return Ok(Deployed {
                     agent_id,
-                    fresh_generation: attempt_started,
-                })
+                    fresh_generation,
+                });
             }
 
             Action::Observe { .. } => substrate.sleep(POLL_INTERVAL).await,

@@ -14,7 +14,7 @@ import {
   createWakeAttemptState,
   eventAddressesAgent,
   isCoveredByReplayFloor,
-  isServedByCommittedFloor,
+  isPresumedDeliveredByFloor,
   isWakeAttemptDebounced,
   isWakeShapedEvent,
   pushBoundedPendingTrigger,
@@ -953,7 +953,11 @@ test("floor coverage honours the harness's REQ skew", () => {
   assert.equal(isCoveredByReplayFloor(1_500, 1_000), true);
 });
 
-test("only a provider-proven fresh generation's floor serves a trigger", () => {
+test("only a provider-proven fresh generation's floor grounds the delivered presumption", () => {
+  // The presumption never deletes a trigger — it only downgrades the
+  // terminal drop log after the one-shot retry — but it must still be
+  // earned by the full chain, or the log would vouch for deliveries even
+  // the deploy-side evidence does not reach.
   const fresh = { retriedOnce: false, createdAtSecs: 1_000 };
   const proven = {
     outcome: "woken",
@@ -961,34 +965,35 @@ test("only a provider-proven fresh generation's floor serves a trigger", () => {
     floorAdopted: true,
   };
 
-  assert.equal(isServedByCommittedFloor(fresh, proven), true);
+  assert.equal(isPresumedDeliveredByFloor(fresh, proven), true);
 
   // A strict no-op (or a provider that gave no classification) installed no
-  // floor — however many heartbeats followed, nothing proves replay.
+  // floor — however many heartbeats followed, nothing presumes replay.
   assert.equal(
-    isServedByCommittedFloor(fresh, { ...proven, floorAdopted: false }),
+    isPresumedDeliveredByFloor(fresh, { ...proven, floorAdopted: false }),
     false,
   );
-  // Process liveness is not delivery: an already-live verdict never serves.
+  // Process liveness is not delivery: an already-live verdict grounds no
+  // presumption.
   assert.equal(
-    isServedByCommittedFloor(fresh, { ...proven, outcome: "already-live" }),
+    isPresumedDeliveredByFloor(fresh, { ...proven, outcome: "already-live" }),
     false,
   );
   // No committed floor means no deploy to cover anyone.
   assert.equal(
-    isServedByCommittedFloor(fresh, { ...proven, committedFloorTs: null }),
+    isPresumedDeliveredByFloor(fresh, { ...proven, committedFloorTs: null }),
     false,
   );
   // Below the REQ window: the fresh generation replays from floor − skew.
   assert.equal(
-    isServedByCommittedFloor({ ...fresh, createdAtSecs: 994 }, proven),
+    isPresumedDeliveredByFloor({ ...fresh, createdAtSecs: 994 }, proven),
     false,
   );
-  // A retried trigger is never floor-covered, even by a proven fresh
+  // A retried trigger is never presumed delivered, even by a proven fresh
   // generation: its age can exceed the harness's replay-floor age cap,
   // which would clamp it out of the REQ window unverifiably.
   assert.equal(
-    isServedByCommittedFloor({ ...fresh, retriedOnce: true }, proven),
+    isPresumedDeliveredByFloor({ ...fresh, retriedOnce: true }, proven),
     false,
   );
 });

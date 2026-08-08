@@ -92,27 +92,41 @@ export function isCoveredByReplayFloor(
   return createdAtSecs >= committedFloorSecs - WAKE_REPLAY_FLOOR_SKEW_SECS;
 }
 
-/// Is a settled trigger SERVED by the deploy its owning attempt committed?
+/// Should a settled trigger be PRESUMED delivered by the deploy its owning
+/// attempt committed? A presumption, never a proof — it must not authorize
+/// dropping a trigger; its only consumer is the terminal drop log after the
+/// one-shot retry, which it downgrades from a warning to an informational
+/// line.
 ///
-/// Positive coverage has exactly one shape: the attempt ended `woken`, the
-/// PROVIDER proved the deploy started a fresh generation, and the committed
-/// floor's REQ window reaches the trigger's `created_at`. Process liveness
-/// alone — an already-live verdict, post-deploy heartbeats — never serves:
-/// it proves a harness runs somewhere, not that this channel's REQ was
-/// active when the mention was delivered, and the desktop cannot observe
-/// per-channel readiness. Without the provider's classification a `woken`
-/// outcome is ambiguous the same way: a strict no-op returns the existing
-/// id and installs nothing, so the floor this attempt computed was never
-/// adopted, however many heartbeats follow.
+/// The strongest chain the desktop can assemble has exactly one shape: the
+/// attempt ended `woken`, the PROVIDER proved the deploy started a fresh
+/// generation (so the env carrying the committed floor is in effect), and
+/// the floor's REQ window reaches the trigger's `created_at`. Even that
+/// chain stops at the harness process boundary: in buzz-acp,
+/// `subscribe_channel(...).await` returns after ENQUEUEING the REQ, which
+/// can then sit rate-gated or be rejected by the relay after presence is
+/// already published — so a floor provably booted is still not the target
+/// channel's delivery. Per-channel readiness is observable only on the
+/// harness/relay side; until the harness surfaces it, nothing the desktop
+/// can see settles a trigger positively, and every settled trigger retains
+/// for the armed one-shot retry.
 ///
-/// Retried triggers are never floor-covered, even by a proven fresh
+/// Process liveness alone — an already-live verdict, post-deploy
+/// heartbeats — grounds no presumption at all: it proves a harness runs
+/// somewhere, not that this channel's REQ was active when the mention was
+/// delivered. Without the provider's classification a `woken` outcome is
+/// ambiguous the same way: a strict no-op returns the existing id and
+/// installs nothing, so the floor this attempt computed was never adopted,
+/// however many heartbeats follow.
+///
+/// Retried triggers are never presumed delivered, even by a proven fresh
 /// generation: their age since first delivery includes a full failed
 /// attempt plus the stranded-retry delay, which can exceed the latency
 /// budget the harness's replay-floor age cap is sized for
 /// (`REPLAY_FLOOR_MAX_AGE_SECS`, buzz-acp) — a clamped floor silently
 /// excludes them, and the desktop cannot verify the harness's clock to
-/// know. Their retry attempt's settlement is terminal instead.
-export function isServedByCommittedFloor(
+/// know.
+export function isPresumedDeliveredByFloor(
   trigger: { retriedOnce: boolean; createdAtSecs: number },
   settlement: {
     outcome: WakeOutcome;
@@ -366,10 +380,10 @@ export function isWakeShapedEvent(
 /// spent a deploy on anyone's behalf — an author veto, an unverifiable
 /// author, or an unavailable presence lookup. There an immediate re-drive
 /// costs nothing it should not and lets a legitimate follower become the
-/// next owner. Every other owned exit either serves a follower positively
-/// (`isServedByCommittedFloor`) or retains it for the armed timer; retried
-/// triggers never re-drive at all — their retry attempt's settlement is
-/// terminal.
+/// next owner. Every other owned exit retains the follower for the armed
+/// timer (no settlement is positive — see `isPresumedDeliveredByFloor`);
+/// retried triggers never re-drive at all — their retry attempt's
+/// settlement is terminal.
 export function shouldRetryCollapsedTriggers(outcome: WakeOutcome): boolean {
   return (
     outcome === "author-rejected" ||

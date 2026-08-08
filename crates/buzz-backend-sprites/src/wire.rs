@@ -109,12 +109,15 @@ pub struct InfoResponse {
 pub struct DeployResponse {
     pub ok: bool,
     pub agent_id: String,
-    /// Whether THIS deploy started the generation now running (true), or
-    /// strict-no-op'd against one an earlier deploy started (false). The
-    /// desktop's wake path treats only `true` as proof that the deploy's
-    /// env — the replay floor included — is in effect; the field is
-    /// optional on the wire (§Deploy), so a provider that omits it simply
-    /// never proves adoption.
+    /// Whether THIS deploy started the generation now running — true only
+    /// when the observed running probe's `gen` is the one this call's
+    /// Start booted (a stale call superseded after lease expiry must not
+    /// vouch for a successor's generation); false for a strict no-op
+    /// against one an earlier deploy started. The desktop's wake path
+    /// treats only `true` as proof that the deploy's env — the replay
+    /// floor included — is in effect (a delivery PRESUMPTION, never
+    /// grounds to drop a trigger; §Deploy); the field is optional on the
+    /// wire, so a provider that omits it simply never proves adoption.
     pub fresh_generation: bool,
 }
 

@@ -463,13 +463,26 @@ the `deployed` axis of I3.
 did: `true` — this call started a fresh harness generation, which therefore
 booted from this call's environment (the wake replay floor included);
 `false` — a strict no-op against a generation an earlier deploy started,
-whose environment is NOT this call's. The field is OPTIONAL: `D` treats a
-missing or non-boolean value as "unproven" — never as either answer — so a
-provider predating the field merely never proves floor adoption. `D`'s wake
-path uses `true` as the only accepted proof that a mention folded into the
-deploy's replay floor will actually be replayed; process liveness signals
-(status, heartbeats) deliberately do not qualify, because they cannot
-distinguish a fresh generation from a no-op against a live one.
+whose environment is NOT this call's. A provider MUST fence `true` by
+generation identity, not by "this call performed a start": a call whose
+start was superseded (e.g. its deploy lease expired mid-call and a
+successor started its own generation) observes a running harness whose
+environment is NOT this call's, and MUST report `false` (the Sprites
+binding compares the running probe's generation with the one its start
+booted). The field is OPTIONAL: `D` treats a missing or non-boolean value
+as "unproven" — never as either answer — so a provider predating the field
+merely never proves floor adoption.
+
+`D` consumes the classification as a delivery PRESUMPTION, never as
+delivery: `true` proves the floor-bearing environment is in effect, but not
+that the trigger's channel subscription was ever accepted or drained (the
+harness enqueues its REQs, which can sit rate-gated or be rejected after
+presence publishes, and `D` cannot observe per-channel readiness). `D`'s
+wake path therefore retains every trigger for its armed one-shot retry
+regardless of the classification, and uses `true` only to grade the
+terminal log once the retry settles. Process liveness signals (status,
+heartbeats) ground no presumption at all, because they cannot distinguish
+a fresh generation from a no-op against a live one.
 
 **There is no `undeploy` op in v1.** Deletion of a remote agent from `D`
 orphans the substrate objects; the UI therefore requires an explicit

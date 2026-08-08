@@ -268,12 +268,19 @@ impl Substrate for Fake {
     async fn start_detached(
         &self,
         name: &str,
-        _argv: &[String],
+        argv: &[String],
         _dir: &str,
     ) -> Result<String, SubstrateError> {
         self.record(format!("start_detached:{name}"));
         let mut state = self.state.borrow_mut();
         if let Some(after) = state.probe_after_start.clone() {
+            // A real start boots the generation named last in the launcher
+            // argv (`launcher_argv`), and the post-start probe reports THAT
+            // `gen` — the two are one identity. Tests opt into the faithful
+            // report with the placeholder; a fixed gen deliberately models
+            // a probe observing some OTHER generation (a successor's).
+            let started_gen = argv.last().cloned().unwrap_or_default();
+            let after = after.replace(STARTED_GEN_PLACEHOLDER, &started_gen);
             state.probe_script = vec![after];
             state.probe_index = 0;
         }
@@ -311,6 +318,16 @@ fn env_map() -> BTreeMap<String, String> {
 
 fn started_probe() -> String {
     r#"{"lock":"held","comm":"buzz-acp","gen":"cafe0001"}"#.to_string()
+}
+
+/// Replaced by the fake's `start_detached` with the generation that start
+/// actually booted (see the placeholder note there).
+const STARTED_GEN_PLACEHOLDER: &str = "__STARTED_GEN__";
+
+/// A post-start probe reporting the generation THIS call's start booted —
+/// the faithful reading of a start that was not superseded.
+fn started_probe_for_this_attempt() -> String {
+    r#"{"lock":"held","comm":"buzz-acp","gen":"__STARTED_GEN__"}"#.to_string()
 }
 
 fn stopped_probe() -> String {
@@ -705,15 +722,15 @@ fn a_live_no_op_reports_no_fresh_generation() {
     );
 }
 
-/// …start side: a deploy that performed the Start reports
-/// `fresh_generation: true` — the running generation booted from this
-/// call's env file.
+/// …start side: a deploy that performed the Start — and then observed that
+/// same generation running (probe `gen` == the generation the Start
+/// booted) — reports `fresh_generation: true`.
 #[test]
 fn a_performed_start_reports_a_fresh_generation() {
     let fake = Fake::new(FakeState {
         sprite: Some(ours()),
         probe_script: vec![stopped_probe()],
-        probe_after_start: Some(started_probe()),
+        probe_after_start: Some(started_probe_for_this_attempt()),
         recorded_intent: Some(desired_intent()),
         ..Default::default()
     });
@@ -722,6 +739,31 @@ fn a_performed_start_reports_a_fresh_generation() {
     assert!(
         deployed.fresh_generation,
         "a performed start did not report a fresh generation"
+    );
+}
+
+/// …and the stale-attempt fence: this call performed a Start, but the
+/// generation observed running is NOT the one it started — the 420s deploy
+/// lease can expire inside this loop's 600s deadline, letting a successor
+/// start its own generation. `attempt_started` alone would vouch for a
+/// floor that successor never adopted; the probe-gen comparison must
+/// refuse.
+#[test]
+fn a_superseded_start_reports_no_fresh_generation() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![stopped_probe()],
+        // A fixed gen that cannot be this attempt's random token: the
+        // running harness is some other call's generation.
+        probe_after_start: Some(started_probe()),
+        recorded_intent: Some(desired_intent()),
+        ..Default::default()
+    });
+    let deployed = run_deployed(&fake).unwrap();
+    assert_eq!(deployed.agent_id, identity().sprite_name());
+    assert!(
+        !deployed.fresh_generation,
+        "a superseded start vouched for a successor's generation"
     );
 }
 

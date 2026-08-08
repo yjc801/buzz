@@ -12,7 +12,7 @@ import { mergeKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import {
   computeWakeReplayFloor,
   createWakeAttemptState,
-  isServedByCommittedFloor,
+  isPresumedDeliveredByFloor,
   isWakeShapedEvent,
   pushBoundedPendingTrigger,
   runWakeAttempt,
@@ -141,12 +141,17 @@ export function useAgentWakeOnMention(enabled: boolean) {
   );
 
   /// A trigger retained behind an owning attempt: the full event (so
-  /// re-drives can pass candidate selection again) and whether its one
-  /// active re-drive has been spent.
+  /// re-drives can pass candidate selection again), whether its one active
+  /// re-drive has been spent, and whether any attempt's proven floor has
+  /// presumed it delivered. `floorPresumed` is sticky across settlements
+  /// and NEVER grounds for deletion — per-channel delivery stays
+  /// unobservable from the desktop — it only downgrades the terminal drop
+  /// log after the one-shot retry.
   type HeldTrigger = {
     id: string;
     event: RelayEvent;
     retriedOnce: boolean;
+    floorPresumed: boolean;
   };
 
   // Triggers that arrived for an agent while another attempt held its
@@ -154,7 +159,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
   // a failed presence lookup ends with no deploy and no liveness, and the
   // collapsed mention is already committed to the seen-set — without
   // retention it would be silently lost. Bounded per agent; the owning
-  // attempt's settlement decides cover/retry/retain (see wakeAgent).
+  // attempt's settlement decides retry/retain (see wakeAgent).
   const collapsedTriggersRef = React.useRef(new Map<string, HeldTrigger[]>());
 
   // One armed re-drive timer per agent with retained stragglers. Retention
@@ -243,6 +248,9 @@ export function useAgentWakeOnMention(enabled: boolean) {
       // generation (which therefore booted from the env carrying the
       // floor). A strict no-op, a missing classification, and a provider
       // predating the field all stay false — unproven, never assumed.
+      // Consumed only as a delivered-PRESUMPTION that grades the terminal
+      // drop log; no floor proof settles a trigger (see
+      // isPresumedDeliveredByFloor).
       let committedFloorAdopted = false;
 
       const { outcome, error } = await runWakeAttempt({
@@ -294,11 +302,19 @@ export function useAgentWakeOnMention(enabled: boolean) {
           // deploy stamp deliberately reads as debounced, so re-holding
           // would arm timer after timer for as long as the clock stays
           // behind — the unbounded cycle the one-shot policy exists to
-          // prevent. The spent retry's settlement is terminal.
-          console.warn(
-            "Wake trigger dropped after retry: the retry landed inside the deploy debounce — a new mention will start fresh",
-            { agent: agent.pubkey, event: trigger.id },
-          );
+          // prevent. The spent retry's settlement is terminal, graded by
+          // the same delivered-presumption as every terminal drop.
+          if (trigger.floorPresumed) {
+            console.info(
+              "Wake trigger dropped after retry: the retry landed inside the deploy debounce; presumed delivered — an earlier attempt's provider-proven fresh generation booted with a replay floor covering it",
+              { agent: agent.pubkey, event: trigger.id },
+            );
+          } else {
+            console.warn(
+              "Wake trigger dropped after retry: the retry landed inside the deploy debounce — a new mention will start fresh",
+              { agent: agent.pubkey, event: trigger.id },
+            );
+          }
           return;
         }
         const held = collapsedTriggersRef.current.get(agentKey) ?? [];
@@ -311,22 +327,23 @@ export function useAgentWakeOnMention(enabled: boolean) {
       reportOutcome(agent, outcome, error, event.pubkey);
 
       // This attempt owned the agent's in-flight claim. Settle the OWNER
-      // and every follower with one uniform matrix. A fresh trigger is
-      // SERVED by exactly one proof: floor coverage on a WOKEN outcome
-      // whose deploy the PROVIDER classified as having started a fresh
-      // generation (isServedByCommittedFloor) — the one chain of evidence
-      // that reaches the trigger itself, because a fresh generation
-      // provably booted from the env carrying the committed floor and its
-      // first REQ replays everything above it. Process liveness never
-      // serves anyone: an already-live verdict and post-deploy heartbeats
-      // both prove a harness runs, not that this channel's REQ was active
-      // when the mention was delivered (REQs queue rate-gated behind
-      // connect), and a strict no-op installs no floor however many beats
-      // follow — so already-live owners and unclassified woken outcomes
-      // RETAIN with the armed timer, like every other ambiguous exit.
-      // Retried triggers are strictly one-shot: their retry attempt's
-      // settlement is terminal — dropped with a warning that says only
-      // what is knowable.
+      // and every follower with one uniform rule: NOTHING the desktop can
+      // observe settles a fresh trigger positively. Even the strongest
+      // deploy-side chain — WOKEN, provider-proven fresh generation,
+      // committed floor covering the trigger — proves only that the fresh
+      // harness BOOTED with the floor: buzz-acp's subscribe enqueues the
+      // channel REQ, which can sit rate-gated or be rejected after
+      // presence publishes, and per-channel readiness is observable only
+      // on the harness/relay side. So every fresh trigger RETAINS with the
+      // armed one-shot timer; that full chain is recorded on the wrapper
+      // as a sticky delivered-PRESUMPTION (isPresumedDeliveredByFloor)
+      // whose only power is downgrading the terminal drop log when the
+      // retry settles. The retry is also the actual recovery: an agent
+      // that died before its REQs drained fails the next attempt's
+      // liveness proof, and the reconcile deploy folds the retained
+      // trigger into a fresh floor. Retried triggers are strictly
+      // one-shot: their retry attempt's settlement is terminal — dropped
+      // with a line that says only what is knowable.
       const held = collapsedTriggersRef.current.get(agentKey) ?? [];
       collapsedTriggersRef.current.delete(agentKey);
       if (signal.aborted || outcome === "cancelled") {
@@ -337,8 +354,8 @@ export function useAgentWakeOnMention(enabled: boolean) {
       }
 
       const provenLive = outcome === "already-live" || outcome === "woken";
-      const floorCovered = (candidate: HeldTrigger) =>
-        isServedByCommittedFloor(
+      const presumedDelivered = (candidate: HeldTrigger) =>
+        isPresumedDeliveredByFloor(
           {
             retriedOnce: candidate.retriedOnce,
             createdAtSecs: candidate.event.created_at,
@@ -350,6 +367,16 @@ export function useAgentWakeOnMention(enabled: boolean) {
           },
         );
       const dropRetried = (candidate: HeldTrigger) => {
+        if (candidate.floorPresumed) {
+          // Some attempt provably booted a fresh generation with a floor
+          // covering this trigger; the only unverifiable link left is the
+          // channel REQ itself. Terminal either way, but not warn-worthy.
+          console.info(
+            "Wake trigger dropped after retry: presumed delivered — a provider-proven fresh generation booted with a replay floor covering it",
+            { agent: agent.pubkey, event: candidate.id },
+          );
+          return;
+        }
         console.warn(
           provenLive
             ? "Wake trigger dropped after retry: agent is live but delivery could not be verified"
@@ -365,19 +392,18 @@ export function useAgentWakeOnMention(enabled: boolean) {
       if (trigger.retriedOnce) {
         // One-shot: this WAS the retry; its settlement is terminal.
         dropRetried(trigger);
-      } else if (floorCovered(trigger)) {
-        // Served: a proven fresh generation replays it from the floor
-        // (the owner's created_at is folded in, so a proven woken deploy
-        // always covers its own owner).
       } else if (outcome === "author-rejected") {
         // Its author is a confirmed agent — never a valid wake trigger.
       } else {
-        // already-live (no proof this channel's delivery landed),
+        // Every other owned exit retains — a fully proven woken deploy
+        // included (the presumption travels on the wrapper), already-live,
         // presence-unavailable, author-unverified, deploy-failed,
-        // wake-unconfirmed, or a woken deploy without the provider's
-        // fresh-generation proof (a strict no-op installed no floor): the
-        // mention is consumed from the seen-set but unserved — retain it
-        // for the armed retry instead of losing it.
+        // wake-unconfirmed, and a woken deploy without the provider's
+        // proof alike: the mention is consumed from the seen-set, so
+        // retention plus the armed retry is the only path that neither
+        // loses it silently nor trusts an unverifiable delivery.
+        trigger.floorPresumed =
+          trigger.floorPresumed || presumedDelivered(trigger);
         retainBack.push(trigger);
       }
 
@@ -387,9 +413,6 @@ export function useAgentWakeOnMention(enabled: boolean) {
           dropRetried(follower);
           continue;
         }
-        if (floorCovered(follower)) {
-          continue; // served by the proven fresh generation's folded floor
-        }
         if (shouldRetryCollapsedTriggers(outcome)) {
           // The owner never proved or spent anything on their behalf —
           // re-drive now, revalidated, oldest first; the first survivor
@@ -397,10 +420,10 @@ export function useAgentWakeOnMention(enabled: boolean) {
           redrive.push(follower);
           continue;
         }
-        // already-live (no proof the follower's channel delivery landed),
-        // woken without the fresh-generation proof or stragglers below
-        // the floor, wake-unconfirmed, deploy-failed: retain for the
-        // armed retry.
+        // Retained like the owner, with the same sticky presumption (a
+        // proven woken deploy folded follower floors in at deploy time).
+        follower.floorPresumed =
+          follower.floorPresumed || presumedDelivered(follower);
         retainBack.push(follower);
       }
 
@@ -445,8 +468,9 @@ export function useAgentWakeOnMention(enabled: boolean) {
   // The active recovery path for retained stragglers: exactly one timer
   // per agent, firing just past the deploy debounce. If the agent has died
   // again by then, the re-driven attempt's deploy folds the stragglers
-  // into its floor; if it is provably live, settlement drops them as
-  // undeliverable (retriedOnce) instead of parking them forever.
+  // into its floor; if it is provably live, settlement drops them
+  // terminally (retriedOnce) — graded by each wrapper's sticky
+  // delivered-presumption — instead of parking them forever.
   const scheduleStrandedRetry = React.useEffectEvent(
     (agent: WakeCandidateAgent, signal: AbortSignal) => {
       const agentKey = normalizePubkey(agent.pubkey);
@@ -502,14 +526,16 @@ export function useAgentWakeOnMention(enabled: boolean) {
         knownAgentAuthors,
       });
       for (const candidate of candidates) {
-        // One wrapper per candidate: retriedOnce is per-agent history and
-        // must not be shared across targets of the same event.
+        // One wrapper per candidate: retriedOnce/floorPresumed are
+        // per-agent history and must not be shared across targets of the
+        // same event.
         void wakeAgent(
           candidate,
           {
             id: event.id,
             event,
             retriedOnce: false,
+            floorPresumed: false,
           },
           signal,
         );

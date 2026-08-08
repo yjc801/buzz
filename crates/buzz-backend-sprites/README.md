@@ -70,6 +70,11 @@ lag) polls rather than risking a double start. The deploy response's
 the running generation booted from this call's env file) or observed a
 generation an earlier deploy started (`false`, the strict no-op — including a
 lost create race, whose winner booted from *its* env, not this call's).
+`true` is additionally fenced by identity: the running probe's `gen` must
+equal the generation this call's start booted, because the deploy lease
+(420s) can expire inside the loop's 600s deadline and a superseded call must
+not vouch for a successor's generation. No probe, no started generation, or
+a mismatch all report `false`.
 
 **At most one live agent.** `flock` on a file the launcher holds open across
 `exec` — the kernel is the arbiter, for exactly the harness's lifetime.

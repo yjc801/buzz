@@ -43,6 +43,7 @@ import {
   type StoredProjectsAgentConversation,
   writeStoredProjectsAgentConversation,
 } from "@/features/projects/lib/projectAgentConversationStorage";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { sendChannelMessage } from "@/shared/api/tauri";
 import type { Channel } from "@/shared/api/types";
@@ -139,6 +140,7 @@ function useAgentCandidates() {
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
   const channelsQuery = useChannelsQuery();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
 
   return React.useMemo(() => {
     const managed = managedAgentsQuery.data ?? [];
@@ -147,19 +149,24 @@ function useAgentCandidates() {
       managed.map((agent) => [normalizePubkey(agent.pubkey), agent]),
     );
     const mentionable = getMentionableAgentPubkeys({
+      activeCommunityRelayUrl,
       currentPubkey: identityQuery.data?.pubkey,
       eligibilityScope: { type: "community" },
-      managedAgentPubkeys: managedByPubkey.keys(),
+      managedAgents: managed,
       relayAgents,
       sharedChannelIds: getSharedChannelIds(channelsQuery.data),
     });
 
-    const candidates: AgentCandidate[] = managed.map((agent) => ({
-      pubkey: normalizePubkey(agent.pubkey),
-      name: agent.name,
-      isManaged: true,
-      isActive: isManagedAgentActive(agent),
-    }));
+    // Managed agents run through the same gate as relay agents — this is a
+    // picker, so identities bound to another community are not offered.
+    const candidates: AgentCandidate[] = managed
+      .filter((agent) => mentionable.has(normalizePubkey(agent.pubkey)))
+      .map((agent) => ({
+        pubkey: normalizePubkey(agent.pubkey),
+        name: agent.name,
+        isManaged: true,
+        isActive: isManagedAgentActive(agent),
+      }));
     for (const agent of relayAgents) {
       const pubkey = normalizePubkey(agent.pubkey);
       if (managedByPubkey.has(pubkey) || !mentionable.has(pubkey)) continue;
@@ -177,6 +184,7 @@ function useAgentCandidates() {
       return left.name.localeCompare(right.name);
     });
   }, [
+    activeCommunityRelayUrl,
     channelsQuery.data,
     identityQuery.data?.pubkey,
     managedAgentsQuery.data,

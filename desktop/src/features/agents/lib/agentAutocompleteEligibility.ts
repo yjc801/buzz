@@ -1,5 +1,6 @@
 import type { Channel, RelayAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { relayUrlsMatch } from "./communityScope";
 
 export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
   return new Set(
@@ -46,22 +47,97 @@ export type AgentEligibilityScope =
   | { type: "channel"; channelId: string }
   | { type: "managed-only" };
 
+/** The fields of a managed-agent record needed to scope it to a community. */
+export type ManagedAgentScopeInput = {
+  pubkey: string;
+  communityRelayUrl?: string | null;
+};
+
+/**
+ * Whether a locally-managed agent record belongs to the community being
+ * viewed.
+ *
+ * Managed agents live in ONE global store shared by every community, so
+ * without this every agent is offered in every community — including several
+ * identically-named identities provisioned separately per community, where
+ * only one has a process here. Picking one of the others yields silence,
+ * because nothing failed: the mention is delivered to a relay whose harness
+ * for that pubkey was never started.
+ *
+ * Signals, in order:
+ *
+ * 1. **Directory presence.** `directoryAgentPubkeys` derives from the active
+ *    relay's kind:10100 agent-profile query, so an entry there means this
+ *    identity has actually run in this community. Community-scoped truth —
+ *    outranks anything stored locally. Dropping this would be a regression:
+ *    an agent *bound* to community A that is registered and running in B
+ *    (which #2122 permits) must stay mentionable in B.
+ * 2. **Unscoped record** (`communityRelayUrl` null/blank): a shared identity,
+ *    offered everywhere.
+ * 3. **Active community unresolved**: fail open — briefly showing too much
+ *    beats an empty picker.
+ * 4. Otherwise: bound record, shown only in its own community.
+ *
+ * This does NOT restrict where an agent may run — spawn resolution ignores
+ * community scope entirely (`effective_agent_relay_url`, "agents-everywhere"
+ * #2122), and relay admission travels with the owner's NIP-OA delegation.
+ * Scope exists to tell same-named identities apart in pickers.
+ *
+ * Scoping rule of thumb for callers: scope *suggestion lists*; never scope
+ * resolution of a pubkey you already have (message history, channel
+ * membership, live runtime) — that would render a name as a raw npub.
+ */
+export function managedAgentBelongsToCommunity({
+  agent,
+  directoryAgentPubkeys,
+  activeCommunityRelayUrl,
+}: {
+  agent: ManagedAgentScopeInput;
+  directoryAgentPubkeys: ReadonlySet<string>;
+  activeCommunityRelayUrl: string | null;
+}) {
+  if (directoryAgentPubkeys.has(normalizePubkey(agent.pubkey))) return true;
+  const bound = agent.communityRelayUrl?.trim();
+  if (!bound) return true;
+  if (!activeCommunityRelayUrl) return true;
+  return relayUrlsMatch(bound, activeCommunityRelayUrl);
+}
+
 export function getMentionableAgentPubkeys({
+  activeCommunityRelayUrl,
   currentPubkey,
   eligibilityScope,
-  managedAgentPubkeys,
+  managedAgents,
   relayAgents,
   sharedChannelIds,
 }: {
+  activeCommunityRelayUrl: string | null;
   currentPubkey?: string | null;
   eligibilityScope: AgentEligibilityScope;
-  managedAgentPubkeys: Iterable<string>;
+  managedAgents: Iterable<ManagedAgentScopeInput>;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
 }) {
-  const pubkeys = new Set(
-    [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
+  // Same source as the eligibility loop below, so directory presence and
+  // mentionability can never disagree (see `shouldHideAgentFromMentions`).
+  const directoryAgentPubkeys = new Set(
+    (relayAgents ?? []).map((agent) => normalizePubkey(agent.pubkey)),
   );
+
+  // Managed agents are scoped BEFORE admission — seeding them unconditionally
+  // is what let records from other communities into every picker.
+  const pubkeys = new Set<string>();
+  for (const agent of managedAgents) {
+    if (
+      managedAgentBelongsToCommunity({
+        agent,
+        directoryAgentPubkeys,
+        activeCommunityRelayUrl,
+      })
+    ) {
+      pubkeys.add(normalizePubkey(agent.pubkey));
+    }
+  }
 
   for (const agent of relayAgents ?? []) {
     const isAllowed =

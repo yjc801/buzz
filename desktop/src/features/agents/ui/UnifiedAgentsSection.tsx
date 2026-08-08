@@ -21,6 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
+import { AgentCommunityScopeBadge } from "./AgentCommunityScopeBadge";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
@@ -32,6 +33,12 @@ type UnifiedAgentsSectionProps = {
   actionErrorMessage: string | null;
   actionNoticeMessage: string | null;
   agents: ManagedAgent[];
+  /**
+   * Instances bound to a different community. Kept reachable behind a
+   * collapsed disclosure — it is the only path to a record whose community
+   * was removed, and where the assign-to-community action lives.
+   */
+  agentsElsewhere: ManagedAgent[];
   agentsError: Error | null;
   isActionPending: boolean;
   isAgentsLoading: boolean;
@@ -77,6 +84,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     actionNoticeMessage,
     defaultModel,
     agents,
+    agentsElsewhere,
     agentsError,
     isActionPending,
     isAgentsLoading,
@@ -108,7 +116,10 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     () => buildUnifiedGroups(personas, agents),
     [personas, agents],
   );
-  const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
+  // Foreign-community instances start collapsed: reachable, not prominent.
+  const [collapsed, setCollapsed] = React.useState<Set<string>>(
+    () => new Set(["__elsewhere__"]),
+  );
   const {
     fileInputRef,
     isDragOver,
@@ -223,6 +234,21 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               defaultModel={defaultModel}
               groupKey="__ungrouped__"
               label="Custom agents"
+              restartingAgentPubkey={restartingAgentPubkey}
+              startingAgentPubkey={startingAgentPubkey}
+              onToggle={toggle}
+              onOpenAgentProfile={onOpenAgentProfile}
+              onRestartAgent={onRestartAgent}
+              onStartAgent={onStartAgent}
+            />
+          ) : null}
+          {agentsElsewhere.length > 0 ? (
+            <CollapsibleAgentGroup
+              agents={agentsElsewhere}
+              collapsed={collapsed}
+              defaultModel={defaultModel}
+              groupKey="__elsewhere__"
+              label="From other communities"
               restartingAgentPubkey={restartingAgentPubkey}
               startingAgentPubkey={startingAgentPubkey}
               onToggle={toggle}
@@ -357,12 +383,15 @@ function AgentPersonaCard({
         onOpenPersonaProfile(persona);
       }}
       statusBadge={
-        agent?.personaOrphaned ? (
-          <Badge className="gap-1" variant="warning">
-            <AlertTriangle className="h-3 w-3" />
-            Configuration missing
-          </Badge>
-        ) : null
+        <>
+          {agent?.personaOrphaned ? (
+            <Badge className="gap-1" variant="warning">
+              <AlertTriangle className="h-3 w-3" />
+              Configuration missing
+            </Badge>
+          ) : null}
+          {agent ? <AgentCommunityScopeBadge agent={agent} /> : null}
+        </>
       }
     />
   );
@@ -437,12 +466,15 @@ function StandaloneAgentCard({
         );
       }}
       statusBadge={
-        agent.personaOrphaned ? (
-          <Badge className="gap-1" variant="warning">
-            <AlertTriangle className="h-3 w-3" />
-            Configuration missing
-          </Badge>
-        ) : null
+        <>
+          {agent.personaOrphaned ? (
+            <Badge className="gap-1" variant="warning">
+              <AlertTriangle className="h-3 w-3" />
+              Configuration missing
+            </Badge>
+          ) : null}
+          <AgentCommunityScopeBadge agent={agent} />
+        </>
       }
     />
   );

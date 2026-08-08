@@ -9,6 +9,7 @@ import {
   useCreatePersonaMutation,
   useDeletePersonaMutation,
   useExportAgentSnapshotMutation,
+  useManagedAgentsQuery,
   usePersonasQuery,
   usePreviewAgentSnapshotImportMutation,
   useConfirmAgentSnapshotImportMutation,
@@ -59,6 +60,7 @@ import {
   type AgentCreateIntent,
 } from "./agentCreateIntent";
 import { resolveManagedAgentAvatarUrl } from "./managedAgentAvatar";
+import { instanceNameTakenInScope } from "../lib/communityScope";
 import {
   buildInstanceInputForDefinition,
   type BackendIntent,
@@ -72,6 +74,8 @@ export function usePersonaActions() {
   const identityQuery = useIdentityQuery();
   const communityId = activeCommunity?.id ?? null;
   const personasQuery = usePersonasQuery();
+  // For the create-time name preflight only (shares the Agents page cache).
+  const managedAgentsQuery = useManagedAgentsQuery();
   const catalogQuery = usePersonaCatalogQuery(communityId);
   usePersonaCatalogLiveUpdates(communityId);
   const setCatalogSharedMutation =
@@ -212,6 +216,26 @@ export function usePersonaActions() {
         if (!runtime) {
           setPersonaErrorMessage(
             "Choose an available provider for this agent.",
+          );
+          return false;
+        }
+
+        // Preflight the per-(community, name) rule before creating anything.
+        // The backend check in `create_managed_agent` is the authority (it
+        // runs under the store lock), but its failure arrives after the
+        // persona was already created and reads as "created, but…" — this
+        // rejects inline instead. Definition-only creates mint no instance,
+        // so they are exempt.
+        if (
+          resolveCreateIntent(intent) !== "definition" &&
+          instanceNameTakenInScope(
+            managedAgentsQuery.data ?? [],
+            input.displayName,
+            activeCommunity?.relayUrl ?? null,
+          )
+        ) {
+          setPersonaErrorMessage(
+            `An agent named "${input.displayName}" already exists in this community. Choose a different name.`,
           );
           return false;
         }

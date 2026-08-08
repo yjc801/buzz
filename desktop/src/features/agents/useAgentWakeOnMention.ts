@@ -11,10 +11,14 @@ import {
 import { mergeKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import {
   createWakeAttemptState,
+  isWakeShapedEvent,
   pushBoundedPendingTrigger,
   runWakeAttempt,
   selectWakeCandidates,
+  shouldRetryCollapsedTriggers,
+  WAKE_COLLAPSED_TRIGGER_LIMIT,
   type WakeCandidateAgent,
+  type WakeOutcome,
 } from "@/features/agents/lib/agentWake";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
 import { subscribeToLiveChannelEvents } from "@/features/channels/liveChannelEventTap";
@@ -125,31 +129,25 @@ export function useAgentWakeOnMention(enabled: boolean) {
     },
   );
 
-  const wakeAgent = React.useEffectEvent(
-    async (
-      agent: WakeCandidateAgent,
-      triggerCreatedAt: number,
-      authorPubkey: string,
-      signal: AbortSignal,
-    ) => {
-      const { outcome, error } = await runWakeAttempt({
-        agent,
-        state: wakeStateRef.current,
-        signal,
-        startManagedAgent: (pubkey) =>
-          startMutation.mutateAsync({
-            pubkey,
-            wakeReplayFloorTs: triggerCreatedAt,
-          }),
-        confirmAuthorNotKnownAgent: () =>
-          confirmAuthorNotKnownAgent(authorPubkey),
-        // Surface the wake when the deploy is accepted, not two minutes
-        // later when convergence settles. runWakeAttempt skips this for
-        // reconcile deploys (status said online without evidence) — the
-        // agent is most likely already up.
-        onDeployed: () => toast.success(`${agent.name} is waking up`),
-      });
+  /// A mention as the wake path needs it: enough to re-drive an attempt
+  /// (replay floor + author) and to deduplicate (id).
+  type WakeTrigger = { id: string; created_at: number; pubkey: string };
 
+  // Triggers that arrived for an agent while another attempt held its
+  // in-flight claim. The owner does not cover every exit: an author veto or
+  // a failed presence lookup ends with no deploy and no liveness, and the
+  // collapsed mention is already committed to the seen-set — without
+  // retention it would be silently lost. Bounded per agent, retried when
+  // the owner exits uncovered (see shouldRetryCollapsedTriggers).
+  const collapsedTriggersRef = React.useRef(new Map<string, WakeTrigger[]>());
+
+  const reportOutcome = React.useEffectEvent(
+    (
+      agent: WakeCandidateAgent,
+      outcome: WakeOutcome,
+      error: unknown,
+      authorPubkey: string,
+    ) => {
       // Only a wake the user did not ask for is worth interrupting them
       // about; the quiet outcomes are the common ones (any mention of a
       // healthy agent lands here) and must stay silent. Failures are NEVER
@@ -193,6 +191,65 @@ export function useAgentWakeOnMention(enabled: boolean) {
     },
   );
 
+  const wakeAgent = React.useEffectEvent(
+    async (
+      agent: WakeCandidateAgent,
+      trigger: WakeTrigger,
+      signal: AbortSignal,
+    ) => {
+      const agentKey = normalizePubkey(agent.pubkey);
+      const { outcome, error } = await runWakeAttempt({
+        agent,
+        state: wakeStateRef.current,
+        signal,
+        startManagedAgent: (pubkey) =>
+          startMutation.mutateAsync({
+            pubkey,
+            wakeReplayFloorTs: trigger.created_at,
+          }),
+        confirmAuthorNotKnownAgent: () =>
+          confirmAuthorNotKnownAgent(trigger.pubkey),
+        // Surface the wake when the deploy is accepted, not two minutes
+        // later when convergence settles. runWakeAttempt skips this for
+        // reconcile deploys (status said online without evidence) — the
+        // agent is most likely already up.
+        onDeployed: () => toast.success(`${agent.name} is waking up`),
+      });
+
+      if (outcome === "in-flight") {
+        // Another attempt owns this agent. Its exit may not cover this
+        // mention (author veto, unavailable presence) — retain it for
+        // retry; the owner's completion decides.
+        const held = collapsedTriggersRef.current.get(agentKey) ?? [];
+        pushBoundedPendingTrigger(held, trigger, WAKE_COLLAPSED_TRIGGER_LIMIT);
+        collapsedTriggersRef.current.set(agentKey, held);
+        return;
+      }
+
+      reportOutcome(agent, outcome, error, trigger.pubkey);
+
+      // This attempt owned the agent's in-flight claim; settle whatever
+      // collapsed behind it. Covered or terminal outcomes clear the list;
+      // uncovered exits re-drive the held triggers, oldest first (its
+      // earlier floor covers the later ones if a deploy results). A retried
+      // trigger that collapses again behind a new owner is simply retained
+      // again, and no retry re-runs a trigger the map no longer holds — the
+      // recursion terminates.
+      const held = collapsedTriggersRef.current.get(agentKey);
+      collapsedTriggersRef.current.delete(agentKey);
+      if (
+        held !== undefined &&
+        held.length > 0 &&
+        shouldRetryCollapsedTriggers(outcome) &&
+        !signal.aborted
+      ) {
+        for (const heldTrigger of held) {
+          void wakeAgent(agent, heldTrigger, signal);
+        }
+      }
+    },
+  );
+
   // Triggers delivered before the wake prerequisites resolve. The tap is a
   // memoryless fan-out — no history, no guaranteed redelivery — so an
   // unevaluable event must be HELD (boundedly), not declined: a one-shot
@@ -221,7 +278,11 @@ export function useAgentWakeOnMention(enabled: boolean) {
         knownAgentAuthors,
       });
       for (const candidate of candidates) {
-        void wakeAgent(candidate, event.created_at, event.pubkey, signal);
+        void wakeAgent(
+          candidate,
+          { id: event.id, created_at: event.created_at, pubkey: event.pubkey },
+          signal,
+        );
       }
     },
   );
@@ -233,7 +294,12 @@ export function useAgentWakeOnMention(enabled: boolean) {
         accessOwnerOnly === undefined ||
         ownerPubkey.length === 0
       ) {
-        pushBoundedPendingTrigger(pendingTriggersRef.current, event);
+        // Only wake-shaped events may consume buffer slots: the broad tap
+        // also carries reactions/edits/system traffic, and 64 of those
+        // would evict a real mention the tap can never replay.
+        if (isWakeShapedEvent(event, managedAgents)) {
+          pushBoundedPendingTrigger(pendingTriggersRef.current, event);
+        }
         return;
       }
       evaluateEvent(event, signal);

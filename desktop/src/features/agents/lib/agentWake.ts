@@ -55,6 +55,10 @@ export const WAKE_EVIDENCE_MIN_SPACING_MS = 30_000;
 /// be held, not dropped — but only boundedly.
 export const WAKE_PENDING_TRIGGER_LIMIT = 64;
 
+/// Bound on triggers retained per agent behind an in-flight attempt, for
+/// retry if the owning attempt exits without covering them.
+export const WAKE_COLLAPSED_TRIGGER_LIMIT = 16;
+
 /// Only human-visible message kinds may wake an agent. The live-channel tap
 /// delivers every channel event, and reactions/edits/deletions p-tag the
 /// original author — an owner reacting to an agent's old message must not
@@ -252,8 +256,61 @@ export function createLiveEvidenceTracker(
   };
 }
 
+/// Could this event possibly be a wake trigger?
+///
+/// The cheap shape filter that guards the bounded pending buffer: the broad
+/// tap also delivers reactions, edits, deletions, and system/huddle traffic,
+/// and letting those consume buffer slots would evict a real mention (the
+/// tap has no replay to recover it). Requires a wake-trigger kind and an
+/// agent p-tag. While the managed set is still loading (`agents`
+/// undefined), ANY p-tag qualifies — the whole point of buffering is that
+/// the sets needed for a precise answer have not resolved yet; once the
+/// managed records exist, only events addressing a provider agent qualify.
+export function isWakeShapedEvent(
+  event: AddressingEvent,
+  agents: readonly WakeCandidateAgent[] | undefined,
+): boolean {
+  if (!WAKE_TRIGGER_KINDS.has(event.kind)) {
+    return false;
+  }
+  if (agents === undefined) {
+    return event.tags.some(
+      (tag) => tag[0] === "p" && (tag[1] ?? "").length > 0,
+    );
+  }
+  return agents.some(
+    (agent) =>
+      agent.backend.type === "provider" &&
+      eventAddressesAgent(event, agent.pubkey),
+  );
+}
+
+/// Should triggers that collapsed behind an owning attempt (its `in-flight`
+/// verdict) be retried when that attempt ends with `outcome`?
+///
+/// A collapsed trigger is covered when the owner produced positive liveness
+/// (`already-live`: the live agent received the later mention itself) or a
+/// deploy whose replay floor predates it (`woken`, and `wake-unconfirmed` —
+/// the deploy happened with a floor at the OWNER's earlier trigger, so a
+/// late-booting harness still replays the collapsed mention; the released
+/// debounce covers the never-boots case). `deploy-failed` is deliberately
+/// not retried: the held debounce is the anti-hammer policy and a retry
+/// would just be refused again. `cancelled` means the effect generation
+/// unmounted — everything dies with it. What remains uncovered are the
+/// exits that neither proved liveness nor deployed: an author veto or an
+/// unavailable presence lookup, where a legitimate collapsed mention would
+/// otherwise be silently lost to the seen-set.
+export function shouldRetryCollapsedTriggers(outcome: WakeOutcome): boolean {
+  return (
+    outcome === "author-rejected" ||
+    outcome === "author-unverified" ||
+    outcome === "presence-unavailable"
+  );
+}
+
 /// Buffer a trigger that cannot be evaluated yet (wake prerequisites still
-/// resolving at startup). Deduplicates by event id (the tap can deliver the
+/// resolving at startup), or retained behind an in-flight attempt.
+/// Deduplicates by event id (the tap can deliver the
 /// same event via both the broad and mention subscriptions) and drops the
 /// OLDEST beyond the bound — the newest mentions are the most actionable,
 /// and the tap has no history replay to recover anything dropped.

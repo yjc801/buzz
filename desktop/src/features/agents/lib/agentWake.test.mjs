@@ -13,9 +13,11 @@ import {
   createWakeAttemptState,
   eventAddressesAgent,
   isWakeAttemptDebounced,
+  isWakeShapedEvent,
   pushBoundedPendingTrigger,
   runWakeAttempt,
   selectWakeCandidates,
+  shouldRetryCollapsedTriggers,
   shouldWakeAgent,
   WAKE_ATTEMPT_DEBOUNCE_MS,
   WAKE_LIVE_EVIDENCE_POLL_MS,
@@ -876,6 +878,59 @@ test("an abort while the deploy settles suppresses its outcome", async () => {
   });
   const failure = await runWakeAttempt({ agent: agent(), ...failureHarness });
   assert.equal(failure.outcome, "cancelled");
+});
+
+test("only wake-shaped events qualify for the pending buffer", () => {
+  const provider = agent();
+  const local = agent({ pubkey: OTHER_AGENT, backend: { type: "local" } });
+
+  // With the managed set resolved: only a wake-trigger kind addressing a
+  // provider agent qualifies.
+  assert.equal(isWakeShapedEvent(mention(), [provider, local]), true);
+  assert.equal(
+    isWakeShapedEvent(mention({ kind: KIND_REACTION }), [provider]),
+    false,
+  );
+  assert.equal(isWakeShapedEvent(mention({ targets: [] }), [provider]), false);
+  // Addressing only a local agent is not wake-shaped.
+  assert.equal(
+    isWakeShapedEvent(mention({ targets: [OTHER_AGENT] }), [provider, local]),
+    false,
+  );
+  // Unrelated p-tag with no matching provider agent: not wake-shaped.
+  assert.equal(
+    isWakeShapedEvent(mention({ targets: [STRANGER] }), [provider]),
+    false,
+  );
+
+  // While the managed set is still loading, any p-tagged trigger-kind
+  // event qualifies — precision requires the very sets that are missing.
+  assert.equal(
+    isWakeShapedEvent(mention({ targets: [STRANGER] }), undefined),
+    true,
+  );
+  assert.equal(
+    isWakeShapedEvent(mention({ kind: KIND_REACTION }), undefined),
+    false,
+  );
+  assert.equal(isWakeShapedEvent(mention({ targets: [] }), undefined), false);
+});
+
+test("collapsed triggers retry only after uncovered exits", () => {
+  // Uncovered: no liveness proven, no deploy spent — the collapsed mention
+  // would otherwise be lost to the seen-set.
+  assert.equal(shouldRetryCollapsedTriggers("author-rejected"), true);
+  assert.equal(shouldRetryCollapsedTriggers("author-unverified"), true);
+  assert.equal(shouldRetryCollapsedTriggers("presence-unavailable"), true);
+  // Covered by liveness or by the owner's earlier replay floor.
+  assert.equal(shouldRetryCollapsedTriggers("already-live"), false);
+  assert.equal(shouldRetryCollapsedTriggers("woken"), false);
+  assert.equal(shouldRetryCollapsedTriggers("wake-unconfirmed"), false);
+  // Terminal by policy (anti-hammer debounce) or by lifecycle.
+  assert.equal(shouldRetryCollapsedTriggers("deploy-failed"), false);
+  assert.equal(shouldRetryCollapsedTriggers("cancelled"), false);
+  assert.equal(shouldRetryCollapsedTriggers("debounced"), false);
+  assert.equal(shouldRetryCollapsedTriggers("in-flight"), false);
 });
 
 test("pending triggers are bounded and deduplicated", () => {

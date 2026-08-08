@@ -46,18 +46,16 @@ export function recordPresenceHeartbeat(
 }
 
 /**
- * Milliseconds since a live heartbeat was last observed for `pubkey`, or
- * `undefined` when none has been observed (unknown, NOT offline).
+ * Local `Date.now()` time at which a live heartbeat was last observed for
+ * `pubkey`, or `undefined` when none has been observed (unknown, NOT
+ * offline). A raw timestamp rather than an age, because consumers fence on
+ * "observed AFTER moment X" — a heartbeat that predates the moment a wake
+ * attempt began proves nothing about the harness surviving until now.
  */
-export function lastLiveHeartbeatAgeMs(
+export function lastLiveHeartbeatObservedAtMs(
   pubkey: string,
-  nowMs: number = Date.now(),
 ): number | undefined {
-  const observedAt = lastLiveHeartbeatAtMs.get(normalizePubkey(pubkey));
-  if (observedAt === undefined) {
-    return undefined;
-  }
-  return Math.max(0, nowMs - observedAt);
+  return lastLiveHeartbeatAtMs.get(normalizePubkey(pubkey));
 }
 
 export function resetPresenceHeartbeatLog() {

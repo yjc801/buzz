@@ -1,4 +1,4 @@
-import { lastLiveHeartbeatAgeMs } from "@/features/presence/presenceHeartbeatLog";
+import { lastLiveHeartbeatObservedAtMs } from "@/features/presence/presenceHeartbeatLog";
 import { getPresence } from "@/shared/api/tauri";
 import type {
   ManagedAgent,
@@ -23,28 +23,23 @@ import {
 /// be wider than a cold start rather than merely debouncing a double-send.
 export const WAKE_ATTEMPT_DEBOUNCE_MS = 120_000;
 
-/// How long a live-looking harness gets to publish offline before "online" is
-/// believed. Presence is not a generation fence: a harness whose main loop has
-/// already chosen shutdown still reports online until its offline publish
-/// (bounded at ~2s) lands. One sample inside that race would skip the wake and
-/// strand the mention; a second sample after this delay sees the truth.
-export const WAKE_LIVE_RECHECK_DELAY_MS = 10_000;
-
 /// Post-deploy convergence: how long, and how often, to look for the fresh
-/// generation's presence before declaring the wake unconfirmed. Sized to the
+/// generation's heartbeat before declaring the wake unconfirmed. Sized to the
 /// same cold-start bound as the debounce window.
 export const WAKE_CONFIRM_POLL_MS = 5_000;
 export const WAKE_CONFIRM_ATTEMPTS = 24; // × WAKE_CONFIRM_POLL_MS = 120s
 
-/// How recently a live heartbeat must have been OBSERVED for an "online"
-/// status to count as a live harness. The store keeps a crashed harness's
-/// last "online" for the full presence TTL (180s) — status alone cannot tell
-/// crashed from running, no matter how many samples agree. A running harness
-/// republishes its heartbeat every 60s over live fan-out; 1.5 heartbeat
-/// intervals tolerates one delayed delivery. An older or absent observation
-/// means freshness is UNKNOWN — the wake path then reconciles through the
-/// idempotent deploy instead of trusting the store.
-export const WAKE_PRESENCE_FRESH_MS = 90_000;
+/// How long an "online" status gets to prove itself with a live heartbeat
+/// OBSERVED after the wake attempt began. A heartbeat from before the
+/// attempt proves nothing — the harness can crash one second after
+/// publishing it, and the store keeps its last "online" for the full
+/// presence TTL (180s), so any number of status samples and any pre-attempt
+/// observation agree while the agent is dead. A running harness republishes
+/// its heartbeat every 60s over live fan-out; one interval plus delivery
+/// margin bounds the wait. No post-attempt evidence inside the window →
+/// reconcile through the idempotent deploy instead of trusting the store.
+export const WAKE_LIVE_EVIDENCE_POLL_MS = 5_000;
+export const WAKE_LIVE_EVIDENCE_ATTEMPTS = 15; // × POLL = 75s > 60s heartbeat
 
 /// Only human-visible message kinds may wake an agent. The live-channel tap
 /// delivers every channel event, and reactions/edits/deletions p-tag the
@@ -203,27 +198,17 @@ export function shouldWakeAgent(
   return !isManagedAgentLive(agent, presence);
 }
 
-/// Is this presence sample proof of a live harness RIGHT NOW?
+/// Is this heartbeat observation proof of a harness alive since `sinceMs`?
 ///
-/// Status alone is not: a crashed harness cannot publish offline, so its
-/// last "online" survives in the store for the presence TTL and every
-/// status-only sample inside that window agrees. Proof requires a live
-/// heartbeat OBSERVED recently (see `WAKE_PRESENCE_FRESH_MS`); an absent or
-/// old observation means freshness is unknown and the caller must reconcile
-/// through the idempotent deploy instead of skipping the wake.
-export function isConfirmedLivePresence(
-  agent: Pick<WakeCandidateAgent, "status" | "backend">,
-  presence: PresenceStatus | null | undefined,
-  heartbeatAge: number | undefined,
+/// The only accepted liveness evidence: a live heartbeat OBSERVED at or
+/// after the fence moment. Status samples and pre-fence observations are
+/// both survivable by a crashed harness (store TTL, heartbeat-then-crash)
+/// and prove nothing.
+export function isLiveEvidenceSince(
+  observedAtMs: number | undefined,
+  sinceMs: number,
 ) {
-  if (agent.backend.type !== "provider") {
-    return false;
-  }
-  return (
-    isManagedAgentLive(agent, presence) &&
-    heartbeatAge !== undefined &&
-    heartbeatAge <= WAKE_PRESENCE_FRESH_MS
-  );
+  return observedAtMs !== undefined && observedAtMs >= sinceMs;
 }
 
 /// Has this agent been woken recently enough that another attempt is noise?
@@ -244,9 +229,12 @@ export function isWakeAttemptDebounced(
 /// Why a wake attempt ended. Every arm is a normal outcome except
 /// `deploy-failed` and `wake-unconfirmed` — "the agent was already up" is the
 /// common case, not an error, because any mention of a healthy agent reaches
-/// this path. `wake-unconfirmed` means the deploy was accepted but no fresh
-/// presence ever appeared; the attempt has already released its debounce so
-/// the next mention can retry.
+/// this path. `wake-unconfirmed` means the deploy was accepted but no
+/// post-attempt heartbeat ever appeared; the attempt has already released
+/// its debounce so the next mention can retry. `author-rejected` /
+/// `author-unverified` come from the pre-deploy author re-validation: the
+/// fresh known-agent fetch identified the author as an agent, or could not
+/// be completed — neither spends a deploy, and neither stamps the debounce.
 export type WakeOutcome =
   | "woken"
   | "already-live"
@@ -254,7 +242,9 @@ export type WakeOutcome =
   | "in-flight"
   | "presence-unavailable"
   | "deploy-failed"
-  | "wake-unconfirmed";
+  | "wake-unconfirmed"
+  | "author-rejected"
+  | "author-unverified";
 
 /// Per-agent bookkeeping shared across attempts. Lives in the caller (a ref
 /// in the hook) so it survives re-renders without making this module stateful.
@@ -276,45 +266,57 @@ const waitMs = (ms: number) =>
 /// double-firing on a burst, deploying on a relay hiccup, deploying an agent
 /// that is already up — and none of them are reachable from a render test.
 ///
-/// Presence status is never trusted as a generation fence. A harness that is
-/// already exiting can still say "online" (a confirmed-live verdict must
-/// survive a recheck), a CRASHED harness's last "online" survives in the
-/// store for the presence TTL so any number of status samples agree
-/// (liveness additionally requires a recently observed heartbeat — without
-/// one the attempt deploys anyway, `reconcile`-style, because deploy is a
-/// strict no-op against a genuinely live agent), the old process outlives
-/// its offline publish by the relay teardown bound (the attempt waits out
-/// the same post-offline grace the restart path uses), and a deploy return
-/// proves nothing about the new generation (the attempt polls for a
-/// confirmed-live sample and releases its debounce if none appears, so the
-/// next mention can retry instead of being suppressed for two minutes while
-/// the agent stays dead).
+/// The ONLY accepted proof of a live harness is a heartbeat OBSERVED after
+/// this attempt began. Status is never trusted: a crashed harness's last
+/// "online" survives in the store for the presence TTL, and a heartbeat
+/// observed BEFORE the mention proves nothing (the harness can crash one
+/// second after publishing it). So a live-claiming status gets one heartbeat
+/// interval to produce post-attempt evidence; silence means the claim is
+/// unverifiable and the attempt deploys anyway (`reconcile`) — a strict
+/// no-op against a genuinely live agent, the wake against a crashed one. A
+/// dead status waits out the same post-offline teardown fence the restart
+/// path uses before deploying. Convergence applies the same evidence rule:
+/// only a post-attempt heartbeat completes a wake; otherwise the attempt
+/// releases its debounce so the next mention can retry.
 ///
-/// `reconcile: true` on the result marks an attempt whose pre-deploy sample
-/// still claimed "online": the deploy is reconciliation against possibly
-/// stale state, so `onDeployed` (the "waking up" surface) deliberately does
-/// not fire and an unconfirmed outcome is not worth an error toast.
+/// Immediately before spending the deploy, the author is re-validated
+/// through `confirmAuthorNotKnownAgent` (a FRESH known-agent fetch): the
+/// synchronous baseline the caller filtered with can be minutes stale, and
+/// a newly registered agent on another desktop must not be able to wake
+/// this one through that window. Rejection and lookup failure both refuse
+/// without stamping the debounce.
+///
+/// `reconcile: true` marks an attempt whose pre-deploy status still claimed
+/// "online": the deploy is reconciliation against possibly stale state, so
+/// `onDeployed` (the "waking up" surface) deliberately does not fire.
+/// Failures are NOT suppressed on that flag — reconcile also covers the
+/// dead-agent case, and staying quiet there would silently lose the mention.
 export async function runWakeAttempt({
   agent,
   state,
   startManagedAgent,
   onDeployed,
+  confirmAuthorNotKnownAgent,
   fetchPresence = getPresence,
-  heartbeatAgeMs = lastLiveHeartbeatAgeMs,
+  heartbeatObservedAtMs = lastLiveHeartbeatObservedAtMs,
   now = Date.now,
   delay = waitMs,
 }: {
   agent: WakeCandidateAgent;
   state: WakeAttemptState;
   startManagedAgent: (pubkey: string) => Promise<unknown>;
-  /** Fires the moment a NON-reconcile deploy is accepted, before presence
+  /** Fires the moment a NON-reconcile deploy is accepted, before
    * convergence — the "waking up" surface belongs here, not on the final
    * outcome. */
   onDeployed?: () => void;
+  /** Authoritative pre-deploy author re-validation. Resolve `true` when the
+   * author is confirmed NOT to be a known agent; `false` or a rejection
+   * refuses the deploy. */
+  confirmAuthorNotKnownAgent?: () => Promise<boolean>;
   /** Injectable for tests; production always uses the real relay call. */
   fetchPresence?: (pubkeys: string[]) => Promise<PresenceLookup>;
   /** Injectable for tests; production reads the live heartbeat log. */
-  heartbeatAgeMs?: (pubkey: string, nowMs?: number) => number | undefined;
+  heartbeatObservedAtMs?: (pubkey: string) => number | undefined;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
 }): Promise<{ outcome: WakeOutcome; reconcile?: boolean; error?: unknown }> {
@@ -327,7 +329,8 @@ export async function runWakeAttempt({
   if (state.inFlight.has(key)) {
     return { outcome: "in-flight" };
   }
-  if (isWakeAttemptDebounced(state.lastAttemptAt.get(key), now())) {
+  const attemptStartedAt = now();
+  if (isWakeAttemptDebounced(state.lastAttemptAt.get(key), attemptStartedAt)) {
     return { outcome: "debounced" };
   }
   state.inFlight.add(key);
@@ -338,12 +341,9 @@ export async function runWakeAttempt({
   // means the harness is gone; treating an outage as death would deploy on
   // every relay hiccup.
   const samplePresence = async () => (await fetchPresence([agent.pubkey]))[key];
-  const confirmedLive = (presence: PresenceStatus | null | undefined) =>
-    isConfirmedLivePresence(
-      agent,
-      presence,
-      heartbeatAgeMs(agent.pubkey, now()),
-    );
+  const observedAt = () => heartbeatObservedAtMs(agent.pubkey);
+  const postAttemptEvidence = () =>
+    isLiveEvidenceSince(observedAt(), attemptStartedAt);
 
   try {
     let presence: PresenceStatus | null | undefined;
@@ -353,42 +353,76 @@ export async function runWakeAttempt({
       return { outcome: "presence-unavailable", error };
     }
 
-    if (confirmedLive(presence)) {
-      // Even a heartbeat-fresh "online" may be a harness that has already
-      // chosen shutdown and not yet published offline. Believe it only if
-      // it survives a recheck.
-      await delay(WAKE_LIVE_RECHECK_DELAY_MS);
-      try {
-        presence = await samplePresence();
-      } catch (error) {
-        return { outcome: "presence-unavailable", error };
+    let reconcile = false;
+    if (isManagedAgentLive(agent, presence)) {
+      // Status claims live. Give the harness one heartbeat interval to
+      // prove it with a post-attempt observation. An offline heartbeat
+      // arriving meanwhile clears the log entry — that is the harness
+      // announcing its exit, and routes to the dead path below.
+      const hadEntryAtStart = observedAt() !== undefined;
+      let announcedExit = false;
+      for (
+        let attempt = 0;
+        attempt < WAKE_LIVE_EVIDENCE_ATTEMPTS;
+        attempt += 1
+      ) {
+        if (postAttemptEvidence()) {
+          return { outcome: "already-live" };
+        }
+        if (hadEntryAtStart && observedAt() === undefined) {
+          announcedExit = true;
+          break;
+        }
+        await delay(WAKE_LIVE_EVIDENCE_POLL_MS);
       }
-      if (confirmedLive(presence)) {
+      if (postAttemptEvidence()) {
         return { outcome: "already-live" };
       }
+      if (hadEntryAtStart && observedAt() === undefined) {
+        announcedExit = true;
+      }
+      // No evidence: the "online" is unverifiable (crashed harness, or one
+      // whose heartbeats do not reach us) → reconcile through the deploy.
+      // An announced exit is a real death and takes the fenced dead path.
+      reconcile = !announcedExit;
     }
 
-    // Not confirmed live: either a dead status, or an "online" with no
-    // recently observed heartbeat — which a crashed harness produces for the
-    // full presence TTL. The latter deploys anyway (reconcile): against a
-    // genuinely live agent the deploy is a strict no-op, against a crashed
-    // one it is the wake, and status alone cannot tell the two apart.
-    let reconcile = isManagedAgentLive(agent, presence);
     if (!reconcile) {
-      // The old process can outlive its offline publish by the relay's
-      // graceful teardown. Wait out the same fence the restart path uses,
-      // then look once more: if something is confirmed live now (the
-      // recheck race, or another client's deploy), there is nothing to do.
+      // Dead status (or an observed exit). The old process can outlive its
+      // offline publish by the relay's graceful teardown — deploying inside
+      // that window strict-no-ops against the dying process. Wait out the
+      // same fence the restart path uses, then look once more: a fresh
+      // generation appearing meanwhile (another client's deploy) shows up
+      // as post-attempt evidence.
       await delay(REMOTE_POST_OFFLINE_GRACE_MS);
       try {
         presence = await samplePresence();
       } catch (error) {
         return { outcome: "presence-unavailable", error };
       }
-      if (confirmedLive(presence)) {
+      if (postAttemptEvidence()) {
         return { outcome: "already-live" };
       }
+      // Status resurfacing live without evidence is the unverifiable case
+      // again — deploy, but as reconciliation.
       reconcile = isManagedAgentLive(agent, presence);
+    }
+
+    // Last gate before spending money: re-validate the author against a
+    // FRESH known-agent set. The caller's synchronous baseline polls slowly
+    // (and pauses backgrounded), so a newly registered remote agent could
+    // have slipped past it. No stamp on refusal — a legitimate mention
+    // right after must not find the window closed.
+    if (confirmAuthorNotKnownAgent) {
+      let authorConfirmedHuman: boolean;
+      try {
+        authorConfirmedHuman = await confirmAuthorNotKnownAgent();
+      } catch (error) {
+        return { outcome: "author-unverified", reconcile, error };
+      }
+      if (!authorConfirmedHuman) {
+        return { outcome: "author-rejected", reconcile };
+      }
     }
 
     // Stamp before the deploy, not after: the attempt is what the debounce
@@ -406,25 +440,20 @@ export async function runWakeAttempt({
       onDeployed?.();
     }
 
-    // Converge on a confirmed-live generation. A deploy return alone can be
-    // a strict no-op against a process that was still dying, and a stale
-    // "online" satisfies a status check without a harness behind it — only a
-    // freshly observed heartbeat proves one is actually up.
+    // Converge on post-attempt evidence. A deploy return alone can be a
+    // strict no-op against a process that was still dying, and a stale
+    // "online" satisfies any status check without a harness behind it —
+    // only a heartbeat observed after this attempt began proves one is
+    // actually up (a woken harness publishes presence at startup; a
+    // genuinely live one heartbeats within the interval).
     for (let attempt = 0; attempt < WAKE_CONFIRM_ATTEMPTS; attempt += 1) {
       await delay(WAKE_CONFIRM_POLL_MS);
-      try {
-        presence = await samplePresence();
-      } catch {
-        // A transient lookup failure mid-convergence is not a verdict;
-        // keep watching until the window closes.
-        continue;
-      }
-      if (confirmedLive(presence)) {
+      if (postAttemptEvidence()) {
         return { outcome: "woken", reconcile };
       }
     }
 
-    // No confirmed-live generation appeared. Release our own stamp (and only
+    // No post-attempt evidence appeared. Release our own stamp (and only
     // ours — a concurrent future attempt may have re-stamped) so the next
     // mention retries instead of being debounced against a dead agent.
     if (state.lastAttemptAt.get(key) === stampedAt) {

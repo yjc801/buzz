@@ -1,7 +1,9 @@
 import * as React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
+  relayAgentsQueryKey,
   useManagedAgentsQuery,
   useRelayAgentsQuery,
   useStartManagedAgentMutation,
@@ -17,7 +19,9 @@ import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOw
 import { subscribeToLiveChannelEvents } from "@/features/channels/liveChannelEventTap";
 import { trackSeenEvent } from "@/features/channels/useLiveChannelUpdates";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { listRelayAgents } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 
 /// The tap re-delivers events (mention-filter overlap, reconnect replay).
 /// Bound the seen-set the way the channel path does.
@@ -77,6 +81,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
   // clamps to owner-only — the safe answer under every real policy.
   const accessOwnerOnlyQuery = useAgentAccessOwnerOnlyQuery();
   const startMutation = useStartManagedAgentMutation();
+  const queryClient = useQueryClient();
 
   const ownerPubkey = identityQuery.data?.pubkey ?? "";
   const managedAgents = managedAgentsQuery.data;
@@ -97,9 +102,35 @@ export function useAgentWakeOnMention(enabled: boolean) {
   const seenEventIdsRef = React.useRef<Set<string>>(new Set());
   const wakeStateRef = React.useRef(createWakeAttemptState());
 
+  // Authoritative author re-check, run by runWakeAttempt immediately before
+  // any deploy. The render-time baseline above is a poll (kind:10100 has no
+  // event invalidation, five-minute interval, paused while backgrounded),
+  // so a newly registered agent on another desktop can be missing from it
+  // for minutes — long enough to reopen the cross-desktop wake loop. This
+  // forces a fresh relay-agents fetch (staleTime 0; deduped and written
+  // back into the shared cache) and re-derives the baseline at deploy time.
+  const confirmAuthorNotKnownAgent = React.useEffectEvent(
+    async (authorPubkey: string) => {
+      const freshRelayAgents = await queryClient.fetchQuery({
+        queryKey: relayAgentsQueryKey,
+        queryFn: listRelayAgents,
+        staleTime: 0,
+      });
+      const baseline = mergeKnownAgentPubkeys(
+        managedAgents ?? [],
+        freshRelayAgents,
+      );
+      return !baseline.has(normalizePubkey(authorPubkey));
+    },
+  );
+
   const wakeAgent = React.useEffectEvent(
-    async (agent: WakeCandidateAgent, triggerCreatedAt: number) => {
-      const { outcome, reconcile, error } = await runWakeAttempt({
+    async (
+      agent: WakeCandidateAgent,
+      triggerCreatedAt: number,
+      authorPubkey: string,
+    ) => {
+      const { outcome, error } = await runWakeAttempt({
         agent,
         state: wakeStateRef.current,
         startManagedAgent: (pubkey) =>
@@ -107,44 +138,51 @@ export function useAgentWakeOnMention(enabled: boolean) {
             pubkey,
             wakeReplayFloorTs: triggerCreatedAt,
           }),
+        confirmAuthorNotKnownAgent: () =>
+          confirmAuthorNotKnownAgent(authorPubkey),
         // Surface the wake when the deploy is accepted, not two minutes
-        // later when presence convergence settles. runWakeAttempt skips
-        // this for reconcile deploys (status said online, freshness
-        // unknown) — the agent is most likely already up.
+        // later when convergence settles. runWakeAttempt skips this for
+        // reconcile deploys (status said online without evidence) — the
+        // agent is most likely already up.
         onDeployed: () => toast.success(`${agent.name} is waking up`),
       });
 
       // Only a wake the user did not ask for is worth interrupting them
       // about; the quiet outcomes are the common ones (any mention of a
-      // healthy agent lands here) and must stay silent. A reconcile
-      // attempt stays quiet even when unconfirmed: its pre-deploy sample
-      // said online, so "never came online" would usually be a false alarm
-      // against a healthy agent whose heartbeat we simply have not seen.
+      // healthy agent lands here) and must stay silent. Failures are NEVER
+      // quiet — `reconcile` also covers the dead-agent case (stale
+      // "online"), and suppressing there would silently lose the mention.
+      // Quiet requires positive liveness evidence, which only the
+      // already-live and woken outcomes carry.
       if (outcome === "deploy-failed") {
         console.error("Wake deploy failed", error);
-        if (!reconcile) {
-          toast.error(
-            `Could not wake ${agent.name}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
+        toast.error(
+          `Could not wake ${agent.name}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
         return;
       }
       if (outcome === "wake-unconfirmed") {
-        console.warn("Wake deploy never confirmed a live harness", {
+        console.warn("Wake deploy never produced liveness evidence", {
           pubkey: agent.pubkey,
-          reconcile,
         });
-        if (!reconcile) {
-          toast.error(
-            `${agent.name} was deployed but never came online — mention it again to retry`,
-          );
-        }
+        toast.error(
+          `${agent.name} was deployed but never came online — mention it again to retry`,
+        );
         return;
       }
       if (outcome === "presence-unavailable") {
         console.warn("Wake skipped: presence lookup failed", error);
+        return;
+      }
+      if (outcome === "author-rejected") {
+        // Working as intended — an agent-authored mention must not wake.
+        console.warn("Wake refused: author is a known agent", authorPubkey);
+        return;
+      }
+      if (outcome === "author-unverified") {
+        console.warn("Wake refused: author could not be verified", error);
       }
     },
   );
@@ -161,7 +199,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
       knownAgentAuthors,
     });
     for (const candidate of candidates) {
-      void wakeAgent(candidate, event.created_at);
+      void wakeAgent(candidate, event.created_at, event.pubkey);
     }
   });
 

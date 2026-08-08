@@ -17,7 +17,6 @@ import {
   filterCachedAgentSuggestions,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentIdentityInAllowedList,
   isAgentMentionChannelType,
   shouldHideAgentFromMentions,
   uniqueAutocompleteLabels,
@@ -255,9 +254,10 @@ export function useMentions(
       if (isArchivedDiscovery(pubkey)) {
         return;
       }
-      if (!isAgentIdentityInAllowedList(candidate, mentionableAgentPubkeys)) {
-        return;
-      }
+      // Agents are gated ONLY by shouldHideAgentFromMentions. Adding
+      // `isAgentIdentityInAllowedList` here (as this once did) makes its
+      // member branch unreachable and hides every channel-member agent
+      // with no kind:10100 entry — see its disagreement test.
       if (
         shouldHideAgentFromMentions({
           isAgent: candidate.isAgent === true,

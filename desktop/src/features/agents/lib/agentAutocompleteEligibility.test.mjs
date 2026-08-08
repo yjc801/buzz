@@ -320,6 +320,36 @@ test("shouldHideAgentFromMentions: shows member agents with unknown invocability
   );
 });
 
+test("member agents: the allowed-list predicate is STRICTER than the hide rule", () => {
+  // These two disagree on exactly one input: a channel-member agent with no
+  // kind:10100 directory entry. `shouldHideAgentFromMentions` deliberately
+  // SHOWS it ("unknown invocability => show"); `isAgentIdentityInAllowedList`
+  // rejects it.
+  //
+  // The mention picker must therefore gate on the hide rule ALONE. Running
+  // both in sequence (as it did) made the member branch unreachable and hid
+  // every other-owner agent whose kind:10100 profile was never published —
+  // which is all of them, since nothing in the repo writes that event.
+  const shared = {
+    isAgent: true,
+    isMember: true,
+    pubkey: PUB_A,
+    mentionableAgentPubkeys: new Set(),
+    directoryAgentPubkeys: new Set(),
+  };
+
+  assert.equal(
+    shouldHideAgentFromMentions(shared),
+    false,
+    "a channel-member agent with no directory entry must be shown",
+  );
+  assert.equal(
+    isAgentIdentityInAllowedList({ isAgent: true, pubkey: PUB_A }, new Set()),
+    false,
+    "the stricter predicate rejects it — do not add it to the mention picker",
+  );
+});
+
 test("shouldHideAgentFromMentions: normalizes the pubkey before lookup", () => {
   const mixedCase = "Ab".repeat(32);
   const normalized = mixedCase.toLowerCase();

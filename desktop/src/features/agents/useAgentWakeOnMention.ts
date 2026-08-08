@@ -10,7 +10,9 @@ import {
 } from "@/features/agents/hooks";
 import { mergeKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import {
+  computeWakeReplayFloor,
   createWakeAttemptState,
+  isCoveredByReplayFloor,
   isWakeShapedEvent,
   pushBoundedPendingTrigger,
   runWakeAttempt,
@@ -107,39 +109,45 @@ export function useAgentWakeOnMention(enabled: boolean) {
   const seenEventIdsRef = React.useRef<Set<string>>(new Set());
   const wakeStateRef = React.useRef(createWakeAttemptState());
 
+  // The freshest post-trigger known-agent baseline any veto has fetched.
+  // Used to gate re-driven collapsed triggers without depending on React
+  // having re-rendered the query result yet.
+  const freshBaselineRef = React.useRef<ReadonlySet<string> | null>(null);
+
   // Authoritative author re-check, run by runWakeAttempt immediately before
   // any deploy. The render-time baseline above is a poll (kind:10100 has no
   // event invalidation, five-minute interval, paused while backgrounded),
   // so a newly registered agent on another desktop can be missing from it
-  // for minutes — long enough to reopen the cross-desktop wake loop. This
-  // forces a fresh relay-agents fetch (staleTime 0; deduped and written
-  // back into the shared cache) and re-derives the baseline at deploy time.
+  // for minutes — long enough to reopen the cross-desktop wake loop.
+  //
+  // A DIRECT request, never the query cache: fetchQuery (even with
+  // staleTime 0) dedupes onto an in-flight background poll whose server
+  // snapshot may predate this trigger, and a pre-trigger snapshot cannot
+  // veto a just-registered agent. A request that provably STARTS after the
+  // trigger is the registration barrier. The result is written back into
+  // the shared cache so every render-time consumer benefits too.
   const confirmAuthorNotKnownAgent = React.useEffectEvent(
     async (authorPubkey: string) => {
-      const freshRelayAgents = await queryClient.fetchQuery({
-        queryKey: relayAgentsQueryKey,
-        queryFn: listRelayAgents,
-        staleTime: 0,
-      });
+      const freshRelayAgents = await listRelayAgents();
+      queryClient.setQueryData(relayAgentsQueryKey, freshRelayAgents);
       const baseline = mergeKnownAgentPubkeys(
         managedAgents ?? [],
         freshRelayAgents,
       );
+      freshBaselineRef.current = baseline;
       return !baseline.has(normalizePubkey(authorPubkey));
     },
   );
-
-  /// A mention as the wake path needs it: enough to re-drive an attempt
-  /// (replay floor + author) and to deduplicate (id).
-  type WakeTrigger = { id: string; created_at: number; pubkey: string };
 
   // Triggers that arrived for an agent while another attempt held its
   // in-flight claim. The owner does not cover every exit: an author veto or
   // a failed presence lookup ends with no deploy and no liveness, and the
   // collapsed mention is already committed to the seen-set — without
-  // retention it would be silently lost. Bounded per agent, retried when
-  // the owner exits uncovered (see shouldRetryCollapsedTriggers).
-  const collapsedTriggersRef = React.useRef(new Map<string, WakeTrigger[]>());
+  // retention it would be silently lost. Bounded per agent; the owning
+  // attempt's settlement decides retry/retain/clear (see wakeAgent). Full
+  // events are held, not trimmed triggers, so a re-drive can pass through
+  // candidate selection again.
+  const collapsedTriggersRef = React.useRef(new Map<string, RelayEvent[]>());
 
   const reportOutcome = React.useEffectEvent(
     (
@@ -194,21 +202,34 @@ export function useAgentWakeOnMention(enabled: boolean) {
   const wakeAgent = React.useEffectEvent(
     async (
       agent: WakeCandidateAgent,
-      trigger: WakeTrigger,
+      event: RelayEvent,
       signal: AbortSignal,
     ) => {
       const agentKey = normalizePubkey(agent.pubkey);
+      // The floor this attempt actually committed to a deploy, if any.
+      // Folded at deploy time from the owner AND everything collapsed
+      // behind it by then: authors' clocks are independent, so a mention
+      // delivered later can carry an EARLIER created_at that the owner's
+      // timestamp alone would leave outside the fresh harness's REQ.
+      let committedFloorTs: number | null = null;
+
       const { outcome, error } = await runWakeAttempt({
         agent,
         state: wakeStateRef.current,
         signal,
-        startManagedAgent: (pubkey) =>
-          startMutation.mutateAsync({
+        startManagedAgent: (pubkey) => {
+          const heldNow = collapsedTriggersRef.current.get(agentKey) ?? [];
+          committedFloorTs = computeWakeReplayFloor(
+            event.created_at,
+            heldNow.map((heldEvent) => heldEvent.created_at),
+          );
+          return startMutation.mutateAsync({
             pubkey,
-            wakeReplayFloorTs: trigger.created_at,
-          }),
+            wakeReplayFloorTs: committedFloorTs,
+          });
+        },
         confirmAuthorNotKnownAgent: () =>
-          confirmAuthorNotKnownAgent(trigger.pubkey),
+          confirmAuthorNotKnownAgent(event.pubkey),
         // Surface the wake when the deploy is accepted, not two minutes
         // later when convergence settles. runWakeAttempt skips this for
         // reconcile deploys (status said online without evidence) — the
@@ -218,33 +239,75 @@ export function useAgentWakeOnMention(enabled: boolean) {
 
       if (outcome === "in-flight") {
         // Another attempt owns this agent. Its exit may not cover this
-        // mention (author veto, unavailable presence) — retain it for
-        // retry; the owner's completion decides.
+        // mention (author veto, unavailable presence, a floor above this
+        // event's created_at) — retain it; the owner's settlement decides.
         const held = collapsedTriggersRef.current.get(agentKey) ?? [];
-        pushBoundedPendingTrigger(held, trigger, WAKE_COLLAPSED_TRIGGER_LIMIT);
+        pushBoundedPendingTrigger(held, event, WAKE_COLLAPSED_TRIGGER_LIMIT);
         collapsedTriggersRef.current.set(agentKey, held);
         return;
       }
 
-      reportOutcome(agent, outcome, error, trigger.pubkey);
+      reportOutcome(agent, outcome, error, event.pubkey);
 
       // This attempt owned the agent's in-flight claim; settle whatever
-      // collapsed behind it. Covered or terminal outcomes clear the list;
-      // uncovered exits re-drive the held triggers, oldest first (its
-      // earlier floor covers the later ones if a deploy results). A retried
-      // trigger that collapses again behind a new owner is simply retained
-      // again, and no retry re-runs a trigger the map no longer holds — the
-      // recursion terminates.
+      // collapsed behind it.
       const held = collapsedTriggersRef.current.get(agentKey);
       collapsedTriggersRef.current.delete(agentKey);
-      if (
-        held !== undefined &&
-        held.length > 0 &&
-        shouldRetryCollapsedTriggers(outcome) &&
-        !signal.aborted
-      ) {
-        for (const heldTrigger of held) {
-          void wakeAgent(agent, heldTrigger, signal);
+      if (held === undefined || held.length === 0) {
+        return;
+      }
+      if (signal.aborted || outcome === "cancelled") {
+        // The effect generation is gone; its triggers die with it.
+        return;
+      }
+      if (outcome === "already-live") {
+        // Liveness was proven across the wait, so the agent received the
+        // held mentions live itself. Covered.
+        return;
+      }
+      if (outcome === "woken" || outcome === "wake-unconfirmed") {
+        // The deploy's committed floor covers everything folded into it,
+        // but a trigger that arrived AFTER the deploy fired can carry a
+        // created_at below it (independent author clocks). Retain those:
+        // an immediate retry would only hit the deploy's debounce, and the
+        // NEXT owner's deploy will fold them into its floor.
+        const uncovered = held.filter(
+          (heldEvent) =>
+            committedFloorTs === null ||
+            !isCoveredByReplayFloor(heldEvent.created_at, committedFloorTs),
+        );
+        if (uncovered.length > 0) {
+          collapsedTriggersRef.current.set(agentKey, uncovered);
+        }
+        return;
+      }
+      if (!shouldRetryCollapsedTriggers(outcome)) {
+        // deploy-failed: terminal by the anti-hammer policy — the held
+        // debounce would refuse an immediate retry identically.
+        return;
+      }
+      // Uncovered exit (author veto, unverified author, presence outage):
+      // re-drive the held triggers oldest-first — but each must pass
+      // candidate selection AGAIN, against the freshest baseline any veto
+      // has fetched. The exit that brought us here may have just learned
+      // the previous owner's author is an agent; a sibling event from that
+      // same author must not claim another full ownership cycle only to be
+      // vetoed at the end of it. Recursion terminates: retries only
+      // re-drive what the map held at settlement, and a re-collapsed
+      // trigger is simply retained behind the new owner.
+      const baseline = freshBaselineRef.current ?? knownAgentAuthors;
+      for (const heldEvent of held) {
+        const stillCandidate = selectWakeCandidates(
+          heldEvent,
+          managedAgents ?? [],
+          {
+            ownerPubkey,
+            accessOwnerOnly,
+            knownAgentAuthors: baseline,
+          },
+        ).some((candidate) => normalizePubkey(candidate.pubkey) === agentKey);
+        if (stillCandidate) {
+          void wakeAgent(agent, heldEvent, signal);
         }
       }
     },
@@ -278,11 +341,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
         knownAgentAuthors,
       });
       for (const candidate of candidates) {
-        void wakeAgent(
-          candidate,
-          { id: event.id, created_at: event.created_at, pubkey: event.pubkey },
-          signal,
-        );
+        void wakeAgent(candidate, event, signal);
       }
     },
   );

@@ -9,9 +9,11 @@ import {
 import { REMOTE_POST_OFFLINE_GRACE_MS } from "./managedAgentControlActions.ts";
 import {
   agentRespondsToAuthor,
+  computeWakeReplayFloor,
   createLiveEvidenceTracker,
   createWakeAttemptState,
   eventAddressesAgent,
+  isCoveredByReplayFloor,
   isWakeAttemptDebounced,
   isWakeShapedEvent,
   pushBoundedPendingTrigger,
@@ -931,6 +933,23 @@ test("collapsed triggers retry only after uncovered exits", () => {
   assert.equal(shouldRetryCollapsedTriggers("cancelled"), false);
   assert.equal(shouldRetryCollapsedTriggers("debounced"), false);
   assert.equal(shouldRetryCollapsedTriggers("in-flight"), false);
+});
+
+test("the committed replay floor folds in every held trigger", () => {
+  // Authors' clocks are independent: a later-delivered mention can carry an
+  // earlier created_at, and the deploy floor must reach it.
+  assert.equal(computeWakeReplayFloor(1_000, []), 1_000);
+  assert.equal(computeWakeReplayFloor(1_000, [1_200, 1_500]), 1_000);
+  assert.equal(computeWakeReplayFloor(1_000, [1_200, 400]), 400);
+});
+
+test("floor coverage honours the harness's REQ skew", () => {
+  // The first REQ subscribes at floor − 5s, so anything at or above that is
+  // replayed; anything below is not, whatever the delivery order was.
+  assert.equal(isCoveredByReplayFloor(1_000, 1_000), true);
+  assert.equal(isCoveredByReplayFloor(995, 1_000), true);
+  assert.equal(isCoveredByReplayFloor(994, 1_000), false);
+  assert.equal(isCoveredByReplayFloor(1_500, 1_000), true);
 });
 
 test("pending triggers are bounded and deduplicated", () => {

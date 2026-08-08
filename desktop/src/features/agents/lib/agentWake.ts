@@ -59,6 +59,33 @@ export const WAKE_PENDING_TRIGGER_LIMIT = 64;
 /// retry if the owning attempt exits without covering them.
 export const WAKE_COLLAPSED_TRIGGER_LIMIT = 16;
 
+/// The harness subtracts this from its replay floor on the first REQ, so a
+/// mention whose `created_at` is at least `floor − skew` is replayed to the
+/// fresh generation. Mirrors buzz-acp's resubscribe skew.
+export const WAKE_REPLAY_FLOOR_SKEW_SECS = 5;
+
+/// The replay floor a wake deploy should commit: the minimum `created_at`
+/// across the owning trigger AND every trigger currently collapsed behind
+/// it. Authors' clocks are independent (the relay accepts ±15 minutes), so
+/// a mention delivered later can carry an EARLIER timestamp — deploying
+/// with only the owner's would leave that collapsed mention outside the
+/// fresh harness's first REQ.
+export function computeWakeReplayFloor(
+  ownerCreatedAtSecs: number,
+  heldCreatedAtSecs: readonly number[],
+): number {
+  return Math.min(ownerCreatedAtSecs, ...heldCreatedAtSecs);
+}
+
+/// Does a committed replay floor actually cover a trigger — i.e. will the
+/// fresh harness's first REQ (`since = floor − skew`) replay it?
+export function isCoveredByReplayFloor(
+  createdAtSecs: number,
+  committedFloorSecs: number,
+): boolean {
+  return createdAtSecs >= committedFloorSecs - WAKE_REPLAY_FLOOR_SKEW_SECS;
+}
+
 /// Only human-visible message kinds may wake an agent. The live-channel tap
 /// delivers every channel event, and reactions/edits/deletions p-tag the
 /// original author — an owner reacting to an agent's old message must not

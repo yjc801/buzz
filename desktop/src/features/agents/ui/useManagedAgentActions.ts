@@ -13,8 +13,10 @@ import {
   useStopManagedAgentMutation,
   useDeleteManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { managedAgentBelongsToCommunity } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
 import { removeChannelMember } from "@/shared/api/tauri";
@@ -87,6 +89,34 @@ export function useManagedAgentActions() {
   );
   // Observer ingestion is owner-global (useAgentObserverIngestion in
   // AppShell); this hook only reads derived state.
+
+  // Community partition for DISPLAY only. `managedAgents` above stays
+  // global on purpose — it feeds running counts, stop-all, and
+  // harness-delete counts, which span every community.
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
+  const { communityAgents, agentsElsewhere } = React.useMemo(() => {
+    const directoryAgentPubkeys = new Set(
+      (relayAgentsQuery.data ?? []).map((agent) =>
+        normalizePubkey(agent.pubkey),
+      ),
+    );
+    const communityAgents: ManagedAgent[] = [];
+    const agentsElsewhere: ManagedAgent[] = [];
+    for (const agent of managedAgents) {
+      if (
+        managedAgentBelongsToCommunity({
+          agent,
+          directoryAgentPubkeys,
+          activeCommunityRelayUrl,
+        })
+      ) {
+        communityAgents.push(agent);
+      } else {
+        agentsElsewhere.push(agent);
+      }
+    }
+    return { communityAgents, agentsElsewhere };
+  }, [activeCommunityRelayUrl, managedAgents, relayAgentsQuery.data]);
 
   const managedPubkeys = React.useMemo(
     () => new Set(managedAgents.map((agent) => agent.pubkey)),
@@ -430,6 +460,8 @@ export function useManagedAgentActions() {
     managedAgentLogQuery,
     managedPresenceQuery,
     managedAgents,
+    communityAgents,
+    agentsElsewhere,
     managedPubkeys,
     channelIdToName,
     channelsByPubkey,

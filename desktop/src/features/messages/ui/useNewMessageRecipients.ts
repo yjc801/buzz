@@ -18,6 +18,7 @@ import {
   useUsersBatchQuery,
 } from "@/features/profile/hooks";
 import { rankUserCandidatesBySearch } from "@/features/profile/lib/userCandidateSearch";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ManagedAgent, UserSearchResult } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
@@ -86,6 +87,7 @@ export function useNewMessageRecipients({
   );
 
   const identityQuery = useIdentityQuery();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: active });
   const relayAgentsQuery = useRelayAgentsQuery({ enabled: active });
   const channelsQuery = useChannelsQuery({ enabled: active });
@@ -110,11 +112,10 @@ export function useNewMessageRecipients({
       ? normalizePubkey(currentPubkey)
       : null;
     const eligibleAgentPubkeys = getMentionableAgentPubkeys({
+      activeCommunityRelayUrl,
       currentPubkey,
       eligibilityScope: { type: "community" },
-      managedAgentPubkeys: (managedAgentsQuery.data ?? []).map(
-        (agent) => agent.pubkey,
-      ),
+      managedAgents: managedAgentsQuery.data ?? [],
       relayAgents: relayAgentsQuery.data,
       sharedChannelIds: getSharedChannelIds(channelsQuery.data),
     });
@@ -217,6 +218,7 @@ export function useNewMessageRecipients({
       query: deferredSearchQuery,
     });
   }, [
+    activeCommunityRelayUrl,
     channelsQuery.data,
     currentPubkey,
     deferredSearchQuery,

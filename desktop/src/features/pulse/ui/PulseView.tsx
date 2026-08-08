@@ -5,6 +5,9 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { managedAgentBelongsToCommunity } from "@/features/agents/lib/agentAutocompleteEligibility";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   useContactListQuery,
   useUsersBatchQuery,
@@ -90,6 +93,7 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
 
   const relayAgentsQuery = useRelayAgentsQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
   const relayAgents = React.useMemo(() => {
     const agentsByPubkey = new Map<
       string,
@@ -98,7 +102,22 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
     for (const agent of relayAgentsQuery.data ?? []) {
       agentsByPubkey.set(agent.pubkey, agent);
     }
+    // This is a user-facing list of the community's agents: managed records
+    // bound to another community are not synthesized into it. (Anything in
+    // the relay directory above is community truth and always shown.)
+    const directoryAgentPubkeys = new Set(
+      [...agentsByPubkey.keys()].map((pubkey) => normalizePubkey(pubkey)),
+    );
     for (const agent of managedAgentsQuery.data ?? []) {
+      if (
+        !managedAgentBelongsToCommunity({
+          agent,
+          directoryAgentPubkeys,
+          activeCommunityRelayUrl,
+        })
+      ) {
+        continue;
+      }
       if (!agentsByPubkey.has(agent.pubkey)) {
         agentsByPubkey.set(agent.pubkey, {
           pubkey: agent.pubkey,
@@ -117,7 +136,7 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
       }
     }
     return [...agentsByPubkey.values()];
-  }, [managedAgentsQuery.data, relayAgentsQuery.data]);
+  }, [activeCommunityRelayUrl, managedAgentsQuery.data, relayAgentsQuery.data]);
   const agentPubkeys = React.useMemo(
     () => relayAgents.map((a) => a.pubkey),
     [relayAgents],

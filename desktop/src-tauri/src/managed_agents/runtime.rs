@@ -303,6 +303,7 @@ pub fn build_managed_agent_summary(
         runtime: record.runtime.clone(),
         team_id: record.team_id.clone(),
         relay_url: record.relay_url.clone(),
+        community_relay_url: record.community_relay_url.clone(),
         acp_command: record.acp_command.clone(),
         agent_command: descriptor.command,
         agent_command_override: record.agent_command_override.clone(),

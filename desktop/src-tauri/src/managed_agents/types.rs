@@ -92,107 +92,6 @@ pub struct AgentDefinition {
     pub updated_at: String,
 }
 
-impl AgentDefinition {
-    /// Project this persona onto a key-less unified [`ManagedAgentRecord`]
-    /// (Phase 1A store fold). Identity fields stay empty — keys are minted on
-    /// first start. `AgentDefinition.id` becomes `slug`, preserving the 30175
-    /// event coordinate (`d_tag = slug`) across the fold.
-    pub fn into_agent_record(self) -> ManagedAgentRecord {
-        ManagedAgentRecord {
-            pubkey: String::new(),
-            name: self.display_name.clone(),
-            persona_id: None,
-            private_key_nsec: String::new(),
-            auth_tag: None,
-            relay_url: String::new(),
-            avatar_url: self.avatar_url,
-            acp_command: DEFAULT_ACP_COMMAND.to_string(),
-            agent_command: String::new(),
-            agent_command_override: None,
-            agent_args: Vec::new(),
-            mcp_command: String::new(),
-            turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
-            idle_timeout_seconds: None,
-            max_turn_duration_seconds: None,
-            parallelism: default_agent_parallelism(),
-            system_prompt: (!self.system_prompt.is_empty()).then_some(self.system_prompt),
-            model: self.model,
-            provider: self.provider,
-            persona_source_version: None,
-            env_vars: self.env_vars,
-            start_on_app_launch: false,
-            auto_restart_on_config_change: true,
-            runtime_pid: None,
-            backend: BackendKind::default(),
-            backend_agent_id: None,
-            provider_binary_path: None,
-            team_id: None,
-            persona_team_dir: None,
-            persona_name_in_team: None,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            last_started_at: None,
-            last_stopped_at: None,
-            last_exit_code: None,
-            last_error: None,
-            last_error_code: None,
-            respond_to: RespondTo::default(),
-            respond_to_allowlist: Vec::new(),
-            display_name: Some(self.display_name),
-            slug: Some(self.id),
-            runtime: self.runtime,
-            name_pool: self.name_pool,
-            is_builtin: self.is_builtin,
-            is_active: self.is_active,
-            // Catalog visibility is relay+owner scoped, not definition-global.
-            shared: false,
-            source_team: self.source_team,
-            source_team_persona_slug: self.source_team_persona_slug,
-            catalog_source: self.catalog_source,
-            definition_respond_to: self.respond_to,
-            definition_respond_to_allowlist: self.respond_to_allowlist,
-            definition_parallelism: self.parallelism,
-            relay_mesh: None,
-        }
-    }
-}
-
-impl ManagedAgentRecord {
-    /// Present a key-less definition record back in the legacy
-    /// [`AgentDefinition`] shape — the compatibility view the persona command
-    /// surface serves until Phase 1B unifies the UI. Inverse of
-    /// [`AgentDefinition::into_agent_record`] for the fields personas carry.
-    pub fn to_definition_view(&self) -> Option<AgentDefinition> {
-        let slug = self.slug.clone()?;
-        Some(AgentDefinition {
-            id: slug,
-            display_name: self
-                .display_name
-                .clone()
-                .unwrap_or_else(|| self.name.clone()),
-            avatar_url: self.avatar_url.clone(),
-            system_prompt: self.system_prompt.clone().unwrap_or_default(),
-            runtime: self.runtime.clone(),
-            model: self.model.clone(),
-            provider: self.provider.clone(),
-            name_pool: self.name_pool.clone(),
-            is_builtin: self.is_builtin,
-            is_active: self.is_active,
-            // Projected by `list_personas` from the active retention scope.
-            shared: false,
-            source_team: self.source_team.clone(),
-            source_team_persona_slug: self.source_team_persona_slug.clone(),
-            catalog_source: self.catalog_source.clone(),
-            env_vars: self.env_vars.clone(),
-            respond_to: self.definition_respond_to.clone(),
-            respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
-            parallelism: self.definition_parallelism,
-            created_at: self.created_at.clone(),
-            updated_at: self.updated_at.clone(),
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
@@ -236,6 +135,23 @@ pub struct ManagedAgentRecord {
     #[serde(default)]
     pub auth_tag: Option<String>,
     pub relay_url: String,
+    /// The community this identity belongs to, as a canonical relay URL
+    /// (`buzz_core_pkg::relay::normalize_relay_url`). `None` = unscoped: the
+    /// identity is offered in every community.
+    ///
+    /// DISTINCT FROM `relay_url` above, which is a creation-era spawn pin
+    /// that `effective_agent_relay_url` deliberately ignores (#2122). This
+    /// field is never read at spawn time either — it scopes pickers and the
+    /// per-(community, name) uniqueness rule, nothing else. An agent bound
+    /// here still runs against whatever workspace relay it is started on.
+    ///
+    /// NOTE: intentionally NO `skip_serializing_if`, unlike the other
+    /// options on this struct. The boot migration backfilling this field is
+    /// idempotent by *key presence*; an explicitly unscoped agent must leave
+    /// a literal `null` in the store, or the next boot would re-derive a
+    /// binding from the legacy pin and silently re-bind it.
+    #[serde(default)]
+    pub community_relay_url: Option<String>,
     /// Avatar URL resolved at creation time (user-supplied input, else the
     /// command-based fallback). Persisted so startup reconciliation compares
     /// against what was actually published rather than re-deriving it from
@@ -501,6 +417,10 @@ pub struct ManagedAgentSummary {
     pub runtime: Option<String>,
     pub team_id: Option<String>,
     pub relay_url: String,
+    /// Mirror of `ManagedAgentRecord.community_relay_url` — the community
+    /// this identity belongs to (`None` = unscoped, offered everywhere).
+    /// Display/uniqueness scope only; never read at spawn time.
+    pub community_relay_url: Option<String>,
     pub acp_command: String,
     pub agent_command: String,
     /// Mirrors `ManagedAgentRecord.agent_command_override`: `Some` when the user
@@ -811,7 +731,7 @@ pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
 pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
 
-fn default_agent_parallelism() -> u32 {
+pub(super) fn default_agent_parallelism() -> u32 {
     DEFAULT_AGENT_PARALLELISM
 }
 

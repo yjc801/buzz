@@ -3,6 +3,7 @@ import {
   getAdmittedMemberAgentPubkeys,
   getMentionableAgentPubkeys,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
+import type { ManagedAgentScopeInput } from "@/features/agents/lib/agentAutocompleteEligibility";
 import type { ChannelMember, RelayAgent } from "@/shared/api/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -22,11 +23,12 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
  * audience promotion and Huddle enrollment.
  */
 export function useMentionAgentPubkeys({
+  activeCommunityRelayUrl,
   currentPubkey,
   directoryAgentPubkeys,
   isArchived,
   managedAgentNamesByPubkey,
-  managedAgentPubkeys,
+  managedAgents,
   members,
   mentionChannelId,
   profiles,
@@ -34,11 +36,12 @@ export function useMentionAgentPubkeys({
   relayAgentNamesByPubkey,
   sharedChannelIds,
 }: {
+  activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
   directoryAgentPubkeys: ReadonlySet<string>;
   isArchived: (pubkey: string) => boolean;
   managedAgentNamesByPubkey: ReadonlyMap<string, string>;
-  managedAgentPubkeys: ReadonlySet<string>;
+  managedAgents: readonly ManagedAgentScopeInput[] | undefined;
   members: readonly ChannelMember[] | undefined;
   mentionChannelId: string | null;
   profiles: UserProfileLookup | undefined;
@@ -53,17 +56,19 @@ export function useMentionAgentPubkeys({
   const mentionableAgentPubkeys = React.useMemo(
     () =>
       getMentionableAgentPubkeys({
+        activeCommunityRelayUrl,
         currentPubkey,
         eligibilityScope: mentionChannelId
           ? { type: "channel", channelId: mentionChannelId }
           : { type: "managed-only" },
-        managedAgentPubkeys,
+        managedAgents: managedAgents ?? [],
         relayAgents,
         sharedChannelIds,
       }),
     [
+      activeCommunityRelayUrl,
       currentPubkey,
-      managedAgentPubkeys,
+      managedAgents,
       mentionChannelId,
       relayAgents,
       sharedChannelIds,

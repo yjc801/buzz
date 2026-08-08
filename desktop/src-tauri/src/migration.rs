@@ -191,6 +191,9 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     reconcile_provider_mcp_commands(app);
     reconcile_databricks_v1_to_v2(app);
     materialize_agent_runtimes(app);
+    // Last: needs no ambient state (pure record-local rewrite), but must run
+    // after the fold so folded definition records also get an explicit null.
+    backfill_agent_community_scope(app);
 }
 
 /// Copy one-time app state from the legacy app identifier directory to
@@ -480,42 +483,6 @@ fn copy_file_over_generated_default(src: &Path, dst: &Path) -> std::io::Result<(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::copy(src, dst).map(|_| ())
-}
-
-/// Read a JSON array of objects from `path`, apply `f` to each object,
-/// and write back if any mutation returned `true`.
-///
-/// Writes back via [`crate::managed_agents::atomic_write_json_restricted`]
-/// (owner-only `0o600`): the store files this rewrites can carry plaintext
-/// agent nsecs on a keyringless host, so the write must not reopen the umask
-/// window SECURITY.md:90 closes.
-fn patch_json_records(
-    path: &Path,
-    mut f: impl FnMut(&mut serde_json::Map<String, serde_json::Value>) -> bool,
-) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(mut records) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
-        eprintln!(
-            "buzz-desktop: patch-json-records: failed to parse {}",
-            path.display()
-        );
-        return;
-    };
-    let mut changed = false;
-    for record in &mut records {
-        if let Some(obj) = record.as_object_mut() {
-            changed |= f(obj);
-        }
-    }
-    if changed {
-        if let Ok(bytes) = serde_json::to_vec_pretty(&records) {
-            if let Err(e) = crate::managed_agents::atomic_write_json_restricted(path, &bytes) {
-                eprintln!("buzz-desktop: patch-json-records: {e}");
-            }
-        }
-    }
 }
 
 struct LegacyBuiltInAvatar<'a> {
@@ -1367,8 +1334,12 @@ pub fn migrate_persona_provider_to_runtime(app: &tauri::AppHandle) {
     }
     rename_provider_to_runtime_in_personas(&path);
 }
+mod json_patch;
+use json_patch::patch_json_records;
 mod materialize;
 pub use materialize::materialize_agent_runtimes;
+mod community_scope;
+pub use community_scope::backfill_agent_community_scope;
 mod fold;
 pub use fold::fold_personas_into_agent_store;
 use fold::load_persona_runtimes;

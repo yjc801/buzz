@@ -74,6 +74,24 @@ export async function setManagedAgentAutoRestart(
   return fromRawManagedAgent(response);
 }
 
+/**
+ * Assign a managed agent to a community (pass a relay URL) or unscope it
+ * (`null` = offered in every community). Display/uniqueness scope only.
+ */
+export async function setManagedAgentCommunity(
+  pubkey: string,
+  communityRelayUrl: string | null,
+): Promise<ManagedAgent> {
+  const response = await invokeTauri<RawManagedAgent>(
+    "set_managed_agent_community",
+    {
+      pubkey,
+      communityRelayUrl,
+    },
+  );
+  return fromRawManagedAgent(response);
+}
+
 export async function listManagedAgentRuntimes(): Promise<
   ManagedAgentRuntimeStatus[]
 > {

@@ -120,12 +120,28 @@ fn emit_runtime_lifecycle(
 const RELAY_ACCEPTED_PAST_SKEW_SECS: u64 = 900;
 
 /// Time a wake pipeline can legitimately spend between trigger delivery and
-/// this process capturing its startup watermark: the desktop's liveness
-/// evidence window (up to 135s) or post-offline teardown fence, the
-/// pre-deploy author re-check, the provider deploy round trip, and
-/// VM/harness cold start. Generous on purpose — the clamp exists to stop a
-/// stale or corrupted floor replaying HOURS, not to shave minutes.
-const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 600;
+/// this process capturing its startup watermark, as the SUM of the enforced
+/// bounds along the path — each term is a real timeout/window in code, not
+/// an estimate, because any single term assigned to the whole pipeline
+/// silently under-budgets the rest:
+/// - the desktop's stale-online liveness evidence window
+///   (`WAKE_LIVE_EVIDENCE_ATTEMPTS × POLL` = 135s, agentWake.ts);
+/// - the post-offline teardown fence (`REMOTE_POST_OFFLINE_GRACE_MS` = 10s);
+/// - the provider `info` probe invocation timeout (10s, backend.rs);
+/// - the provider `deploy` invocation timeout (600s, backend.rs);
+/// - margin for the pre-deploy author fetch, provider-internal VM
+///   provisioning after the deploy call returns, and harness boot up to
+///   the watermark capture.
+const WAKE_EVIDENCE_WINDOW_BOUND_SECS: u64 = 135;
+const WAKE_TEARDOWN_FENCE_BOUND_SECS: u64 = 10;
+const PROVIDER_INFO_PROBE_TIMEOUT_SECS: u64 = 10;
+const PROVIDER_DEPLOY_INVOCATION_TIMEOUT_SECS: u64 = 600;
+const WAKE_BOOT_AND_SLACK_MARGIN_SECS: u64 = 300;
+const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = WAKE_EVIDENCE_WINDOW_BOUND_SECS
+    + WAKE_TEARDOWN_FENCE_BOUND_SECS
+    + PROVIDER_INFO_PROBE_TIMEOUT_SECS
+    + PROVIDER_DEPLOY_INVOCATION_TIMEOUT_SECS
+    + WAKE_BOOT_AND_SLACK_MARGIN_SECS;
 
 /// Max age of an externally supplied replay floor, relative to the startup
 /// watermark. Bounds how much history a stale or corrupted
@@ -161,9 +177,7 @@ fn apply_replay_floor(startup_watermark: u64, floor: Option<&str>) -> u64 {
 
 #[cfg(test)]
 mod replay_floor_tests {
-    use super::{
-        apply_replay_floor, RELAY_ACCEPTED_PAST_SKEW_SECS, REPLAY_FLOOR_MAX_AGE_SECS,
-    };
+    use super::{apply_replay_floor, RELAY_ACCEPTED_PAST_SKEW_SECS, REPLAY_FLOOR_MAX_AGE_SECS};
 
     const NOW: u64 = 1_700_000_000;
 
@@ -174,6 +188,16 @@ mod replay_floor_tests {
         // admit it so the first REQ replays the trigger that caused this
         // very start.
         let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 300;
+        assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
+    }
+
+    #[test]
+    fn the_budget_covers_every_enforced_bound_stacked() {
+        // Worst legitimate case: max relay past skew, then the full
+        // evidence window, the provider info probe, and the full deploy
+        // invocation timeout back to back (~1,645s) — the budget is a sum
+        // of those enforced bounds plus margin, so the trigger survives.
+        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 135 - 10 - 600;
         assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
     }
 

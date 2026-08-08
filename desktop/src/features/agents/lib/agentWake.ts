@@ -70,6 +70,17 @@ export const WAKE_STRANDED_RETRY_DELAY_MS = WAKE_ATTEMPT_DEBOUNCE_MS + 5_000;
 /// fresh generation. Mirrors buzz-acp's resubscribe skew.
 export const WAKE_REPLAY_FLOOR_SKEW_SECS = 5;
 
+/// A heartbeat proves the harness CONNECTED — not that the addressed
+/// channel's subscription is active yet: channel REQs are queued and
+/// rate-gated (draining one per pacing tick after the gate opens), so
+/// subscription readiness lags the first beat by up to channel-count ×
+/// pacing. Live-delivery coverage therefore requires delivery this long
+/// AFTER the liveness anchor; sized to outlast the drain for many hundreds
+/// of channels plus gate deferral. The error direction is deliberate: a
+/// trigger inside the margin is retained and re-verified (or reported
+/// unverified), never falsely marked covered.
+export const WAKE_CHANNEL_SUBSCRIBE_MARGIN_MS = 120_000;
+
 /// The replay floor a wake deploy should commit: the minimum `created_at`
 /// across the owning trigger AND every trigger currently collapsed behind
 /// it. Authors' clocks are independent (the relay accepts ±15 minutes), so

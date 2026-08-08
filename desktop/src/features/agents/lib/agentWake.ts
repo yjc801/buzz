@@ -59,6 +59,12 @@ export const WAKE_PENDING_TRIGGER_LIMIT = 64;
 /// retry if the owning attempt exits without covering them.
 export const WAKE_COLLAPSED_TRIGGER_LIMIT = 16;
 
+/// When a settlement retains uncovered stragglers, one active re-drive is
+/// scheduled this long out — just past the deploy debounce, so the retry is
+/// never refused as a hammer and a dead-again agent gets a real deploy that
+/// folds the stragglers into its floor.
+export const WAKE_STRANDED_RETRY_DELAY_MS = WAKE_ATTEMPT_DEBOUNCE_MS + 5_000;
+
 /// The harness subtracts this from its replay floor on the first REQ, so a
 /// mention whose `created_at` is at least `floor − skew` is replayed to the
 /// fresh generation. Mirrors buzz-acp's resubscribe skew.
@@ -280,6 +286,14 @@ export function createLiveEvidenceTracker(
     hasPostFenceBeat(): boolean {
       return anchor !== undefined;
     },
+    /** Local delivery time of the earliest post-fence beat: the moment the
+     * harness is known to have been connected since. A trigger DELIVERED
+     * after this was ingested while the harness's subscriptions were up,
+     * so the harness received it live — a coverage rule that never needs
+     * the replay floor. */
+    firstPostFenceBeatObservedAtMs(): number | undefined {
+      return anchor?.observedAtMs;
+    },
   };
 }
 
@@ -477,7 +491,15 @@ export async function runWakeAttempt({
   heartbeatEvidence?: (pubkey: string) => LiveHeartbeatObservation | undefined;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
-}): Promise<{ outcome: WakeOutcome; reconcile?: boolean; error?: unknown }> {
+}): Promise<{
+  outcome: WakeOutcome;
+  reconcile?: boolean;
+  error?: unknown;
+  /** Local delivery time of the earliest beat proving the CURRENT liveness
+   * (already-live) or the post-deploy generation (woken). Settlement uses
+   * it to tell live-delivered held triggers from boot-window stragglers. */
+  livenessAnchorMs?: number;
+}> {
   const key = normalizePubkey(agent.pubkey);
 
   // An attempt already deciding for this agent owns the decision: two
@@ -534,7 +556,10 @@ export async function runWakeAttempt({
         attempt += 1
       ) {
         if (provenLive()) {
-          return { outcome: "already-live" };
+          return {
+            outcome: "already-live",
+            livenessAnchorMs: tracker.firstPostFenceBeatObservedAtMs(),
+          };
         }
         if (hadEntryAtStart && evidence() === undefined) {
           announcedExit = true;
@@ -552,7 +577,10 @@ export async function runWakeAttempt({
         }
       }
       if (provenLive()) {
-        return { outcome: "already-live" };
+        return {
+          outcome: "already-live",
+          livenessAnchorMs: tracker.firstPostFenceBeatObservedAtMs(),
+        };
       }
       if (hadEntryAtStart && evidence() === undefined) {
         announcedExit = true;
@@ -581,7 +609,10 @@ export async function runWakeAttempt({
         return { outcome: "presence-unavailable", error };
       }
       if (provenLive()) {
-        return { outcome: "already-live" };
+        return {
+          outcome: "already-live",
+          livenessAnchorMs: tracker.firstPostFenceBeatObservedAtMs(),
+        };
       }
       // Status resurfacing live without proof is the unverifiable case
       // again — deploy, but as reconciliation.
@@ -658,7 +689,11 @@ export async function runWakeAttempt({
       }
       const observation = evidence();
       if (observation !== undefined && observation.observedAtMs >= deployedAt) {
-        return { outcome: "woken", reconcile };
+        return {
+          outcome: "woken",
+          reconcile,
+          livenessAnchorMs: observation.observedAtMs,
+        };
       }
     }
 

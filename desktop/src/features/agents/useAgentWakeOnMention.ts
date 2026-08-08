@@ -19,6 +19,7 @@ import {
   selectWakeCandidates,
   shouldRetryCollapsedTriggers,
   WAKE_COLLAPSED_TRIGGER_LIMIT,
+  WAKE_STRANDED_RETRY_DELAY_MS,
   type WakeCandidateAgent,
   type WakeOutcome,
 } from "@/features/agents/lib/agentWake";
@@ -139,15 +140,42 @@ export function useAgentWakeOnMention(enabled: boolean) {
     },
   );
 
+  /// A trigger retained behind an owning attempt: the full event (so
+  /// re-drives can pass candidate selection again), WHEN it was delivered
+  /// here (local clock — settlement compares it against the liveness
+  /// anchor to tell live-delivered triggers from boot-window stragglers),
+  /// and whether its one active re-drive has been spent.
+  type HeldTrigger = {
+    id: string;
+    event: RelayEvent;
+    deliveredAtMs: number;
+    retriedOnce: boolean;
+  };
+
   // Triggers that arrived for an agent while another attempt held its
   // in-flight claim. The owner does not cover every exit: an author veto or
   // a failed presence lookup ends with no deploy and no liveness, and the
   // collapsed mention is already committed to the seen-set — without
   // retention it would be silently lost. Bounded per agent; the owning
-  // attempt's settlement decides retry/retain/clear (see wakeAgent). Full
-  // events are held, not trimmed triggers, so a re-drive can pass through
-  // candidate selection again.
-  const collapsedTriggersRef = React.useRef(new Map<string, RelayEvent[]>());
+  // attempt's settlement decides cover/retry/retain (see wakeAgent).
+  const collapsedTriggersRef = React.useRef(new Map<string, HeldTrigger[]>());
+
+  // One armed re-drive timer per agent with retained stragglers. Retention
+  // alone is not recovery — without a later mention nothing would ever
+  // drain the map — so settlement arms exactly one active retry, past the
+  // deploy debounce. Cleared wholesale on effect cleanup (community
+  // switch): timers must not fire into a successor generation.
+  const strandedRetryTimersRef = React.useRef(
+    new Map<string, ReturnType<typeof globalThis.setTimeout>>(),
+  );
+
+  const clearStrandedTimer = (agentKey: string) => {
+    const timer = strandedRetryTimersRef.current.get(agentKey);
+    if (timer !== undefined) {
+      globalThis.clearTimeout(timer);
+      strandedRetryTimersRef.current.delete(agentKey);
+    }
+  };
 
   const reportOutcome = React.useEffectEvent(
     (
@@ -213,7 +241,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
       // timestamp alone would leave outside the fresh harness's REQ.
       let committedFloorTs: number | null = null;
 
-      const { outcome, error } = await runWakeAttempt({
+      const { outcome, error, livenessAnchorMs } = await runWakeAttempt({
         agent,
         state: wakeStateRef.current,
         signal,
@@ -221,7 +249,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
           const heldNow = collapsedTriggersRef.current.get(agentKey) ?? [];
           committedFloorTs = computeWakeReplayFloor(
             event.created_at,
-            heldNow.map((heldEvent) => heldEvent.created_at),
+            heldNow.map((held) => held.event.created_at),
           );
           return startMutation.mutateAsync({
             pubkey,
@@ -242,48 +270,94 @@ export function useAgentWakeOnMention(enabled: boolean) {
         // mention (author veto, unavailable presence, a floor above this
         // event's created_at) — retain it; the owner's settlement decides.
         const held = collapsedTriggersRef.current.get(agentKey) ?? [];
-        pushBoundedPendingTrigger(held, event, WAKE_COLLAPSED_TRIGGER_LIMIT);
+        pushBoundedPendingTrigger(
+          held,
+          {
+            id: event.id,
+            event,
+            deliveredAtMs: Date.now(),
+            retriedOnce: false,
+          },
+          WAKE_COLLAPSED_TRIGGER_LIMIT,
+        );
         collapsedTriggersRef.current.set(agentKey, held);
+        return;
+      }
+      if (outcome === "debounced") {
+        // A debounced attempt never owned the in-flight claim — it must
+        // not settle (and above all not delete) another owner's held
+        // triggers.
+        reportOutcome(agent, outcome, error, event.pubkey);
         return;
       }
 
       reportOutcome(agent, outcome, error, event.pubkey);
 
       // This attempt owned the agent's in-flight claim; settle whatever
-      // collapsed behind it.
-      const held = collapsedTriggersRef.current.get(agentKey);
+      // collapsed behind it. Held triggers are only ever CLEARED when a
+      // coverage rule proves the harness got them; everything else is
+      // retained with an armed re-drive or re-driven now.
+      const held = collapsedTriggersRef.current.get(agentKey) ?? [];
       collapsedTriggersRef.current.delete(agentKey);
-      if (held === undefined || held.length === 0) {
+      if (held.length === 0) {
         return;
       }
       if (signal.aborted || outcome === "cancelled") {
-        // The effect generation is gone; its triggers die with it.
+        // The effect generation is gone; its triggers die with it (the
+        // successor community must not inherit them).
+        clearStrandedTimer(agentKey);
         return;
       }
-      if (outcome === "already-live") {
-        // Liveness was proven across the wait, so the agent received the
-        // held mentions live itself. Covered.
-        return;
-      }
-      if (outcome === "woken" || outcome === "wake-unconfirmed") {
-        // The deploy's committed floor covers everything folded into it,
-        // but a trigger that arrived AFTER the deploy fired can carry a
-        // created_at below it (independent author clocks). Retain those:
-        // an immediate retry would only hit the deploy's debounce, and the
-        // NEXT owner's deploy will fold them into its floor.
-        const uncovered = held.filter(
-          (heldEvent) =>
-            committedFloorTs === null ||
-            !isCoveredByReplayFloor(heldEvent.created_at, committedFloorTs),
+
+      // Coverage rules — both local-clock-only:
+      // (a) replay floor: the deploy's committed floor reaches the
+      //     trigger's created_at, so the fresh REQ replays it;
+      // (b) liveness anchor: the trigger was DELIVERED here after the
+      //     earliest beat proving the (current or fresh) generation
+      //     connected — its relay ingest happened while the harness's
+      //     subscriptions were up, so it was live-delivered.
+      const covered = (held$: HeldTrigger) =>
+        (committedFloorTs !== null &&
+          isCoveredByReplayFloor(held$.event.created_at, committedFloorTs)) ||
+        (livenessAnchorMs !== undefined &&
+          held$.deliveredAtMs > livenessAnchorMs);
+
+      if (
+        outcome === "already-live" ||
+        outcome === "woken" ||
+        outcome === "wake-unconfirmed"
+      ) {
+        const uncovered = held.filter((heldTrigger) => !covered(heldTrigger));
+        // A straggler that already spent its one active re-drive against a
+        // PROVEN-LIVE agent is undeliverable: the desktop cannot re-sign
+        // another author's event, a deploy no-ops on a live harness, and
+        // the fresh REQ has already passed it by. Say so and let it go —
+        // parking it forever is just a quieter way of losing it.
+        const provenLive = outcome === "already-live" || outcome === "woken";
+        const undeliverable = uncovered.filter(
+          (heldTrigger) => heldTrigger.retriedOnce && provenLive,
         );
-        if (uncovered.length > 0) {
-          collapsedTriggersRef.current.set(agentKey, uncovered);
+        for (const dropped of undeliverable) {
+          console.warn(
+            "Wake trigger undeliverable: agent is live but the mention predates its replay floor",
+            { agent: agent.pubkey, event: dropped.id },
+          );
+        }
+        const retained = uncovered.filter(
+          (heldTrigger) => !(heldTrigger.retriedOnce && provenLive),
+        );
+        if (retained.length > 0) {
+          collapsedTriggersRef.current.set(agentKey, retained);
+          scheduleStrandedRetry(agent, signal);
         }
         return;
       }
       if (!shouldRetryCollapsedTriggers(outcome)) {
-        // deploy-failed: terminal by the anti-hammer policy — the held
-        // debounce would refuse an immediate retry identically.
+        // deploy-failed: this attempt is terminal (anti-hammer debounce),
+        // but the held mentions are still unserved — retain them and let
+        // the scheduled re-drive run after the debounce window.
+        collapsedTriggersRef.current.set(agentKey, held);
+        scheduleStrandedRetry(agent, signal);
         return;
       }
       // Uncovered exit (author veto, unverified author, presence outage):
@@ -295,10 +369,21 @@ export function useAgentWakeOnMention(enabled: boolean) {
       // vetoed at the end of it. Recursion terminates: retries only
       // re-drive what the map held at settlement, and a re-collapsed
       // trigger is simply retained behind the new owner.
+      redriveHeldTriggers(agent, held, signal);
+    },
+  );
+
+  const redriveHeldTriggers = React.useEffectEvent(
+    (
+      agent: WakeCandidateAgent,
+      held: readonly HeldTrigger[],
+      signal: AbortSignal,
+    ) => {
+      const agentKey = normalizePubkey(agent.pubkey);
       const baseline = freshBaselineRef.current ?? knownAgentAuthors;
-      for (const heldEvent of held) {
+      for (const heldTrigger of held) {
         const stillCandidate = selectWakeCandidates(
-          heldEvent,
+          heldTrigger.event,
           managedAgents ?? [],
           {
             ownerPubkey,
@@ -307,9 +392,41 @@ export function useAgentWakeOnMention(enabled: boolean) {
           },
         ).some((candidate) => normalizePubkey(candidate.pubkey) === agentKey);
         if (stillCandidate) {
-          void wakeAgent(agent, heldEvent, signal);
+          void wakeAgent(agent, heldTrigger.event, signal);
         }
       }
+    },
+  );
+
+  // The active recovery path for retained stragglers: exactly one timer
+  // per agent, firing just past the deploy debounce. If the agent has died
+  // again by then, the re-driven attempt's deploy folds the stragglers
+  // into its floor; if it is provably live, settlement drops them as
+  // undeliverable (retriedOnce) instead of parking them forever.
+  const scheduleStrandedRetry = React.useEffectEvent(
+    (agent: WakeCandidateAgent, signal: AbortSignal) => {
+      const agentKey = normalizePubkey(agent.pubkey);
+      if (strandedRetryTimersRef.current.has(agentKey) || signal.aborted) {
+        return;
+      }
+      const timer = globalThis.setTimeout(() => {
+        strandedRetryTimersRef.current.delete(agentKey);
+        if (signal.aborted) {
+          return;
+        }
+        const held = collapsedTriggersRef.current.get(agentKey);
+        if (held === undefined || held.length === 0) {
+          return;
+        }
+        for (const heldTrigger of held) {
+          heldTrigger.retriedOnce = true;
+        }
+        // Take the map entry: the re-driven owner re-collapses (and its
+        // settlement re-retains) whatever it does not cover.
+        collapsedTriggersRef.current.delete(agentKey);
+        redriveHeldTriggers(agent, held, signal);
+      }, WAKE_STRANDED_RETRY_DELAY_MS);
+      strandedRetryTimersRef.current.set(agentKey, timer);
     },
   );
 
@@ -415,6 +532,12 @@ export function useAgentWakeOnMention(enabled: boolean) {
     return () => {
       unsubscribe();
       controller.abort();
+      // Stranded-retry timers belong to this generation: firing into a
+      // successor community would re-drive another community's triggers.
+      for (const timer of strandedRetryTimersRef.current.values()) {
+        globalThis.clearTimeout(timer);
+      }
+      strandedRetryTimersRef.current.clear();
     };
   }, [enabled, managedResolved, hasWakeableAgents, prerequisitesReady]);
 }

@@ -114,12 +114,32 @@ fn emit_runtime_lifecycle(
     }
 }
 
+/// How far behind its own clock the relay still accepts an event's
+/// `created_at` at ingest. A wake trigger can therefore legitimately be
+/// this old the moment it is delivered.
+const RELAY_ACCEPTED_PAST_SKEW_SECS: u64 = 900;
+
+/// Time a wake pipeline can legitimately spend between trigger delivery and
+/// this process capturing its startup watermark: the desktop's liveness
+/// evidence window (up to 135s) or post-offline teardown fence, the
+/// pre-deploy author re-check, the provider deploy round trip, and
+/// VM/harness cold start. Generous on purpose — the clamp exists to stop a
+/// stale or corrupted floor replaying HOURS, not to shave minutes.
+const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 600;
+
 /// Max age of an externally supplied replay floor, relative to the startup
 /// watermark. Bounds how much history a stale or corrupted
 /// `BUZZ_ACP_REPLAY_FLOOR` can force back into the first REQ; a floor older
 /// than this is clamped to the bound rather than ignored, so a slow deploy
 /// still replays as much of the missed window as the bound allows.
-const REPLAY_FLOOR_MAX_AGE_SECS: u64 = 900;
+///
+/// Sized as the relay's accepted past skew PLUS the wake pipeline latency
+/// budget: a trigger accepted at the relay's maximum age (900s behind) has
+/// aged further by every second of fence/evidence/deploy/boot latency, and
+/// a cap equal to the skew alone would advance the watermark past the very
+/// trigger that caused this start.
+const REPLAY_FLOOR_MAX_AGE_SECS: u64 =
+    RELAY_ACCEPTED_PAST_SKEW_SECS + WAKE_PIPELINE_LATENCY_BUDGET_SECS;
 
 /// Floor the startup watermark to a wake deploy's trigger timestamp.
 ///
@@ -141,9 +161,21 @@ fn apply_replay_floor(startup_watermark: u64, floor: Option<&str>) -> u64 {
 
 #[cfg(test)]
 mod replay_floor_tests {
-    use super::{apply_replay_floor, REPLAY_FLOOR_MAX_AGE_SECS};
+    use super::{
+        apply_replay_floor, RELAY_ACCEPTED_PAST_SKEW_SECS, REPLAY_FLOOR_MAX_AGE_SECS,
+    };
 
     const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn a_trigger_at_the_relay_age_limit_survives_wake_latency() {
+        // Accepted by the relay at its maximum past skew, then aged further
+        // by the fence/evidence/deploy/boot pipeline — the cap must still
+        // admit it so the first REQ replays the trigger that caused this
+        // very start.
+        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 300;
+        assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
+    }
 
     #[test]
     fn recent_floor_wins() {

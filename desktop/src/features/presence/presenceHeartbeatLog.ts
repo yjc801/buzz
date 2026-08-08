@@ -2,8 +2,8 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 
 /**
  * The last live presence heartbeat observed by this desktop, per pubkey:
- * when it was DELIVERED here (local `Date.now()`) and when the harness
- * EMITTED it (the event's `created_at`).
+ * when it was DELIVERED here (local `Date.now()`) and WHICH event it was
+ * (the event id).
  *
  * Exists because a presence *status* is not evidence of a live harness: a
  * crashed process cannot publish `offline`, so its last `online` survives in
@@ -13,11 +13,11 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
  * kind:20001 every 60s over the relay's live fan-out, which the shell's
  * presence subscription already receives.
  *
- * Both timestamps matter, because each alone can lie in one direction:
- * delivery time is local-clock-clean but relay delivery can land an OLD
- * generation's final in-flight heartbeat after a fence moment; emission
- * time excludes that delayed delivery but rides the emitter's clock.
- * Liveness fences therefore require BOTH to be at/after the fence.
+ * Deliberately NO event timestamps: the emitter's `created_at` rides a
+ * remote clock (the relay tolerates ±15 minutes of drift), so ordering it
+ * against this machine's clock proves nothing. The event id gives consumers
+ * a clock-free way to distinguish observations: two entries with different
+ * ids are two distinct emissions, however either machine's clock is set.
  *
  * Observational, not authoritative: a missing entry means "no heartbeat
  * seen", which legitimately happens right after app start or a relay
@@ -31,8 +31,8 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 export type LiveHeartbeatObservation = {
   /** Local `Date.now()` at delivery. */
   observedAtMs: number;
-  /** The event's `created_at` (emitter's clock), in milliseconds. */
-  emittedAtMs: number;
+  /** The heartbeat event's id — distinct ids are distinct emissions. */
+  eventId: string;
 };
 
 const lastLiveHeartbeat = new Map<string, LiveHeartbeatObservation>();
@@ -41,10 +41,7 @@ const lastLiveHeartbeat = new Map<string, LiveHeartbeatObservation>();
 export function recordPresenceHeartbeat(
   pubkey: string,
   status: string,
-  /** The presence event's `created_at`, unix SECONDS. Absent (older event
-   * shapes) records an emission time of 0, which no fence accepts —
-   * conservative: unproven liveness reconciles via idempotent deploy. */
-  emittedAtSecs?: number,
+  eventId: string,
   nowMs: number = Date.now(),
 ) {
   const key = normalizePubkey(pubkey);
@@ -52,10 +49,7 @@ export function recordPresenceHeartbeat(
     return;
   }
   if (status === "online" || status === "away") {
-    lastLiveHeartbeat.set(key, {
-      observedAtMs: nowMs,
-      emittedAtMs: (emittedAtSecs ?? 0) * 1_000,
-    });
+    lastLiveHeartbeat.set(key, { observedAtMs: nowMs, eventId });
     return;
   }
   // An explicit offline is a harness announcing its exit — stale "live"

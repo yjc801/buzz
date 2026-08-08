@@ -32,17 +32,28 @@ export const WAKE_ATTEMPT_DEBOUNCE_MS = 120_000;
 export const WAKE_CONFIRM_POLL_MS = 5_000;
 export const WAKE_CONFIRM_ATTEMPTS = 24; // × WAKE_CONFIRM_POLL_MS = 120s
 
-/// How long an "online" status gets to prove itself with a live heartbeat
-/// OBSERVED after the wake attempt began. A heartbeat from before the
-/// attempt proves nothing — the harness can crash one second after
-/// publishing it, and the store keeps its last "online" for the full
-/// presence TTL (180s), so any number of status samples and any pre-attempt
-/// observation agree while the agent is dead. A running harness republishes
-/// its heartbeat every 60s over live fan-out; one interval plus delivery
-/// margin bounds the wait. No post-attempt evidence inside the window →
-/// reconcile through the idempotent deploy instead of trusting the store.
+/// How long an "online" status gets to PROVE itself before the attempt
+/// reconciles through the idempotent deploy instead of trusting the store.
+///
+/// Proof is two DISTINCT heartbeat deliveries (different event ids) after
+/// the attempt began, spaced by at least `WAKE_EVIDENCE_MIN_SPACING_MS` of
+/// LOCAL delivery time — a rule that never orders two machines' clocks. A
+/// dying generation has at most ONE final in-flight beat to deliver late,
+/// whatever its clock says; only a process still running emits a second
+/// one. A live harness beats every 60s, so two beats need up to two
+/// intervals: the window is sized for that, with an early bailout when not
+/// even ONE post-attempt beat arrives within a single interval plus margin
+/// (a live harness would have produced one; the store entry is a crashed
+/// harness's residue).
 export const WAKE_LIVE_EVIDENCE_POLL_MS = 5_000;
-export const WAKE_LIVE_EVIDENCE_ATTEMPTS = 15; // × POLL = 75s > 60s heartbeat
+export const WAKE_LIVE_EVIDENCE_ATTEMPTS = 27; // × POLL = 135s ≥ 2 heartbeats
+export const WAKE_LIVE_NO_BEAT_BAILOUT_ATTEMPTS = 15; // 75s > 1 heartbeat
+export const WAKE_EVIDENCE_MIN_SPACING_MS = 30_000;
+
+/// Bound on triggers buffered while wake prerequisites are still resolving
+/// at startup. The tap has no history replay, so an unevaluable event must
+/// be held, not dropped — but only boundedly.
+export const WAKE_PENDING_TRIGGER_LIMIT = 64;
 
 /// Only human-visible message kinds may wake an agent. The live-channel tap
 /// delivers every channel event, and reactions/edits/deletions p-tag the
@@ -201,27 +212,63 @@ export function shouldWakeAgent(
   return !isManagedAgentLive(agent, presence);
 }
 
-/// Is this heartbeat observation proof of a harness alive since `sinceMs`?
+/// Clock-free liveness proof for one wake attempt.
 ///
-/// The only accepted liveness evidence: a live heartbeat both DELIVERED and
-/// EMITTED at/after the fence moment. Delivery time alone is not enough —
-/// relay delivery can land an old generation's final in-flight heartbeat
-/// after the fence even though that harness already committed to shutdown
-/// and stopped reading channel events; requiring the emission timestamp
-/// (`created_at`) to also clear the fence excludes that delayed delivery.
-/// The emission side rides the emitter's clock; under skew it degrades
-/// toward "unproven", which reconciles via an idempotent no-op deploy —
-/// never toward a false already-live. Status samples and pre-fence
-/// observations prove nothing (store TTL, heartbeat-then-crash).
-export function isLiveEvidenceSince(
-  evidence: LiveHeartbeatObservation | undefined,
+/// Proof requires TWO distinct heartbeat events, both DELIVERED (local
+/// clock) at/after `sinceMs`, with the later delivery at least
+/// `minSpacingMs` after the earliest post-fence one. Every comparison is in
+/// this machine's clock or between event identities — never between two
+/// machines' clocks (the relay tolerates ±15 minutes of `created_at`
+/// drift, so an emitter timestamp can be ordered against nothing local). A
+/// dying generation can land at most one final in-flight beat after the
+/// fence; it cannot produce a second, spaced one. The earliest post-fence
+/// beat stays the anchor, so any later distinct beat that clears the
+/// spacing proves liveness.
+///
+/// Feed the latest observation via `observe`; it returns true once proven.
+export function createLiveEvidenceTracker(
   sinceMs: number,
+  minSpacingMs: number = WAKE_EVIDENCE_MIN_SPACING_MS,
 ) {
-  return (
-    evidence !== undefined &&
-    evidence.observedAtMs >= sinceMs &&
-    evidence.emittedAtMs >= sinceMs
-  );
+  let anchor: LiveHeartbeatObservation | undefined;
+  return {
+    observe(current: LiveHeartbeatObservation | undefined): boolean {
+      if (current === undefined || current.observedAtMs < sinceMs) {
+        return false;
+      }
+      if (anchor === undefined) {
+        anchor = current;
+        return false;
+      }
+      if (current.eventId === anchor.eventId) {
+        return false;
+      }
+      return current.observedAtMs >= anchor.observedAtMs + minSpacingMs;
+    },
+    /** Has at least one post-fence beat been observed? */
+    hasPostFenceBeat(): boolean {
+      return anchor !== undefined;
+    },
+  };
+}
+
+/// Buffer a trigger that cannot be evaluated yet (wake prerequisites still
+/// resolving at startup). Deduplicates by event id (the tap can deliver the
+/// same event via both the broad and mention subscriptions) and drops the
+/// OLDEST beyond the bound — the newest mentions are the most actionable,
+/// and the tap has no history replay to recover anything dropped.
+export function pushBoundedPendingTrigger<T extends { id: string }>(
+  queue: T[],
+  event: T,
+  limit: number = WAKE_PENDING_TRIGGER_LIMIT,
+): void {
+  if (queue.some((queued) => queued.id === event.id)) {
+    return;
+  }
+  queue.push(event);
+  if (queue.length > limit) {
+    queue.shift();
+  }
 }
 
 /// Has this agent been woken recently enough that another attempt is noise?
@@ -283,18 +330,22 @@ const waitMs = (ms: number) =>
 /// double-firing on a burst, deploying on a relay hiccup, deploying an agent
 /// that is already up — and none of them are reachable from a render test.
 ///
-/// The ONLY accepted proof of a live harness is a heartbeat OBSERVED after
-/// this attempt began. Status is never trusted: a crashed harness's last
-/// "online" survives in the store for the presence TTL, and a heartbeat
-/// observed BEFORE the mention proves nothing (the harness can crash one
-/// second after publishing it). So a live-claiming status gets one heartbeat
-/// interval to produce post-attempt evidence; silence means the claim is
-/// unverifiable and the attempt deploys anyway (`reconcile`) — a strict
-/// no-op against a genuinely live agent, the wake against a crashed one. A
-/// dead status waits out the same post-offline teardown fence the restart
-/// path uses before deploying. Convergence applies the same evidence rule:
-/// only a post-attempt heartbeat completes a wake; otherwise the attempt
-/// releases its debounce so the next mention can retry.
+/// The ONLY accepted proof of a live harness is two distinct heartbeat
+/// deliveries after this attempt began, spaced in LOCAL time (see
+/// `createLiveEvidenceTracker`). Status is never trusted (a crashed
+/// harness's last "online" survives in the store for the presence TTL), a
+/// pre-attempt heartbeat proves nothing (the harness can crash one second
+/// after publishing it), and a single post-attempt delivery proves nothing
+/// either — it can be an old generation's delayed final in-flight beat,
+/// and its `created_at` rides a remote clock the relay lets drift ±15
+/// minutes, so no timestamp comparison can save it. Unproven means the
+/// attempt deploys anyway (`reconcile`) — a strict no-op against a
+/// genuinely live agent, the wake against a crashed one. A dead status
+/// waits out the same post-offline teardown fence the restart path uses
+/// before deploying. Convergence fences on the deploy-completion moment
+/// (also local-clock-only): only a beat delivered after it completes the
+/// wake; otherwise the attempt releases its debounce so the next mention
+/// can retry.
 ///
 /// Immediately before spending the deploy, the author is re-validated
 /// through `confirmAuthorNotKnownAgent` (a FRESH known-agent fetch): the
@@ -368,8 +419,8 @@ export async function runWakeAttempt({
   // every relay hiccup.
   const samplePresence = async () => (await fetchPresence([agent.pubkey]))[key];
   const evidence = () => heartbeatEvidence(agent.pubkey);
-  const postAttemptEvidence = () =>
-    isLiveEvidenceSince(evidence(), attemptStartedAt);
+  const tracker = createLiveEvidenceTracker(attemptStartedAt);
+  const provenLive = () => tracker.observe(evidence());
   const aborted = () => signal?.aborted === true;
 
   try {
@@ -385,10 +436,12 @@ export async function runWakeAttempt({
 
     let reconcile = false;
     if (isManagedAgentLive(agent, presence)) {
-      // Status claims live. Give the harness one heartbeat interval to
-      // prove it with a post-attempt observation. An offline heartbeat
-      // arriving meanwhile clears the log entry — that is the harness
-      // announcing its exit, and routes to the dead path below.
+      // Status claims live. Proof requires TWO distinct post-attempt beat
+      // deliveries (see createLiveEvidenceTracker) — up to two heartbeat
+      // intervals — with an early bailout when not even one beat arrives
+      // within a single interval. An offline heartbeat arriving meanwhile
+      // clears the log entry: that is the harness announcing its exit, and
+      // routes to the fenced dead path below.
       const hadEntryAtStart = evidence() !== undefined;
       let announcedExit = false;
       for (
@@ -396,11 +449,17 @@ export async function runWakeAttempt({
         attempt < WAKE_LIVE_EVIDENCE_ATTEMPTS;
         attempt += 1
       ) {
-        if (postAttemptEvidence()) {
+        if (provenLive()) {
           return { outcome: "already-live" };
         }
         if (hadEntryAtStart && evidence() === undefined) {
           announcedExit = true;
+          break;
+        }
+        if (
+          attempt >= WAKE_LIVE_NO_BEAT_BAILOUT_ATTEMPTS &&
+          !tracker.hasPostFenceBeat()
+        ) {
           break;
         }
         await delay(WAKE_LIVE_EVIDENCE_POLL_MS);
@@ -408,15 +467,16 @@ export async function runWakeAttempt({
           return { outcome: "cancelled" };
         }
       }
-      if (postAttemptEvidence()) {
+      if (provenLive()) {
         return { outcome: "already-live" };
       }
       if (hadEntryAtStart && evidence() === undefined) {
         announcedExit = true;
       }
-      // No evidence: the "online" is unverifiable (crashed harness, or one
-      // whose heartbeats do not reach us) → reconcile through the deploy.
-      // An announced exit is a real death and takes the fenced dead path.
+      // Unproven: the "online" is unverifiable (crashed harness, a lone
+      // delayed final beat, or heartbeats not reaching us) → reconcile
+      // through the deploy. An announced exit is a real death and takes
+      // the fenced dead path.
       reconcile = !announcedExit;
     }
 
@@ -425,8 +485,8 @@ export async function runWakeAttempt({
       // offline publish by the relay's graceful teardown — deploying inside
       // that window strict-no-ops against the dying process. Wait out the
       // same fence the restart path uses, then look once more: a fresh
-      // generation appearing meanwhile (another client's deploy) shows up
-      // as post-attempt evidence.
+      // generation appearing meanwhile (another client's deploy) can prove
+      // itself through the same tracker.
       await delay(REMOTE_POST_OFFLINE_GRACE_MS);
       if (aborted()) {
         return { outcome: "cancelled" };
@@ -436,10 +496,10 @@ export async function runWakeAttempt({
       } catch (error) {
         return { outcome: "presence-unavailable", error };
       }
-      if (postAttemptEvidence()) {
+      if (provenLive()) {
         return { outcome: "already-live" };
       }
-      // Status resurfacing live without evidence is the unverifiable case
+      // Status resurfacing live without proof is the unverifiable case
       // again — deploy, but as reconciliation.
       reconcile = isManagedAgentLive(agent, presence);
     }
@@ -478,20 +538,33 @@ export async function runWakeAttempt({
     try {
       await startManagedAgent(agent.pubkey);
     } catch (error) {
+      // The signal can abort while the provider call is pending — the
+      // unmounted community's error must not surface in its successor.
+      if (aborted()) {
+        return { outcome: "cancelled", reconcile };
+      }
       // Holding the debounce after a refusal is deliberate: a provider that
       // just refused will refuse the next mention too.
       return { outcome: "deploy-failed", reconcile, error };
     }
+    if (aborted()) {
+      // Same fence on the success path: the deploy happened under the
+      // right generation, but its toast must not appear in the next one.
+      return { outcome: "cancelled", reconcile };
+    }
     if (!reconcile) {
       onDeployed?.();
     }
+    const deployedAt = now();
 
-    // Converge on post-attempt evidence. A deploy return alone can be a
-    // strict no-op against a process that was still dying, and a stale
-    // "online" satisfies any status check without a harness behind it —
-    // only a heartbeat observed after this attempt began proves one is
-    // actually up (a woken harness publishes presence at startup; a
-    // genuinely live one heartbeats within the interval).
+    // Converge on a beat delivered AFTER the deploy completed. A deploy
+    // return alone can be a strict no-op against a process that was still
+    // dying, and a stale "online" satisfies any status check without a
+    // harness behind it. The deploy-completion fence is local-clock-only
+    // and sits at least one teardown fence (dead path) or a full evidence
+    // window (reconcile path) after the attempt began, so an old
+    // generation's in-flight beat cannot reach past it; the expected
+    // signal is the fresh generation's startup presence publish.
     for (let attempt = 0; attempt < WAKE_CONFIRM_ATTEMPTS; attempt += 1) {
       await delay(WAKE_CONFIRM_POLL_MS);
       if (aborted()) {
@@ -499,7 +572,8 @@ export async function runWakeAttempt({
         // watching stops. The successor generation starts fresh state.
         return { outcome: "cancelled", reconcile };
       }
-      if (postAttemptEvidence()) {
+      const observation = evidence();
+      if (observation !== undefined && observation.observedAtMs >= deployedAt) {
         return { outcome: "woken", reconcile };
       }
     }

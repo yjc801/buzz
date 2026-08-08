@@ -9,16 +9,17 @@ import {
 import { REMOTE_POST_OFFLINE_GRACE_MS } from "./managedAgentControlActions.ts";
 import {
   agentRespondsToAuthor,
+  createLiveEvidenceTracker,
   createWakeAttemptState,
   eventAddressesAgent,
-  isLiveEvidenceSince,
   isWakeAttemptDebounced,
+  pushBoundedPendingTrigger,
   runWakeAttempt,
   selectWakeCandidates,
   shouldWakeAgent,
   WAKE_ATTEMPT_DEBOUNCE_MS,
-  WAKE_LIVE_EVIDENCE_ATTEMPTS,
   WAKE_LIVE_EVIDENCE_POLL_MS,
+  WAKE_LIVE_NO_BEAT_BAILOUT_ATTEMPTS,
 } from "./agentWake.ts";
 
 const OWNER = "a".repeat(64);
@@ -343,37 +344,35 @@ test("a backwards clock counts as debounced", () => {
 const CLOCK = 5_000_000;
 
 /// Presence STATUS script: statuses consumed one per lookup (last entry
-/// repeats; `null` = no record). Liveness EVIDENCE is a separate axis —
-/// that separation IS the crashed-harness fix — simulated per pubkey as
-/// {observedAtMs, emittedAtMs} pairs: `heartbeatAtStart` seeds AGENT's
-/// entry with both at that value (use `CLOCK - x` for a pre-attempt
-/// observation), `evidenceAfterDelays: n` records a fresh heartbeat (both
-/// at the clock) after the nth `delay()`, `delayedFinalAfterDelays: n`
-/// records a DELIVERED-now-but-EMITTED-pre-attempt heartbeat (the dying
-/// generation's final beat arriving late), `offlineAfterDelays: n` deletes
-/// the entry (the harness announcing its exit), `abortAfterDelays: n`
-/// fires the harness's abort signal, and a successful deploy records fresh
-/// evidence unless `evidenceOnDeploy: false`.
+/// repeats; `null` = no record). The harness clock ADVANCES with every
+/// `delay()` so local-time spacing rules are exercised for real; use
+/// `advance(ms)` to jump it between attempts. Liveness EVIDENCE is
+/// simulated per pubkey as {observedAtMs, eventId}: `heartbeatAtStart`
+/// seeds AGENT's entry (use `CLOCK - x` for a pre-attempt delivery),
+/// `beatsAfterDelays: [n, …]` records a NEW distinct beat (fresh event id,
+/// delivered at the current clock) after each listed `delay()` count,
+/// `offlineAfterDelays: n` deletes the entry (the harness announcing its
+/// exit), `abortAfterDelays: n` fires the harness's abort signal,
+/// `abortDuringDeploy` aborts while the provider call is settling, and a
+/// successful deploy records a fresh beat unless `evidenceOnDeploy: false`.
 function wakeHarness({
   presenceScript = [],
   heartbeatAtStart = null,
-  evidenceAfterDelays = null,
-  delayedFinalAfterDelays = null,
+  beatsAfterDelays = [],
   offlineAfterDelays = null,
   abortAfterDelays = null,
+  abortDuringDeploy = false,
   evidenceOnDeploy = true,
   deployFails = false,
-  clock = () => CLOCK,
 } = {}) {
   const deployed = [];
   const delays = [];
   const evidence = new Map();
   const controller = new AbortController();
+  let clockNow = CLOCK;
+  let beatSerial = 0;
   if (heartbeatAtStart !== null) {
-    evidence.set(AGENT, {
-      observedAtMs: heartbeatAtStart,
-      emittedAtMs: heartbeatAtStart,
-    });
+    evidence.set(AGENT, { observedAtMs: heartbeatAtStart, eventId: "hb-seed" });
   }
   let scriptIndex = 0;
   let delayCount = 0;
@@ -386,21 +385,20 @@ function wakeHarness({
     delays,
     evidence,
     state: createWakeAttemptState(),
-    now: clock,
+    now: () => clockNow,
+    advance: (ms) => {
+      clockNow += ms;
+    },
     signal: controller.signal,
     delay: async (ms) => {
       delays.push(ms);
+      clockNow += ms;
       delayCount += 1;
-      if (evidenceAfterDelays !== null && delayCount === evidenceAfterDelays) {
-        evidence.set(AGENT, { observedAtMs: clock(), emittedAtMs: clock() });
-      }
-      if (
-        delayedFinalAfterDelays !== null &&
-        delayCount === delayedFinalAfterDelays
-      ) {
+      if (beatsAfterDelays.includes(delayCount)) {
+        beatSerial += 1;
         evidence.set(AGENT, {
-          observedAtMs: clock(),
-          emittedAtMs: clock() - 30_000,
+          observedAtMs: clockNow,
+          eventId: `hb-${beatSerial}`,
         });
       }
       if (offlineAfterDelays !== null && delayCount === offlineAfterDelays) {
@@ -418,13 +416,16 @@ function wakeHarness({
     heartbeatEvidence: (pubkey) => evidence.get(pubkey.toLowerCase()),
     startManagedAgent: async (pubkey) => {
       deployed.push(pubkey);
+      if (abortDuringDeploy) {
+        controller.abort();
+      }
       if (deployFails) {
         throw new Error("provider refused");
       }
       if (evidenceOnDeploy) {
         evidence.set(pubkey.toLowerCase(), {
-          observedAtMs: clock(),
-          emittedAtMs: clock(),
+          observedAtMs: clockNow,
+          eventId: `hb-deploy-${deployed.length}`,
         });
       }
       return {};
@@ -442,12 +443,13 @@ test("an offline agent is deployed exactly once", async () => {
   assert.ok(harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
 });
 
-test("a live agent that heartbeats after the mention is left alone", async () => {
-  // The ONLY accepted proof of life: a heartbeat observed after the attempt
-  // began. A genuinely live harness produces one within the interval.
+test("a live agent that keeps heartbeating after the mention is left alone", async () => {
+  // The ONLY accepted proof of life: two distinct beats delivered after the
+  // attempt began, spaced in local time. A genuinely live harness produces
+  // them across two intervals; nothing dead can.
   const harness = wakeHarness({
     presenceScript: ["online"],
-    evidenceAfterDelays: 1,
+    beatsAfterDelays: [1, 8], // T+5s and T+40s — distinct, 35s apart
   });
   const result = await runWakeAttempt({ agent: agent(), ...harness });
 
@@ -481,9 +483,10 @@ test("a dying harness that still says online is woken once it announces exit", a
 test("a pre-attempt heartbeat is not proof of life — the crash window closes", async () => {
   // The heartbeat-then-crash case: the harness heartbeats, dies one second
   // later, and the mention arrives while the store still says online and
-  // the last observation is recent. Neither is post-attempt evidence, so
-  // after one silent heartbeat interval the attempt must deploy (a strict
-  // no-op if the agent is actually alive) instead of trusting either.
+  // the last observation is recent. No post-attempt beat ever arrives, so
+  // the no-beat bailout fires after one interval and the attempt deploys
+  // (a strict no-op if the agent is actually alive) instead of trusting
+  // the store.
   const harness = wakeHarness({
     presenceScript: ["online"],
     heartbeatAtStart: CLOCK - 30_000,
@@ -499,16 +502,46 @@ test("a pre-attempt heartbeat is not proof of life — the crash window closes",
   assert.equal(result.reconcile, true);
   assert.deepEqual(harness.deployed, [AGENT]);
   // The reconcile deploy is quiet and skips the teardown fence (a stale
-  // record is not a recent offline publish), after waiting out the full
-  // evidence window.
+  // record is not a recent offline publish). With zero post-attempt beats
+  // the bailout ends the wait after one interval, plus one convergence
+  // poll (both intervals share the same 5s value).
   assert.equal(onDeployedCalls.length, 0);
   assert.ok(!harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
-  // The full evidence window was waited out, plus one convergence poll
-  // (both intervals share the same 5s value).
   assert.equal(
     harness.delays.filter((ms) => ms === WAKE_LIVE_EVIDENCE_POLL_MS).length,
-    WAKE_LIVE_EVIDENCE_ATTEMPTS + 1,
+    WAKE_LIVE_NO_BEAT_BAILOUT_ATTEMPTS + 1,
   );
+});
+
+test("a lone delayed final heartbeat is not proof of life", async () => {
+  // A dying generation's last in-flight beat can be DELIVERED after the
+  // attempt began — with any created_at its remote clock likes. One beat is
+  // therefore never proof; without a second, spaced delivery the attempt
+  // waits out the full window and reconciles through the deploy.
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    heartbeatAtStart: CLOCK - 30_000,
+    beatsAfterDelays: [2],
+  });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "woken");
+  assert.equal(result.reconcile, true);
+  assert.deepEqual(harness.deployed, [AGENT]);
+});
+
+test("two beats delivered too close together are not proof of life", async () => {
+  // A burst (e.g. queued deliveries flushed together) does not demonstrate
+  // ongoing life — only spacing in LOCAL delivery time does.
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    beatsAfterDelays: [1, 2], // 5s apart, under the 30s spacing floor
+  });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "woken");
+  assert.equal(result.reconcile, true);
+  assert.deepEqual(harness.deployed, [AGENT]);
 });
 
 test("an unconfirmed reconcile releases the debounce", async () => {
@@ -532,36 +565,21 @@ test("an unconfirmed reconcile releases the debounce", async () => {
   assert.deepEqual(harness.deployed, [AGENT, AGENT]);
 });
 
-test("live evidence must be delivered AND emitted at or after the fence", () => {
-  const at = (observedAtMs, emittedAtMs) => ({ observedAtMs, emittedAtMs });
-  assert.equal(isLiveEvidenceSince(at(1_000, 1_000), 1_000), true);
-  assert.equal(isLiveEvidenceSince(at(1_001, 1_001), 1_000), true);
-  // Delivered after the fence but emitted before: the dying generation's
-  // delayed final heartbeat. Not evidence.
-  assert.equal(isLiveEvidenceSince(at(1_001, 999), 1_000), false);
-  // Emitted after but delivered before is impossible in practice; still
-  // not evidence — both clocks must clear the fence.
-  assert.equal(isLiveEvidenceSince(at(999, 1_001), 1_000), false);
-  assert.equal(isLiveEvidenceSince(at(999, 999), 1_000), false);
-  assert.equal(isLiveEvidenceSince(undefined, 1_000), false);
-});
-
-test("a delayed final heartbeat from a dying generation is not proof of life", async () => {
-  // The old harness emits its last heartbeat, commits to shutdown, and
-  // relay delivery lands that beat AFTER the attempt began. Delivery time
-  // clears the fence; emission time does not — so the attempt must not
-  // return already-live, and after the evidence window it reconciles
-  // through the deploy.
-  const harness = wakeHarness({
-    presenceScript: ["online"],
-    heartbeatAtStart: CLOCK - 30_000,
-    delayedFinalAfterDelays: 2,
-  });
-  const result = await runWakeAttempt({ agent: agent(), ...harness });
-
-  assert.equal(result.outcome, "woken");
-  assert.equal(result.reconcile, true);
-  assert.deepEqual(harness.deployed, [AGENT]);
+test("proof of life requires two distinct spaced deliveries", () => {
+  const tracker = createLiveEvidenceTracker(1_000, 30_000);
+  assert.equal(tracker.observe(undefined), false);
+  // Pre-fence delivery: not even an anchor.
+  assert.equal(tracker.observe({ observedAtMs: 999, eventId: "a" }), false);
+  assert.equal(tracker.hasPostFenceBeat(), false);
+  // First post-fence beat anchors, proves nothing alone.
+  assert.equal(tracker.observe({ observedAtMs: 1_000, eventId: "b" }), false);
+  assert.equal(tracker.hasPostFenceBeat(), true);
+  // The same event re-observed later is still one emission.
+  assert.equal(tracker.observe({ observedAtMs: 40_000, eventId: "b" }), false);
+  // A distinct beat under the spacing floor is a burst, not ongoing life.
+  assert.equal(tracker.observe({ observedAtMs: 20_000, eventId: "c" }), false);
+  // Distinct AND spaced from the earliest anchor: proven.
+  assert.equal(tracker.observe({ observedAtMs: 31_000, eventId: "d" }), true);
 });
 
 test("an aborted attempt cancels before deploying", async () => {
@@ -629,18 +647,19 @@ test("a pre-aborted signal refuses immediately", async () => {
   assert.deepEqual(harness.deployed, []);
 });
 
-test("an agent that comes up during the teardown fence is left alone", async () => {
-  // Another client's deploy (or a restart finishing) produced post-attempt
-  // evidence while we waited out the fence — deploying again would be a
-  // wasted round trip.
+test("a single beat during the teardown fence does not fake proof — the deploy proceeds", async () => {
+  // One delivery during the fence could be another client's fresh
+  // generation booting — or a dying generation's final beat. Unprovable
+  // either way, so the deploy proceeds; against a genuinely fresh
+  // generation it is a strict no-op.
   const harness = wakeHarness({
     presenceScript: ["offline"],
-    evidenceAfterDelays: 1,
+    beatsAfterDelays: [1],
   });
   const result = await runWakeAttempt({ agent: agent(), ...harness });
 
-  assert.equal(result.outcome, "already-live");
-  assert.deepEqual(harness.deployed, []);
+  assert.equal(result.outcome, "woken");
+  assert.deepEqual(harness.deployed, [AGENT]);
 });
 
 test("an author flagged by the fresh re-check never spends the deploy", async () => {
@@ -684,7 +703,7 @@ test("the author re-check runs only when a deploy is imminent", async () => {
   // verdict must not spend it.
   const harness = wakeHarness({
     presenceScript: ["online"],
-    evidenceAfterDelays: 1,
+    beatsAfterDelays: [1, 8],
   });
   let vetCalls = 0;
   const result = await runWakeAttempt({
@@ -726,9 +745,7 @@ test("a failed presence lookup never deploys", async () => {
 
 test("a burst of mentions produces one deploy, not one per mention", async () => {
   const harness = wakeHarness();
-  const clock = 5_000_000;
-  const attempt = () =>
-    runWakeAttempt({ agent: agent(), ...harness, now: () => clock });
+  const attempt = () => runWakeAttempt({ agent: agent(), ...harness });
 
   const first = await attempt();
   const second = await attempt();
@@ -757,12 +774,11 @@ test("two mentions landing together deploy once, not twice", async () => {
 });
 
 test("the agent is wakeable again once the debounce window passes", async () => {
-  let clock = CLOCK;
-  const harness = wakeHarness({ clock: () => clock });
+  const harness = wakeHarness();
   const attempt = () => runWakeAttempt({ agent: agent(), ...harness });
 
   await attempt();
-  clock += WAKE_ATTEMPT_DEBOUNCE_MS;
+  harness.advance(WAKE_ATTEMPT_DEBOUNCE_MS);
   // Status stays absent and the first life's evidence now predates the new
   // attempt, so the second mention wakes again.
   const later = await attempt();
@@ -776,21 +792,12 @@ test("a failed deploy reports the error and still holds the debounce", async () 
   // refused will refuse the next mention too, and retrying per message would
   // hammer it.
   const harness = wakeHarness({ deployFails: true });
-  const clock = 5_000_000;
-  const first = await runWakeAttempt({
-    agent: agent(),
-    ...harness,
-    now: () => clock,
-  });
+  const first = await runWakeAttempt({ agent: agent(), ...harness });
 
   assert.equal(first.outcome, "deploy-failed");
   assert.match(String(first.error), /provider refused/);
 
-  const second = await runWakeAttempt({
-    agent: agent(),
-    ...harness,
-    now: () => clock,
-  });
+  const second = await runWakeAttempt({ agent: agent(), ...harness });
   assert.equal(second.outcome, "debounced");
   assert.deepEqual(harness.deployed, [AGENT]);
 });
@@ -813,8 +820,8 @@ test("a deploy that never produces evidence releases the debounce", async () => 
   assert.deepEqual(harness.deployed, [AGENT]);
   assert.equal(onDeployedCalls.length, 1);
 
-  // Same clock, so a held debounce would return "debounced" — the release
-  // is what lets the next mention retry.
+  // Well inside the debounce window, so a held stamp would return
+  // "debounced" — the release is what lets the next mention retry.
   const second = await attempt();
   assert.equal(second.outcome, "wake-unconfirmed");
   assert.deepEqual(harness.deployed, [AGENT, AGENT]);
@@ -838,17 +845,53 @@ test("a wake that converges fires onDeployed before the confirmation", async () 
 test("one agent's debounce does not silence another", async () => {
   const harness = wakeHarness();
   const peer = agent({ pubkey: OTHER_AGENT, name: "Alex" });
-  const clock = 5_000_000;
 
-  await runWakeAttempt({ agent: agent(), ...harness, now: () => clock });
-  const peerResult = await runWakeAttempt({
-    agent: peer,
-    ...harness,
-    now: () => clock,
-    // The shared harness only knows AGENT's presence; the peer resolves to
-    // no entry, which is offline.
-  });
+  await runWakeAttempt({ agent: agent(), ...harness });
+  // The peer resolves to no presence entry (offline) and its own evidence
+  // slot — AGENT's stamp and beats are per-pubkey.
+  const peerResult = await runWakeAttempt({ agent: peer, ...harness });
 
   assert.equal(peerResult.outcome, "woken");
   assert.deepEqual(harness.deployed, [AGENT, OTHER_AGENT]);
+});
+
+test("an abort while the deploy settles suppresses its outcome", async () => {
+  // Community switch during the in-flight provider call: the deploy
+  // happened, but the unmounted community's toast must not surface in the
+  // successor — on the success path and the failure path alike.
+  const successHarness = wakeHarness({ abortDuringDeploy: true });
+  const onDeployedCalls = [];
+  const success = await runWakeAttempt({
+    agent: agent(),
+    ...successHarness,
+    onDeployed: () => onDeployedCalls.push(true),
+  });
+  assert.equal(success.outcome, "cancelled");
+  assert.equal(onDeployedCalls.length, 0);
+  assert.deepEqual(successHarness.deployed, [AGENT]);
+
+  const failureHarness = wakeHarness({
+    abortDuringDeploy: true,
+    deployFails: true,
+  });
+  const failure = await runWakeAttempt({ agent: agent(), ...failureHarness });
+  assert.equal(failure.outcome, "cancelled");
+});
+
+test("pending triggers are bounded and deduplicated", () => {
+  const queue = [];
+  pushBoundedPendingTrigger(queue, { id: "a" }, 3);
+  pushBoundedPendingTrigger(queue, { id: "a" }, 3); // duplicate delivery
+  pushBoundedPendingTrigger(queue, { id: "b" }, 3);
+  pushBoundedPendingTrigger(queue, { id: "c" }, 3);
+  assert.deepEqual(
+    queue.map((event) => event.id),
+    ["a", "b", "c"],
+  );
+  // Over the bound: the OLDEST is dropped, the newest kept.
+  pushBoundedPendingTrigger(queue, { id: "d" }, 3);
+  assert.deepEqual(
+    queue.map((event) => event.id),
+    ["b", "c", "d"],
+  );
 });

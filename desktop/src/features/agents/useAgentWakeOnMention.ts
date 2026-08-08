@@ -11,6 +11,7 @@ import {
 import { mergeKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import {
   createWakeAttemptState,
+  pushBoundedPendingTrigger,
   runWakeAttempt,
   selectWakeCandidates,
   type WakeCandidateAgent,
@@ -192,21 +193,19 @@ export function useAgentWakeOnMention(enabled: boolean) {
     },
   );
 
-  const handleEvent = React.useEffectEvent(
+  // Triggers delivered before the wake prerequisites resolve. The tap is a
+  // memoryless fan-out — no history, no guaranteed redelivery — so an
+  // unevaluable event must be HELD (boundedly), not declined: a one-shot
+  // mention during query-client startup would otherwise be lost and the
+  // stopped agent stay asleep. Component-scoped ref: a community switch
+  // unmounts it, and another community's triggers must not leak forward.
+  const pendingTriggersRef = React.useRef<RelayEvent[]>([]);
+
+  const evaluateEvent = React.useEffectEvent(
     (event: RelayEvent, signal: AbortSignal) => {
-      // Never consume an event the gates cannot yet evaluate. The listener
-      // only attaches once prerequisites are resolved, so this is defense
-      // in depth against a race between resolution and effect re-run — a
-      // trigger marked seen while the baseline was undefined would be
-      // dropped forever (the tap replays no history, and reconnect
-      // redelivery would hit the seen-set).
-      if (
-        knownAgentAuthors === undefined ||
-        accessOwnerOnly === undefined ||
-        ownerPubkey.length === 0
-      ) {
-        return;
-      }
+      // Seen-set commit happens HERE, on evaluation — never while buffering,
+      // so a held trigger can still be evaluated once (and duplicates that
+      // arrived during buffering are deduped by the queue itself).
       if (
         !trackSeenEvent(
           seenEventIdsRef.current,
@@ -227,24 +226,50 @@ export function useAgentWakeOnMention(enabled: boolean) {
     },
   );
 
-  // Only provider-backed agents can be woken this way; without one there is
-  // nothing to listen for.
+  const handleEvent = React.useEffectEvent(
+    (event: RelayEvent, signal: AbortSignal) => {
+      if (
+        knownAgentAuthors === undefined ||
+        accessOwnerOnly === undefined ||
+        ownerPubkey.length === 0
+      ) {
+        pushBoundedPendingTrigger(pendingTriggersRef.current, event);
+        return;
+      }
+      evaluateEvent(event, signal);
+    },
+  );
+
+  const drainPendingTriggers = React.useEffectEvent((signal: AbortSignal) => {
+    if (
+      knownAgentAuthors === undefined ||
+      accessOwnerOnly === undefined ||
+      ownerPubkey.length === 0
+    ) {
+      return;
+    }
+    const held = pendingTriggersRef.current.splice(0);
+    for (const event of held) {
+      evaluateEvent(event, signal);
+    }
+  });
+
+  // Only provider-backed agents can be woken this way. While the managed
+  // set is still loading we listen anyway (buffering), because the tap
+  // cannot replay what we decline; once it resolves with no provider
+  // agents there is nothing to listen for.
+  const managedResolved = managedAgents !== undefined;
   const hasWakeableAgents = (managedAgents ?? []).some(
     (agent) => agent.backend.type === "provider",
   );
 
-  // Every gate the event evaluation needs must be resolved BEFORE the
-  // listener attaches: an event delivered earlier would either be consumed
-  // unevaluably (baseline) or judged under a clamped policy that later
-  // widens (access flag, owner identity). Until then, triggers stay
-  // unconsumed so reconnect redelivery can still process them.
   const prerequisitesReady =
     knownAgentAuthors !== undefined &&
     accessOwnerOnly !== undefined &&
     ownerPubkey.length > 0;
 
   React.useEffect(() => {
-    if (!enabled || !hasWakeableAgents || !prerequisitesReady) {
+    if (!enabled || (managedResolved && !hasWakeableAgents)) {
       return;
     }
     // The controller is this effect generation's fence: community switch
@@ -256,9 +281,15 @@ export function useAgentWakeOnMention(enabled: boolean) {
     const unsubscribe = subscribeToLiveChannelEvents((event) =>
       handleEvent(event, controller.signal),
     );
+    // Prerequisites flipping ready re-runs this effect; anything buffered
+    // in the earlier unresolved window is evaluated now, under the fresh
+    // generation's fence.
+    if (prerequisitesReady) {
+      drainPendingTriggers(controller.signal);
+    }
     return () => {
       unsubscribe();
       controller.abort();
     };
-  }, [enabled, hasWakeableAgents, prerequisitesReady]);
+  }, [enabled, managedResolved, hasWakeableAgents, prerequisitesReady]);
 }

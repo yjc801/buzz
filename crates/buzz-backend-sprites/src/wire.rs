@@ -109,6 +109,13 @@ pub struct InfoResponse {
 pub struct DeployResponse {
     pub ok: bool,
     pub agent_id: String,
+    /// Whether THIS deploy started the generation now running (true), or
+    /// strict-no-op'd against one an earlier deploy started (false). The
+    /// desktop's wake path treats only `true` as proof that the deploy's
+    /// env — the replay floor included — is in effect; the field is
+    /// optional on the wire (§Deploy), so a provider that omits it simply
+    /// never proves adoption.
+    pub fresh_generation: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,10 +146,11 @@ impl Response {
         })
     }
 
-    pub fn deployed(agent_id: impl Into<String>) -> Self {
+    pub fn deployed(agent_id: impl Into<String>, fresh_generation: bool) -> Self {
         Response::Deploy(DeployResponse {
             ok: true,
             agent_id: agent_id.into(),
+            fresh_generation,
         })
     }
 }
@@ -238,10 +246,14 @@ mod tests {
     /// enum must serialize flat with no variant tag.
     #[test]
     fn responses_serialize_flat() {
-        let v = serde_json::to_value(Response::deployed("buzz-agent-abc")).unwrap();
+        let v = serde_json::to_value(Response::deployed("buzz-agent-abc", true)).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["agent_id"], "buzz-agent-abc");
+        assert_eq!(v["fresh_generation"], true);
         assert!(v.get("Deploy").is_none());
+
+        let v = serde_json::to_value(Response::deployed("buzz-agent-abc", false)).unwrap();
+        assert_eq!(v["fresh_generation"], false);
 
         let v = serde_json::to_value(Response::error("boom")).unwrap();
         assert_eq!(v["ok"], false);

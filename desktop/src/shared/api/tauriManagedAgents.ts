@@ -8,18 +8,35 @@ import type {
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
 
+export type StartManagedAgentOutcome = {
+  agent: ManagedAgent;
+  /** The provider's own deploy classification: `true` — this deploy started
+   * a FRESH harness generation, so the env it carried (any wake replay
+   * floor included) is provably in effect; `false` — a strict no-op against
+   * an already-running generation, whose env is NOT this deploy's; `null` —
+   * no provider evidence (local starts, providers predating the field).
+   * Consumers must treat `null` as "unproven", never as either answer. */
+  freshGeneration: boolean | null;
+};
+
 export async function startManagedAgent(
   pubkey: string,
   /** Unix seconds of the mention that triggered a wake deploy. Carried into
    * the new harness as its startup replay floor so cold-start latency cannot
    * drop the very message that woke it. Omitted for ordinary starts. */
   wakeReplayFloorTs?: number,
-): Promise<ManagedAgent> {
-  const response = await invokeTauri<RawManagedAgent>("start_managed_agent", {
+): Promise<StartManagedAgentOutcome> {
+  const response = await invokeTauri<{
+    agent: RawManagedAgent;
+    fresh_generation: boolean | null;
+  }>("start_managed_agent", {
     pubkey,
     wakeReplayFloor: wakeReplayFloorTs ?? null,
   });
-  return fromRawManagedAgent(response);
+  return {
+    agent: fromRawManagedAgent(response.agent),
+    freshGeneration: response.fresh_generation ?? null,
+  };
 }
 
 export async function stopManagedAgent(pubkey: string): Promise<ManagedAgent> {

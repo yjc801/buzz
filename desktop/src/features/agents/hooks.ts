@@ -545,7 +545,7 @@ export function useStartManagedAgentMutation() {
       typeof input === "string"
         ? startManagedAgent(input)
         : startManagedAgent(input.pubkey, input.wakeReplayFloorTs),
-    onSuccess: (updated) => {
+    onSuccess: ({ agent: updated }) => {
       queryClient.setQueryData<ManagedAgent[]>(
         managedAgentsQueryKey,
         (current) => {

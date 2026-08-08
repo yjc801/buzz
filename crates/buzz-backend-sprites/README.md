@@ -65,7 +65,11 @@ liveness. An in-VM probe reports three independent signals (an election lock,
 the locked PID's process name, the recorded generation); started means the
 lock is held *and* the process is `buzz-acp`. Permission to start requires all
 the negatives, so a mixed reading (the launcher's pre-exec window, teardown
-lag) polls rather than risking a double start.
+lag) polls rather than risking a double start. The deploy response's
+`fresh_generation` reports whether this call performed that start (`true` —
+the running generation booted from this call's env file) or observed a
+generation an earlier deploy started (`false`, the strict no-op — including a
+lost create race, whose winner booted from *its* env, not this call's).
 
 **At most one live agent.** `flock` on a file the launcher holds open across
 `exec` — the kernel is the arbiter, for exactly the harness's lifetime.

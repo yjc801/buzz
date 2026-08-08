@@ -418,7 +418,8 @@ subject to I2 validation when the user's values come back in `deploy`.
 ```
 request:  {"op": "deploy", "request_id": "<uuid>",
            "agent": <payload>, "provider_config": {…}}
-response: {"ok": true, "agent_id": str}
+response: {"ok": true, "agent_id": str,
+           "fresh_generation": bool (OPTIONAL)}
 timeout:  600s
 ```
 
@@ -457,6 +458,18 @@ collide with or reconstruct a reserved key.
 `agent_id` is `P`'s stable handle for the deployment (the Kubernetes binding
 returns the pod name). `D` stores it as `backend_agent_id`; its presence is
 the `deployed` axis of I3.
+
+`fresh_generation` is `P`'s own classification of what the idempotent deploy
+did: `true` — this call started a fresh harness generation, which therefore
+booted from this call's environment (the wake replay floor included);
+`false` — a strict no-op against a generation an earlier deploy started,
+whose environment is NOT this call's. The field is OPTIONAL: `D` treats a
+missing or non-boolean value as "unproven" — never as either answer — so a
+provider predating the field merely never proves floor adoption. `D`'s wake
+path uses `true` as the only accepted proof that a mention folded into the
+deploy's replay floor will actually be replayed; process liveness signals
+(status, heartbeats) deliberately do not qualify, because they cannot
+distinguish a fresh generation from a no-op against a live one.
 
 **There is no `undeploy` op in v1.** Deletion of a remote agent from `D`
 orphans the substrate objects; the UI therefore requires an explicit

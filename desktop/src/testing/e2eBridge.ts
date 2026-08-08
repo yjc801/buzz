@@ -8537,7 +8537,7 @@ async function handleStartManagedAgent(
     pubkey: string;
   },
   config?: E2eConfig,
-): Promise<RawManagedAgent> {
+): Promise<{ agent: RawManagedAgent; fresh_generation: boolean | null }> {
   const startError = config?.mock?.startManagedAgentErrors?.shift();
   if (startError) {
     throw new Error(startError);
@@ -8583,7 +8583,13 @@ async function handleStartManagedAgent(
       : `started mock harness at ${now}`,
   );
   syncMockRelayAgentsFromManagedAgents();
-  return cloneManagedAgent(agent);
+  // Mirror `StartManagedAgentOutcome`: the mock deploy always starts the
+  // harness it models, so a provider deploy reports a fresh generation;
+  // local starts carry no provider classification.
+  return {
+    agent: cloneManagedAgent(agent),
+    fresh_generation: agent.backend.type === "provider" ? true : null,
+  };
 }
 
 async function handleStopManagedAgent(args: {

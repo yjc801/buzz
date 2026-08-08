@@ -158,9 +158,12 @@ esac"#,
     );
     write_test_provider(&provider, &body);
 
-    let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
+    let outcome = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
         .expect("staged deploy");
-    assert_eq!(id, "remote-1");
+    assert_eq!(outcome.agent_id, "remote-1");
+    // This fake omits `fresh_generation`, like any provider predating the
+    // field: the classification must read as "unproven", not as an answer.
+    assert_eq!(outcome.fresh_generation, None);
     let paths: Vec<_> = std::fs::read_to_string(log)
         .unwrap()
         .lines()
@@ -173,6 +176,33 @@ esac"#,
         !Path::new(&paths[0]).exists(),
         "staging directory must be deleted"
     );
+}
+
+/// The fresh-generation classification crosses the wire verbatim when it is
+/// a real boolean — and degrades to "unproven" when it is not, because a
+/// malformed answer must never read as either proof.
+#[cfg(unix)]
+#[test]
+fn provider_deploy_parses_the_fresh_generation_classification() {
+    for (wire_value, parsed) in [
+        ("true", Some(true)),
+        ("false", Some(false)),
+        (r#""yes""#, None),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider");
+        let body = format!(
+            r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,"description":"test provider","config_schema":{{}}}}' ;;
+  *\"op\":\"deploy\"*) printf '%s\n' '{{"ok":true,"agent_id":"remote-1","fresh_generation":{wire_value}}}' ;;
+esac"#
+        );
+        write_test_provider(&provider, &body);
+        let outcome = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
+            .expect("staged deploy");
+        assert_eq!(outcome.fresh_generation, parsed, "wire value {wire_value}");
+    }
 }
 
 #[cfg(unix)]
@@ -214,7 +244,8 @@ esac"#,
     let inode_before = std::fs::metadata(&provider).unwrap().ino();
 
     let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
-        .expect("deploy from immutable staged copy");
+        .expect("deploy from immutable staged copy")
+        .agent_id;
 
     assert_eq!(id, "original-staged-bytes");
     assert_eq!(
@@ -255,7 +286,8 @@ esac"#,
     let inode_before = std::fs::metadata(&provider).unwrap().ino();
 
     let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
-        .expect("deploy from immutable staged copy");
+        .expect("deploy from immutable staged copy")
+        .agent_id;
 
     assert_eq!(id, "original-staged-bytes");
     assert_ne!(

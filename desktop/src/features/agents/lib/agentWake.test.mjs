@@ -14,6 +14,7 @@ import {
   createWakeAttemptState,
   eventAddressesAgent,
   isCoveredByReplayFloor,
+  isServedByCommittedFloor,
   isWakeAttemptDebounced,
   isWakeShapedEvent,
   pushBoundedPendingTrigger,
@@ -950,6 +951,46 @@ test("floor coverage honours the harness's REQ skew", () => {
   assert.equal(isCoveredByReplayFloor(995, 1_000), true);
   assert.equal(isCoveredByReplayFloor(994, 1_000), false);
   assert.equal(isCoveredByReplayFloor(1_500, 1_000), true);
+});
+
+test("only a provider-proven fresh generation's floor serves a trigger", () => {
+  const fresh = { retriedOnce: false, createdAtSecs: 1_000 };
+  const proven = {
+    outcome: "woken",
+    committedFloorTs: 1_000,
+    floorAdopted: true,
+  };
+
+  assert.equal(isServedByCommittedFloor(fresh, proven), true);
+
+  // A strict no-op (or a provider that gave no classification) installed no
+  // floor — however many heartbeats followed, nothing proves replay.
+  assert.equal(
+    isServedByCommittedFloor(fresh, { ...proven, floorAdopted: false }),
+    false,
+  );
+  // Process liveness is not delivery: an already-live verdict never serves.
+  assert.equal(
+    isServedByCommittedFloor(fresh, { ...proven, outcome: "already-live" }),
+    false,
+  );
+  // No committed floor means no deploy to cover anyone.
+  assert.equal(
+    isServedByCommittedFloor(fresh, { ...proven, committedFloorTs: null }),
+    false,
+  );
+  // Below the REQ window: the fresh generation replays from floor − skew.
+  assert.equal(
+    isServedByCommittedFloor({ ...fresh, createdAtSecs: 994 }, proven),
+    false,
+  );
+  // A retried trigger is never floor-covered, even by a proven fresh
+  // generation: its age can exceed the harness's replay-floor age cap,
+  // which would clamp it out of the REQ window unverifiably.
+  assert.equal(
+    isServedByCommittedFloor({ ...fresh, retriedOnce: true }, proven),
+    false,
+  );
 });
 
 test("pending triggers are bounded and deduplicated", () => {

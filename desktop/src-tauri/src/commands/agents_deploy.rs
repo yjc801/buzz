@@ -10,9 +10,94 @@ use tauri::AppHandle;
 use crate::managed_agents::AgentDefinition;
 use crate::{
     app_state::AppState,
-    managed_agents::{load_personas, ManagedAgentRecord},
+    managed_agents::{
+        discover_provider_candidates, load_managed_agents, load_personas, provider_deploy,
+        resolve_provider_binary, save_managed_agents, ManagedAgentRecord, ManagedAgentSummary,
+    },
     relay::relay_ws_url_with_override,
+    util::now_iso,
 };
+
+/// The start command's answer: the refreshed record summary plus, for
+/// provider backends, the provider's own deploy classification (see
+/// `ProviderDeployOutcome::fresh_generation`). Local starts carry `None`:
+/// the only consumer is the wake path, which never targets local agents,
+/// and a value here would claim provider proof that never existed.
+#[derive(serde::Serialize)]
+pub struct StartManagedAgentOutcome {
+    pub agent: ManagedAgentSummary,
+    pub fresh_generation: Option<bool>,
+}
+
+/// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
+/// spawn_blocking, and persists the result (backend_agent_id or last_error).
+///
+/// Idempotency: calling deploy on an already-deployed agent sends the same payload
+/// again. Providers are expected to handle this as an update-in-place or no-op —
+/// the protocol does not include an explicit `undeploy` operation (deferred to v2).
+///
+/// Returns the provider's fresh-generation classification on success
+/// (`None` when the provider gave none — see `ProviderDeployOutcome`),
+/// Err(message) on failure. Either way the record is updated and saved
+/// before returning.
+pub(super) async fn deploy_to_provider(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+    provider_id: &str,
+    config: &serde_json::Value,
+    agent_json: serde_json::Value,
+    cached_binary_path: Option<&str>,
+) -> Result<Option<bool>, String> {
+    // Resolve via discovered candidates only. Cached path must match BOTH
+    // "is a discovered candidate" AND "belongs to this provider_id". A tampered
+    // record cannot redirect deploys to a different provider's binary.
+    let bin_path = cached_binary_path
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .filter(|canonical| {
+            discover_provider_candidates().iter().any(|(id, cp)| {
+                id == provider_id && cp.canonicalize().ok().as_ref() == Some(canonical)
+            })
+        })
+        .map_or_else(|| resolve_provider_binary(provider_id), Ok)?;
+
+    let config_clone = config.clone();
+    let deploy_result =
+        tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
+            .await
+            .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+
+    // Persist result under lock.
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(app)?;
+    let rec = records
+        .iter_mut()
+        .find(|r| r.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+
+    let fresh_generation = match deploy_result {
+        Ok(outcome) => {
+            rec.backend_agent_id = Some(outcome.agent_id);
+            rec.last_started_at = Some(now_iso());
+            rec.updated_at = now_iso();
+            rec.last_error = None;
+            outcome.fresh_generation
+        }
+        Err(ref e) => {
+            rec.last_error = Some(e.clone());
+            rec.updated_at = now_iso();
+            save_managed_agents(app, &records)?;
+            return Err(e.clone());
+        }
+    };
+    save_managed_agents(app, &records)?;
+    Ok(fresh_generation)
+}
 
 /// Effective projection fields for the deploy payload — all derived from the
 /// resolved descriptor and effective config so that the serialised payload and

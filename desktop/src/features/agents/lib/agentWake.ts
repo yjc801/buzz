@@ -92,6 +92,46 @@ export function isCoveredByReplayFloor(
   return createdAtSecs >= committedFloorSecs - WAKE_REPLAY_FLOOR_SKEW_SECS;
 }
 
+/// Is a settled trigger SERVED by the deploy its owning attempt committed?
+///
+/// Positive coverage has exactly one shape: the attempt ended `woken`, the
+/// PROVIDER proved the deploy started a fresh generation, and the committed
+/// floor's REQ window reaches the trigger's `created_at`. Process liveness
+/// alone — an already-live verdict, post-deploy heartbeats — never serves:
+/// it proves a harness runs somewhere, not that this channel's REQ was
+/// active when the mention was delivered, and the desktop cannot observe
+/// per-channel readiness. Without the provider's classification a `woken`
+/// outcome is ambiguous the same way: a strict no-op returns the existing
+/// id and installs nothing, so the floor this attempt computed was never
+/// adopted, however many heartbeats follow.
+///
+/// Retried triggers are never floor-covered, even by a proven fresh
+/// generation: their age since first delivery includes a full failed
+/// attempt plus the stranded-retry delay, which can exceed the latency
+/// budget the harness's replay-floor age cap is sized for
+/// (`REPLAY_FLOOR_MAX_AGE_SECS`, buzz-acp) — a clamped floor silently
+/// excludes them, and the desktop cannot verify the harness's clock to
+/// know. Their retry attempt's settlement is terminal instead.
+export function isServedByCommittedFloor(
+  trigger: { retriedOnce: boolean; createdAtSecs: number },
+  settlement: {
+    outcome: WakeOutcome;
+    committedFloorTs: number | null;
+    /** The provider's fresh-generation proof for the attempt's deploy.
+     * `false` covers both "provider said no-op" and "provider gave no
+     * classification" — unproven is unproven. */
+    floorAdopted: boolean;
+  },
+): boolean {
+  return (
+    !trigger.retriedOnce &&
+    settlement.outcome === "woken" &&
+    settlement.floorAdopted &&
+    settlement.committedFloorTs !== null &&
+    isCoveredByReplayFloor(trigger.createdAtSecs, settlement.committedFloorTs)
+  );
+}
+
 /// Only human-visible message kinds may wake an agent. The live-channel tap
 /// delivers every channel event, and reactions/edits/deletions p-tag the
 /// original author — an owner reacting to an agent's old message must not
@@ -327,7 +367,7 @@ export function isWakeShapedEvent(
 /// author, or an unavailable presence lookup. There an immediate re-drive
 /// costs nothing it should not and lets a legitimate follower become the
 /// next owner. Every other owned exit either serves a follower positively
-/// (floor coverage on `woken`) or retains it for the armed timer; retried
+/// (`isServedByCommittedFloor`) or retains it for the armed timer; retried
 /// triggers never re-drive at all — their retry attempt's settlement is
 /// terminal.
 export function shouldRetryCollapsedTriggers(outcome: WakeOutcome): boolean {

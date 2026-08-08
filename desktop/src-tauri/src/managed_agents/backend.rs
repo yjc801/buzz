@@ -504,13 +504,26 @@ fn stage_provider(
     ))
 }
 
+/// A provider's deploy answer, as much of it as the desktop consumes.
+pub struct ProviderDeployOutcome {
+    pub agent_id: String,
+    /// The provider's own classification of the deploy, when it gives one:
+    /// `Some(true)` — this deploy started a FRESH harness generation, so
+    /// the env it carried (the wake replay floor included) is provably in
+    /// effect; `Some(false)` — a strict no-op against an already-running
+    /// generation, whose env is NOT this deploy's. `None` — the provider
+    /// did not say (the field is optional on the wire), which consumers
+    /// must treat as "unproven", never as either answer.
+    pub fresh_generation: Option<bool>,
+}
+
 /// Deploy through one immutable staged copy: negotiate protocol v1 before the
 /// secret-bearing request, then invoke deploy on those exact same bytes.
 pub fn provider_deploy(
     binary: &Path,
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
-) -> Result<String, String> {
+) -> Result<ProviderDeployOutcome, String> {
     let (_directory, staged, _digest, _execution_guard) = stage_provider(binary)?;
     let info_request = serde_json::json!({
         "op": "info",
@@ -526,10 +539,16 @@ pub fn provider_deploy(
         "provider_config": provider_config,
     });
     let resp = invoke_provider(&staged, &request, Duration::from_secs(600))?;
-    resp["agent_id"]
+    let agent_id = resp["agent_id"]
         .as_str()
         .map(String::from)
-        .ok_or_else(|| "deploy response missing agent_id".to_string())
+        .ok_or_else(|| "deploy response missing agent_id".to_string())?;
+    Ok(ProviderDeployOutcome {
+        agent_id,
+        // `as_bool` reads absent AND non-boolean as None: a malformed
+        // classification must degrade to "unproven", not to a coin flip.
+        fresh_generation: resp["fresh_generation"].as_bool(),
+    })
 }
 
 /// Validate provider_config: flat object, scalar values, no secret-like keys.

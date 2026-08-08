@@ -129,10 +129,12 @@ export function useAgentWakeOnMention(enabled: boolean) {
       agent: WakeCandidateAgent,
       triggerCreatedAt: number,
       authorPubkey: string,
+      signal: AbortSignal,
     ) => {
       const { outcome, error } = await runWakeAttempt({
         agent,
         state: wakeStateRef.current,
+        signal,
         startManagedAgent: (pubkey) =>
           startMutation.mutateAsync({
             pubkey,
@@ -184,24 +186,46 @@ export function useAgentWakeOnMention(enabled: boolean) {
       if (outcome === "author-unverified") {
         console.warn("Wake refused: author could not be verified", error);
       }
+      // "cancelled" is always silent: the attempt's community/effect
+      // generation unmounted and the fence stopped it before it could act
+      // on the successor's workspace.
     },
   );
 
-  const handleEvent = React.useEffectEvent((event: RelayEvent) => {
-    if (
-      !trackSeenEvent(seenEventIdsRef.current, event.id, SEEN_WAKE_EVENT_LIMIT)
-    ) {
-      return;
-    }
-    const candidates = selectWakeCandidates(event, managedAgents ?? [], {
-      ownerPubkey,
-      accessOwnerOnly,
-      knownAgentAuthors,
-    });
-    for (const candidate of candidates) {
-      void wakeAgent(candidate, event.created_at, event.pubkey);
-    }
-  });
+  const handleEvent = React.useEffectEvent(
+    (event: RelayEvent, signal: AbortSignal) => {
+      // Never consume an event the gates cannot yet evaluate. The listener
+      // only attaches once prerequisites are resolved, so this is defense
+      // in depth against a race between resolution and effect re-run — a
+      // trigger marked seen while the baseline was undefined would be
+      // dropped forever (the tap replays no history, and reconnect
+      // redelivery would hit the seen-set).
+      if (
+        knownAgentAuthors === undefined ||
+        accessOwnerOnly === undefined ||
+        ownerPubkey.length === 0
+      ) {
+        return;
+      }
+      if (
+        !trackSeenEvent(
+          seenEventIdsRef.current,
+          event.id,
+          SEEN_WAKE_EVENT_LIMIT,
+        )
+      ) {
+        return;
+      }
+      const candidates = selectWakeCandidates(event, managedAgents ?? [], {
+        ownerPubkey,
+        accessOwnerOnly,
+        knownAgentAuthors,
+      });
+      for (const candidate of candidates) {
+        void wakeAgent(candidate, event.created_at, event.pubkey, signal);
+      }
+    },
+  );
 
   // Only provider-backed agents can be woken this way; without one there is
   // nothing to listen for.
@@ -209,10 +233,32 @@ export function useAgentWakeOnMention(enabled: boolean) {
     (agent) => agent.backend.type === "provider",
   );
 
+  // Every gate the event evaluation needs must be resolved BEFORE the
+  // listener attaches: an event delivered earlier would either be consumed
+  // unevaluably (baseline) or judged under a clamped policy that later
+  // widens (access flag, owner identity). Until then, triggers stay
+  // unconsumed so reconnect redelivery can still process them.
+  const prerequisitesReady =
+    knownAgentAuthors !== undefined &&
+    accessOwnerOnly !== undefined &&
+    ownerPubkey.length > 0;
+
   React.useEffect(() => {
-    if (!enabled || !hasWakeableAgents) {
+    if (!enabled || !hasWakeableAgents || !prerequisitesReady) {
       return;
     }
-    return subscribeToLiveChannelEvents(handleEvent);
-  }, [enabled, hasWakeableAgents]);
+    // The controller is this effect generation's fence: community switch
+    // remounts the shell subtree, and the cleanup must not only stop new
+    // events but cancel attempts already inside their evidence/convergence
+    // waits — otherwise they would resume against the NEXT community's
+    // workspace (the Tauri backend is global) and deploy the agent there.
+    const controller = new AbortController();
+    const unsubscribe = subscribeToLiveChannelEvents((event) =>
+      handleEvent(event, controller.signal),
+    );
+    return () => {
+      unsubscribe();
+      controller.abort();
+    };
+  }, [enabled, hasWakeableAgents, prerequisitesReady]);
 }

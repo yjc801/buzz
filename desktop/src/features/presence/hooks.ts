@@ -111,14 +111,20 @@ export function usePresenceSubscription() {
     let isCancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    function handlePresenceEvent(event: { pubkey: string; content: string }) {
+    function handlePresenceEvent(event: {
+      pubkey: string;
+      content: string;
+      created_at: number;
+    }) {
       if (isCancelled) return;
       const parsed = parseLivePresenceEvent(event);
       if (!parsed) return;
       const { pubkey, status } = parsed;
       // Freshness evidence for liveness-sensitive consumers (agent wake):
       // a status can be a stale store entry, an observed heartbeat cannot.
-      recordPresenceHeartbeat(pubkey, status);
+      // The emission time travels along so fences can exclude a delayed
+      // delivery of an old generation's final heartbeat.
+      recordPresenceHeartbeat(pubkey, status, event.created_at);
       queryClient.setQueriesData<PresenceLookup>(
         {
           queryKey: ["presence"],

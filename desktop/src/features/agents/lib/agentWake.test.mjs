@@ -344,27 +344,36 @@ const CLOCK = 5_000_000;
 
 /// Presence STATUS script: statuses consumed one per lookup (last entry
 /// repeats; `null` = no record). Liveness EVIDENCE is a separate axis —
-/// that separation IS the crashed-harness fix — simulated as observed-at
-/// timestamps per pubkey: `heartbeatAtStart` seeds AGENT's log entry (use
-/// `CLOCK - x` for a pre-attempt observation), `evidenceAfterDelays: n`
-/// records a live heartbeat at the current clock after the nth `delay()`
-/// (a heartbeat arriving mid-wait), `offlineAfterDelays: n` deletes the
-/// entry (the harness announcing its exit), and a successful deploy records
-/// evidence at the clock unless `evidenceOnDeploy: false`.
+/// that separation IS the crashed-harness fix — simulated per pubkey as
+/// {observedAtMs, emittedAtMs} pairs: `heartbeatAtStart` seeds AGENT's
+/// entry with both at that value (use `CLOCK - x` for a pre-attempt
+/// observation), `evidenceAfterDelays: n` records a fresh heartbeat (both
+/// at the clock) after the nth `delay()`, `delayedFinalAfterDelays: n`
+/// records a DELIVERED-now-but-EMITTED-pre-attempt heartbeat (the dying
+/// generation's final beat arriving late), `offlineAfterDelays: n` deletes
+/// the entry (the harness announcing its exit), `abortAfterDelays: n`
+/// fires the harness's abort signal, and a successful deploy records fresh
+/// evidence unless `evidenceOnDeploy: false`.
 function wakeHarness({
   presenceScript = [],
   heartbeatAtStart = null,
   evidenceAfterDelays = null,
+  delayedFinalAfterDelays = null,
   offlineAfterDelays = null,
+  abortAfterDelays = null,
   evidenceOnDeploy = true,
   deployFails = false,
   clock = () => CLOCK,
 } = {}) {
   const deployed = [];
   const delays = [];
-  const observedAt = new Map();
+  const evidence = new Map();
+  const controller = new AbortController();
   if (heartbeatAtStart !== null) {
-    observedAt.set(AGENT, heartbeatAtStart);
+    evidence.set(AGENT, {
+      observedAtMs: heartbeatAtStart,
+      emittedAtMs: heartbeatAtStart,
+    });
   }
   let scriptIndex = 0;
   let delayCount = 0;
@@ -375,17 +384,30 @@ function wakeHarness({
   return {
     deployed,
     delays,
-    observedAt,
+    evidence,
     state: createWakeAttemptState(),
     now: clock,
+    signal: controller.signal,
     delay: async (ms) => {
       delays.push(ms);
       delayCount += 1;
       if (evidenceAfterDelays !== null && delayCount === evidenceAfterDelays) {
-        observedAt.set(AGENT, clock());
+        evidence.set(AGENT, { observedAtMs: clock(), emittedAtMs: clock() });
+      }
+      if (
+        delayedFinalAfterDelays !== null &&
+        delayCount === delayedFinalAfterDelays
+      ) {
+        evidence.set(AGENT, {
+          observedAtMs: clock(),
+          emittedAtMs: clock() - 30_000,
+        });
       }
       if (offlineAfterDelays !== null && delayCount === offlineAfterDelays) {
-        observedAt.delete(AGENT);
+        evidence.delete(AGENT);
+      }
+      if (abortAfterDelays !== null && delayCount === abortAfterDelays) {
+        controller.abort();
       }
     },
     fetchPresence: async (pubkeys) => {
@@ -393,14 +415,17 @@ function wakeHarness({
       const status = nextScripted();
       return status == null ? {} : { [key]: status };
     },
-    heartbeatObservedAtMs: (pubkey) => observedAt.get(pubkey.toLowerCase()),
+    heartbeatEvidence: (pubkey) => evidence.get(pubkey.toLowerCase()),
     startManagedAgent: async (pubkey) => {
       deployed.push(pubkey);
       if (deployFails) {
         throw new Error("provider refused");
       }
       if (evidenceOnDeploy) {
-        observedAt.set(pubkey.toLowerCase(), clock());
+        evidence.set(pubkey.toLowerCase(), {
+          observedAtMs: clock(),
+          emittedAtMs: clock(),
+        });
       }
       return {};
     },
@@ -507,11 +532,101 @@ test("an unconfirmed reconcile releases the debounce", async () => {
   assert.deepEqual(harness.deployed, [AGENT, AGENT]);
 });
 
-test("live evidence must be observed at or after the fence", () => {
-  assert.equal(isLiveEvidenceSince(1_000, 1_000), true);
-  assert.equal(isLiveEvidenceSince(1_001, 1_000), true);
-  assert.equal(isLiveEvidenceSince(999, 1_000), false);
+test("live evidence must be delivered AND emitted at or after the fence", () => {
+  const at = (observedAtMs, emittedAtMs) => ({ observedAtMs, emittedAtMs });
+  assert.equal(isLiveEvidenceSince(at(1_000, 1_000), 1_000), true);
+  assert.equal(isLiveEvidenceSince(at(1_001, 1_001), 1_000), true);
+  // Delivered after the fence but emitted before: the dying generation's
+  // delayed final heartbeat. Not evidence.
+  assert.equal(isLiveEvidenceSince(at(1_001, 999), 1_000), false);
+  // Emitted after but delivered before is impossible in practice; still
+  // not evidence — both clocks must clear the fence.
+  assert.equal(isLiveEvidenceSince(at(999, 1_001), 1_000), false);
+  assert.equal(isLiveEvidenceSince(at(999, 999), 1_000), false);
   assert.equal(isLiveEvidenceSince(undefined, 1_000), false);
+});
+
+test("a delayed final heartbeat from a dying generation is not proof of life", async () => {
+  // The old harness emits its last heartbeat, commits to shutdown, and
+  // relay delivery lands that beat AFTER the attempt began. Delivery time
+  // clears the fence; emission time does not — so the attempt must not
+  // return already-live, and after the evidence window it reconciles
+  // through the deploy.
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    heartbeatAtStart: CLOCK - 30_000,
+    delayedFinalAfterDelays: 2,
+  });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "woken");
+  assert.equal(result.reconcile, true);
+  assert.deepEqual(harness.deployed, [AGENT]);
+});
+
+test("an aborted attempt cancels before deploying", async () => {
+  // Community switch mid-wait: the effect generation aborts, and the
+  // attempt must stop before its next external effect instead of deploying
+  // into the successor community's workspace.
+  const harness = wakeHarness({
+    presenceScript: ["online"],
+    heartbeatAtStart: CLOCK - 30_000,
+    abortAfterDelays: 2,
+  });
+  let vetCalls = 0;
+  const result = await runWakeAttempt({
+    agent: agent(),
+    ...harness,
+    confirmAuthorNotKnownAgent: async () => {
+      vetCalls += 1;
+      return true;
+    },
+  });
+
+  assert.equal(result.outcome, "cancelled");
+  assert.deepEqual(harness.deployed, []);
+  assert.equal(vetCalls, 0);
+});
+
+test("an abort during the teardown fence never reaches the deploy", async () => {
+  const harness = wakeHarness({ abortAfterDelays: 1 });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "cancelled");
+  assert.deepEqual(harness.deployed, []);
+});
+
+test("an abort during convergence stops the watch after the deploy", async () => {
+  // The deploy already happened under the right generation; only the
+  // convergence watching stops.
+  const harness = wakeHarness({
+    evidenceOnDeploy: false,
+    abortAfterDelays: 3,
+  });
+  const result = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(result.outcome, "cancelled");
+  assert.deepEqual(harness.deployed, [AGENT]);
+});
+
+test("a pre-aborted signal refuses immediately", async () => {
+  const harness = wakeHarness();
+  const controller = new AbortController();
+  controller.abort();
+  let sampled = 0;
+  const result = await runWakeAttempt({
+    agent: agent(),
+    ...harness,
+    signal: controller.signal,
+    fetchPresence: async () => {
+      sampled += 1;
+      return {};
+    },
+  });
+
+  assert.equal(result.outcome, "cancelled");
+  assert.equal(sampled, 0);
+  assert.deepEqual(harness.deployed, []);
 });
 
 test("an agent that comes up during the teardown fence is left alone", async () => {

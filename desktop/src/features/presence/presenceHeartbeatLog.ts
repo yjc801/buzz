@@ -1,8 +1,9 @@
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 /**
- * When each pubkey's live presence heartbeat was last OBSERVED by this
- * desktop, in local `Date.now()` milliseconds.
+ * The last live presence heartbeat observed by this desktop, per pubkey:
+ * when it was DELIVERED here (local `Date.now()`) and when the harness
+ * EMITTED it (the event's `created_at`).
  *
  * Exists because a presence *status* is not evidence of a live harness: a
  * crashed process cannot publish `offline`, so its last `online` survives in
@@ -10,26 +11,40 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
  * status lookups inside that window agree with each other. What a crashed
  * harness cannot do is keep heartbeating — a live harness republishes
  * kind:20001 every 60s over the relay's live fan-out, which the shell's
- * presence subscription already receives. Recording the receipt time here
- * gives liveness-sensitive consumers (the agent wake path) a freshness
- * signal with no extra relay traffic and no cross-machine clock skew: both
- * timestamps come from this machine's clock.
+ * presence subscription already receives.
  *
- * Observational, not authoritative: a missing/old entry means "no heartbeat
- * seen recently", which legitimately happens right after app start or a
- * relay reconnect. Consumers must treat that as "freshness unknown", never
- * as "offline".
+ * Both timestamps matter, because each alone can lie in one direction:
+ * delivery time is local-clock-clean but relay delivery can land an OLD
+ * generation's final in-flight heartbeat after a fence moment; emission
+ * time excludes that delayed delivery but rides the emitter's clock.
+ * Liveness fences therefore require BOTH to be at/after the fence.
+ *
+ * Observational, not authoritative: a missing entry means "no heartbeat
+ * seen", which legitimately happens right after app start or a relay
+ * reconnect. Consumers must treat that as "freshness unknown", never as
+ * "offline".
  *
  * Community-scoped data in a module singleton, so it is reset via
  * `resetPresenceHeartbeatLog()` in `resetCommunityState()` — a pubkey's
  * heartbeat observed on one relay must not vouch for it on another.
  */
-const lastLiveHeartbeatAtMs = new Map<string, number>();
+export type LiveHeartbeatObservation = {
+  /** Local `Date.now()` at delivery. */
+  observedAtMs: number;
+  /** The event's `created_at` (emitter's clock), in milliseconds. */
+  emittedAtMs: number;
+};
+
+const lastLiveHeartbeat = new Map<string, LiveHeartbeatObservation>();
 
 /** Record a live presence event received over the relay subscription. */
 export function recordPresenceHeartbeat(
   pubkey: string,
   status: string,
+  /** The presence event's `created_at`, unix SECONDS. Absent (older event
+   * shapes) records an emission time of 0, which no fence accepts —
+   * conservative: unproven liveness reconciles via idempotent deploy. */
+  emittedAtSecs?: number,
   nowMs: number = Date.now(),
 ) {
   const key = normalizePubkey(pubkey);
@@ -37,27 +52,27 @@ export function recordPresenceHeartbeat(
     return;
   }
   if (status === "online" || status === "away") {
-    lastLiveHeartbeatAtMs.set(key, nowMs);
+    lastLiveHeartbeat.set(key, {
+      observedAtMs: nowMs,
+      emittedAtMs: (emittedAtSecs ?? 0) * 1_000,
+    });
     return;
   }
   // An explicit offline is a harness announcing its exit — stale "live"
   // evidence must not outlive it.
-  lastLiveHeartbeatAtMs.delete(key);
+  lastLiveHeartbeat.delete(key);
 }
 
 /**
- * Local `Date.now()` time at which a live heartbeat was last observed for
- * `pubkey`, or `undefined` when none has been observed (unknown, NOT
- * offline). A raw timestamp rather than an age, because consumers fence on
- * "observed AFTER moment X" — a heartbeat that predates the moment a wake
- * attempt began proves nothing about the harness surviving until now.
+ * The last live heartbeat observation for `pubkey`, or `undefined` when
+ * none has been observed (unknown, NOT offline).
  */
-export function lastLiveHeartbeatObservedAtMs(
+export function lastLiveHeartbeatObservation(
   pubkey: string,
-): number | undefined {
-  return lastLiveHeartbeatAtMs.get(normalizePubkey(pubkey));
+): LiveHeartbeatObservation | undefined {
+  return lastLiveHeartbeat.get(normalizePubkey(pubkey));
 }
 
 export function resetPresenceHeartbeatLog() {
-  lastLiveHeartbeatAtMs.clear();
+  lastLiveHeartbeat.clear();
 }

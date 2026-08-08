@@ -1,4 +1,7 @@
-import { lastLiveHeartbeatObservedAtMs } from "@/features/presence/presenceHeartbeatLog";
+import {
+  lastLiveHeartbeatObservation,
+  type LiveHeartbeatObservation,
+} from "@/features/presence/presenceHeartbeatLog";
 import { getPresence } from "@/shared/api/tauri";
 import type {
   ManagedAgent,
@@ -200,15 +203,25 @@ export function shouldWakeAgent(
 
 /// Is this heartbeat observation proof of a harness alive since `sinceMs`?
 ///
-/// The only accepted liveness evidence: a live heartbeat OBSERVED at or
-/// after the fence moment. Status samples and pre-fence observations are
-/// both survivable by a crashed harness (store TTL, heartbeat-then-crash)
-/// and prove nothing.
+/// The only accepted liveness evidence: a live heartbeat both DELIVERED and
+/// EMITTED at/after the fence moment. Delivery time alone is not enough —
+/// relay delivery can land an old generation's final in-flight heartbeat
+/// after the fence even though that harness already committed to shutdown
+/// and stopped reading channel events; requiring the emission timestamp
+/// (`created_at`) to also clear the fence excludes that delayed delivery.
+/// The emission side rides the emitter's clock; under skew it degrades
+/// toward "unproven", which reconciles via an idempotent no-op deploy —
+/// never toward a false already-live. Status samples and pre-fence
+/// observations prove nothing (store TTL, heartbeat-then-crash).
 export function isLiveEvidenceSince(
-  observedAtMs: number | undefined,
+  evidence: LiveHeartbeatObservation | undefined,
   sinceMs: number,
 ) {
-  return observedAtMs !== undefined && observedAtMs >= sinceMs;
+  return (
+    evidence !== undefined &&
+    evidence.observedAtMs >= sinceMs &&
+    evidence.emittedAtMs >= sinceMs
+  );
 }
 
 /// Has this agent been woken recently enough that another attempt is noise?
@@ -235,6 +248,9 @@ export function isWakeAttemptDebounced(
 /// `author-unverified` come from the pre-deploy author re-validation: the
 /// fresh known-agent fetch identified the author as an agent, or could not
 /// be completed — neither spends a deploy, and neither stamps the debounce.
+/// `cancelled` means the attempt's abort signal fired (its community/effect
+/// generation unmounted) — always quiet, and guaranteed BEFORE any external
+/// effect that would act on the successor generation's workspace.
 export type WakeOutcome =
   | "woken"
   | "already-live"
@@ -244,7 +260,8 @@ export type WakeOutcome =
   | "deploy-failed"
   | "wake-unconfirmed"
   | "author-rejected"
-  | "author-unverified";
+  | "author-unverified"
+  | "cancelled";
 
 /// Per-agent bookkeeping shared across attempts. Lives in the caller (a ref
 /// in the hook) so it survives re-renders without making this module stateful.
@@ -297,8 +314,9 @@ export async function runWakeAttempt({
   startManagedAgent,
   onDeployed,
   confirmAuthorNotKnownAgent,
+  signal,
   fetchPresence = getPresence,
-  heartbeatObservedAtMs = lastLiveHeartbeatObservedAtMs,
+  heartbeatEvidence = lastLiveHeartbeatObservation,
   now = Date.now,
   delay = waitMs,
 }: {
@@ -313,10 +331,15 @@ export async function runWakeAttempt({
    * author is confirmed NOT to be a known agent; `false` or a rejection
    * refuses the deploy. */
   confirmAuthorNotKnownAgent?: () => Promise<boolean>;
+  /** The attempt's community/effect generation fence. Once aborted, the
+   * attempt stops before its next external effect — an attempt started
+   * under community A must never run its author fetch or deploy against
+   * community B's workspace after a switch. Checked after every wait. */
+  signal?: AbortSignal;
   /** Injectable for tests; production always uses the real relay call. */
   fetchPresence?: (pubkeys: string[]) => Promise<PresenceLookup>;
   /** Injectable for tests; production reads the live heartbeat log. */
-  heartbeatObservedAtMs?: (pubkey: string) => number | undefined;
+  heartbeatEvidence?: (pubkey: string) => LiveHeartbeatObservation | undefined;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
 }): Promise<{ outcome: WakeOutcome; reconcile?: boolean; error?: unknown }> {
@@ -333,6 +356,9 @@ export async function runWakeAttempt({
   if (isWakeAttemptDebounced(state.lastAttemptAt.get(key), attemptStartedAt)) {
     return { outcome: "debounced" };
   }
+  if (signal?.aborted) {
+    return { outcome: "cancelled" };
+  }
   state.inFlight.add(key);
 
   // Fetched fresh, never read off a render snapshot: this decision starts
@@ -341,9 +367,10 @@ export async function runWakeAttempt({
   // means the harness is gone; treating an outage as death would deploy on
   // every relay hiccup.
   const samplePresence = async () => (await fetchPresence([agent.pubkey]))[key];
-  const observedAt = () => heartbeatObservedAtMs(agent.pubkey);
+  const evidence = () => heartbeatEvidence(agent.pubkey);
   const postAttemptEvidence = () =>
-    isLiveEvidenceSince(observedAt(), attemptStartedAt);
+    isLiveEvidenceSince(evidence(), attemptStartedAt);
+  const aborted = () => signal?.aborted === true;
 
   try {
     let presence: PresenceStatus | null | undefined;
@@ -352,6 +379,9 @@ export async function runWakeAttempt({
     } catch (error) {
       return { outcome: "presence-unavailable", error };
     }
+    if (aborted()) {
+      return { outcome: "cancelled" };
+    }
 
     let reconcile = false;
     if (isManagedAgentLive(agent, presence)) {
@@ -359,7 +389,7 @@ export async function runWakeAttempt({
       // prove it with a post-attempt observation. An offline heartbeat
       // arriving meanwhile clears the log entry — that is the harness
       // announcing its exit, and routes to the dead path below.
-      const hadEntryAtStart = observedAt() !== undefined;
+      const hadEntryAtStart = evidence() !== undefined;
       let announcedExit = false;
       for (
         let attempt = 0;
@@ -369,16 +399,19 @@ export async function runWakeAttempt({
         if (postAttemptEvidence()) {
           return { outcome: "already-live" };
         }
-        if (hadEntryAtStart && observedAt() === undefined) {
+        if (hadEntryAtStart && evidence() === undefined) {
           announcedExit = true;
           break;
         }
         await delay(WAKE_LIVE_EVIDENCE_POLL_MS);
+        if (aborted()) {
+          return { outcome: "cancelled" };
+        }
       }
       if (postAttemptEvidence()) {
         return { outcome: "already-live" };
       }
-      if (hadEntryAtStart && observedAt() === undefined) {
+      if (hadEntryAtStart && evidence() === undefined) {
         announcedExit = true;
       }
       // No evidence: the "online" is unverifiable (crashed harness, or one
@@ -395,6 +428,9 @@ export async function runWakeAttempt({
       // generation appearing meanwhile (another client's deploy) shows up
       // as post-attempt evidence.
       await delay(REMOTE_POST_OFFLINE_GRACE_MS);
+      if (aborted()) {
+        return { outcome: "cancelled" };
+      }
       try {
         presence = await samplePresence();
       } catch (error) {
@@ -406,6 +442,13 @@ export async function runWakeAttempt({
       // Status resurfacing live without evidence is the unverifiable case
       // again — deploy, but as reconciliation.
       reconcile = isManagedAgentLive(agent, presence);
+    }
+
+    // Generation fence before every external effect: the author fetch and
+    // the deploy both act on the CURRENT workspace, so an attempt whose
+    // generation has unmounted must stop here, not act on the successor's.
+    if (aborted()) {
+      return { outcome: "cancelled", reconcile };
     }
 
     // Last gate before spending money: re-validate the author against a
@@ -423,6 +466,9 @@ export async function runWakeAttempt({
       if (!authorConfirmedHuman) {
         return { outcome: "author-rejected", reconcile };
       }
+    }
+    if (aborted()) {
+      return { outcome: "cancelled", reconcile };
     }
 
     // Stamp before the deploy, not after: the attempt is what the debounce
@@ -448,6 +494,11 @@ export async function runWakeAttempt({
     // genuinely live one heartbeats within the interval).
     for (let attempt = 0; attempt < WAKE_CONFIRM_ATTEMPTS; attempt += 1) {
       await delay(WAKE_CONFIRM_POLL_MS);
+      if (aborted()) {
+        // The deploy already happened under the right generation; only the
+        // watching stops. The successor generation starts fresh state.
+        return { outcome: "cancelled", reconcile };
+      }
       if (postAttemptEvidence()) {
         return { outcome: "woken", reconcile };
       }

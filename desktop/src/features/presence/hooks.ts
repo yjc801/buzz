@@ -15,6 +15,7 @@ import {
   PRESENCE_TTL_SECONDS,
   resolveAutomaticPresenceStatus,
 } from "@/features/presence/lib/presence";
+import { recordPresenceHeartbeat } from "@/features/presence/presenceHeartbeatLog";
 import type { PresenceLookup, PresenceStatus } from "@/shared/api/types";
 
 const PRESENCE_STATUS_TICK_INTERVAL_MS = 30_000;
@@ -110,11 +111,20 @@ export function usePresenceSubscription() {
     let isCancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    function handlePresenceEvent(event: { pubkey: string; content: string }) {
+    function handlePresenceEvent(event: {
+      id: string;
+      pubkey: string;
+      content: string;
+    }) {
       if (isCancelled) return;
       const parsed = parseLivePresenceEvent(event);
       if (!parsed) return;
       const { pubkey, status } = parsed;
+      // Freshness evidence for liveness-sensitive consumers (agent wake):
+      // a status can be a stale store entry, an observed heartbeat cannot.
+      // The event id travels along so fences can require DISTINCT
+      // emissions without ordering a remote clock against this one.
+      recordPresenceHeartbeat(pubkey, status, event.id);
       queryClient.setQueriesData<PresenceLookup>(
         {
           queryKey: ["presence"],

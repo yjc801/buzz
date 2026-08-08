@@ -64,6 +64,13 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // ambient env var must not be able to forge setup mode (NotReady) on a
     // Ready agent or suppress it (empty/stale payload) on a NotReady one.
     "BUZZ_ACP_SETUP_PAYLOAD",
+    // Wake replay floor: system-owned per-deploy value carried in
+    // launch.policy_env by wake-on-mention deploys (see
+    // `apply_wake_replay_floor`). Providers apply launch.env AFTER
+    // policy_env, so a saved user value would override the real trigger —
+    // losing the waking mention, or making every ordinary start replay up
+    // to 15 minutes of already-handled traffic.
+    "BUZZ_ACP_REPLAY_FLOOR",
     // Desktop ownership markers: these brand every spawned harness with the
     // launching Desktop instance. A user-supplied override would let a
     // definition masquerade as a different instance or fake the nonce used

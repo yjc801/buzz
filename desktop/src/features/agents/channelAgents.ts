@@ -140,14 +140,14 @@ export async function attachManagedAgentToChannel(
     // another community's.
     const isRemote = input.agent.backend.type === "provider";
     if (isRemote && input.agent.status !== "deployed") {
-      agent = await startManagedAgent(input.agent.pubkey);
+      agent = (await startManagedAgent(input.agent.pubkey)).agent;
       started = true;
     } else if (
       !isRemote &&
       input.agent.status !== "running" &&
       input.agent.status !== "deployed"
     ) {
-      agent = await startManagedAgent(input.agent.pubkey);
+      agent = (await startManagedAgent(input.agent.pubkey)).agent;
       started = true;
     }
   }

@@ -114,6 +114,124 @@ fn emit_runtime_lifecycle(
     }
 }
 
+/// How far behind its own clock the relay still accepts an event's
+/// `created_at` at ingest. A wake trigger can therefore legitimately be
+/// this old the moment it is delivered.
+const RELAY_ACCEPTED_PAST_SKEW_SECS: u64 = 900;
+
+/// Time a wake pipeline can legitimately spend between trigger delivery and
+/// this process capturing its startup watermark, as the SUM of the enforced
+/// bounds along the path — each term is a real timeout/window in code, not
+/// an estimate, because any single term assigned to the whole pipeline
+/// silently under-budgets the rest:
+/// - the desktop's stale-online liveness evidence window
+///   (`WAKE_LIVE_EVIDENCE_ATTEMPTS × POLL` = 135s, agentWake.ts);
+/// - the post-offline teardown fence (`REMOTE_POST_OFFLINE_GRACE_MS` = 10s);
+/// - the provider `info` probe invocation timeout (10s, backend.rs);
+/// - the provider `deploy` invocation timeout (600s, backend.rs);
+/// - margin for the pre-deploy author fetch, provider-internal VM
+///   provisioning after the deploy call returns, and harness boot up to
+///   the watermark capture.
+const WAKE_EVIDENCE_WINDOW_BOUND_SECS: u64 = 135;
+const WAKE_TEARDOWN_FENCE_BOUND_SECS: u64 = 10;
+const PROVIDER_INFO_PROBE_TIMEOUT_SECS: u64 = 10;
+const PROVIDER_DEPLOY_INVOCATION_TIMEOUT_SECS: u64 = 600;
+const WAKE_BOOT_AND_SLACK_MARGIN_SECS: u64 = 300;
+const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = WAKE_EVIDENCE_WINDOW_BOUND_SECS
+    + WAKE_TEARDOWN_FENCE_BOUND_SECS
+    + PROVIDER_INFO_PROBE_TIMEOUT_SECS
+    + PROVIDER_DEPLOY_INVOCATION_TIMEOUT_SECS
+    + WAKE_BOOT_AND_SLACK_MARGIN_SECS;
+
+/// Max age of an externally supplied replay floor, relative to the startup
+/// watermark. Bounds how much history a stale or corrupted
+/// `BUZZ_ACP_REPLAY_FLOOR` can force back into the first REQ; a floor older
+/// than this is clamped to the bound rather than ignored, so a slow deploy
+/// still replays as much of the missed window as the bound allows.
+///
+/// Sized as the relay's accepted past skew PLUS the wake pipeline latency
+/// budget: a trigger accepted at the relay's maximum age (900s behind) has
+/// aged further by every second of fence/evidence/deploy/boot latency, and
+/// a cap equal to the skew alone would advance the watermark past the very
+/// trigger that caused this start.
+const REPLAY_FLOOR_MAX_AGE_SECS: u64 =
+    RELAY_ACCEPTED_PAST_SKEW_SECS + WAKE_PIPELINE_LATENCY_BUDGET_SECS;
+
+/// Floor the startup watermark to a wake deploy's trigger timestamp.
+///
+/// A wake deploy sets `BUZZ_ACP_REPLAY_FLOOR` to the `created_at` of the
+/// mention that caused it. The watermark normally starts at process start,
+/// and the first REQ subtracts only a 5s skew — less than routine cold-start
+/// latency, so without the floor the mention that woke this harness would
+/// fall outside the replay window and never be answered. Unparseable or
+/// future values leave the watermark unchanged.
+fn apply_replay_floor(startup_watermark: u64, floor: Option<&str>) -> u64 {
+    let Some(floor) = floor.and_then(|raw| raw.trim().parse::<u64>().ok()) else {
+        return startup_watermark;
+    };
+    if floor >= startup_watermark {
+        return startup_watermark;
+    }
+    floor.max(startup_watermark.saturating_sub(REPLAY_FLOOR_MAX_AGE_SECS))
+}
+
+#[cfg(test)]
+mod replay_floor_tests {
+    use super::{apply_replay_floor, RELAY_ACCEPTED_PAST_SKEW_SECS, REPLAY_FLOOR_MAX_AGE_SECS};
+
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn a_trigger_at_the_relay_age_limit_survives_wake_latency() {
+        // Accepted by the relay at its maximum past skew, then aged further
+        // by the fence/evidence/deploy/boot pipeline — the cap must still
+        // admit it so the first REQ replays the trigger that caused this
+        // very start.
+        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 300;
+        assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
+    }
+
+    #[test]
+    fn the_budget_covers_every_enforced_bound_stacked() {
+        // Worst legitimate case: max relay past skew, then the full
+        // evidence window, the provider info probe, and the full deploy
+        // invocation timeout back to back (~1,645s) — the budget is a sum
+        // of those enforced bounds plus margin, so the trigger survives.
+        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 135 - 10 - 600;
+        assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
+    }
+
+    #[test]
+    fn recent_floor_wins() {
+        assert_eq!(
+            apply_replay_floor(NOW, Some(&(NOW - 90).to_string())),
+            NOW - 90
+        );
+    }
+
+    #[test]
+    fn missing_or_garbage_floor_is_ignored() {
+        assert_eq!(apply_replay_floor(NOW, None), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some("")), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some("not-a-number")), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some("-5")), NOW);
+    }
+
+    #[test]
+    fn future_floor_is_ignored() {
+        assert_eq!(apply_replay_floor(NOW, Some(&(NOW + 60).to_string())), NOW);
+        assert_eq!(apply_replay_floor(NOW, Some(&NOW.to_string())), NOW);
+    }
+
+    #[test]
+    fn ancient_floor_is_clamped_to_the_age_bound() {
+        assert_eq!(
+            apply_replay_floor(NOW, Some(&(NOW - 86_400).to_string())),
+            NOW - REPLAY_FLOOR_MAX_AGE_SECS,
+        );
+    }
+}
+
 /// Resolve the agent's owner pubkey at startup.
 ///
 /// Priority:
@@ -1613,6 +1731,16 @@ async fn tokio_main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // A wake deploy passes the triggering mention's timestamp as
+    // BUZZ_ACP_REPLAY_FLOOR (via the provider launch contract). Cold-start
+    // latency routinely exceeds the 5s resubscribe skew, so without this
+    // floor the first REQ would start *after* the very message that woke the
+    // harness and the agent would never answer it. Bounded so a stale or
+    // corrupted floor cannot replay hours of history.
+    let startup_watermark = apply_replay_floor(
+        startup_watermark,
+        std::env::var("BUZZ_ACP_REPLAY_FLOOR").ok().as_deref(),
+    );
 
     let pubkey_hex = config.keys.public_key().to_hex();
 

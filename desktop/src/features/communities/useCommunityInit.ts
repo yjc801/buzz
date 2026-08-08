@@ -28,6 +28,7 @@ import {
 } from "@/features/agents/activeAgentTurnsStore";
 import { resetAgentWorkingSignal } from "@/features/agents/agentWorkingSignal";
 import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
+import { resetPresenceHeartbeatLog } from "@/features/presence/presenceHeartbeatLog";
 import { resetAvatarPresentations } from "@/features/profile/avatarPresentationStore";
 import { resetAvatarProfileSync } from "@/features/profile/avatarProfileSync";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
@@ -68,6 +69,7 @@ function resetCommunityState({
   resetSidebarRelayConnectionCardState();
   resetMediaCaches();
   resetLinkPreviewMetadataCache();
+  resetPresenceHeartbeatLog();
   resetVideoPlayerState();
   resetRenderScopedReactionHydration();
   resetBackgroundMediaUploads();

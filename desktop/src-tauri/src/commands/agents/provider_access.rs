@@ -69,7 +69,9 @@ pub(crate) async fn reconcile_on_workspace_apply(
             .lock()
             .map_err(|error| error.to_string())?;
         collect_targets_with(load_managed_agents(app)?, true, |record| {
-            super::build_deploy_payload(app, state, record)
+            // No floor: this is the owner-only access reconcile, not a wake.
+            // There is no triggering mention for the harness to replay to.
+            super::build_deploy_payload(app, state, record, None)
         })
     };
 

@@ -8537,7 +8537,7 @@ async function handleStartManagedAgent(
     pubkey: string;
   },
   config?: E2eConfig,
-): Promise<RawManagedAgent> {
+): Promise<{ agent: RawManagedAgent; fresh_generation: boolean | null }> {
   const startError = config?.mock?.startManagedAgentErrors?.shift();
   if (startError) {
     throw new Error(startError);
@@ -8561,6 +8561,13 @@ async function handleStartManagedAgent(
   }
 
   const now = new Date().toISOString();
+  // Captured BEFORE this call mutates the record: production provider
+  // deploys are idempotent, and one against an already-running generation
+  // strict-no-ops with `fresh_generation: false` — the mock must model
+  // that from pre-call state, or wake E2E coverage would see the trigger
+  // presumed delivered in exactly the case production treats as unproven.
+  const wasAlreadyDeployedProvider =
+    agent.backend.type === "provider" && agent.status === "deployed";
   if (agent.backend.type === "provider") {
     agent.status = "deployed";
     agent.pid = null;
@@ -8583,7 +8590,16 @@ async function handleStartManagedAgent(
       : `started mock harness at ${now}`,
   );
   syncMockRelayAgentsFromManagedAgents();
-  return cloneManagedAgent(agent);
+  // Mirror `StartManagedAgentOutcome`: a provider deploy against a record
+  // that was already deployed models the production strict no-op (`false`
+  // — the running generation's env is not this call's); deploying a
+  // stopped record models a performed start (`true`). Local starts carry
+  // no provider classification.
+  return {
+    agent: cloneManagedAgent(agent),
+    fresh_generation:
+      agent.backend.type === "provider" ? !wasAlreadyDeployedProvider : null,
+  };
 }
 
 async function handleStopManagedAgent(args: {

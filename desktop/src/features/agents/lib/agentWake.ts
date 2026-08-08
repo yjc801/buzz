@@ -70,17 +70,6 @@ export const WAKE_STRANDED_RETRY_DELAY_MS = WAKE_ATTEMPT_DEBOUNCE_MS + 5_000;
 /// fresh generation. Mirrors buzz-acp's resubscribe skew.
 export const WAKE_REPLAY_FLOOR_SKEW_SECS = 5;
 
-/// A heartbeat proves the harness CONNECTED — not that the addressed
-/// channel's subscription is active yet: channel REQs are queued and
-/// rate-gated (draining one per pacing tick after the gate opens), so
-/// subscription readiness lags the first beat by up to channel-count ×
-/// pacing. Live-delivery coverage therefore requires delivery this long
-/// AFTER the liveness anchor; sized to outlast the drain for many hundreds
-/// of channels plus gate deferral. The error direction is deliberate: a
-/// trigger inside the margin is retained and re-verified (or reported
-/// unverified), never falsely marked covered.
-export const WAKE_CHANNEL_SUBSCRIBE_MARGIN_MS = 120_000;
-
 /// The replay floor a wake deploy should commit: the minimum `created_at`
 /// across the owning trigger AND every trigger currently collapsed behind
 /// it. Authors' clocks are independent (the relay accepts ±15 minutes), so
@@ -297,14 +286,6 @@ export function createLiveEvidenceTracker(
     hasPostFenceBeat(): boolean {
       return anchor !== undefined;
     },
-    /** Local delivery time of the earliest post-fence beat: the moment the
-     * harness is known to have been connected since. A trigger DELIVERED
-     * after this was ingested while the harness's subscriptions were up,
-     * so the harness received it live — a coverage rule that never needs
-     * the replay floor. */
-    firstPostFenceBeatObservedAtMs(): number | undefined {
-      return anchor?.observedAtMs;
-    },
   };
 }
 
@@ -337,21 +318,18 @@ export function isWakeShapedEvent(
   );
 }
 
-/// Should triggers that collapsed behind an owning attempt (its `in-flight`
-/// verdict) be retried when that attempt ends with `outcome`?
+/// Should FRESH triggers that collapsed behind an owning attempt be
+/// re-driven immediately (revalidated) when that attempt ends with
+/// `outcome`?
 ///
-/// A collapsed trigger is covered when the owner produced positive liveness
-/// (`already-live`: the live agent received the later mention itself) or a
-/// deploy whose replay floor predates it (`woken`, and `wake-unconfirmed` —
-/// the deploy happened with a floor at the OWNER's earlier trigger, so a
-/// late-booting harness still replays the collapsed mention; the released
-/// debounce covers the never-boots case). `deploy-failed` is deliberately
-/// not retried: the held debounce is the anti-hammer policy and a retry
-/// would just be refused again. `cancelled` means the effect generation
-/// unmounted — everything dies with it. What remains uncovered are the
-/// exits that neither proved liveness nor deployed: an author veto or an
-/// unavailable presence lookup, where a legitimate collapsed mention would
-/// otherwise be silently lost to the seen-set.
+/// True exactly for the exits where the owner neither proved liveness nor
+/// spent a deploy on anyone's behalf — an author veto, an unverifiable
+/// author, or an unavailable presence lookup. There an immediate re-drive
+/// costs nothing it should not and lets a legitimate follower become the
+/// next owner. Every other owned exit either serves a follower positively
+/// (floor coverage on `woken`) or retains it for the armed timer; retried
+/// triggers never re-drive at all — their retry attempt's settlement is
+/// terminal.
 export function shouldRetryCollapsedTriggers(outcome: WakeOutcome): boolean {
   return (
     outcome === "author-rejected" ||
@@ -502,15 +480,7 @@ export async function runWakeAttempt({
   heartbeatEvidence?: (pubkey: string) => LiveHeartbeatObservation | undefined;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
-}): Promise<{
-  outcome: WakeOutcome;
-  reconcile?: boolean;
-  error?: unknown;
-  /** Local delivery time of the earliest beat proving the CURRENT liveness
-   * (already-live) or the post-deploy generation (woken). Settlement uses
-   * it to tell live-delivered held triggers from boot-window stragglers. */
-  livenessAnchorMs?: number;
-}> {
+}): Promise<{ outcome: WakeOutcome; reconcile?: boolean; error?: unknown }> {
   const key = normalizePubkey(agent.pubkey);
 
   // An attempt already deciding for this agent owns the decision: two
@@ -567,10 +537,7 @@ export async function runWakeAttempt({
         attempt += 1
       ) {
         if (provenLive()) {
-          return {
-            outcome: "already-live",
-            livenessAnchorMs: tracker.firstPostFenceBeatObservedAtMs(),
-          };
+          return { outcome: "already-live" };
         }
         if (hadEntryAtStart && evidence() === undefined) {
           announcedExit = true;
@@ -588,10 +555,7 @@ export async function runWakeAttempt({
         }
       }
       if (provenLive()) {
-        return {
-          outcome: "already-live",
-          livenessAnchorMs: tracker.firstPostFenceBeatObservedAtMs(),
-        };
+        return { outcome: "already-live" };
       }
       if (hadEntryAtStart && evidence() === undefined) {
         announcedExit = true;
@@ -620,10 +584,7 @@ export async function runWakeAttempt({
         return { outcome: "presence-unavailable", error };
       }
       if (provenLive()) {
-        return {
-          outcome: "already-live",
-          livenessAnchorMs: tracker.firstPostFenceBeatObservedAtMs(),
-        };
+        return { outcome: "already-live" };
       }
       // Status resurfacing live without proof is the unverifiable case
       // again — deploy, but as reconciliation.
@@ -700,11 +661,7 @@ export async function runWakeAttempt({
       }
       const observation = evidence();
       if (observation !== undefined && observation.observedAtMs >= deployedAt) {
-        return {
-          outcome: "woken",
-          reconcile,
-          livenessAnchorMs: observation.observedAtMs,
-        };
+        return { outcome: "woken", reconcile };
       }
     }
 

@@ -445,9 +445,6 @@ test("an offline agent is deployed exactly once", async () => {
   assert.deepEqual(harness.deployed, [AGENT]);
   // The deploy respected the post-offline teardown fence.
   assert.ok(harness.delays.includes(REMOTE_POST_OFFLINE_GRACE_MS));
-  // The woken anchor is the fresh generation's first observed beat (the
-  // deploy-time beat here, delivered after the 10s fence).
-  assert.equal(result.livenessAnchorMs, CLOCK + REMOTE_POST_OFFLINE_GRACE_MS);
 });
 
 test("a live agent that keeps heartbeating after the mention is left alone", async () => {
@@ -462,10 +459,6 @@ test("a live agent that keeps heartbeating after the mention is left alone", asy
 
   assert.equal(result.outcome, "already-live");
   assert.deepEqual(harness.deployed, []);
-  // The anchor is the EARLIEST post-attempt beat — the moment the harness
-  // is known connected since. Settlement uses it to tell live-delivered
-  // held triggers from boot-window stragglers.
-  assert.equal(result.livenessAnchorMs, CLOCK + 5_000);
 });
 
 test("a dying harness that still says online is woken once it announces exit", async () => {

@@ -18,7 +18,6 @@ import {
   runWakeAttempt,
   selectWakeCandidates,
   shouldRetryCollapsedTriggers,
-  WAKE_CHANNEL_SUBSCRIBE_MARGIN_MS,
   WAKE_COLLAPSED_TRIGGER_LIMIT,
   WAKE_STRANDED_RETRY_DELAY_MS,
   type WakeCandidateAgent,
@@ -243,7 +242,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
       // timestamp alone would leave outside the fresh harness's REQ.
       let committedFloorTs: number | null = null;
 
-      const { outcome, error, livenessAnchorMs } = await runWakeAttempt({
+      const { outcome, error } = await runWakeAttempt({
         agent,
         state: wakeStateRef.current,
         signal,
@@ -281,28 +280,40 @@ export function useAgentWakeOnMention(enabled: boolean) {
       if (outcome === "debounced") {
         // A debounced attempt never owned the in-flight claim — it must
         // not settle (and above all not delete) another owner's held
-        // triggers. A re-driven straggler that lands on a debounce goes
-        // back into the held map so its promised verdict still arrives.
+        // triggers. The trigger itself re-enters the held map (fresh or
+        // retried): the deploy that stamped the debounce committed its
+        // floor BEFORE this trigger existed, so nothing proves coverage.
         reportOutcome(agent, outcome, error, event.pubkey);
-        if (trigger.retriedOnce) {
-          const held = collapsedTriggersRef.current.get(agentKey) ?? [];
-          pushBoundedPendingTrigger(
-            held,
-            trigger,
-            WAKE_COLLAPSED_TRIGGER_LIMIT,
-          );
-          collapsedTriggersRef.current.set(agentKey, held);
-          scheduleStrandedRetry(agent, signal);
-        }
+        const held = collapsedTriggersRef.current.get(agentKey) ?? [];
+        pushBoundedPendingTrigger(held, trigger, WAKE_COLLAPSED_TRIGGER_LIMIT);
+        collapsedTriggersRef.current.set(agentKey, held);
+        scheduleStrandedRetry(agent, signal);
         return;
       }
 
       reportOutcome(agent, outcome, error, event.pubkey);
 
-      // This attempt owned the agent's in-flight claim; settle whatever
-      // collapsed behind it AND — when the owner is itself a re-driven
-      // straggler — the owner too: it exists only because a timer promised
-      // it a verdict, and an empty held map must not erase that promise.
+      // This attempt owned the agent's in-flight claim. Settle the OWNER
+      // and every follower with one uniform matrix. A fresh trigger is
+      // SERVED only by positive coverage:
+      //   - the owner of an already-live attempt (the two-beat proof plus
+      //     a live pre-attempt status is the strongest verdict available —
+      //     the long-standing semantics of this path), or
+      //   - floor coverage on a WOKEN outcome. Floor coverage deliberately
+      //     counts ONLY there: a rejected deploy installed nothing, and
+      //     wake-unconfirmed may have been a strict no-op into a dying
+      //     process. On woken, a post-deploy beat demonstrates a running
+      //     generation, and for FRESH triggers folded into the floor the
+      //     verdict holds on both branches of the provider's no-op
+      //     ambiguity — a fresh generation replays them from the floor,
+      //     while a long-running live harness (strict NoOp) had its
+      //     subscriptions active when they were delivered. That
+      //     disjunction is exactly what fails for RETRIED triggers (their
+      //     original delivery predates this attempt and possibly the
+      //     harness's life), so a retried trigger is never floor-covered.
+      // Everything else RETAINS with the armed timer. Retried triggers are
+      // strictly one-shot: their retry attempt's settlement is terminal —
+      // dropped with a warning that says only what is knowable.
       const held = collapsedTriggersRef.current.get(agentKey) ?? [];
       collapsedTriggersRef.current.delete(agentKey);
       if (signal.aborted || outcome === "cancelled") {
@@ -312,100 +323,69 @@ export function useAgentWakeOnMention(enabled: boolean) {
         return;
       }
 
-      // Coverage rules — both local-clock-only:
-      // (a) replay floor: the deploy's committed floor reaches the
-      //     trigger's created_at, so the fresh REQ replays it;
-      // (b) liveness anchor + subscribe margin: the trigger was DELIVERED
-      //     here comfortably after the earliest beat proving the harness
-      //     connected. The margin matters: a beat proves the CONNECTION,
-      //     while channel REQs are queued and rate-gated behind it, so
-      //     delivery must postdate the anchor by more than the worst-case
-      //     subscription drain before it counts as live-delivered.
-      const covered = (candidate: HeldTrigger) =>
-        (committedFloorTs !== null &&
-          isCoveredByReplayFloor(
-            candidate.event.created_at,
-            committedFloorTs,
-          )) ||
-        (livenessAnchorMs !== undefined &&
-          candidate.deliveredAtMs >
-            livenessAnchorMs + WAKE_CHANNEL_SUBSCRIBE_MARGIN_MS);
-
       const provenLive = outcome === "already-live" || outcome === "woken";
-      const dropUnverified = (candidate: HeldTrigger) => {
+      const floorCovered = (candidate: HeldTrigger) =>
+        !candidate.retriedOnce &&
+        outcome === "woken" &&
+        committedFloorTs !== null &&
+        isCoveredByReplayFloor(candidate.event.created_at, committedFloorTs);
+      const dropRetried = (candidate: HeldTrigger) => {
         console.warn(
-          "Wake trigger dropped after retry: agent is live but delivery could not be verified (mention may predate its replay floor and subscription readiness)",
+          provenLive
+            ? "Wake trigger dropped after retry: agent is live but delivery could not be verified"
+            : "Wake trigger dropped after retry: the retry did not resolve — a new mention will start fresh",
           { agent: agent.pubkey, event: candidate.id },
         );
       };
 
-      // Settle a RETRIED owner first. A fresh owner needs no settlement:
-      // proven-live outcomes answer it directly and deploy outcomes fold
-      // its own created_at into the committed floor.
       const retainBack: HeldTrigger[] = [];
-      if (trigger.retriedOnce && !covered(trigger)) {
-        if (provenLive) {
-          dropUnverified(trigger);
-        } else if (outcome === "author-rejected") {
-          // Its author is a confirmed agent — never a valid wake trigger.
-        } else {
-          retainBack.push(trigger);
-        }
+      const redrive: HeldTrigger[] = [];
+
+      // The owner.
+      if (trigger.retriedOnce) {
+        // One-shot: this WAS the retry; its settlement is terminal.
+        dropRetried(trigger);
+      } else if (outcome === "already-live" || floorCovered(trigger)) {
+        // Served.
+      } else if (outcome === "author-rejected") {
+        // Its author is a confirmed agent — never a valid wake trigger.
+      } else {
+        // presence-unavailable, author-unverified, deploy-failed,
+        // wake-unconfirmed, or a woken outcome that somehow did not cover
+        // it: the mention is consumed from the seen-set but unserved —
+        // retain it for the armed retry instead of losing it.
+        retainBack.push(trigger);
       }
 
-      if (
-        outcome === "already-live" ||
-        outcome === "woken" ||
-        outcome === "wake-unconfirmed"
-      ) {
-        const uncovered = held.filter((heldTrigger) => !covered(heldTrigger));
-        // A straggler that already spent its one active re-drive against a
-        // PROVEN-LIVE agent is unrecoverable by anything the desktop can
-        // do: it cannot re-sign another author's event, a deploy no-ops on
-        // a live harness, and the fresh REQ has passed it by. Say so and
-        // let it go — parking it forever is a quieter way of losing it.
-        for (const dropped of uncovered) {
-          if (dropped.retriedOnce && provenLive) {
-            dropUnverified(dropped);
-          }
+      // The followers.
+      for (const follower of held) {
+        if (follower.retriedOnce) {
+          dropRetried(follower);
+          continue;
         }
-        const retained = [
-          ...retainBack,
-          ...uncovered.filter(
-            (heldTrigger) => !(heldTrigger.retriedOnce && provenLive),
-          ),
-        ];
-        if (retained.length > 0) {
-          collapsedTriggersRef.current.set(agentKey, retained);
-          scheduleStrandedRetry(agent, signal);
+        if (floorCovered(follower)) {
+          continue; // served by the woken deploy's folded floor
         }
-        return;
+        if (shouldRetryCollapsedTriggers(outcome)) {
+          // The owner never proved or spent anything on their behalf —
+          // re-drive now, revalidated, oldest first; the first survivor
+          // becomes the next owner and the rest re-collapse behind it.
+          redrive.push(follower);
+          continue;
+        }
+        // already-live (no proof the follower's channel delivery landed),
+        // woken stragglers below the floor, wake-unconfirmed,
+        // deploy-failed: retain for the armed retry.
+        retainBack.push(follower);
       }
-      if (!shouldRetryCollapsedTriggers(outcome)) {
-        // deploy-failed: this attempt is terminal (anti-hammer debounce),
-        // but the held mentions are still unserved — retain them and let
-        // the scheduled re-drive run after the debounce window.
-        const retained = [...retainBack, ...held];
-        if (retained.length > 0) {
-          collapsedTriggersRef.current.set(agentKey, retained);
-          scheduleStrandedRetry(agent, signal);
-        }
-        return;
-      }
-      // Uncovered exit (author veto, unverified author, presence outage):
-      // re-drive the held triggers oldest-first — but each must pass
-      // candidate selection AGAIN, against the freshest baseline any veto
-      // has fetched. The exit that brought us here may have just learned
-      // the previous owner's author is an agent; a sibling event from that
-      // same author must not claim another full ownership cycle only to be
-      // vetoed at the end of it. Recursion terminates: retries only
-      // re-drive what the map held at settlement, and a re-collapsed
-      // trigger is simply retained behind the new owner.
+
       if (retainBack.length > 0) {
         collapsedTriggersRef.current.set(agentKey, retainBack);
         scheduleStrandedRetry(agent, signal);
       }
-      redriveHeldTriggers(agent, held, signal);
+      if (redrive.length > 0) {
+        redriveHeldTriggers(agent, redrive, signal);
+      }
     },
   );
 

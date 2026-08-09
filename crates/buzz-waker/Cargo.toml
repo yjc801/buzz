@@ -2,7 +2,11 @@
 name = "buzz-waker"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Overrides the workspace 1.88: the fenced floor store uses
+# std::fs::File::lock (stabilised 1.89), which is cross-platform —
+# flock on Unix, LockFileEx on Windows. rustix::fs::flock is POSIX-only
+# and broke the Windows workspace check.
+rust-version = "1.89.0"
 license.workspace = true
 repository.workspace = true
 description = "Headless wake daemon for remote Buzz agents: signed launch bundles and durable anti-rollback state"
@@ -10,7 +14,6 @@ description = "Headless wake daemon for remote Buzz agents: signed launch bundle
 [dependencies]
 buzz-core  = { workspace = true }
 nostr       = { workspace = true }
-rustix      = { version = "1", features = ["fs"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }

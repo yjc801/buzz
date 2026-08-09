@@ -17,8 +17,10 @@
 //!
 //! **Lost update.** Two `FloorStore` handles can each cache the record, and the
 //! second one's write would clobber the first one's. Every mutation therefore
-//! takes an exclusive `flock` on a sidecar lock file, **re-reads the record
-//! from disk under that lock**, decides against those bytes, and writes before
+//! takes an exclusive advisory lock on a sidecar lock file
+//! ([`std::fs::File::lock`], which is `flock` on Unix and `LockFileEx` on
+//! Windows), **re-reads the record from disk under that lock**, decides
+//! against those bytes, and writes before
 //! releasing. The in-memory copy is a snapshot for display, never the basis of
 //! a decision. The lock lives on a sidecar rather than on the record itself
 //! because the record is replaced by `rename`, which swaps the inode out from
@@ -45,7 +47,6 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 
 /// Failures reading or advancing the durable record.
@@ -352,7 +353,7 @@ impl FenceGuard {
             .write(true)
             .open(lock_path)
             .map_err(|e| fail(format!("could not open the fence: {e}")))?;
-        flock(&file, FlockOperation::LockExclusive)
+        file.lock()
             .map_err(|e| fail(format!("could not take the fence: {e}")))?;
         Ok(Self { file })
     }
@@ -360,8 +361,8 @@ impl FenceGuard {
 
 impl Drop for FenceGuard {
     fn drop(&mut self) {
-        // Best effort: closing the descriptor releases the lock regardless.
-        let _ = flock(&self.file, FlockOperation::Unlock);
+        // Best effort: closing the handle releases the lock regardless.
+        let _ = self.file.unlock();
     }
 }
 

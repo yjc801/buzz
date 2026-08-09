@@ -3,6 +3,25 @@
 use thiserror::Error;
 use url::{Host, Url};
 
+/// How far an event's `created_at` may sit from server time and still be
+/// accepted, in seconds (±15 minutes).
+///
+/// This is **relay ingest policy**, and it is defined here rather than in
+/// `buzz-relay` because two other components have to reason about the same
+/// number and cannot import the relay:
+///
+/// - `buzz-acp` derives its replay-floor age cap from it, so that a wake
+///   deploy can still hand a fresh harness a floor reaching the oldest
+///   trigger the relay would have accepted;
+/// - `buzz-waker` sizes its reconnect overlap at `2 ×` this value, because a
+///   future-dated event can advance a timestamp cursor by the full drift and
+///   an accepted backdated event can then land the full drift behind it.
+///
+/// Those were previously independent `900` literals in separate crates with
+/// nothing tying them together, so changing the relay's tolerance would have
+/// silently invalidated the other two. One definition removes the question.
+pub const MAX_TIMESTAMP_DRIFT_SECS: u64 = 900;
+
 /// Errors returned while canonicalizing a relay URL for runtime identity.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NormalizeRelayUrlError {

@@ -117,7 +117,12 @@ fn emit_runtime_lifecycle(
 /// How far behind its own clock the relay still accepts an event's
 /// `created_at` at ingest. A wake trigger can therefore legitimately be
 /// this old the moment it is delivered.
-const RELAY_ACCEPTED_PAST_SKEW_SECS: u64 = 900;
+///
+/// Taken from `buzz-core` rather than restated: this used to be an
+/// independent `900` literal here with nothing tying it to the relay's own
+/// ingest bound, so raising the relay's tolerance would have silently left
+/// this cap too small and quietly excluded triggers the relay had accepted.
+const RELAY_ACCEPTED_PAST_SKEW_SECS: u64 = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
 
 /// Time a wake pipeline can legitimately spend between trigger delivery and
 /// this process capturing its startup watermark, as the SUM of the enforced

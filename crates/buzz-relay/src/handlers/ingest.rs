@@ -1973,7 +1973,9 @@ async fn ingest_event_inner(
     }
     let event = std::sync::Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone());
 
-    const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
+    // Defined in buzz-core because buzz-acp's replay-floor cap and
+    // buzz-waker's reconnect overlap are both derived from this exact value.
+    const MAX_TIMESTAMP_DRIFT_SECS: i64 = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS as i64;
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
     if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {

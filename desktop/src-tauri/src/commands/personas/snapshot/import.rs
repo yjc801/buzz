@@ -868,6 +868,39 @@ pub(crate) async fn submit_engram_event(
     Ok(())
 }
 
+// ── NIP-49 egress guard: boundary 7 (persona snapshot engram submit) ─────────
+//
+// Stays inline: `egress_guard_tests.rs` inventories NIP-49 fixtures and
+// `/events` URL sites per file, and names this module as boundary 7's
+// injection test. The avatar tests carry the line-count relief instead.
+
+#[cfg(test)]
+mod egress_guard_tests {
+    use super::submit_engram_event;
+
+    const NCRYPTSEC: &str = "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
+
+    /// An engram body carrying an ncryptsec must be rejected by the guard
+    /// before any network I/O (the target port is a discard address; a guard
+    /// error — not a connection error — proves the abort ordering).
+    #[tokio::test]
+    async fn blocks_ncryptsec_before_network() {
+        let state = crate::app_state::build_app_state();
+        let keys = nostr::Keys::generate();
+        let body = format!("{{\"content\":\"{NCRYPTSEC}\"}}");
+        let err = submit_engram_event(
+            &state,
+            &keys,
+            body.as_bytes(),
+            "http://127.0.0.1:9/events",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("key-backup material"), "{err}");
+    }
+}
+
 #[cfg(test)]
 #[path = "import_tests.rs"]
 mod tests;

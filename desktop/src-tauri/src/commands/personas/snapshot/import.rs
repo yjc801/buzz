@@ -18,7 +18,7 @@ use crate::{
             decrypt_envelope, parse_chunk_payload, resolve_unlock_secret, ChunkPayload,
             LOCKED_CARD_REFUSAL,
         },
-        load_managed_agents, load_personas, minted_community_scope, save_managed_agents,
+        load_managed_agents, load_personas, mint_scope_and_check_name, save_managed_agents,
         save_personas, AgentDefinition, ManagedAgentRecord, RespondTo,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
@@ -555,6 +555,17 @@ pub async fn confirm_agent_snapshot_import(
             return Err(format!("generated pubkey {pubkey} already exists — retry"));
         }
 
+        // Same per-(community, name) uniqueness `create_managed_agent` enforces,
+        // in the same critical section as the write. Importing a snapshot named
+        // Bumble into a community that already offers Bumble would otherwise
+        // persist a second scoped instance and recreate exactly the ambiguous
+        // picker entry this scoping exists to remove.
+        let minted_scope = mint_scope_and_check_name(
+            &records,
+            &display_name,
+            &relay_ws_url_with_override(&state),
+        )?;
+
         let now = now_iso();
         let persona_id = uuid::Uuid::new_v4().to_string();
 
@@ -603,7 +614,7 @@ pub async fn confirm_agent_snapshot_import(
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
             relay_url: String::new(), // resolves to workspace relay at runtime
-            community_relay_url: minted_community_scope(&relay_ws_url_with_override(&state)),
+            community_relay_url: minted_scope,
             avatar_url: effective_avatar.clone(),
             // Machine-local commands: derive from the runtime catalog at
             // spawn time — never manufacture from snapshot data.

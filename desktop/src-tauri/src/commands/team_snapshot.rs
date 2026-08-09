@@ -17,8 +17,9 @@ use crate::{
     },
     managed_agents::{
         agent_snapshot::{build_snapshot, AgentSnapshot, AgentSnapshotMemoryEntry, MemoryLevel},
-        load_managed_agents, load_personas, load_teams, load_teams_readonly,
-        minted_community_scope, save_managed_agents, save_personas, save_teams, AgentDefinition,
+        instance_name_taken_in_scope, load_managed_agents, load_personas, load_teams,
+        load_teams_readonly, minted_community_scope, save_managed_agents, save_personas, save_teams,
+        AgentDefinition,
         ManagedAgentRecord, TeamRecord,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
@@ -642,6 +643,30 @@ pub async fn confirm_team_snapshot_import(
                     m.pubkey
                 ));
             }
+        }
+
+        // Same per-(community, name) uniqueness `create_managed_agent` enforces,
+        // in the same critical section as the write — importing a team whose
+        // member is named Bumble into a community that already offers Bumble
+        // would otherwise recreate the ambiguous picker entry scoping removes.
+        //
+        // Accumulate the members as we go so they are also checked against ONE
+        // ANOTHER: a single snapshot can carry two members who collide with
+        // each other even though neither collides with the existing store.
+        let mut checked = existing_records.clone();
+        for m in &minted {
+            if instance_name_taken_in_scope(
+                &checked,
+                &m.display_name,
+                m.record.community_relay_url.as_deref(),
+                None,
+            ) {
+                return Err(format!(
+                    "an agent named \"{}\" already exists in this community",
+                    m.display_name
+                ));
+            }
+            checked.push(m.record.clone());
         }
 
         // Snapshot both store files for rollback on partial write failure.

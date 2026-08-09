@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   coalesceAgentAutocompleteCandidates,
   filterCachedAgentSuggestions,
+  getAdmittedMemberAgentPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
   isAgentIdentityInAllowedList,
@@ -347,6 +348,69 @@ test("member agents: the allowed-list predicate is STRICTER than the hide rule",
     isAgentIdentityInAllowedList({ isAgent: true, pubkey: PUB_A }, new Set()),
     false,
     "the stricter predicate rejects it — do not add it to the mention picker",
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: admits the member agent the picker shows", () => {
+  // The picker's member branch and the send path's agent classification must
+  // agree, or an agent the user just picked is treated as an ordinary person
+  // once the message sends (no audience promotion, no Huddle enrollment).
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [PUB_A],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set(),
+      }),
+    ],
+    [PUB_A],
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: drops what the hide rule and archive gate reject", () => {
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        // PUB_A: explicitly not invocable (directory entry excludes us).
+        // PUB_B: archived.
+        // PUB_C: invocable.
+        // PUB_D: member agent with unknown invocability.
+        memberAgentPubkeys: [PUB_A, PUB_B, PUB_C, PUB_D],
+        isArchived: (pubkey) => pubkey === PUB_B,
+        mentionableAgentPubkeys: new Set([PUB_C]),
+        directoryAgentPubkeys: new Set([PUB_A, PUB_C]),
+      }),
+    ],
+    [PUB_C, PUB_D],
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: normalizes before gating and emitting", () => {
+  const mixedCase = "Ab".repeat(32);
+  const normalized = mixedCase.toLowerCase();
+
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [mixedCase],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set(),
+      }),
+    ],
+    [normalized],
+  );
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [mixedCase],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set([normalized]),
+      }),
+    ],
+    [],
   );
 });
 

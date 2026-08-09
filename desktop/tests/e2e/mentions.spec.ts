@@ -8,6 +8,7 @@ import {
 
 const MOCK_VIEWER_PUBKEY = "deadbeef".repeat(8);
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+const GENERAL_THREAD_ROOT_ID = "mock-general-welcome";
 
 test.beforeEach(async ({ page }) => {
   await installMockBridge(page);
@@ -848,18 +849,70 @@ test("other-owned agents without a shared channel are hidden from mentions", asy
   await expect(input.locator(".mention-chip")).toHaveCount(0);
 });
 
-test("stale channel-member agents absent from managed and relay directories stay hidden", async ({
+test("channel-member agents absent from the directories stay agents through the send path", async ({
   page,
 }) => {
+  // `mira` is a channel member the relay classifies as an agent, with no
+  // kind:10100 directory entry — so she is admitted by the picker's member
+  // branch but is absent from `mentionableAgentPubkeys`. Selecting her must
+  // classify her as an agent downstream too, or the send treats her as an
+  // ordinary person: dropped from the thread's persistent audience and from
+  // Huddle enrollment.
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz:keep-addressed-agents-active", "1");
+  });
   await installMockBridge(page, { userSearchDelayMs: 1_000 });
-  await page.goto("/");
-  await page.getByTestId("channel-general").click();
-  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await page.goto(
+    `/#/channels/${GENERAL_CHANNEL_ID}?messageId=${GENERAL_THREAD_ROOT_ID}&thread=${GENERAL_THREAD_ROOT_ID}`,
+    { waitUntil: "domcontentloaded" },
+  );
+  await expect(page.getByTestId("message-thread-panel")).toBeVisible();
 
-  const input = page.getByTestId("message-input");
+  const composer = page.getByTestId("thread-composer-overlay");
+  const input = composer.getByTestId("message-input");
   await input.fill("@mira");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  const suggestion = composer
+    .getByTestId("mention-autocomplete")
+    .getByTestId(`mention-suggestion-${PROFILE_ONLY_AGENT_PUBKEY}`);
+  await expect(suggestion).toBeVisible();
+  await suggestion.click();
+  await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
+  await input.pressSequentially("status?");
+
+  const baselineHuddleSyncs = commandCount(
+    await readCommandLog(page),
+    "sync_agents_to_active_huddle",
+  );
+  await composer.getByTestId("send-message").click();
+
+  // Stays addressed for the next reply instead of vanishing after the send.
+  await expect(input).toHaveText("@mira ");
+  await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
+  // Promoted into the thread's stored audience.
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ owner, channelId, rootId }) => {
+          const stored = JSON.parse(
+            localStorage.getItem("buzz:persistent-agent-audiences:v2") ?? "{}",
+          );
+          return stored[`${owner}:${channelId}:thread:${rootId}`] ?? null;
+        },
+        {
+          owner: MOCK_VIEWER_PUBKEY,
+          channelId: GENERAL_CHANNEL_ID,
+          rootId: GENERAL_THREAD_ROOT_ID,
+        },
+      ),
+    )
+    .toEqual([PROFILE_ONLY_AGENT_PUBKEY]);
+  // Enrolled in the Huddle like any other mentioned agent.
+  await expect
+    .poll(async () =>
+      commandCount(await readCommandLog(page), "sync_agents_to_active_huddle"),
+    )
+    .toBe(baselineHuddleSyncs + 1);
 });
 
 test("managed relay agents are visible in channel mentions regardless of relay policy", async ({

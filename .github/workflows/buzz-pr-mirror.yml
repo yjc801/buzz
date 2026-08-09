@@ -27,24 +27,48 @@ name: buzz-pr-mirror
 # then runs its side effect, logging and swallowing any failure ("Side effect
 # failed" in handlers/ingest.rs). `buzz channels …` exits 0 on storage, so a
 # clean exit proves the event exists, never that `archived_at`, the TTL, or a
-# membership row changed. Every mutation below is therefore fenced by an
-# authoritative postcondition — a kind-39002 roster read, or the relay's own
-# pre-storage refusal of writes to an archived channel — rather than by an
-# exit code. The one mutation with no such fence is the TTL: no CLI projection
-# exposes a channel's TTL (`channels get` returns id/name/description/
-# created_at only), so its application is unobservable from here. That gap is
-# marked at both of its call sites, and closing it needs a relay/CLI change.
+# membership row changed. NO SUCCESS PATH BELOW REPORTS AN UNVERIFIED
+# MUTATION. Each one is fenced by an authoritative postcondition — a kind-39002
+# roster read, or the relay's own pre-storage refusal of writes to an archived
+# channel — and where no postcondition exists the mutation is not performed at
+# all rather than performed and assumed:
+#   * no channel TTL is ever set on a success path. A channel's TTL is
+#     unobservable through the CLI (`channels get` projects only id/name/
+#     description/created_at; `channels search` exposes `archived` but not
+#     `ttl`), so a TTL write can never be confirmed. The velvet-era
+#     "archive 404s on the hosted relay, fall back to a 60s idle TTL" branch is
+#     therefore gone: it turned an unverifiable write into a green close job,
+#     which is exactly the defect. Archive works on this relay (verified live
+#     2026-08-09: `channels archive` applied, and the follow-up write came back
+#     `invalid: channel is archived`), and if a host ever loses it again the
+#     answer is a red job, not a fallback that cannot be checked.
+#   * the archive fence probes with `channels update --no-ttl`, which is a
+#     genuine no-op on these rooms — they never carry a TTL — chosen precisely
+#     so the probe observes without mutating.
 #
 # THE PR→CHANNEL BINDING IS DURABLE AND CI-OWNED. Each PR's channel UUID is
-# recorded in a CI-authored NIP-23 note whose slug is derived from the repo
-# and PR number, and read back at an exact addressable coordinate (kind,
-# author, d-tag). `channels search` cannot replace it: it fetches a capped
-# newest-first window of kind-39000 records and filters names client-side, so
-# a successful empty result is not proof of absence, and channel names are not
-# unique — anyone authenticated can pre-create an open `buzz-pr-N` and have it
-# adopted. The binding is exact, uncapped, and writable only by this CI key.
-# The name search survives only as an adoption path for rooms that predate the
-# binding, and every adoption is gated on CI holding the channel's owner role.
+# recorded in a CI-authored NIP-23 note whose slug is derived from the repo and
+# PR number, and read back at an exact addressable coordinate (kind, author,
+# d-tag): exact, uncapped, and writable by no one else.
+#
+# Creating the room and writing that note are two separate durable writes, so
+# a run cancelled between them (cancel-in-progress makes that a live risk)
+# leaves a room with no note. THE BINDING IS THEREFORE A FAST PATH, NEVER THE
+# PROOF OF ABSENCE. When it is missing, absence is established by listing the
+# channels THIS CI IDENTITY IS A MEMBER OF and finding no room of ours named
+# `buzz-pr-N`. CI owns every room it creates, so that list contains the room if
+# it exists at all; it is bounded by one room per mirrored PR rather than by
+# every channel in a community shared with velvet; it includes archived rooms
+# (verified live); and a full window is treated as INDETERMINATE and fails the
+# job instead of reading as absence. `channels search` is deliberately not used
+# anywhere: it fetches a capped newest-first window of kind-39000 records for
+# the whole community and filters names client-side, so its empty result
+# carries no information at all.
+#
+# Channel names are not unique — anyone authenticated can pre-create an open
+# `buzz-pr-N`. A squatted room simply never appears as ours: the scan only sees
+# rooms CI belongs to, and any candidate CI does not OWN is skipped rather than
+# adopted, so a squatter can neither capture the seed card nor wedge the job.
 #
 # Requires two repo secrets (provision with scripts/buzz-mint-auth-tag.py):
 #   BUZZ_CI_PRIVATE_KEY — a DEDICATED Nostr key for CI (never the owner key).
@@ -175,6 +199,12 @@ jobs:
             exit 1
           }
 
+          # Ceiling on the membership scan that proves a room's absence. It has
+          # to exceed the number of channels this CI identity belongs to —
+          # roughly one per PR mirrored by every repo sharing the identity — or
+          # the scan reports "unproven" and fails the job rather than guessing.
+          MEMBER_SCAN_LIMIT=2000
+
           # FAILURE IS SIGNALLED BY STATUS AND CHECKED AT EVERY CALL SITE.
           # No helper below may report a broken relay by returning an empty
           # string: empty means "absent" to its caller, and absent means
@@ -230,28 +260,33 @@ jobs:
             buzz channels members --channel "$1"
           }
 
-          assert_ci_owner() {
-            # Channel names are not unique and these rooms are open, so any
-            # authenticated relay user can pre-create `buzz-pr-N`. Adopting one
-            # would post a CI-signed seed card into someone else's room, add
-            # our reviewers to it, and leave CI unable to archive it — the
-            # squatter stays owner. Ownership is the discriminator:
-            # `channels create` makes the creator the owner, so CI holds the
-            # owner role in exactly the rooms it created. Refusal fails the job
-            # rather than falling through to create, so a name collision is
-            # never resolved by silently minting a second room.
-            local CH="$1" ROSTER
-            ROSTER=$(channel_roster "$CH") || {
-              echo "roster read failed for $CH — failing so the rerun re-probes" >&2
-              return 1
-            }
+          ci_owns() {
+            # 0 = CI holds the channel's owner role, 1 = it does not,
+            # 2 = the roster could not be read (never "not owned").
+            # `channels create` makes the creator the owner, so CI owns exactly
+            # the rooms it created — that is what separates our room from a
+            # squatter's room of the same name.
+            local ROSTER
+            ROSTER=$(channel_roster "$1") || return 2
             printf '%s' "$ROSTER" | jq -e --arg ci "$CI_PUB" \
-              'any(.[]?; .pubkey == $ci and .role == "owner")' >/dev/null || {
-              echo "channel $CH (#${NAME}) is not owned by this CI identity — refusing to adopt it." >&2
-              echo "Either another relay user holds that name, or BUZZ_CI_PRIVATE_KEY was rotated" >&2
-              echo "without migrating channel ownership; see this workflow's header." >&2
-              return 1
-            }
+              'any(.[]?; .pubkey == $ci and .role == "owner")' >/dev/null || return 1
+            return 0
+          }
+
+          assert_ci_owner() {
+            # Post-create sanity check: we just made this room, so anything but
+            # "owned" means the create did not apply the way we were told.
+            local CH="$1"
+            ci_owns "$CH"
+            case "$?" in
+              0) return 0 ;;
+              1) echo "channel $CH (#${NAME}) is not owned by this CI identity." >&2
+                 echo "Either the create did not apply, or BUZZ_CI_PRIVATE_KEY was rotated" >&2
+                 echo "without migrating channel ownership; see this workflow's header." >&2
+                 return 1 ;;
+              *) echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+                 return 1 ;;
+            esac
           }
 
           verify_members() {
@@ -273,34 +308,69 @@ jobs:
             done
           }
 
-          resolve_channel() {
-            # Binding first. A miss here is proof this CI identity never
-            # finished creating a channel for this PR.
-            local CH RESULTS
-            CH=$(read_binding) || return 1
-            if [ -n "$CH" ]; then
-              printf '%s' "$CH"
-              return 0
-            fi
-            # Adoption path, only for rooms that predate the binding — nothing
-            # this workflow creates from now on lacks one. A failed search must
-            # fail the job, never read as "no channel". A SUCCESSFUL empty
-            # result is still not proof of absence (capped window, client-side
-            # name filter), but the binding above is what proves absence here,
-            # so a truncated search can only cost the adoption of a pre-binding
-            # room — it can no longer duplicate a room we made.
-            RESULTS=$(buzz channels search --query "$NAME" --exact --include-archived) || {
-              echo "channel search failed — failing so the rerun re-probes" >&2
+          resolve_by_membership() {
+            # Establish, without guessing, whether a room of ours already
+            # exists. Prints its UUID, or nothing when there provably is none;
+            # returns non-zero when the answer is unknowable.
+            #
+            # Scoped to the channels this CI identity is a MEMBER of: CI owns
+            # every room it creates, so the room is in that set if it exists,
+            # the set includes archived rooms (verified live), and it grows by
+            # roughly one room per mirrored PR — a bound this workflow controls,
+            # unlike the whole shared community.
+            local LIST N COUNT I CH
+            LIST=$(buzz channels list --member --limit "$MEMBER_SCAN_LIMIT") || {
+              echo "membership listing failed — failing so the rerun re-probes" >&2
               return 1
             }
-            CH=$(printf '%s' "$RESULTS" \
-              | jq -r --arg n "$NAME" '[.[] | select(.name == $n)] | first | .channel_id // empty')
-            if [ -z "$CH" ]; then
-              return 0
+            N=$(printf '%s' "$LIST" | jq 'length') || return 1
+            if [ "$N" -ge "$MEMBER_SCAN_LIMIT" ]; then
+              # A full window is indistinguishable from a truncated one, so
+              # absence stays UNPROVEN and must not be acted on.
+              echo "membership listing filled its window ($N of $MEMBER_SCAN_LIMIT) — absence unproven." >&2
+              echo "Raise MEMBER_SCAN_LIMIT; creating a room on this evidence could duplicate one." >&2
+              return 1
             fi
-            assert_ci_owner "$CH" || return 1
-            write_binding "$CH" || return 1
-            printf '%s' "$CH"
+            COUNT=$(printf '%s' "$LIST" | jq --arg n "$NAME" '[.[] | select(.name == $n)] | length') || return 1
+            I=0
+            while [ "$I" -lt "$COUNT" ]; do
+              CH=$(printf '%s' "$LIST" | jq -r --arg n "$NAME" --argjson i "$I" \
+                '[.[] | select(.name == $n)][$i].channel_id') || return 1
+              ci_owns "$CH"
+              case "$?" in
+                0) write_binding "$CH" || return 1
+                   printf '%s' "$CH"
+                   return 0 ;;
+                1) # Someone else's room that happens to share the name and has
+                   # CI in it. Skipping rather than failing means a squatter
+                   # cannot wedge this workflow; we simply use our own room.
+                   echo "ignoring #${NAME} room $CH — not owned by this CI identity" >&2 ;;
+                *) echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+                   return 1 ;;
+              esac
+              I=$((I + 1))
+            done
+            # Stdout is the resolved UUID, so this goes to stderr.
+            echo "no #${NAME} room among this identity's ${N} channels — none exists" >&2
+          }
+
+          resolve_channel() {
+            # The binding note is the fast path, not the proof of absence: the
+            # room and its note are two separate writes, so a run cancelled
+            # between them leaves a room with no note. Only the membership scan
+            # can tell "never created" from "created, note lost".
+            local BOUND
+            BOUND=$(read_binding) || return 1
+            if [ -z "$BOUND" ]; then
+              resolve_by_membership
+              return $?
+            fi
+            printf '%s' "$BOUND" \
+              | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || {
+              echo "binding note holds '${BOUND}', not a channel UUID — refusing to guess" >&2
+              return 1
+            }
+            printf '%s' "$BOUND"
           }
 
           create_channel() {
@@ -436,9 +506,12 @@ jobs:
               echo "channel create returned no UUID (got: '${CH}') — failing so the rerun re-probes" >&2
               return 1
             }
-            # Prove the room is ours before writing anything into it, and bind
-            # it before provisioning: a run cancelled mid-provision has to
-            # resume on THIS channel, not mint a second one.
+            # Prove the room exists and is ours BEFORE recording it: a binding
+            # written from an unverified create would point later runs at a
+            # room that may not be there, and they would fail on it forever.
+            # Widening the create→bind window costs nothing now, because a lost
+            # binding is recovered by the membership scan — which finds any
+            # room CI owns — rather than by the note's absence.
             assert_ci_owner "$CH" || return 1
             write_binding "$CH" || return 1
             provision_members "$CH" || return 1
@@ -453,43 +526,41 @@ jobs:
             # PRE-storage gate: an archived channel rejects every
             # channel-scoped write except unarchive, and that rejection is
             # decided before any side effect runs, so unlike the archive
-            # command it cannot false-succeed. We probe with the very TTL we
-            # would otherwise have fallen back to, which makes the probe
-            # self-repairing — refused ⇒ the channel is archived and no TTL was
-            # set; accepted ⇒ it is not archived, and it now carries a 60s idle
-            # TTL for the relay's reaper while we retry.
-            local CH="$1" ATTEMPT PROBE_ERR
+            # command it cannot false-succeed. The probe is `--no-ttl`: these
+            # rooms never carry a TTL, so on a live channel it changes nothing,
+            # and the only thing read from it is whether the relay refused.
+            local CH="$1" ATTEMPT ARCHIVE_ERR PROBE_ERR
             for ATTEMPT in 1 2 3; do
               if ! buzz channels archive --channel "$CH" >/dev/null 2>"$ERRFILE"; then
-                # Tolerated exactly as before: the hosted communities relay
-                # 404s the archive event ("no community is configured for this
-                # host") even though create/send/add-member succeed on the same
-                # env. A rejection is honest — it is the false SUCCESS above
-                # that needed fencing — so fall back to the short idle TTL and
-                # let the relay archive the channel itself. A failed TTL write
-                # fails the job: nothing retries a silently-open channel. This
-                # TTL write is the one mutation here with no postcondition
-                # available to check it (see the header); if the relay swallows
-                # it, the room stays open and nothing here can tell.
-                echo "archive rejected ($(cat "$ERRFILE")) — falling back to a 60s idle TTL"
-                buzz channels update --channel "$CH" --ttl 60 >/dev/null
-                return 0
+                # No TTL fallback here any more. Archive works on this relay,
+                # and the fallback's only effect was to report success from a
+                # write whose application nothing can observe — see the header.
+                # A red job is the honest outcome, and rerunning retries.
+                ARCHIVE_ERR=$(cat "$ERRFILE")
+                echo "archive rejected: $ARCHIVE_ERR" >&2
+                return 1
               fi
               PROBE_ERR=""
-              buzz channels update --channel "$CH" --ttl 60 >/dev/null 2>"$ERRFILE" \
+              buzz channels update --channel "$CH" --no-ttl >/dev/null 2>"$ERRFILE" \
                 || PROBE_ERR=$(cat "$ERRFILE")
               case "$PROBE_ERR" in
                 *"channel is archived"*)
                   echo "channel archived — proved by the relay refusing a write to it"
                   return 0 ;;
                 "")
-                  echo "attempt ${ATTEMPT}: archive accepted but not applied; 60s idle TTL set — retrying" ;;
+                  echo "attempt ${ATTEMPT}: archive accepted but not applied — retrying" ;;
                 *)
                   echo "archive fence probe failed: $PROBE_ERR" >&2
                   return 1 ;;
               esac
             done
-            echo "archive never took effect after 3 attempts — only the 60s idle TTL is left" >&2
+            # Out of attempts: the room is still live and we cannot prove
+            # otherwise. Set a short idle TTL so the relay's reaper closes it
+            # anyway — but this is a mitigation on a path that ALREADY fails,
+            # never evidence, precisely because a swallowed TTL is invisible.
+            buzz channels update --channel "$CH" --ttl 60 >/dev/null 2>&1 \
+              || echo "idle-TTL mitigation also rejected" >&2
+            echo "archive never took effect after 3 attempts — room may still be live" >&2
             return 1
           }
 
@@ -584,24 +655,23 @@ jobs:
                 # Restoration is driven by write outcomes, not the discovery
                 # snapshot (the reaper commits archived_at before its discovery
                 # emission, so snapshots can be stale). Unarchive is
-                # best-effort — rejected harmlessly when the channel is still
-                # active in the TTL grace window. The TTL clear is mandatory
-                # and doubles as the fence: archived channels reject every
-                # write except unarchive, so its ACCEPTANCE proves the channel
-                # is active no matter what the snapshot said. What its
-                # acceptance does NOT prove is that the TTL was actually
-                # cleared — that is the unfenceable mutation described in the
-                # header, and a swallowed clear re-archives this room after 60s
-                # idle, surfacing as a rejected write on the next PR event.
+                # best-effort — rejected harmlessly when the channel is already
+                # active. The reopen notice is the fence, and it is sent FIRST:
+                # the relay refuses every channel-scoped write on an archived
+                # room BEFORE storing it, so this send succeeding proves the
+                # room is live no matter what any snapshot said, and it fails
+                # loudly here rather than as a confusing add-member error
+                # further down. It replaces the old `--no-ttl` clear, which
+                # proved the same thing but also performed a mutation whose
+                # application nothing could verify — and there is now no TTL to
+                # clear, because no success path ever sets one.
                 buzz channels unarchive --channel "$CH" \
                   || echo "unarchive rejected (channel likely already active) — proceeding"
-                buzz channels update --channel "$CH" --no-ttl
-                # Recovery runs after the fence: writes are only accepted on
-                # an active channel, and a create-then-cancel partial can
-                # reach reopened without ever having been provisioned.
-                ensure_provisioned "$CH" || exit 1
                 printf 'PR #%s reopened on GitHub — channel unarchived.\n%s\n' \
                   "$PR_NUMBER" "$PR_URL" | buzz messages send --channel "$CH" --content -
+                # Recovery runs after the fence: a create-then-cancel partial
+                # can reach reopened without ever having been provisioned.
+                ensure_provisioned "$CH" || exit 1
               fi
               # Reverse the close sweep everywhere, not just in this room. The
               # close path edited CI-authored references, reacted on everyone

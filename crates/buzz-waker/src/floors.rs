@@ -138,16 +138,18 @@ impl FloorStore {
 
     /// Create the enrolment record, pinning `owner_pubkey`.
     ///
+    /// Creation is fenced by the same sidecar lock as every other mutation,
+    /// and absence is re-tested *under* it. An unfenced `exists()` check is a
+    /// TOCTOU: two enrolments could both observe an empty store, the first
+    /// could install its owner and advance the floor, and the second could
+    /// then replace the record — resetting both floors and re-pinning the
+    /// signer, defeating the very state the fence exists to protect.
+    ///
     /// # Errors
     /// [`FloorError::AlreadyEnrolled`] if a record is already present — this
     /// never overwrites durable floors.
     pub fn enroll(path: impl Into<PathBuf>, owner_pubkey: &str) -> Result<Self, FloorError> {
         let path = path.into();
-        if path.exists() {
-            return Err(FloorError::AlreadyEnrolled {
-                path: path.display().to_string(),
-            });
-        }
         let store = Self {
             lock_path: Self::lock_path_for(&path),
             path,
@@ -157,8 +159,16 @@ impl FloorStore {
                 revocation_floor: 0,
             },
         };
+
+        let fence = FenceGuard::acquire(&store.lock_path, &store.path)?;
+        if store.path.exists() {
+            return Err(FloorError::AlreadyEnrolled {
+                path: store.path.display().to_string(),
+            });
+        }
         let initial = store.snapshot.clone();
-        store.persist(&initial)?;
+        store.persist(&fence, &initial)?;
+        drop(fence);
         Ok(store)
     }
 
@@ -254,16 +264,16 @@ impl FloorStore {
         &mut self,
         decide: impl FnOnce(&Floors) -> Result<(Option<Floors>, T), FloorError>,
     ) -> Result<T, FloorError> {
-        let guard = FenceGuard::acquire(&self.lock_path, &self.path)?;
+        let fence = FenceGuard::acquire(&self.lock_path, &self.path)?;
         let current = Self::read(&self.path)?;
         let (next, out) = decide(&current)?;
         if let Some(next) = next {
-            self.persist(&next)?;
+            self.persist(&fence, &next)?;
             self.snapshot = next;
         } else {
             self.snapshot = current;
         }
-        drop(guard);
+        drop(fence);
         Ok(out)
     }
 
@@ -288,9 +298,14 @@ impl FloorStore {
     /// The directory fsync is what makes the rename durable; without it a crash
     /// can leave the old contents visible even though the new file was synced.
     /// The temp name is process-unique so two writers cannot truncate each
-    /// other's staging file — though the fence above is what actually orders
-    /// them.
-    fn persist(&self, next: &Floors) -> Result<(), FloorError> {
+    /// other's staging file — though the fence is what actually orders them.
+    ///
+    /// `_fence` is an unused witness parameter, and that is the point: it makes
+    /// "never write outside the fence" a property the compiler enforces rather
+    /// than one every future caller has to remember. The first version of this
+    /// module fenced all three ordinary mutations and still let `enroll` write
+    /// unfenced; a witness would have caught that at the type level.
+    fn persist(&self, _fence: &FenceGuard, next: &Floors) -> Result<(), FloorError> {
         let fail = |reason: String| FloorError::Persist {
             path: self.path.display().to_string(),
             reason,
@@ -379,6 +394,80 @@ mod tests {
         let err =
             FloorStore::enroll(dir.path().join("floors.json"), "other").expect_err("must refuse");
         assert!(matches!(err, FloorError::AlreadyEnrolled { .. }));
+    }
+
+    /// A delayed second enrolment must not reset state the first has already
+    /// advanced. Unfenced, B's `exists()` check could predate A's write, and B
+    /// would then replace the record — re-pinning the signer and zeroing both
+    /// floors.
+    #[test]
+    fn a_delayed_enrolment_cannot_reset_an_advanced_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("floors.json");
+
+        let mut a = FloorStore::enroll(&path, "owner-x").expect("A enrols");
+        a.admit(9).expect("A admits 9");
+
+        let err = FloorStore::enroll(&path, "owner-y").expect_err("B must be refused");
+        assert!(matches!(err, FloorError::AlreadyEnrolled { .. }));
+
+        let after = FloorStore::open(&path).expect("open");
+        assert_eq!(after.snapshot().owner_pubkey, "owner-x");
+        assert_eq!(after.snapshot().highest_accepted_version, 9);
+    }
+
+    /// The actual race rather than its sequential shadow: several threads
+    /// enrol the same path at once, each with a distinct owner. Exactly one
+    /// may win and the durable record must be that winner's. Unfenced, more
+    /// than one `exists()` check passes and the last writer wins.
+    #[test]
+    fn concurrent_enrolments_cannot_both_succeed() {
+        use std::sync::Barrier;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("floors.json");
+        const RACERS: usize = 8;
+        let barrier = Barrier::new(RACERS);
+
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..RACERS)
+                .map(|i| {
+                    let path = &path;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        FloorStore::enroll(path, &format!("owner-{i}"))
+                            .map(|s| s.snapshot().owner_pubkey.clone())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+
+        let winners: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one enrolment may win, got {winners:?}"
+        );
+        for outcome in outcomes.iter().filter(|r| r.is_err()) {
+            let err = outcome.as_ref().expect_err("checked");
+            assert!(
+                matches!(err, FloorError::AlreadyEnrolled { .. }),
+                "losers must be refused as already-enrolled, got {err:?}"
+            );
+        }
+        assert_eq!(
+            &FloorStore::open(&path)
+                .expect("open")
+                .snapshot()
+                .owner_pubkey,
+            winners[0],
+            "the durable record must be the winner's"
+        );
     }
 
     #[test]

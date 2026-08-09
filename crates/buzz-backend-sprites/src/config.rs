@@ -225,7 +225,7 @@ pub fn config_schema() -> serde_json::Value {
                 "type": "string",
                 "title": "Sprig release",
                 "default": DEFAULT_SPRIG_VERSION,
-                "description": "GitHub release tag of block/buzz to fetch the agent runtime from."
+                "description": "GitHub release tag of yjc801/buzz to fetch the agent runtime from."
             },
             "sprig_sha256": {
                 "type": "string",

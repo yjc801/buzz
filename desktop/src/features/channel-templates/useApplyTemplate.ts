@@ -13,6 +13,7 @@ import { resolvePersonaRuntime } from "@/features/agents/lib/resolvePersonaRunti
 import { resolveTeamPersonas } from "@/features/agents/lib/teamPersonas";
 import { useLastRuntime } from "@/features/agents/lib/useLastRuntime";
 import { useChannelTemplatesQuery } from "@/features/channel-templates/hooks";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { setCanvas } from "@/shared/api/tauri";
 import type { ChannelTemplate } from "@/shared/api/types";
 
@@ -33,6 +34,7 @@ export function useApplyTemplate() {
   const personasQuery = usePersonasQuery();
   const teamsQuery = useTeamsQuery();
   const { lastRuntimeId } = useLastRuntime();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
 
   async function applyCanvas(
     templateId: string | undefined,
@@ -132,7 +134,9 @@ export function useApplyTemplate() {
     if (inputs.length === 0) return;
 
     try {
-      const result = await createChannelManagedAgents(channelId, inputs);
+      const result = await createChannelManagedAgents(channelId, inputs, {
+        activeCommunityRelayUrl,
+      });
       if (result.failures.length > 0) {
         const { toast } = await import("sonner");
         toast.warning(

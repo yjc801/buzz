@@ -16,6 +16,7 @@ import {
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import { useClassifiedMembers } from "@/features/channels/lib/useClassifiedMembers";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { formatMemberName } from "@/features/channels/lib/memberUtils";
 import {
   canAddChannelMembers,
@@ -260,6 +261,7 @@ export function MembersSidebar({
   });
   const userSearchResults = useFlattenedUserSearchResults(userSearchQuery.data);
   const isArchivedDiscovery = useIsArchivedPredicate();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
   const addSearchResults = React.useMemo(() => {
     if (!canAddMembers || normalizedDeferredSearchQuery.length === 0) {
       return [];
@@ -274,9 +276,10 @@ export function MembersSidebar({
     );
     const sharedChannelIds = getSharedChannelIds(channelsQuery.data);
     const allowedAgentPubkeys = getMentionableAgentPubkeys({
+      activeCommunityRelayUrl,
       currentPubkey,
       eligibilityScope: { type: "community" },
-      managedAgentPubkeys: managedAgentsByPubkey.keys(),
+      managedAgents: managedAgentsQuery.data ?? [],
       relayAgents: relayAgentsQuery.data,
       sharedChannelIds,
     });
@@ -364,6 +367,7 @@ export function MembersSidebar({
       query: normalizedDeferredSearchQuery,
     });
   }, [
+    activeCommunityRelayUrl,
     canAddMembers,
     channelsQuery.data,
     isArchivedDiscovery,

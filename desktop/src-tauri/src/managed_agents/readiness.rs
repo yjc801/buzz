@@ -1475,62 +1475,27 @@ mod tests {
             "claude-opus-4-5".to_string(),
         );
 
-        // Minimal record: only the fields resolve_effective_agent_env reads.
-        let record = crate::managed_agents::types::ManagedAgentRecord {
-            pubkey: "test-pubkey".to_string(),
-            name: "test-agent".to_string(),
-            persona_id: None,
-            private_key_nsec: String::new(),
-            auth_tag: None,
-            relay_url: String::new(),
-            avatar_url: None,
-            acp_command: "buzz-acp".to_string(),
-            agent_command: "buzz-agent".to_string(),
-            agent_command_override: None,
-            agent_args: vec![],
-            mcp_command: String::new(),
-            turn_timeout_seconds: 320,
-            idle_timeout_seconds: None,
-            max_turn_duration_seconds: None,
-            parallelism: 1,
-            system_prompt: None,
-            model: None,
-            provider: None,
-            persona_source_version: None,
-            env_vars,
-            start_on_app_launch: false,
-            auto_restart_on_config_change: true,
-            runtime_pid: None,
-            backend: Default::default(),
-            backend_agent_id: None,
-            provider_binary_path: None,
-            team_id: None,
-            persona_team_dir: None,
-            persona_name_in_team: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            last_started_at: None,
-            last_stopped_at: None,
-            last_exit_code: None,
-            last_error: None,
-            last_error_code: None,
-            respond_to: Default::default(),
-            respond_to_allowlist: vec![],
-            display_name: None,
-            slug: None,
-            runtime: None,
-            name_pool: Vec::new(),
-            is_builtin: false,
-            is_active: true,
-            shared: false,
-            source_team: None,
-            source_team_persona_slug: None,
-            catalog_source: None,
-            definition_respond_to: None,
-            definition_respond_to_allowlist: Vec::new(),
-            definition_parallelism: None,
-            relay_mesh: None,
-        };
+        // Minimal record via JSON (the storage-tests convention): only the
+        // required keys plus what resolve_effective_agent_env reads, so new
+        // optional record fields don't churn this fixture.
+        let mut record: crate::managed_agents::types::ManagedAgentRecord = serde_json::from_str(
+            r#"{
+                    "pubkey": "test-pubkey",
+                    "name": "test-agent",
+                    "private_key_nsec": "",
+                    "relay_url": "",
+                    "acp_command": "buzz-acp",
+                    "agent_command": "buzz-agent",
+                    "agent_args": [],
+                    "mcp_command": "",
+                    "turn_timeout_seconds": 320,
+                    "created_at": "",
+                    "updated_at": ""
+                }"#,
+        )
+        .expect("minimal record must deserialize");
+        record.env_vars = env_vars;
+        let record = record;
 
         let runtime = known_acp_runtime_exact("buzz-agent");
         let effective = resolve_effective_agent_env(&record, &[], runtime, &Default::default());

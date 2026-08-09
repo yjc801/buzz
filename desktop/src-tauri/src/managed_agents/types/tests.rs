@@ -707,6 +707,7 @@ fn summary_fixture(
         runtime: None,
         team_id: None,
         relay_url: String::new(),
+        community_relay_url: None,
         acp_command: "buzz-acp".into(),
         agent_command: "goose".into(),
         agent_command_override: None,
@@ -783,4 +784,93 @@ fn summary_with_drift_serializes_restart_diff_entries() {
             "change": { "kind": "value", "before": "gpt-5", "after": "claude-4" },
         }]))
     );
+}
+
+// ── community scope collision rules ─────────────────────────────────────────
+
+fn scoped_record(name: &str, pubkey: &str, scope: Option<&str>) -> ManagedAgentRecord {
+    let mut record = sample_agent_record();
+    record.name = name.to_string();
+    record.pubkey = pubkey.to_string();
+    record.community_relay_url = scope.map(str::to_string);
+    record
+}
+
+#[test]
+fn community_scopes_collide_unscoped_collides_with_everything() {
+    use crate::managed_agents::community_scopes_collide;
+    assert!(community_scopes_collide(None, None));
+    assert!(community_scopes_collide(None, Some("wss://one.example")));
+    assert!(community_scopes_collide(Some("wss://one.example"), None));
+}
+
+#[test]
+fn community_scopes_collide_bound_scopes_collide_only_when_equal() {
+    use crate::managed_agents::community_scopes_collide;
+    assert!(community_scopes_collide(
+        Some("wss://one.example"),
+        Some("wss://one.example")
+    ));
+    assert!(!community_scopes_collide(
+        Some("wss://one.example"),
+        Some("wss://two.example")
+    ));
+}
+
+#[test]
+fn instance_name_taken_same_community_collides_case_insensitively() {
+    use crate::managed_agents::instance_name_taken_in_scope;
+    let records = vec![scoped_record("Bumble", "aa", Some("wss://one.example"))];
+    assert!(instance_name_taken_in_scope(
+        &records,
+        "bumble",
+        Some("wss://one.example"),
+        None
+    ));
+}
+
+#[test]
+fn instance_name_taken_other_community_does_not_collide() {
+    use crate::managed_agents::instance_name_taken_in_scope;
+    let records = vec![scoped_record("Bumble", "aa", Some("wss://one.example"))];
+    assert!(!instance_name_taken_in_scope(
+        &records,
+        "Bumble",
+        Some("wss://two.example"),
+        None
+    ));
+}
+
+#[test]
+fn instance_name_taken_unscoped_record_collides_everywhere() {
+    use crate::managed_agents::instance_name_taken_in_scope;
+    let records = vec![scoped_record("Alex", "bb", None)];
+    assert!(instance_name_taken_in_scope(
+        &records,
+        "Alex",
+        Some("wss://one.example"),
+        None
+    ));
+    assert!(instance_name_taken_in_scope(&records, "Alex", None, None));
+}
+
+#[test]
+fn instance_name_taken_ignores_definitions_and_self() {
+    use crate::managed_agents::instance_name_taken_in_scope;
+    // A key-less persona record named Bumble must not block an instance.
+    let definition = scoped_record("Bumble", "", Some("wss://one.example"));
+    assert!(!instance_name_taken_in_scope(
+        &[definition],
+        "Bumble",
+        Some("wss://one.example"),
+        None
+    ));
+    // The assign flow excludes the record's own pubkey.
+    let records = vec![scoped_record("Alex", "bb", None)];
+    assert!(!instance_name_taken_in_scope(
+        &records,
+        "Alex",
+        Some("wss://one.example"),
+        Some("bb")
+    ));
 }

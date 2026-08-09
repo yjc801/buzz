@@ -24,6 +24,7 @@ import {
   useInfiniteUserSearchQuery,
   useUsersBatchQuery,
 } from "@/features/profile/hooks";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { AutocompleteEdit } from "./useRichTextEditor";
 import type {
@@ -37,6 +38,7 @@ import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { flushMentionDebounce } from "./flushMentionDebounce";
+import { useManagedAgentMentionMaps } from "./managedAgentMentionMaps";
 import { hasMention } from "./hasMention";
 import { useDraftMentionRouting } from "./useDraftMentionRouting";
 import { useMentionAgentPubkeys } from "./useMentionAgentPubkeys";
@@ -109,6 +111,7 @@ export function useMentions(
   const channelsQuery = useChannelsQuery();
   const personasQuery = usePersonasQuery();
   const teamsQuery = useTeamsQuery();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
   const managedAgentDirectoryReady =
     managedAgentsQuery.data !== undefined ||
     !managedAgentsQuery.isLoading ||
@@ -130,46 +133,13 @@ export function useMentions(
     () => userSearchQuery.data?.pages.flatMap((page) => page.users) ?? [],
     [userSearchQuery.data],
   );
-  const managedAgentNamesByPubkey = React.useMemo(
-    () =>
-      new Map(
-        (managedAgentsQuery.data ?? []).map((agent) => [
-          normalizePubkey(agent.pubkey),
-          agent.name,
-        ]),
-      ),
-    [managedAgentsQuery.data],
-  );
-  const managedAgentPersonaIdsByPubkey = React.useMemo(
-    () =>
-      new Map(
-        (managedAgentsQuery.data ?? [])
-          .filter((agent) => Boolean(agent.personaId))
-          .map((agent) => [
-            normalizePubkey(agent.pubkey),
-            agent.personaId as string,
-          ]),
-      ),
-    [managedAgentsQuery.data],
-  );
-  const managedAgentPersonaIds = React.useMemo(
-    () =>
-      new Set(
-        (managedAgentsQuery.data ?? [])
-          .map((agent) => agent.personaId)
-          .filter((personaId): personaId is string => Boolean(personaId)),
-      ),
-    [managedAgentsQuery.data],
-  );
-  const managedAgentPubkeys = React.useMemo(
-    () =>
-      new Set(
-        (managedAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ),
-    [managedAgentsQuery.data],
-  );
+  // Community-unfiltered rendering maps — see useManagedAgentMentionMaps.
+  const {
+    managedAgentNamesByPubkey,
+    managedAgentPersonaIdsByPubkey,
+    managedAgentPersonaIds,
+    managedAgentPubkeys,
+  } = useManagedAgentMentionMaps(managedAgentsQuery.data);
   const relayAgentNamesByPubkey = React.useMemo(
     () =>
       new Map(
@@ -211,11 +181,12 @@ export function useMentions(
   }, [managedAgentsQuery.data, personasQuery.data]);
   const { mentionableAgentPubkeys, memberAgentPubkeys, knownAgentPubkeys } =
     useMentionAgentPubkeys({
+      activeCommunityRelayUrl,
       currentPubkey,
       directoryAgentPubkeys,
       isArchived: isArchivedDiscovery,
       managedAgentNamesByPubkey,
-      managedAgentPubkeys,
+      managedAgents: managedAgentsQuery.data,
       members,
       mentionChannelId,
       profiles,

@@ -5,6 +5,7 @@ import {
   useAcpRuntimesQuery,
   useManagedAgentsQuery,
 } from "@/features/agents/hooks";
+import { managedAgentBelongsToCommunity } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
@@ -148,16 +149,26 @@ function normalizeRelayUrl(relayUrl?: string | null) {
   return relayUrl?.trim().replace(/\/+$/, "") ?? null;
 }
 
+/** Kickoff resolves from the managed-agent list alone — no directory query. */
+const NO_DIRECTORY_SIGNAL: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Selects the Welcome set by community binding, not the legacy `relayUrl`
+ * creation pin — a moved agent keeps its old pin, so pin matching hid it from
+ * the community it now belongs to and left it selectable in the one it left.
+ */
 function resolveWelcomeAgentSetForRelay(
   agents: readonly ManagedAgent[],
   relayUrl?: string | null,
 ) {
-  const normalizedRelayUrl = normalizeRelayUrl(relayUrl);
+  const activeCommunityRelayUrl = normalizeRelayUrl(relayUrl);
   return resolveWelcomeAgentSet(
-    agents.filter(
-      (agent) =>
-        !normalizedRelayUrl ||
-        normalizeRelayUrl(agent.relayUrl) === normalizedRelayUrl,
+    agents.filter((agent) =>
+      managedAgentBelongsToCommunity({
+        agent,
+        directoryAgentPubkeys: NO_DIRECTORY_SIGNAL,
+        activeCommunityRelayUrl,
+      }),
     ),
   );
 }

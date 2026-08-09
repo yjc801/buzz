@@ -71,6 +71,7 @@ fn test_record() -> ManagedAgentRecord {
         private_key_nsec: "".to_string(),
         auth_tag: None,
         relay_url: "ws://localhost:3000".to_string(),
+        community_relay_url: None,
         avatar_url: None,
         acp_command: "buzz-acp".to_string(),
         agent_command: "goose".to_string(),

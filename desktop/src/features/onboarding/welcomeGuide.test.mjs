@@ -105,16 +105,18 @@ test("pickWelcomeGuideAgent ignores non-Kit agents with the legacy prompt", () =
 });
 
 test("pickWelcomeGuideAgentForRelay ignores Fizz agents from other communities", () => {
+  // Community membership is `communityRelayUrl`, not the creation-era
+  // `relayUrl` pin — the pin stays put when an agent is moved.
   const otherCommunityFizz = makeAgent({
     pubkey: PUB_A,
     personaId: WELCOME_GUIDE_PERSONA_ID,
-    relayUrl: RELAY_A,
+    communityRelayUrl: RELAY_A,
     status: "running",
   });
   const currentCommunityFizz = makeAgent({
     pubkey: PUB_B,
     personaId: WELCOME_GUIDE_PERSONA_ID,
-    relayUrl: RELAY_B,
+    communityRelayUrl: RELAY_B,
     status: "stopped",
   });
 
@@ -131,13 +133,40 @@ test("pickWelcomeGuideAgentForRelay returns null when Fizz only exists in anothe
   const otherCommunityFizz = makeAgent({
     pubkey: PUB_A,
     personaId: WELCOME_GUIDE_PERSONA_ID,
-    relayUrl: RELAY_A,
+    communityRelayUrl: RELAY_A,
   });
 
   assert.equal(
     pickWelcomeGuideAgentForRelay([otherCommunityFizz], RELAY_B),
     null,
   );
+});
+
+test("pickWelcomeGuideAgentForRelay follows a moved agent to its new community", () => {
+  // The regression: moving Fizz from A to B rewrites `communityRelayUrl` and
+  // deliberately leaves the `relayUrl` spawn pin on A. Selecting on the pin
+  // hid the record from B (whose replacement create then hit the scoped name
+  // collision rule) and kept offering it in A.
+  const movedFizz = makeAgent({
+    pubkey: PUB_A,
+    personaId: WELCOME_GUIDE_PERSONA_ID,
+    relayUrl: RELAY_A,
+    communityRelayUrl: RELAY_B,
+  });
+
+  assert.equal(pickWelcomeGuideAgentForRelay([movedFizz], RELAY_B), movedFizz);
+  assert.equal(pickWelcomeGuideAgentForRelay([movedFizz], RELAY_A), null);
+});
+
+test("pickWelcomeGuideAgentForRelay keeps unscoped agents available anywhere", () => {
+  const shared = makeAgent({
+    pubkey: PUB_A,
+    personaId: WELCOME_GUIDE_PERSONA_ID,
+    communityRelayUrl: null,
+  });
+
+  assert.equal(pickWelcomeGuideAgentForRelay([shared], RELAY_A), shared);
+  assert.equal(pickWelcomeGuideAgentForRelay([shared], RELAY_B), shared);
 });
 
 test("starter persona activation is serialized to protect the shared store", async () => {
@@ -335,12 +364,12 @@ test("starter matching is relay scoped and normalizes trailing slashes", () => {
   const bumble = WELCOME_TEAM_STARTERS[2];
   const otherRelay = makeAgent({
     personaId: bumble.personaId,
-    relayUrl: RELAY_B,
+    communityRelayUrl: RELAY_B,
     status: "running",
   });
   const matchingRelay = makeAgent({
     personaId: bumble.personaId,
-    relayUrl: `${RELAY_A}/`,
+    communityRelayUrl: `${RELAY_A}/`,
     pubkey: PUB_B,
   });
 

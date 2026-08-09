@@ -1,10 +1,8 @@
 import { AlertTriangle } from "lucide-react";
 import * as React from "react";
 
-import {
-  useAvailableAcpRuntimes,
-  useCreateChannelManagedAgentsMutation,
-} from "@/features/agents/hooks";
+import { useCreateChannelManagedAgentsMutation } from "@/features/agents/channelAgentMutations";
+import { useAvailableAcpRuntimes } from "@/features/agents/hooks";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import type { CreateChannelManagedAgentsResult } from "@/features/agents/channelAgents";
 import {

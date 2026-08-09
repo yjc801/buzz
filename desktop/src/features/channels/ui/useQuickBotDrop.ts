@@ -1,9 +1,7 @@
 import * as React from "react";
 
-import {
-  useAvailableAcpRuntimes,
-  useCreateChannelManagedAgentMutation,
-} from "@/features/agents/hooks";
+import { useCreateChannelManagedAgentMutation } from "@/features/agents/channelAgentMutations";
+import { useAvailableAcpRuntimes } from "@/features/agents/hooks";
 import { resolvePersonaRuntime } from "@/features/agents/lib/resolvePersonaRuntime";
 import type { AgentPersona } from "@/shared/api/types";
 

@@ -9,6 +9,7 @@ import {
   getSharedChannelIds,
   isAgentIdentityInAllowedList,
   isAgentMentionChannelType,
+  managedAgentBelongsToCommunity,
   relayAgentCanRespondInChannel,
   relayAgentIsSharedWithUser,
   shouldHideAgentFromMentions,
@@ -132,10 +133,128 @@ test("relayAgentCanRespondInChannel: requires exact channel membership and viewe
   );
 });
 
+test("managedAgentBelongsToCommunity: unscoped record is never hidden", () => {
+  // null/blank communityRelayUrl = shared identity, offered everywhere.
+  const directoryAgentPubkeys = new Set();
+  for (const communityRelayUrl of [undefined, null, "", "   "]) {
+    assert.equal(
+      managedAgentBelongsToCommunity({
+        agent: { pubkey: PUB_A, communityRelayUrl },
+        directoryAgentPubkeys,
+        activeCommunityRelayUrl: "wss://one.example",
+      }),
+      true,
+    );
+  }
+});
+
+test("managedAgentBelongsToCommunity: directory presence outranks a foreign binding", () => {
+  // Registered in THIS community's kind:10100 directory => it has actually
+  // run here, whatever community it is bound to (#2122 permits this).
+  assert.equal(
+    managedAgentBelongsToCommunity({
+      agent: {
+        pubkey: PUB_A,
+        communityRelayUrl: "wss://other.communities.example",
+      },
+      directoryAgentPubkeys: new Set([PUB_A]),
+      activeCommunityRelayUrl: "wss://one.example",
+    }),
+    true,
+  );
+});
+
+test("managedAgentBelongsToCommunity: bound elsewhere and unregistered here is excluded", () => {
+  assert.equal(
+    managedAgentBelongsToCommunity({
+      agent: {
+        pubkey: PUB_A,
+        communityRelayUrl: "wss://other.communities.example",
+      },
+      directoryAgentPubkeys: new Set([PUB_B]),
+      activeCommunityRelayUrl: "wss://one.example",
+    }),
+    false,
+  );
+});
+
+test("managedAgentBelongsToCommunity: canonical-spelling differences still match", () => {
+  // The stored value is canonical, but the active community's relayUrl is
+  // user-entered and may be spelled differently.
+  assert.equal(
+    managedAgentBelongsToCommunity({
+      agent: { pubkey: PUB_A, communityRelayUrl: "wss://one.example" },
+      directoryAgentPubkeys: new Set(),
+      activeCommunityRelayUrl: "WSS://One.Example:443/",
+    }),
+    true,
+  );
+});
+
+test("managedAgentBelongsToCommunity: fails open while the community is unresolved", () => {
+  assert.equal(
+    managedAgentBelongsToCommunity({
+      agent: {
+        pubkey: PUB_A,
+        communityRelayUrl: "wss://other.communities.example",
+      },
+      directoryAgentPubkeys: new Set(),
+      activeCommunityRelayUrl: null,
+    }),
+    true,
+  );
+});
+
+test("getMentionableAgentPubkeys: same-named identities bound per community do not leak", () => {
+  // The reported bug: three separate identities all named "Bumble", one per
+  // community. Only the one bound to the active community is mentionable; the
+  // other two would produce a mention no local harness answers.
+  const result = getMentionableAgentPubkeys({
+    activeCommunityRelayUrl: "wss://devenish.communities.example",
+    currentPubkey: CURRENT_PUBKEY,
+    eligibilityScope: { type: "managed-only" },
+    managedAgents: [
+      {
+        pubkey: PUB_A,
+        communityRelayUrl: "wss://devenish.communities.example",
+      },
+      { pubkey: PUB_B, communityRelayUrl: "wss://yjc.communities.example" },
+      {
+        pubkey: PUB_C,
+        communityRelayUrl: "wss://openvelvet.communities.example",
+      },
+    ],
+    relayAgents: [],
+    sharedChannelIds: new Set(),
+  });
+
+  assert.deepEqual(result, new Set([PUB_A]));
+});
+
+test("getMentionableAgentPubkeys: managed-only scope still excludes foreign-community records", () => {
+  // Regression guard for the original defect: managed agents were seeded into
+  // the result set BEFORE the eligibilityScope switch, so even "managed-only"
+  // admitted every record in the global store.
+  const result = getMentionableAgentPubkeys({
+    activeCommunityRelayUrl: "wss://one.example",
+    currentPubkey: CURRENT_PUBKEY,
+    eligibilityScope: { type: "managed-only" },
+    managedAgents: [
+      { pubkey: PUB_A },
+      { pubkey: PUB_D, communityRelayUrl: "wss://other.communities.example" },
+    ],
+    relayAgents: [],
+    sharedChannelIds: new Set(),
+  });
+
+  assert.deepEqual(result, new Set([PUB_A]));
+});
+
 test("getMentionableAgentPubkeys: keeps managed agents and shared relay agents", () => {
   const result = getMentionableAgentPubkeys({
+    activeCommunityRelayUrl: "wss://one.example",
     eligibilityScope: { type: "community" },
-    managedAgentPubkeys: [PUB_A],
+    managedAgents: [{ pubkey: PUB_A }],
     currentPubkey: CURRENT_PUBKEY,
     relayAgents: [
       {
@@ -173,8 +292,9 @@ test("getMentionableAgentPubkeys: scopes channel composers and fails closed with
     },
   ];
   const base = {
+    activeCommunityRelayUrl: "wss://one.example",
     currentPubkey: CURRENT_PUBKEY,
-    managedAgentPubkeys: [PUB_A],
+    managedAgents: [{ pubkey: PUB_A }],
     relayAgents,
     sharedChannelIds: new Set(["general"]),
   };

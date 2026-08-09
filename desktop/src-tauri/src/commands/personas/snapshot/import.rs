@@ -18,8 +18,8 @@ use crate::{
             decrypt_envelope, parse_chunk_payload, resolve_unlock_secret, ChunkPayload,
             LOCKED_CARD_REFUSAL,
         },
-        load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
-        ManagedAgentRecord, RespondTo,
+        load_managed_agents, load_personas, mint_scope_and_check_name, save_managed_agents,
+        save_personas, AgentDefinition, ManagedAgentRecord, RespondTo,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -555,6 +555,17 @@ pub async fn confirm_agent_snapshot_import(
             return Err(format!("generated pubkey {pubkey} already exists — retry"));
         }
 
+        // Same per-(community, name) uniqueness `create_managed_agent` enforces,
+        // in the same critical section as the write. Importing a snapshot named
+        // Bumble into a community that already offers Bumble would otherwise
+        // persist a second scoped instance and recreate exactly the ambiguous
+        // picker entry this scoping exists to remove.
+        let minted_scope = mint_scope_and_check_name(
+            &records,
+            &display_name,
+            &relay_ws_url_with_override(&state),
+        )?;
+
         let now = now_iso();
         let persona_id = uuid::Uuid::new_v4().to_string();
 
@@ -603,6 +614,7 @@ pub async fn confirm_agent_snapshot_import(
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
             relay_url: String::new(), // resolves to workspace relay at runtime
+            community_relay_url: minted_scope,
             avatar_url: effective_avatar.clone(),
             // Machine-local commands: derive from the runtime catalog at
             // spawn time — never manufacture from snapshot data.
@@ -857,6 +869,10 @@ pub(crate) async fn submit_engram_event(
 }
 
 // ── NIP-49 egress guard: boundary 7 (persona snapshot engram submit) ─────────
+//
+// Stays inline: `egress_guard_tests.rs` inventories NIP-49 fixtures and
+// `/events` URL sites per file, and names this module as boundary 7's
+// injection test. The avatar tests carry the line-count relief instead.
 
 #[cfg(test)]
 mod egress_guard_tests {
@@ -886,112 +902,5 @@ mod egress_guard_tests {
 }
 
 #[cfg(test)]
-mod import_avatar_tests {
-    use super::materialize_import_avatar;
-    use std::cell::Cell;
-
-    #[tokio::test]
-    async fn inline_avatar_is_uploaded_and_replaced_with_hosted_url() {
-        let uploaded = Cell::new(false);
-        let result = materialize_import_avatar(
-            Some("data:image/png;base64,iVBORw0KGgo="),
-            Some("https://sender.invalid/avatar.png"),
-            |bytes| {
-                uploaded.set(true);
-                async move {
-                    assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
-                    Ok("https://relay.example/media/avatar.png".to_string())
-                }
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(uploaded.get());
-        assert_eq!(
-            result.as_deref(),
-            Some("https://relay.example/media/avatar.png")
-        );
-    }
-
-    #[tokio::test]
-    async fn hosted_avatar_skips_upload() {
-        let result =
-            materialize_import_avatar(None, Some("https://sender.example/avatar.png"), |_| async {
-                panic!("hosted avatars must not be uploaded")
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.as_deref(), Some("https://sender.example/avatar.png"));
-    }
-
-    #[tokio::test]
-    async fn relay_sized_inline_avatar_becomes_bounded_signed_profile() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        use image::ImageEncoder;
-        use nostr::JsonUtil;
-
-        let mut pixels = vec![0_u8; 512 * 512 * 4];
-        let mut seed = 0x1234_5678_u32;
-        for byte in &mut pixels {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            *byte = seed as u8;
-        }
-        let mut source = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut source)
-            .write_image(&pixels, 512, 512, image::ExtendedColorType::Rgba8)
-            .unwrap();
-        assert!(source.len() > 256 * 1024);
-        let data_url = format!("data:image/png;base64,{}", STANDARD.encode(&source));
-        assert!(data_url.len() > 256 * 1024);
-
-        let avatar = materialize_import_avatar(Some(&data_url), None, |bytes| async move {
-            let mime = crate::commands::media::detect_and_validate_mime(&bytes)?;
-            assert_eq!(mime, "image/png");
-            let sanitized = crate::commands::media::sanitize_image_for_upload(bytes, &mime)?;
-            image::load_from_memory(&sanitized).map_err(|error| error.to_string())?;
-            Ok("https://relay.example/media/avatar.png".to_string())
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
-        let event =
-            crate::events::build_profile(Some("Imported agent"), None, Some(&avatar), None, None)
-                .unwrap()
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-        assert!(event.content.len() < 64 * 1024);
-        assert!(!event.content.contains("data:image/"));
-        assert!(event
-            .content
-            .contains("https://relay.example/media/avatar.png"));
-        assert!(event.as_json().len() < 256 * 1024);
-    }
-
-    #[tokio::test]
-    async fn upload_failure_aborts_avatar_materialization() {
-        let result = materialize_import_avatar(
-            Some("data:image/png;base64,iVBORw0KGgo="),
-            None,
-            |_| async { Err("relay upload failed".to_string()) },
-        )
-        .await;
-
-        assert_eq!(result.unwrap_err(), "relay upload failed");
-    }
-
-    #[tokio::test]
-    async fn malformed_inline_avatar_fails_before_upload() {
-        let result =
-            materialize_import_avatar(Some("data:image/png;base64,not-base64!"), None, |_| async {
-                panic!("malformed avatars must not be uploaded")
-            })
-            .await;
-
-        assert_eq!(result.unwrap_err(), "Snapshot avatar data is malformed.");
-    }
-}
+#[path = "import_tests.rs"]
+mod tests;

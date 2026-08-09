@@ -169,6 +169,22 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     }
     migrate_persona_provider_to_runtime(app);
     reconcile_legacy_command_names(app);
+    // BEFORE the first typed rewrite of managed-agents.json (the fold below).
+    // This backfill is idempotent by KEY PRESENCE, and `community_relay_url`
+    // deserializes `#[serde(default)]` with no `skip_serializing_if` — so any
+    // typed load/save round-trip turns "key absent" into an explicit `null`
+    // that this backfill is then obliged to treat as a deliberate unscope.
+    // Running it after the fold therefore permanently stranded every
+    // pre-existing instance on an upgrade that still had personas.json: their
+    // non-empty legacy `relay_url` pin was never converted and they stayed
+    // globally visible. The steps above are raw JSON patches, so key absence
+    // still survives to here. Everything after this point sees a stamped key
+    // and round-trips its value unchanged.
+    //
+    // Records the fold and later steps ADD (folded/manufactured definitions)
+    // never reach this backfill, and must not: they serialize their own
+    // explicit `null`, which is the correct unscoped binding for a definition.
+    backfill_agent_community_scope(app);
     // Fold personas.json into the unified store HERE: after the JSON-level
     // personas.json migrations above (which must see the legacy file), and
     // before every consumer of the load/save_personas shims below —
@@ -480,42 +496,6 @@ fn copy_file_over_generated_default(src: &Path, dst: &Path) -> std::io::Result<(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::copy(src, dst).map(|_| ())
-}
-
-/// Read a JSON array of objects from `path`, apply `f` to each object,
-/// and write back if any mutation returned `true`.
-///
-/// Writes back via [`crate::managed_agents::atomic_write_json_restricted`]
-/// (owner-only `0o600`): the store files this rewrites can carry plaintext
-/// agent nsecs on a keyringless host, so the write must not reopen the umask
-/// window SECURITY.md:90 closes.
-fn patch_json_records(
-    path: &Path,
-    mut f: impl FnMut(&mut serde_json::Map<String, serde_json::Value>) -> bool,
-) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(mut records) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
-        eprintln!(
-            "buzz-desktop: patch-json-records: failed to parse {}",
-            path.display()
-        );
-        return;
-    };
-    let mut changed = false;
-    for record in &mut records {
-        if let Some(obj) = record.as_object_mut() {
-            changed |= f(obj);
-        }
-    }
-    if changed {
-        if let Ok(bytes) = serde_json::to_vec_pretty(&records) {
-            if let Err(e) = crate::managed_agents::atomic_write_json_restricted(path, &bytes) {
-                eprintln!("buzz-desktop: patch-json-records: {e}");
-            }
-        }
-    }
 }
 
 struct LegacyBuiltInAvatar<'a> {
@@ -1367,8 +1347,12 @@ pub fn migrate_persona_provider_to_runtime(app: &tauri::AppHandle) {
     }
     rename_provider_to_runtime_in_personas(&path);
 }
+mod json_patch;
+use json_patch::patch_json_records;
 mod materialize;
 pub use materialize::materialize_agent_runtimes;
+mod community_scope;
+pub use community_scope::backfill_agent_community_scope;
 mod fold;
 pub use fold::fold_personas_into_agent_store;
 use fold::load_persona_runtimes;

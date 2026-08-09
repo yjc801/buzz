@@ -5,6 +5,7 @@ import {
   pickPreferredManagedAgent,
 } from "@/features/agents/agentReuse";
 export { findReusableAgent } from "@/features/agents/agentReuse";
+import { managedAgentIsReusableInCommunity } from "@/features/agents/lib/communityScope";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { resolveManagedAgentAvatarUrl } from "@/features/agents/ui/managedAgentAvatar";
 import {
@@ -99,6 +100,22 @@ export type CreateChannelManagedAgentBatchFailure = {
   error: string;
 };
 
+/**
+ * The active community every provisioning entry point must be told about.
+ * Required (not optional) so a new call site cannot silently drop the scope
+ * and fall back to global reuse; `null` is the explicit "unresolved" value,
+ * which `managedAgentIsReusableInCommunity` fails closed on for bound records.
+ */
+export type ChannelAgentCommunityContext = {
+  activeCommunityRelayUrl: string | null;
+};
+
+/** Reuse inputs shared by every agent provisioned in one batch. */
+export type ChannelAgentProvisionContext = ChannelAgentCommunityContext & {
+  managedAgents: ManagedAgent[];
+  channelMemberPubkeys: ReadonlySet<string>;
+};
+
 export type CreateChannelManagedAgentsResult = {
   successes: CreateChannelManagedAgentResult[];
   failures: CreateChannelManagedAgentBatchFailure[];
@@ -173,7 +190,10 @@ function pickPreferredChannelPresetAgent(
   memberPubkeys: ReadonlySet<string>,
   runtimeCommand: string,
   expectedName: string,
+  activeCommunityRelayUrl: string | null | undefined,
 ) {
+  // Already in this channel: an established binding, not a fresh adoption —
+  // scoping it would strand a channel whose agent was later bound elsewhere.
   const inChannelAgent = pickPreferredManagedAgent(
     agents.filter(
       (agent) =>
@@ -185,11 +205,15 @@ function pickPreferredChannelPresetAgent(
     return inChannelAgent;
   }
 
+  // Name match outside the channel IS a fresh adoption, and preset names are
+  // deliberately generic (the runtime id), so without a community scope this
+  // reaches straight for another community's identically-named instance.
   return pickPreferredManagedAgent(
     agents.filter(
       (agent) =>
         commandsMatch(agent.agentCommand, runtimeCommand) &&
-        agent.name.trim().toLowerCase() === expectedName.trim().toLowerCase(),
+        agent.name.trim().toLowerCase() === expectedName.trim().toLowerCase() &&
+        managedAgentIsReusableInCommunity(agent, activeCommunityRelayUrl),
     ),
   );
 }
@@ -197,6 +221,7 @@ function pickPreferredChannelPresetAgent(
 export async function ensureChannelAgentPresetInChannel(
   channelId: string,
   input: EnsureChannelAgentPresetInput,
+  context: ChannelAgentCommunityContext,
 ): Promise<EnsureChannelAgentPresetResult> {
   const role = input.role ?? "bot";
   const ensureRunning = input.ensureRunning ?? true;
@@ -214,6 +239,7 @@ export async function ensureChannelAgentPresetInChannel(
     memberPubkeys,
     input.runtime.command,
     expectedName,
+    context.activeCommunityRelayUrl,
   );
 
   if (existingAgent) {
@@ -254,10 +280,7 @@ export async function ensureChannelAgentPresetInChannel(
 
 export async function provisionChannelManagedAgent(
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
+  context: ChannelAgentProvisionContext,
 ): Promise<ProvisionChannelManagedAgentResult> {
   const trimmedName = input.name.trim();
 
@@ -267,16 +290,12 @@ export async function provisionChannelManagedAgent(
 
   // Smart reuse: if a managed agent with the same personaId already exists
   // and is not already in this channel, attach it instead of creating a new one.
-  if (
-    input.personaId &&
-    !input.forceNewInstance &&
-    context?.managedAgents &&
-    context.channelMemberPubkeys
-  ) {
+  if (input.personaId && !input.forceNewInstance) {
     const reusable = findReusablePersonaAgent(
       context.managedAgents,
       input.personaId,
       context.channelMemberPubkeys,
+      context.activeCommunityRelayUrl,
     );
     if (reusable) {
       // Apply the caller's respondTo settings so the user's permission
@@ -309,14 +328,13 @@ export async function provisionChannelManagedAgent(
   if (
     !input.personaId &&
     !input.systemPrompt?.trim() &&
-    !input.forceNewInstance &&
-    context?.managedAgents &&
-    context.channelMemberPubkeys
+    !input.forceNewInstance
   ) {
     const reusable = findReusableGenericAgent(
       context.managedAgents,
       input.runtime.command,
       context.channelMemberPubkeys,
+      context.activeCommunityRelayUrl,
     );
     if (reusable) {
       const needsRespondToUpdate =
@@ -387,10 +405,7 @@ export async function provisionChannelManagedAgent(
 export async function createChannelManagedAgent(
   channelId: string,
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
+  context: ChannelAgentProvisionContext,
 ): Promise<CreateChannelManagedAgentResult> {
   const provisioned = await provisionChannelManagedAgent(input, context);
   const attached = await attachManagedAgentToChannel(channelId, {
@@ -409,6 +424,7 @@ export async function createChannelManagedAgent(
 export async function createChannelManagedAgents(
   channelId: string,
   inputs: readonly CreateChannelManagedAgentInput[],
+  communityContext: ChannelAgentCommunityContext,
 ): Promise<CreateChannelManagedAgentsResult> {
   // Fetch managed agents and channel members once for smart reuse checks.
   const [managedAgents, members] = await Promise.all([
@@ -418,7 +434,11 @@ export async function createChannelManagedAgents(
   const channelMemberPubkeys = new Set(
     members.map((m) => normalizePubkey(m.pubkey)),
   );
-  const context = { managedAgents, channelMemberPubkeys };
+  const context: ChannelAgentProvisionContext = {
+    managedAgents,
+    channelMemberPubkeys,
+    activeCommunityRelayUrl: communityContext.activeCommunityRelayUrl,
+  };
 
   // Sequential loop: each agent must be fully created and its relay membership
   // written before the next starts. Concurrent writes to the replaceable

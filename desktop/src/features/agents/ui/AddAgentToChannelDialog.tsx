@@ -1,9 +1,7 @@
 import * as React from "react";
 
-import {
-  type AttachManagedAgentToChannelResult,
-  useAttachManagedAgentToChannelMutation,
-} from "@/features/agents/hooks";
+import { useAttachManagedAgentToChannelMutation } from "@/features/agents/channelAgentMutations";
+import type { AttachManagedAgentToChannelResult } from "@/features/agents/hooks";
 import {
   useChannelMembersQuery,
   useChannelsQuery,

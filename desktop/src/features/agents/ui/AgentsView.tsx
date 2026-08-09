@@ -212,7 +212,8 @@ export function AgentsView() {
               defaultModel={inheritedDefaults.model.value}
               actionErrorMessage={agents.actionErrorMessage}
               actionNoticeMessage={agents.actionNoticeMessage}
-              agents={agents.managedAgents}
+              agents={agents.communityAgents}
+              agentsElsewhere={agents.agentsElsewhere}
               agentsError={
                 agents.managedAgentsQuery.error instanceof Error
                   ? agents.managedAgentsQuery.error

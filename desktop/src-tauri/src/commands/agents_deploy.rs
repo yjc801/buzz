@@ -10,9 +10,94 @@ use tauri::AppHandle;
 use crate::managed_agents::AgentDefinition;
 use crate::{
     app_state::AppState,
-    managed_agents::{load_personas, ManagedAgentRecord},
+    managed_agents::{
+        discover_provider_candidates, load_managed_agents, load_personas, provider_deploy,
+        resolve_provider_binary, save_managed_agents, ManagedAgentRecord, ManagedAgentSummary,
+    },
     relay::relay_ws_url_with_override,
+    util::now_iso,
 };
+
+/// The start command's answer: the refreshed record summary plus, for
+/// provider backends, the provider's own deploy classification (see
+/// `ProviderDeployOutcome::fresh_generation`). Local starts carry `None`:
+/// the only consumer is the wake path, which never targets local agents,
+/// and a value here would claim provider proof that never existed.
+#[derive(serde::Serialize)]
+pub struct StartManagedAgentOutcome {
+    pub agent: ManagedAgentSummary,
+    pub fresh_generation: Option<bool>,
+}
+
+/// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
+/// spawn_blocking, and persists the result (backend_agent_id or last_error).
+///
+/// Idempotency: calling deploy on an already-deployed agent sends the same payload
+/// again. Providers are expected to handle this as an update-in-place or no-op —
+/// the protocol does not include an explicit `undeploy` operation (deferred to v2).
+///
+/// Returns the provider's fresh-generation classification on success
+/// (`None` when the provider gave none — see `ProviderDeployOutcome`),
+/// Err(message) on failure. Either way the record is updated and saved
+/// before returning.
+pub(super) async fn deploy_to_provider(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+    provider_id: &str,
+    config: &serde_json::Value,
+    agent_json: serde_json::Value,
+    cached_binary_path: Option<&str>,
+) -> Result<Option<bool>, String> {
+    // Resolve via discovered candidates only. Cached path must match BOTH
+    // "is a discovered candidate" AND "belongs to this provider_id". A tampered
+    // record cannot redirect deploys to a different provider's binary.
+    let bin_path = cached_binary_path
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .filter(|canonical| {
+            discover_provider_candidates().iter().any(|(id, cp)| {
+                id == provider_id && cp.canonicalize().ok().as_ref() == Some(canonical)
+            })
+        })
+        .map_or_else(|| resolve_provider_binary(provider_id), Ok)?;
+
+    let config_clone = config.clone();
+    let deploy_result =
+        tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
+            .await
+            .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+
+    // Persist result under lock.
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(app)?;
+    let rec = records
+        .iter_mut()
+        .find(|r| r.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+
+    let fresh_generation = match deploy_result {
+        Ok(outcome) => {
+            rec.backend_agent_id = Some(outcome.agent_id);
+            rec.last_started_at = Some(now_iso());
+            rec.updated_at = now_iso();
+            rec.last_error = None;
+            outcome.fresh_generation
+        }
+        Err(ref e) => {
+            rec.last_error = Some(e.clone());
+            rec.updated_at = now_iso();
+            save_managed_agents(app, &records)?;
+            return Err(e.clone());
+        }
+    };
+    save_managed_agents(app, &records)?;
+    Ok(fresh_generation)
+}
 
 /// Effective projection fields for the deploy payload — all derived from the
 /// resolved descriptor and effective config so that the serialised payload and
@@ -120,11 +205,39 @@ pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result
     Ok(())
 }
 
+/// Inject a wake deploy's replay floor into the launch contract.
+///
+/// `launch.policy_env` is the provider contract for harness environment
+/// (applied below the user env layer). The floor is the `created_at` of the
+/// mention that triggered the wake: cold-start latency routinely exceeds the
+/// harness's 5s startup replay skew, so without it the fresh harness would
+/// subscribe *after* the very message that woke it and never answer it.
+/// Transient by design — it lives only in this deploy's payload, never on
+/// the record, so ordinary deploys carry no floor.
+///
+/// The key is in `RESERVED_ENV_KEYS`, so every user-controllable layer
+/// (global/persona/agent env) strips it before it can reach `launch.env` —
+/// which providers apply AFTER `policy_env` and would otherwise override
+/// this value. This function is therefore the only writer.
+pub(super) fn apply_wake_replay_floor(
+    payload: &mut serde_json::Value,
+    wake_replay_floor: Option<u64>,
+) {
+    if let Some(floor) = wake_replay_floor {
+        payload["launch"]["policy_env"]["BUZZ_ACP_REPLAY_FLOOR"] =
+            serde_json::Value::String(floor.to_string());
+    }
+}
+
 /// Build the standard agent JSON payload for provider deploy calls.
+///
+/// `wake_replay_floor` is set only when this deploy is a wake-on-mention —
+/// see [`apply_wake_replay_floor`].
 pub(super) fn build_deploy_payload(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
+    wake_replay_floor: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     if let Some(err) = crate::managed_agents::spawn_key_refusal(record) {
         return Err(err);
@@ -161,7 +274,7 @@ pub(super) fn build_deploy_payload(
     let effective_parallelism =
         crate::managed_agents::effective_parallelism(&descriptor.command, record.parallelism);
 
-    Ok(deploy_payload_json(
+    let mut payload = deploy_payload_json(
         record,
         crate::relay::effective_agent_relay_url(
             &record.relay_url,
@@ -176,7 +289,9 @@ pub(super) fn build_deploy_payload(
         },
         merged_user_env,
         launch,
-    ))
+    );
+    apply_wake_replay_floor(&mut payload, wake_replay_floor);
+    Ok(payload)
 }
 
 /// Pure serialization half of [`build_deploy_payload`]. Legacy top-level fields
@@ -473,6 +588,34 @@ mod tests {
         assert_eq!(
             payload["parallelism"], cap,
             "legacy top-level parallelism must match launch.policy_env — both must be {cap}"
+        );
+    }
+
+    /// A wake deploy injects its trigger timestamp into `launch.policy_env`;
+    /// an ordinary deploy leaves the launch contract untouched.
+    #[test]
+    fn wake_replay_floor_is_injected_only_when_present() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
+        let mut payload = serde_json::json!({ "launch": launch });
+
+        apply_wake_replay_floor(&mut payload, None);
+        assert!(
+            payload["launch"]["policy_env"]
+                .get("BUZZ_ACP_REPLAY_FLOOR")
+                .is_none(),
+            "ordinary deploys must not carry a replay floor"
+        );
+
+        apply_wake_replay_floor(&mut payload, Some(1_700_000_123));
+        assert_eq!(
+            payload["launch"]["policy_env"]["BUZZ_ACP_REPLAY_FLOOR"], "1700000123",
+            "wake deploys must carry the trigger timestamp as a string env value"
         );
     }
 }

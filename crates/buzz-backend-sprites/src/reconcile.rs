@@ -39,13 +39,31 @@ const DEADLINE: Duration = Duration::from_secs(600);
 /// and a slow one is better retried by the loop than waited on.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A terminal deploy outcome: the agent's stable handle, plus whether THIS
+/// call started the generation now running.
+pub struct Deployed {
+    pub agent_id: String,
+    /// True exactly when this call performed the Start AND the generation
+    /// observed running at success is the one that Start booted (the
+    /// probe's `gen` names it — env file name, lifecycle correlator, and
+    /// probe `gen` are one identity) — so everything that generation's env
+    /// carried (the wake replay floor included) is provably in effect.
+    /// False for a strict no-op against a generation some earlier deploy
+    /// started — including a concurrent rival's (`adopted_winner`), whose
+    /// env is not ours — and false when this call's Start was superseded:
+    /// the deploy lease expires at 420s while this loop may run 600s, so a
+    /// successor can start ITS generation and a stale call must not vouch
+    /// for a floor that successor never adopted.
+    pub fresh_generation: bool,
+}
+
 /// Run one deploy to a terminal outcome.
 pub async fn deploy(
     substrate: &impl Substrate,
     identity: &AgentIdentity,
     cfg: &ProviderConfig,
     env_map: BTreeMap<String, String>,
-) -> Result<String, String> {
+) -> Result<Deployed, String> {
     // The sprite-wide fence: both mutating actions (Provision, Start) run
     // under an in-sprite deploy lease taken with this call's token, so two
     // concurrent deploys against the same *existing* sprite — the case the
@@ -79,7 +97,7 @@ async fn deploy_loop(
     env_map: BTreeMap<String, String>,
     lease_token: &str,
     lease_held: &mut bool,
-) -> Result<String, String> {
+) -> Result<Deployed, String> {
     let sprite_name = identity.sprite_name();
     let mut attempt_started = false;
     let mut created = false;
@@ -209,7 +227,26 @@ async fn deploy_loop(
         }
 
         match action {
-            Action::NoOp { agent_id } => return Ok(agent_id),
+            // Every success returns through NoOp, but `attempt_started`
+            // alone is NOT the fresh-generation answer: it stays true after
+            // this call's Start even if the observed running harness is a
+            // successor's (the deploy lease expires at 420s, this loop may
+            // run 600s). The claim is therefore fenced by identity: only a
+            // running probe whose `gen` equals the generation this call
+            // started proves the floor-bearing env is in effect. Fail
+            // closed — no probe, no started generation, or a mismatch all
+            // report false (unproven, never a guess).
+            Action::NoOp { agent_id } => {
+                let fresh_generation = attempt_started
+                    && match (attempt_generation.as_deref(), probe.as_ref()) {
+                        (Some(started), Some(running)) => running.gen == started,
+                        _ => false,
+                    };
+                return Ok(Deployed {
+                    agent_id,
+                    fresh_generation,
+                });
+            }
 
             Action::Observe { .. } => substrate.sleep(POLL_INTERVAL).await,
 

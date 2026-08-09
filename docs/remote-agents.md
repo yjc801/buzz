@@ -418,7 +418,8 @@ subject to I2 validation when the user's values come back in `deploy`.
 ```
 request:  {"op": "deploy", "request_id": "<uuid>",
            "agent": <payload>, "provider_config": {…}}
-response: {"ok": true, "agent_id": str}
+response: {"ok": true, "agent_id": str,
+           "fresh_generation": bool (OPTIONAL)}
 timeout:  600s
 ```
 
@@ -457,6 +458,31 @@ collide with or reconstruct a reserved key.
 `agent_id` is `P`'s stable handle for the deployment (the Kubernetes binding
 returns the pod name). `D` stores it as `backend_agent_id`; its presence is
 the `deployed` axis of I3.
+
+`fresh_generation` is `P`'s own classification of what the idempotent deploy
+did: `true` — this call started a fresh harness generation, which therefore
+booted from this call's environment (the wake replay floor included);
+`false` — a strict no-op against a generation an earlier deploy started,
+whose environment is NOT this call's. A provider MUST fence `true` by
+generation identity, not by "this call performed a start": a call whose
+start was superseded (e.g. its deploy lease expired mid-call and a
+successor started its own generation) observes a running harness whose
+environment is NOT this call's, and MUST report `false` (the Sprites
+binding compares the running probe's generation with the one its start
+booted). The field is OPTIONAL: `D` treats a missing or non-boolean value
+as "unproven" — never as either answer — so a provider predating the field
+merely never proves floor adoption.
+
+`D` consumes the classification as a delivery PRESUMPTION, never as
+delivery: `true` proves the floor-bearing environment is in effect, but not
+that the trigger's channel subscription was ever accepted or drained (the
+harness enqueues its REQs, which can sit rate-gated or be rejected after
+presence publishes, and `D` cannot observe per-channel readiness). `D`'s
+wake path therefore retains every trigger for its armed one-shot retry
+regardless of the classification, and uses `true` only to grade the
+terminal log once the retry settles. Process liveness signals (status,
+heartbeats) ground no presumption at all, because they cannot distinguish
+a fresh generation from a no-op against a live one.
 
 **There is no `undeploy` op in v1.** Deletion of a remote agent from `D`
 orphans the substrate objects; the UI therefore requires an explicit

@@ -190,7 +190,10 @@ const REMOTE_SHUTDOWN_POLL_MS = 2_000;
 /// before deploying. (A true fresh-generation proof needs the deploy
 /// response to distinguish no-op from started, which the provider wire
 /// contract does not carry today.)
-const REMOTE_POST_OFFLINE_GRACE_MS = 10_000;
+///
+/// Exported because the wake-on-mention path deploys through the same
+/// provider contract and must respect the same fence (see agentWake.ts).
+export const REMOTE_POST_OFFLINE_GRACE_MS = 10_000;
 
 const waitMs = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));

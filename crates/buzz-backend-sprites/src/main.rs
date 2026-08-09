@@ -91,7 +91,7 @@ fn respond(input: &str) -> Response {
                 Err(e) => return Response::error(format!("could not start the runtime: {e}")),
             };
             match runtime.block_on(deploy_agent(&deploy)) {
-                Ok(agent_id) => Response::deployed(agent_id),
+                Ok(deployed) => Response::deployed(deployed.agent_id, deployed.fresh_generation),
                 Err(e) => Response::error(e),
             }
         }
@@ -115,7 +115,7 @@ fn refuse_relay_mesh(raw: &serde_json::Value) -> Option<String> {
 }
 
 /// Run one deploy to a terminal outcome.
-async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
+async fn deploy_agent(request: &wire::DeployRequest) -> Result<reconcile::Deployed, String> {
     let cfg = config::parse(&request.provider_config)?;
     // Identity before any substrate contact: a malformed nsec is a refusal,
     // not a failed connection (§Deploy State Machine step 0).

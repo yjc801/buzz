@@ -1077,6 +1077,7 @@ dependencies = [
  "buzz-sdk",
  "buzz-terminal",
  "buzz-voice",
+ "buzz-waker",
  "bytes",
  "bzip2 0.6.1",
  "chrono",
@@ -1230,6 +1231,18 @@ dependencies = [
  "sherpa-onnx",
  "symphonia",
  "tokenizers",
+]
+
+[[package]]
+name = "buzz-waker"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "hex",
+ "nostr",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

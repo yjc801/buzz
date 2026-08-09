@@ -249,9 +249,26 @@ async fn fetch_published_digest(
     Ok(digest)
 }
 
+/// GitHub repo whose releases sprites fetch the agent runtime from.
+///
+/// **Deliberately diverges from upstream (`block/buzz`).** On a sprite,
+/// `buzz-acp` is a symlink into this sprig multicall, and wake-on-mention
+/// lives only in this fork: upstream's sprig has no `BUZZ_ACP_REPLAY_FLOOR`
+/// handling, so a woken sprite starts its first REQ *after* the mention that
+/// woke it and silently drops exactly that one message. Verified by
+/// `strings` on both binaries — 0 occurrences upstream, present here.
+///
+/// Revert to `block/buzz` once the wake-on-mention work is upstreamed.
+///
+/// Kept a constant rather than a `provider_config` field on purpose: this
+/// selects the binary that runs as the agent, with the agent's key in its
+/// env, and `fetch_published_digest` treats the release's own `.sha256` as
+/// its trust root — which only means anything for a repo we control.
+const SPRIG_RELEASE_REPO: &str = "yjc801/buzz";
+
 fn sprig_url(version: &str, arch: &str) -> String {
     format!(
-        "https://github.com/block/buzz/releases/download/{version}/sprig-{arch}-unknown-linux-musl.tar.gz"
+        "https://github.com/{SPRIG_RELEASE_REPO}/releases/download/{version}/sprig-{arch}-unknown-linux-musl.tar.gz"
     )
 }
 
@@ -910,7 +927,7 @@ mod tests {
     fn sprig_url_is_the_release_asset_shape() {
         assert_eq!(
             sprig_url("sprig-latest", "x86_64"),
-            "https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz"
+            "https://github.com/yjc801/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz"
         );
     }
 
@@ -1020,7 +1037,7 @@ mod tests {
         let tarball = sprig_url("sprig-latest", "x86_64");
         assert_eq!(
             format!("{tarball}.sha256"),
-            "https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz.sha256"
+            "https://github.com/yjc801/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz.sha256"
         );
     }
 

@@ -82,11 +82,26 @@ name: buzz-pr-mirror
 # not freely rotatable. Channels are owned by the key that created them, the
 # binding notes are addressed under that key, and the seed marker is only
 # trusted from it — a new key owns none of that and cannot archive, unarchive,
-# or re-TTL an existing room. Rotating it therefore requires, per live PR:
-# transfer channel ownership to the new pubkey, then re-point the binding note.
-# Until that migration exists, treat the key as immutable. A rotation without
-# it now fails loudly at the ownership assertion instead of running green while
-# the close path silently loses control of the room.
+# or re-TTL an existing room.
+#
+# That is enforced, not merely documented: EXPECTED_CI_PUBKEY below pins the
+# identity, and the job aborts before touching the relay if the key in the
+# secret derives to anything else. The pin is load-bearing because EVERY view
+# this workflow has of the world is scoped to the current key — the binding
+# note is read at its author coordinate, and the membership scan lists only
+# rooms it belongs to. A rotated key therefore sees an empty world, and
+# without the pin it would read that as "no room exists" and mint a second
+# `buzz-pr-N` under the new identity while the real history stayed under the
+# retired one. Absence is only meaningful for the identity that owns the
+# rooms, so the identity is checked first.
+#
+# Rotating for real means, in one reviewed change: transfer ownership of every
+# live room to the new pubkey, re-point each binding note to it, and update
+# EXPECTED_CI_PUBKEY in the same PR. The pin being a constant rather than a
+# repo variable is deliberate — it makes rotation a reviewed code change and
+# costs an urgent key revocation a PR to restore mirroring, which is the right
+# trade for a mirror. It is a PUBLIC key: it already appears as the owner of
+# every room this workflow created and as the author of every seed card.
 #
 # Optional repo variable:
 #   BUZZ_FALLBACK_CHANNEL — channel UUID for close notices on PRs that predate
@@ -170,6 +185,12 @@ jobs:
           # Community owner — added to every new channel so it shows up in
           # their sidebar (open channels are joinable but not auto-joined).
           OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+          # The pinned CI identity — the public half of BUZZ_CI_PRIVATE_KEY, and
+          # the owner of every room this workflow has created. See the header:
+          # changing it without migrating channel ownership and the binding
+          # notes forks the room history, so the job refuses to run on any
+          # other key rather than discovering an empty world and rebuilding it.
+          EXPECTED_CI_PUBKEY: fbc33a2cf3637867fa90e9e3e334304701e1fdf3c57eae4283cea60134f604af
         run: |
           NAME="buzz-pr-${PR_NUMBER}"
           RANGE="origin/${BASE_REF}...HEAD"
@@ -188,6 +209,28 @@ jobs:
             echo "CI pubkey derivation failed — failing so the rerun re-probes" >&2
             exit 1
           }
+
+          # Identity fence, and it has to come FIRST — before the binding read,
+          # before any scan, before anything is created. Every question this
+          # workflow asks the relay is scoped to the key it is holding: the
+          # binding note is read at that key's author coordinate, and the
+          # membership scan lists only rooms that key belongs to. So a
+          # different key does not see a conflict, it sees an EMPTY WORLD, and
+          # every downstream "provably absent" becomes true-but-meaningless —
+          # the workflow would cheerfully mint a second #buzz-pr-N under the
+          # new identity and go green while the real room stayed under the old
+          # one. Absence is only meaningful for the identity that owns the
+          # rooms, so the identity is established before absence is consulted.
+          if [ "$CI_PUB" != "$EXPECTED_CI_PUBKEY" ]; then
+            echo "BUZZ_CI_PRIVATE_KEY derives to ${CI_PUB}," >&2
+            echo "but this workflow is pinned to ${EXPECTED_CI_PUBKEY}." >&2
+            echo "Refusing to run: the pinned identity owns every existing #buzz-pr-N room and" >&2
+            echo "authors every binding note, and this key can see neither. Continuing would" >&2
+            echo "fork the room history rather than rotate it." >&2
+            echo "To rotate: transfer ownership of every live room to the new pubkey, re-point" >&2
+            echo "each binding note, and update EXPECTED_CI_PUBKEY in the same PR." >&2
+            exit 1
+          fi
 
           # Slug of this PR's binding note. Lowercased and slash-free to stay
           # inside the note-slug charset; asserted rather than assumed, because

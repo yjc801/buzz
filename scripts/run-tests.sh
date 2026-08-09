@@ -117,6 +117,11 @@ run_unit_tests() {
   # on BUZZ_SPRITES_LIVE=1 and skip themselves without it.
   run_test_step "buzz-backend-sprites tests" \
     cargo test -p buzz-backend-sprites -- --nocapture
+
+  # Waker: launch-bundle signature verification and durable anti-rollback.
+  # Pure, no infra. Security checks — keep in step with the nextest path.
+  run_test_step "buzz-waker tests" \
+    cargo test -p buzz-waker -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

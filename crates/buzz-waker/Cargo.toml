@@ -10,6 +10,7 @@ description = "Headless wake daemon for remote Buzz agents: signed launch bundle
 [dependencies]
 buzz-core  = { workspace = true }
 nostr       = { workspace = true }
+rustix      = { version = "1", features = ["fs"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }

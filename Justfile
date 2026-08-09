@@ -323,6 +323,11 @@ test-unit:
         # scripted fake substrate and a fake clock. Its live tests are gated
         # on BUZZ_SPRITES_LIVE=1 and skip themselves here.
         cargo nextest run -p buzz-backend-sprites
+        # Waker: launch-bundle signature verification and the durable
+        # anti-rollback floors. Pure, no infra. These are security checks —
+        # a regression here silently accepts a tampered or replayed bundle,
+        # so they must fail the gate rather than merely exist.
+        cargo nextest run -p buzz-waker
     else
         ./scripts/run-tests.sh unit
     fi

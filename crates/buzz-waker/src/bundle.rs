@@ -124,7 +124,14 @@ pub struct ProviderEnvelope {
 }
 
 /// The signed content of a launch bundle.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand and redacts [`Self::agent_json`]:
+/// `build_deploy_payload` always puts `private_key_nsec` in there
+/// (`desktop/src-tauri/src/commands/agents_deploy.rs`), so a derived `Debug`
+/// would print the agent's portable signing key into any log line, span field,
+/// or failed-assertion message. Matches the redaction the sibling
+/// secret-bearing types use (`buzz-backend-sprites/src/credentials.rs`).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchBundleBody {
     /// Hex pubkey of the agent this bundle launches.
     pub agent_pubkey: String,
@@ -150,11 +157,29 @@ pub struct LaunchBundleBody {
     pub owner_only_access: bool,
 }
 
+impl std::fmt::Debug for LaunchBundleBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchBundleBody")
+            .field("agent_pubkey", &self.agent_pubkey)
+            .field("agent_json", &"<redacted: contains private_key_nsec>")
+            .field("provider", &self.provider)
+            .field("bundle_version", &self.bundle_version)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("owner_only_access", &self.owner_only_access)
+            .finish()
+    }
+}
+
 /// A launch bundle as it travels and rests: opaque bytes plus a signature.
 ///
 /// The body is not parsed — and must not be acted on — until
 /// [`SignedLaunchBundle::verify`] returns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::body_json`] for the same reason
+/// [`LaunchBundleBody`] redacts `agent_json`: those bytes *are* the agent
+/// payload, nsec included.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedLaunchBundle {
     /// The exact bytes that were signed, as a UTF-8 JSON string.
     pub body_json: String,
@@ -162,6 +187,16 @@ pub struct SignedLaunchBundle {
     pub owner_pubkey: String,
     /// Hex BIP-340 signature over [`bundle_digest`] of `body_json`.
     pub sig: String,
+}
+
+impl std::fmt::Debug for SignedLaunchBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedLaunchBundle")
+            .field("body_json", &"<redacted: contains private_key_nsec>")
+            .field("owner_pubkey", &self.owner_pubkey)
+            .field("sig", &self.sig)
+            .finish()
+    }
 }
 
 /// The digest a launch bundle signature covers.
@@ -275,10 +310,18 @@ mod tests {
         hex::encode(xonly.serialize())
     }
 
+    /// The real payload always carries the agent's key — `build_deploy_payload`
+    /// sets `private_key_nsec` unconditionally — so the fixture carries one too.
+    /// Without it the redaction tests below would pass vacuously.
+    const FIXTURE_NSEC: &str = "nsec1thisisthefakeagentsigningkey";
+
     fn body() -> LaunchBundleBody {
         LaunchBundleBody {
             agent_pubkey: "a".repeat(64),
-            agent_json: serde_json::json!({"launch": {"command": "buzz-acp"}}),
+            agent_json: serde_json::json!({
+                "private_key_nsec": FIXTURE_NSEC,
+                "launch": {"command": "buzz-acp"},
+            }),
             provider: ProviderEnvelope {
                 provider_id: "sprites".to_string(),
                 provider_config: serde_json::json!({"org": "buzz-team"}),
@@ -407,6 +450,37 @@ mod tests {
             bundle_digest("{}"),
             raw,
             "a bare body hash must not be a valid bundle digest"
+        );
+    }
+
+    /// The agent's nsec rides in `agent_json`, so a derived `Debug` would
+    /// print a portable signing key into any log line or span field.
+    #[test]
+    fn debug_does_not_leak_the_agent_key_from_the_body() {
+        let rendered = format!("{:?}", body());
+        assert!(
+            !rendered.contains(FIXTURE_NSEC),
+            "LaunchBundleBody Debug leaked the nsec: {rendered}"
+        );
+        assert!(
+            rendered.contains("agent_pubkey"),
+            "redaction must not blank the whole struct: {rendered}"
+        );
+    }
+
+    /// Same hazard one level up: `body_json` *is* the agent payload.
+    #[test]
+    fn debug_does_not_leak_the_agent_key_from_the_signed_wrapper() {
+        let kp = keypair();
+        let signed = SignedLaunchBundle::sign(&body(), &kp).expect("sign");
+        assert!(
+            signed.body_json.contains(FIXTURE_NSEC),
+            "precondition: the signed bytes really do carry the key"
+        );
+        let rendered = format!("{signed:?}");
+        assert!(
+            !rendered.contains(FIXTURE_NSEC),
+            "SignedLaunchBundle Debug leaked the nsec: {rendered}"
         );
     }
 

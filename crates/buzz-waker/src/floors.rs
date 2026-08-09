@@ -1,4 +1,4 @@
-//! Durable anti-rollback floors — **G2**.
+//! The durable enrolment record and its anti-rollback floors — **G2**.
 //!
 //! A signature authenticates an *old* bundle exactly as well as a current one.
 //! So "refuse a version lower than the one we hold" is only a real defence if
@@ -6,32 +6,49 @@
 //! previously-valid signed bundle restarts the waker and gets the stale access
 //! policy back — the precise regression the owner-only clamp exists to prevent.
 //!
-//! Two monotonic values, both persisted:
+//! One record holds all three durable facts, because they are only meaningful
+//! together:
 //!
+//! - `owner_pubkey` — pinned once, at enrolment, and never rewritten;
 //! - `highest_accepted_version` — the newest bundle ever activated;
 //! - `revocation_floor` — the owner's published minimum acceptable version.
 //!
-//! # Ordering is the property
+//! # Three ways this can be got wrong, and what stops each
 //!
-//! [`FloorStore::admit`] persists **before** it returns `Ok`. A caller may
-//! therefore treat a successful `admit` as "this version is durably recorded"
-//! and activate the bundle. Persisting after activation would leave a crash
-//! window in which the activated version is not on disk, which is the rollback
-//! hole with extra steps.
+//! **Lost update.** Two `FloorStore` handles can each cache the record, and the
+//! second one's write would clobber the first one's. Every mutation therefore
+//! takes an exclusive `flock` on a sidecar lock file, **re-reads the record
+//! from disk under that lock**, decides against those bytes, and writes before
+//! releasing. The in-memory copy is a snapshot for display, never the basis of
+//! a decision. The lock lives on a sidecar rather than on the record itself
+//! because the record is replaced by `rename`, which swaps the inode out from
+//! under any lock held on it.
 //!
-//! # Failing closed
+//! **Missing state.** A missing record is legitimate exactly once — at
+//! enrolment. [`FloorStore::enroll`] creates it and refuses if one already
+//! exists; [`FloorStore::open`] requires it and fails closed if it is gone.
+//! Treating absence as "start at zero" would make deleting one file equivalent
+//! to rolling every floor back.
 //!
-//! An unreadable or corrupt floor file is an error, never a reset to zero.
-//! Silently defaulting would turn "someone deleted a byte" into "every old
-//! bundle is acceptable again".
+//! **Corruption.** An unreadable record is fatal for the same reason: silently
+//! defaulting would turn "someone damaged a byte" into "every old bundle is
+//! acceptable again".
+//!
+//! # Ordering
+//!
+//! [`FloorStore::admit`] persists **before** it returns `Ok`, so a caller may
+//! treat success as "durably recorded" and activate the bundle. Persisting
+//! after activation would leave a crash window in which the activated version
+//! is not on disk — the rollback hole with extra steps.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 
-/// Failures reading or advancing the durable floors.
+/// Failures reading or advancing the durable record.
 #[derive(Debug, thiserror::Error)]
 pub enum FloorError {
     /// The bundle's version is below the owner's published revocation floor.
@@ -52,10 +69,25 @@ pub enum FloorError {
         accepted: u64,
     },
 
-    /// The floor file exists but could not be read or parsed.
+    /// No enrolment record where one is required.
     ///
-    /// Deliberately fatal: see the module note on failing closed.
-    #[error("floor state at {path} is unreadable ({reason}); refusing to run without it")]
+    /// Deliberately fatal rather than an implicit re-enrolment: see the module
+    /// note on missing state.
+    #[error("no enrolment record at {path}; refusing to run (enroll explicitly to create one)")]
+    NotEnrolled {
+        /// The path that should have held the record.
+        path: String,
+    },
+
+    /// Enrolment was asked to create a record that already exists.
+    #[error("already enrolled at {path}; refusing to overwrite the durable floors")]
+    AlreadyEnrolled {
+        /// The path that already holds a record.
+        path: String,
+    },
+
+    /// The record exists but could not be read or parsed.
+    #[error("enrolment record at {path} is unreadable ({reason}); refusing to run without it")]
     Corrupt {
         /// The path that could not be read.
         path: String,
@@ -63,8 +95,8 @@ pub enum FloorError {
         reason: String,
     },
 
-    /// The floors could not be made durable.
-    #[error("could not persist floor state to {path}: {reason}")]
+    /// The record could not be made durable, or the fence could not be taken.
+    #[error("could not persist enrolment record to {path}: {reason}")]
     Persist {
         /// The path being written.
         path: String,
@@ -73,50 +105,91 @@ pub enum FloorError {
     },
 }
 
-/// The persisted monotonic state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// The persisted enrolment record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Floors {
+    /// The owner whose signature a launch bundle must carry.
+    ///
+    /// Pinned at enrolment and never rewritten, so it cannot be swapped by any
+    /// bundle that shows up later.
+    pub owner_pubkey: String,
     /// Highest bundle version ever activated.
     pub highest_accepted_version: u64,
     /// Owner-published minimum acceptable bundle version.
     pub revocation_floor: u64,
 }
 
-/// A file-backed [`Floors`] with atomic, fail-closed updates.
+/// A file-backed [`Floors`] with fenced, atomic, fail-closed updates.
 #[derive(Debug)]
 pub struct FloorStore {
     path: PathBuf,
-    floors: Floors,
+    lock_path: PathBuf,
+    /// Last-read snapshot. Never the basis of a decision — every mutation
+    /// re-reads under the fence.
+    snapshot: Floors,
 }
 
 impl FloorStore {
-    /// Load the floors, or start at zero if the file does not exist yet.
-    ///
-    /// # Errors
-    /// [`FloorError::Corrupt`] if the file exists but cannot be read or parsed
-    /// — a missing file is a first run, a broken one is not.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, FloorError> {
-        let path = path.into();
-        let floors = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| FloorError::Corrupt {
-                path: path.display().to_string(),
-                reason: e.to_string(),
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Floors::default(),
-            Err(e) => {
-                return Err(FloorError::Corrupt {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                })
-            }
-        };
-        Ok(Self { path, floors })
+    fn lock_path_for(path: &Path) -> PathBuf {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        path.with_file_name(name)
     }
 
-    /// The current floors.
+    /// Create the enrolment record, pinning `owner_pubkey`.
+    ///
+    /// # Errors
+    /// [`FloorError::AlreadyEnrolled`] if a record is already present — this
+    /// never overwrites durable floors.
+    pub fn enroll(path: impl Into<PathBuf>, owner_pubkey: &str) -> Result<Self, FloorError> {
+        let path = path.into();
+        if path.exists() {
+            return Err(FloorError::AlreadyEnrolled {
+                path: path.display().to_string(),
+            });
+        }
+        let store = Self {
+            lock_path: Self::lock_path_for(&path),
+            path,
+            snapshot: Floors {
+                owner_pubkey: owner_pubkey.to_string(),
+                highest_accepted_version: 0,
+                revocation_floor: 0,
+            },
+        };
+        let initial = store.snapshot.clone();
+        store.persist(&initial)?;
+        Ok(store)
+    }
+
+    /// Open an existing enrolment record.
+    ///
+    /// # Errors
+    /// [`FloorError::NotEnrolled`] if the record is absent, or
+    /// [`FloorError::Corrupt`] if it cannot be read — both fail closed rather
+    /// than resetting the floors to zero.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, FloorError> {
+        let path = path.into();
+        let snapshot = Self::read(&path)?;
+        Ok(Self {
+            lock_path: Self::lock_path_for(&path),
+            path,
+            snapshot,
+        })
+    }
+
+    /// The last-read record. A snapshot for display; decisions re-read.
     #[must_use]
-    pub fn floors(&self) -> Floors {
-        self.floors
+    pub fn snapshot(&self) -> &Floors {
+        &self.snapshot
+    }
+
+    /// The pinned owner, re-read from disk under the fence.
+    ///
+    /// # Errors
+    /// Propagates a missing or corrupt record.
+    pub fn pinned_owner(&mut self) -> Result<String, FloorError> {
+        self.with_fence(|current| Ok((None, current.owner_pubkey.clone())))
     }
 
     /// Admit a bundle version, making the decision durable before returning.
@@ -127,32 +200,28 @@ impl FloorStore {
     /// # Errors
     /// [`FloorError::Revoked`] or [`FloorError::RolledBack`] to refuse the
     /// bundle; [`FloorError::Persist`] if the new floor could not be made
-    /// durable — in which case nothing is activated and in-memory state is
-    /// left unchanged.
+    /// durable, in which case nothing is activated.
     pub fn admit(&mut self, version: u64) -> Result<(), FloorError> {
-        if version < self.floors.revocation_floor {
-            return Err(FloorError::Revoked {
-                version,
-                floor: self.floors.revocation_floor,
-            });
-        }
-        if version < self.floors.highest_accepted_version {
-            return Err(FloorError::RolledBack {
-                version,
-                accepted: self.floors.highest_accepted_version,
-            });
-        }
-        if version == self.floors.highest_accepted_version {
-            return Ok(());
-        }
-
-        let next = Floors {
-            highest_accepted_version: version,
-            ..self.floors
-        };
-        self.persist(next)?;
-        self.floors = next;
-        Ok(())
+        self.with_fence(|current| {
+            if version < current.revocation_floor {
+                return Err(FloorError::Revoked {
+                    version,
+                    floor: current.revocation_floor,
+                });
+            }
+            if version < current.highest_accepted_version {
+                return Err(FloorError::RolledBack {
+                    version,
+                    accepted: current.highest_accepted_version,
+                });
+            }
+            if version == current.highest_accepted_version {
+                return Ok((None, ()));
+            }
+            let mut next = current.clone();
+            next.highest_accepted_version = version;
+            Ok((Some(next), ()))
+        })
     }
 
     /// Raise the revocation floor. Monotonic by construction.
@@ -164,31 +233,73 @@ impl FloorStore {
     /// # Errors
     /// [`FloorError::Persist`] if the raised floor could not be made durable.
     pub fn raise_revocation_floor(&mut self, floor: u64) -> Result<bool, FloorError> {
-        if floor <= self.floors.revocation_floor {
-            return Ok(false);
+        self.with_fence(|current| {
+            if floor <= current.revocation_floor {
+                return Ok((None, false));
+            }
+            let mut next = current.clone();
+            next.revocation_floor = floor;
+            Ok((Some(next), true))
+        })
+    }
+
+    /// Run a decision against the on-disk record under an exclusive fence.
+    ///
+    /// The closure receives the **freshly read** record and returns the record
+    /// to persist (`None` for no change) plus its own result. Reading inside
+    /// the fence is the whole point: a decision made against `self.snapshot`
+    /// could be based on state another handle has already superseded, and
+    /// writing it back would silently undo their update.
+    fn with_fence<T>(
+        &mut self,
+        decide: impl FnOnce(&Floors) -> Result<(Option<Floors>, T), FloorError>,
+    ) -> Result<T, FloorError> {
+        let guard = FenceGuard::acquire(&self.lock_path, &self.path)?;
+        let current = Self::read(&self.path)?;
+        let (next, out) = decide(&current)?;
+        if let Some(next) = next {
+            self.persist(&next)?;
+            self.snapshot = next;
+        } else {
+            self.snapshot = current;
         }
-        let next = Floors {
-            revocation_floor: floor,
-            ..self.floors
-        };
-        self.persist(next)?;
-        self.floors = next;
-        Ok(true)
+        drop(guard);
+        Ok(out)
+    }
+
+    fn read(path: &Path) -> Result<Floors, FloorError> {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| FloorError::Corrupt {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(FloorError::NotEnrolled {
+                path: path.display().to_string(),
+            }),
+            Err(e) => Err(FloorError::Corrupt {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            }),
+        }
     }
 
     /// Write-temp, fsync, rename, fsync-dir.
     ///
-    /// The directory fsync is what makes the rename itself durable; without it
-    /// a crash can leave the old contents visible even though the new file was
-    /// synced.
-    fn persist(&self, next: Floors) -> Result<(), FloorError> {
+    /// The directory fsync is what makes the rename durable; without it a crash
+    /// can leave the old contents visible even though the new file was synced.
+    /// The temp name is process-unique so two writers cannot truncate each
+    /// other's staging file — though the fence above is what actually orders
+    /// them.
+    fn persist(&self, next: &Floors) -> Result<(), FloorError> {
         let fail = |reason: String| FloorError::Persist {
             path: self.path.display().to_string(),
             reason,
         };
 
-        let encoded = serde_json::to_vec(&next).map_err(|e| fail(e.to_string()))?;
-        let tmp = self.path.with_extension("tmp");
+        let encoded = serde_json::to_vec(next).map_err(|e| fail(e.to_string()))?;
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
 
         let mut file = fs::File::create(&tmp).map_err(|e| fail(e.to_string()))?;
         file.write_all(&encoded).map_err(|e| fail(e.to_string()))?;
@@ -206,26 +317,76 @@ impl FloorStore {
     }
 }
 
+/// An exclusive interprocess fence over the record, released on drop.
+struct FenceGuard {
+    file: fs::File,
+}
+
+impl FenceGuard {
+    fn acquire(lock_path: &Path, record_path: &Path) -> Result<Self, FloorError> {
+        let fail = |reason: String| FloorError::Persist {
+            path: record_path.display().to_string(),
+            reason,
+        };
+        // The lock file carries no state, so creating it on demand is safe —
+        // absence of the *record* is what fails closed, and `read` below
+        // enforces that.
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)
+            .map_err(|e| fail(format!("could not open the fence: {e}")))?;
+        flock(&file, FlockOperation::LockExclusive)
+            .map_err(|e| fail(format!("could not take the fence: {e}")))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for FenceGuard {
+    fn drop(&mut self) {
+        // Best effort: closing the descriptor releases the lock regardless.
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn store(dir: &tempfile::TempDir) -> FloorStore {
+    const OWNER: &str = "ff00ff00";
+
+    fn enrolled(dir: &tempfile::TempDir) -> FloorStore {
+        FloorStore::enroll(dir.path().join("floors.json"), OWNER).expect("enroll")
+    }
+
+    fn reopen(dir: &tempfile::TempDir) -> FloorStore {
         FloorStore::open(dir.path().join("floors.json")).expect("open")
     }
 
     #[test]
-    fn a_missing_file_starts_at_zero() {
+    fn enrolment_pins_the_owner_and_starts_at_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(store(&dir).floors(), Floors::default());
+        let s = enrolled(&dir);
+        assert_eq!(s.snapshot().owner_pubkey, OWNER);
+        assert_eq!(s.snapshot().highest_accepted_version, 0);
+    }
+
+    #[test]
+    fn enrolment_refuses_to_overwrite_an_existing_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        enrolled(&dir);
+        let err =
+            FloorStore::enroll(dir.path().join("floors.json"), "other").expect_err("must refuse");
+        assert!(matches!(err, FloorError::AlreadyEnrolled { .. }));
     }
 
     #[test]
     fn admitting_advances_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut s = store(&dir);
+        let mut s = enrolled(&dir);
         s.admit(5).expect("admit 5");
-        assert_eq!(s.floors().highest_accepted_version, 5);
+        assert_eq!(s.snapshot().highest_accepted_version, 5);
     }
 
     /// G2, the headline case: accept an owner-only bundle, restart, then
@@ -234,16 +395,11 @@ mod tests {
     fn an_older_bundle_is_refused_after_a_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         {
-            let mut s = store(&dir);
+            let mut s = enrolled(&dir);
             s.admit(9).expect("admit 9");
         }
-        // Fresh process, same disk.
-        let mut reopened = store(&dir);
-        assert_eq!(
-            reopened.floors().highest_accepted_version,
-            9,
-            "the floor must survive the restart"
-        );
+        let mut reopened = reopen(&dir);
+        assert_eq!(reopened.snapshot().highest_accepted_version, 9);
         let err = reopened
             .admit(4)
             .expect_err("older version must be refused");
@@ -256,19 +412,81 @@ mod tests {
         ));
     }
 
+    /// Deleting the record must not read as "start at zero" — that would make
+    /// `rm` a rollback primitive.
+    #[test]
+    fn a_deleted_record_fails_closed_instead_of_resetting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("floors.json");
+        {
+            let mut s = enrolled(&dir);
+            s.admit(9).expect("admit 9");
+        }
+        fs::remove_file(&path).expect("simulate loss");
+        let err = FloorStore::open(&path).expect_err("must refuse");
+        assert!(matches!(err, FloorError::NotEnrolled { .. }));
+    }
+
+    /// The lost-update race: two handles cache the same starting record, one
+    /// advances the floor, and the other must not be able to write its stale
+    /// view back over the top.
+    #[test]
+    fn a_stale_handle_cannot_clobber_a_newer_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        enrolled(&dir);
+        let mut a = reopen(&dir);
+        let mut b = reopen(&dir); // both snapshot version 0
+
+        a.admit(9).expect("A admits 9");
+
+        // B still believes the floor is 0. It must decide against disk, not
+        // against its snapshot, and therefore refuse.
+        assert_eq!(b.snapshot().highest_accepted_version, 0);
+        let err = b.admit(4).expect_err("stale handle must not roll back");
+        assert!(matches!(
+            err,
+            FloorError::RolledBack {
+                version: 4,
+                accepted: 9
+            }
+        ));
+        assert_eq!(reopen(&dir).snapshot().highest_accepted_version, 9);
+    }
+
+    /// Same hazard across the two different fields: a revocation raised by one
+    /// handle must not be erased by another handle's version admission.
+    #[test]
+    fn an_admit_does_not_erase_a_concurrently_raised_revocation_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        enrolled(&dir);
+        let mut a = reopen(&dir);
+        let mut b = reopen(&dir);
+
+        a.raise_revocation_floor(20).expect("A raises to 20");
+        b.admit(25).expect("B admits a version above the new floor");
+
+        let final_state = reopen(&dir);
+        assert_eq!(
+            final_state.snapshot().revocation_floor,
+            20,
+            "B's write must have preserved A's revocation floor"
+        );
+        assert_eq!(final_state.snapshot().highest_accepted_version, 25);
+    }
+
     #[test]
     fn re_admitting_the_current_version_is_a_no_op_success() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut s = store(&dir);
+        let mut s = enrolled(&dir);
         s.admit(3).expect("admit 3");
         s.admit(3).expect("re-admit 3");
-        assert_eq!(s.floors().highest_accepted_version, 3);
+        assert_eq!(s.snapshot().highest_accepted_version, 3);
     }
 
     #[test]
     fn a_revoked_version_is_refused_even_when_it_is_newer_than_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut s = store(&dir);
+        let mut s = enrolled(&dir);
         s.admit(2).expect("admit 2");
         assert!(s.raise_revocation_floor(10).expect("raise"));
         let err = s.admit(5).expect_err("below the revocation floor");
@@ -284,28 +502,38 @@ mod tests {
     #[test]
     fn the_revocation_floor_never_decreases() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut s = store(&dir);
+        let mut s = enrolled(&dir);
         assert!(s.raise_revocation_floor(7).expect("raise to 7"));
         assert!(
             !s.raise_revocation_floor(3).expect("stale revocation"),
             "a lower floor is ignored, not applied"
         );
-        assert_eq!(s.floors().revocation_floor, 7);
+        assert_eq!(s.snapshot().revocation_floor, 7);
     }
 
     #[test]
     fn the_revocation_floor_survives_a_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         {
-            let mut s = store(&dir);
+            let mut s = enrolled(&dir);
             s.raise_revocation_floor(12).expect("raise");
         }
-        assert_eq!(store(&dir).floors().revocation_floor, 12);
+        assert_eq!(reopen(&dir).snapshot().revocation_floor, 12);
     }
 
-    /// Failing closed: a damaged floor file must not read as "no floor".
+    /// The pinned owner is enrolment state, not bundle state: no admission
+    /// may rewrite it.
     #[test]
-    fn a_corrupt_floor_file_refuses_to_load() {
+    fn admitting_never_rewrites_the_pinned_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = enrolled(&dir);
+        s.admit(4).expect("admit");
+        s.raise_revocation_floor(2).expect("raise");
+        assert_eq!(reopen(&dir).snapshot().owner_pubkey, OWNER);
+    }
+
+    #[test]
+    fn a_corrupt_record_refuses_to_load() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("floors.json");
         fs::write(&path, b"{not json").expect("write");
@@ -316,8 +544,14 @@ mod tests {
     #[test]
     fn no_temp_file_is_left_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut s = store(&dir);
+        let mut s = enrolled(&dir);
         s.admit(1).expect("admit");
-        assert!(!dir.path().join("floors.tmp").exists());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     }
 }

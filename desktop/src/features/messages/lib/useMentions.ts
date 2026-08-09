@@ -15,9 +15,7 @@ import {
   coalesceAgentAutocompleteCandidates,
   coalesceAutocompleteCandidatesByKey,
   filterCachedAgentSuggestions,
-  getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentIdentityInAllowedList,
   isAgentMentionChannelType,
   shouldHideAgentFromMentions,
   uniqueAutocompleteLabels,
@@ -41,6 +39,7 @@ import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { hasMention } from "./hasMention";
 import { useDraftMentionRouting } from "./useDraftMentionRouting";
+import { useMentionAgentPubkeys } from "./useMentionAgentPubkeys";
 import { rankMentionCandidates } from "./mentionRanking";
 import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
 import {
@@ -197,25 +196,6 @@ export function useMentions(
   const mentionChannelId = isAgentMentionChannelType(options?.channelType)
     ? channelId
     : null;
-  const mentionableAgentPubkeys = React.useMemo(
-    () =>
-      getMentionableAgentPubkeys({
-        currentPubkey,
-        eligibilityScope: mentionChannelId
-          ? { type: "channel", channelId: mentionChannelId }
-          : { type: "managed-only" },
-        managedAgentPubkeys,
-        relayAgents: relayAgentsQuery.data,
-        sharedChannelIds,
-      }),
-    [
-      currentPubkey,
-      managedAgentPubkeys,
-      mentionChannelId,
-      relayAgentsQuery.data,
-      sharedChannelIds,
-    ],
-  );
   const personaNameByPubkey = React.useMemo(() => {
     const agents = managedAgentsQuery.data ?? [];
     const personas = personasQuery.data ?? [];
@@ -229,7 +209,20 @@ export function useMentions(
     }
     return lookup;
   }, [managedAgentsQuery.data, personasQuery.data]);
-  const knownAgentPubkeys = mentionableAgentPubkeys;
+  const { mentionableAgentPubkeys, memberAgentPubkeys, knownAgentPubkeys } =
+    useMentionAgentPubkeys({
+      currentPubkey,
+      directoryAgentPubkeys,
+      isArchived: isArchivedDiscovery,
+      managedAgentNamesByPubkey,
+      managedAgentPubkeys,
+      members,
+      mentionChannelId,
+      profiles,
+      relayAgents: relayAgentsQuery.data,
+      relayAgentNamesByPubkey,
+      sharedChannelIds,
+    });
   const activePersonas = React.useMemo(
     () => (personasQuery.data ?? []).filter((persona) => persona.isActive),
     [personasQuery.data],
@@ -255,9 +248,10 @@ export function useMentions(
       if (isArchivedDiscovery(pubkey)) {
         return;
       }
-      if (!isAgentIdentityInAllowedList(candidate, mentionableAgentPubkeys)) {
-        return;
-      }
+      // Agents are gated ONLY by shouldHideAgentFromMentions. Adding
+      // `isAgentIdentityInAllowedList` here (as this once did) makes its
+      // member branch unreachable and hides every channel-member agent
+      // with no kind:10100 entry — see its disagreement test.
       if (
         shouldHideAgentFromMentions({
           isAgent: candidate.isAgent === true,
@@ -324,12 +318,7 @@ export function useMentions(
         isMember: true,
         personaId:
           managedAgentPersonaIdsByPubkey.get(pubkey) ?? linkedPersonaId,
-        isAgent:
-          member.isAgent === true ||
-          profile?.isAgent === true ||
-          member.role === "bot" ||
-          managedAgentNamesByPubkey.has(pubkey) ||
-          relayAgentNamesByPubkey.has(pubkey),
+        isAgent: memberAgentPubkeys.has(pubkey),
         ownerPubkey: profile?.ownerPubkey ?? null,
         personaName: personaNameByPubkey.get(pubkey) ?? null,
         role: member.role,
@@ -430,6 +419,7 @@ export function useMentions(
     managedAgentPersonaIds,
     managedAgentPersonaIdsByPubkey,
     managedAgentsQuery.data,
+    memberAgentPubkeys,
     memberPubkeys,
     members,
     mentionableAgentPubkeys,

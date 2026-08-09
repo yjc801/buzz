@@ -125,6 +125,50 @@ export function shouldHideAgentFromMentions({
   return directoryAgentPubkeys.has(normalized);
 }
 
+/**
+ * The channel-member agents the mention picker admits.
+ *
+ * The picker gates member agents on `shouldHideAgentFromMentions` alone, so a
+ * member agent with no kind:10100 entry is mentionable even though it is not in
+ * `mentionableAgentPubkeys`. Downstream agent classification (persistent
+ * audience promotion, Huddle enrollment) must use the SAME gate, or an agent
+ * the user just picked is treated as an ordinary person once the message sends.
+ */
+export function getAdmittedMemberAgentPubkeys({
+  memberAgentPubkeys,
+  isArchived,
+  mentionableAgentPubkeys,
+  directoryAgentPubkeys,
+}: {
+  memberAgentPubkeys: Iterable<string>;
+  isArchived: (pubkey: string) => boolean;
+  mentionableAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys: ReadonlySet<string>;
+}) {
+  const admitted = new Set<string>();
+
+  for (const pubkey of memberAgentPubkeys) {
+    const normalized = normalizePubkey(pubkey);
+    if (isArchived(normalized)) {
+      continue;
+    }
+    if (
+      shouldHideAgentFromMentions({
+        isAgent: true,
+        isMember: true,
+        pubkey: normalized,
+        mentionableAgentPubkeys,
+        directoryAgentPubkeys,
+      })
+    ) {
+      continue;
+    }
+    admitted.add(normalized);
+  }
+
+  return admitted;
+}
+
 export function isAgentMentionChannelType(type?: string | null) {
   return type === "stream" || type === "forum";
 }

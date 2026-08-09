@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   coalesceAgentAutocompleteCandidates,
   filterCachedAgentSuggestions,
+  getAdmittedMemberAgentPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
   isAgentIdentityInAllowedList,
@@ -317,6 +318,99 @@ test("shouldHideAgentFromMentions: shows member agents with unknown invocability
       directoryAgentPubkeys: new Set(),
     }),
     false,
+  );
+});
+
+test("member agents: the allowed-list predicate is STRICTER than the hide rule", () => {
+  // These two disagree on exactly one input: a channel-member agent with no
+  // kind:10100 directory entry. `shouldHideAgentFromMentions` deliberately
+  // SHOWS it ("unknown invocability => show"); `isAgentIdentityInAllowedList`
+  // rejects it.
+  //
+  // The mention picker must therefore gate on the hide rule ALONE. Running
+  // both in sequence (as it did) made the member branch unreachable and hid
+  // every other-owner agent whose kind:10100 profile was never published —
+  // which is all of them, since nothing in the repo writes that event.
+  const shared = {
+    isAgent: true,
+    isMember: true,
+    pubkey: PUB_A,
+    mentionableAgentPubkeys: new Set(),
+    directoryAgentPubkeys: new Set(),
+  };
+
+  assert.equal(
+    shouldHideAgentFromMentions(shared),
+    false,
+    "a channel-member agent with no directory entry must be shown",
+  );
+  assert.equal(
+    isAgentIdentityInAllowedList({ isAgent: true, pubkey: PUB_A }, new Set()),
+    false,
+    "the stricter predicate rejects it — do not add it to the mention picker",
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: admits the member agent the picker shows", () => {
+  // The picker's member branch and the send path's agent classification must
+  // agree, or an agent the user just picked is treated as an ordinary person
+  // once the message sends (no audience promotion, no Huddle enrollment).
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [PUB_A],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set(),
+      }),
+    ],
+    [PUB_A],
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: drops what the hide rule and archive gate reject", () => {
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        // PUB_A: explicitly not invocable (directory entry excludes us).
+        // PUB_B: archived.
+        // PUB_C: invocable.
+        // PUB_D: member agent with unknown invocability.
+        memberAgentPubkeys: [PUB_A, PUB_B, PUB_C, PUB_D],
+        isArchived: (pubkey) => pubkey === PUB_B,
+        mentionableAgentPubkeys: new Set([PUB_C]),
+        directoryAgentPubkeys: new Set([PUB_A, PUB_C]),
+      }),
+    ],
+    [PUB_C, PUB_D],
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: normalizes before gating and emitting", () => {
+  const mixedCase = "Ab".repeat(32);
+  const normalized = mixedCase.toLowerCase();
+
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [mixedCase],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set(),
+      }),
+    ],
+    [normalized],
+  );
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [mixedCase],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set([normalized]),
+      }),
+    ],
+    [],
   );
 });
 

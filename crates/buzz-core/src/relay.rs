@@ -22,6 +22,45 @@ use url::{Host, Url};
 /// silently invalidated the other two. One definition removes the question.
 pub const MAX_TIMESTAMP_DRIFT_SECS: u64 = 900;
 
+/// Time a wake pipeline can legitimately spend between trigger delivery and
+/// the woken harness capturing its startup watermark, as the SUM of the
+/// enforced bounds along the path — each term is a real timeout or window in
+/// code, not an estimate, because any single term assigned to the whole
+/// pipeline silently under-budgets the rest:
+///
+/// - the wake decision's stale-online liveness evidence window
+///   (`WAKE_LIVE_EVIDENCE_ATTEMPTS × POLL` = 135s, `agentWake.ts`);
+/// - the post-offline teardown fence (`REMOTE_POST_OFFLINE_GRACE_MS` = 10s);
+/// - the provider `info` probe invocation timeout (10s, `backend.rs`);
+/// - the provider `deploy` invocation timeout (600s, `backend.rs`);
+/// - margin for the pre-deploy author fetch, provider-internal VM
+///   provisioning after the deploy call returns, and harness boot up to the
+///   watermark capture.
+pub const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 135 + 10 + 10 + 600 + 300;
+
+/// Max age of an externally supplied replay floor, relative to the woken
+/// harness's startup watermark.
+///
+/// Bounds how much history a stale or corrupted `BUZZ_ACP_REPLAY_FLOOR` can
+/// force back into the first REQ; a floor older than this is clamped to the
+/// bound rather than ignored, so a slow deploy still replays as much of the
+/// missed window as the bound allows.
+///
+/// Sized as the relay's accepted past skew PLUS the wake pipeline latency
+/// budget: a trigger accepted at the relay's maximum age has aged further by
+/// every second of fence/evidence/deploy/boot latency, and a cap equal to the
+/// skew alone would advance the watermark past the very trigger that caused
+/// the start.
+///
+/// Defined here rather than in `buzz-acp` because it is the contract between
+/// two crates, not one crate's internal: the harness *enforces* it, and
+/// `buzz-waker` needs the same number to know when a recovery gap has grown
+/// past what a woken agent could still be shown — beyond this, waking the
+/// agent would answer nobody, so the waker raises an operational failure
+/// instead of pretending the mention was delivered.
+pub const REPLAY_FLOOR_MAX_AGE_SECS: u64 =
+    MAX_TIMESTAMP_DRIFT_SECS + WAKE_PIPELINE_LATENCY_BUDGET_SECS;
+
 /// Errors returned while canonicalizing a relay URL for runtime identity.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NormalizeRelayUrlError {

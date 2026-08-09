@@ -21,9 +21,12 @@
 //! (`G1`–`G3`) it discharges so the reason is not lost.
 
 pub mod bundle;
+pub mod cursor;
+mod fence;
 pub mod floors;
 
 pub use bundle::{BundleError, LaunchBundleBody, ProviderEnvelope, SignedLaunchBundle};
+pub use cursor::{Admission, Cursor, CursorError, CursorStore, Resume};
 pub use floors::{FloorError, FloorStore, Floors};
 
 /// Seconds of overlap to subtract from the persisted cursor when re-issuing a

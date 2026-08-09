@@ -44,10 +44,11 @@
 //! is not on disk — the rollback hole with extra steps.
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::fence::{atomic_write, lock_path_for, FenceGuard};
 
 /// Failures reading or advancing the durable record.
 #[derive(Debug, thiserror::Error)]
@@ -131,12 +132,6 @@ pub struct FloorStore {
 }
 
 impl FloorStore {
-    fn lock_path_for(path: &Path) -> PathBuf {
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".lock");
-        path.with_file_name(name)
-    }
-
     /// Create the enrolment record, pinning `owner_pubkey`.
     ///
     /// Creation is fenced by the same sidecar lock as every other mutation,
@@ -152,7 +147,7 @@ impl FloorStore {
     pub fn enroll(path: impl Into<PathBuf>, owner_pubkey: &str) -> Result<Self, FloorError> {
         let path = path.into();
         let store = Self {
-            lock_path: Self::lock_path_for(&path),
+            lock_path: lock_path_for(&path),
             path,
             snapshot: Floors {
                 owner_pubkey: owner_pubkey.to_string(),
@@ -161,7 +156,10 @@ impl FloorStore {
             },
         };
 
-        let fence = FenceGuard::acquire(&store.lock_path, &store.path)?;
+        let fence = FenceGuard::acquire(&store.lock_path).map_err(|e| FloorError::Persist {
+            path: store.path.display().to_string(),
+            reason: e.to_string(),
+        })?;
         if store.path.exists() {
             return Err(FloorError::AlreadyEnrolled {
                 path: store.path.display().to_string(),
@@ -183,7 +181,7 @@ impl FloorStore {
         let path = path.into();
         let snapshot = Self::read(&path)?;
         Ok(Self {
-            lock_path: Self::lock_path_for(&path),
+            lock_path: lock_path_for(&path),
             path,
             snapshot,
         })
@@ -265,7 +263,10 @@ impl FloorStore {
         &mut self,
         decide: impl FnOnce(&Floors) -> Result<(Option<Floors>, T), FloorError>,
     ) -> Result<T, FloorError> {
-        let fence = FenceGuard::acquire(&self.lock_path, &self.path)?;
+        let fence = FenceGuard::acquire(&self.lock_path).map_err(|e| FloorError::Persist {
+            path: self.path.display().to_string(),
+            reason: e.to_string(),
+        })?;
         let current = Self::read(&self.path)?;
         let (next, out) = decide(&current)?;
         if let Some(next) = next {
@@ -294,75 +295,15 @@ impl FloorStore {
         }
     }
 
-    /// Write-temp, fsync, rename, fsync-dir.
-    ///
-    /// The directory fsync is what makes the rename durable; without it a crash
-    /// can leave the old contents visible even though the new file was synced.
-    /// The temp name is process-unique so two writers cannot truncate each
-    /// other's staging file — though the fence is what actually orders them.
-    ///
-    /// `_fence` is an unused witness parameter, and that is the point: it makes
-    /// "never write outside the fence" a property the compiler enforces rather
-    /// than one every future caller has to remember. The first version of this
-    /// module fenced all three ordinary mutations and still let `enroll` write
-    /// unfenced; a witness would have caught that at the type level.
-    fn persist(&self, _fence: &FenceGuard, next: &Floors) -> Result<(), FloorError> {
+    /// Durably replace the record. Requires the fence as a witness — see
+    /// [`crate::fence::atomic_write`].
+    fn persist(&self, fence: &FenceGuard, next: &Floors) -> Result<(), FloorError> {
         let fail = |reason: String| FloorError::Persist {
             path: self.path.display().to_string(),
             reason,
         };
-
         let encoded = serde_json::to_vec(next).map_err(|e| fail(e.to_string()))?;
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-
-        let mut file = fs::File::create(&tmp).map_err(|e| fail(e.to_string()))?;
-        file.write_all(&encoded).map_err(|e| fail(e.to_string()))?;
-        file.sync_all().map_err(|e| fail(e.to_string()))?;
-        drop(file);
-
-        fs::rename(&tmp, &self.path).map_err(|e| fail(e.to_string()))?;
-
-        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| fail(e.to_string()))?;
-
-        Ok(())
-    }
-}
-
-/// An exclusive interprocess fence over the record, released on drop.
-struct FenceGuard {
-    file: fs::File,
-}
-
-impl FenceGuard {
-    fn acquire(lock_path: &Path, record_path: &Path) -> Result<Self, FloorError> {
-        let fail = |reason: String| FloorError::Persist {
-            path: record_path.display().to_string(),
-            reason,
-        };
-        // The lock file carries no state, so creating it on demand is safe —
-        // absence of the *record* is what fails closed, and `read` below
-        // enforces that.
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)
-            .map_err(|e| fail(format!("could not open the fence: {e}")))?;
-        file.lock()
-            .map_err(|e| fail(format!("could not take the fence: {e}")))?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for FenceGuard {
-    fn drop(&mut self) {
-        // Best effort: closing the handle releases the lock regardless.
-        let _ = self.file.unlock();
+        atomic_write(fence, &self.path, &encoded).map_err(|e| fail(e.to_string()))
     }
 }
 

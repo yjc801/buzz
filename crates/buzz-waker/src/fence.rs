@@ -30,24 +30,47 @@ pub(crate) fn lock_path_for(path: &Path) -> PathBuf {
 /// Holding one is the *only* way to call [`atomic_write`], which takes a
 /// `&FenceGuard` it never reads. The parameter is a compile-time witness:
 /// writing outside the fence does not typecheck.
+///
+/// Two hold patterns are supported, and the choice is each store's:
+/// [`FenceGuard::acquire`] takes it per mutation (the floor store re-reads and
+/// decides inside each one), while [`FenceGuard::try_acquire`] can hold it for
+/// a whole store's lifetime to make that store the file's sole writer (the
+/// cursor, whose decisions depend on in-memory state no other handle can see).
 #[derive(Debug)]
 pub(crate) struct FenceGuard {
     file: fs::File,
 }
 
 impl FenceGuard {
-    /// Take the fence, creating the sidecar if needed.
+    /// Take the fence, creating the sidecar if needed, waiting if it is held.
     ///
     /// The sidecar carries no state, so creating it on demand is safe —
     /// whether the *record* may be absent is each store's own policy.
     pub(crate) fn acquire(lock_path: &Path) -> std::io::Result<Self> {
-        let file = fs::OpenOptions::new()
+        let file = Self::open_sidecar(lock_path)?;
+        file.lock()?;
+        Ok(Self { file })
+    }
+
+    /// Take the fence, or report `None` if another holder has it.
+    ///
+    /// For lifetime ownership, where blocking would hang the process behind a
+    /// lock the other holder never intends to release.
+    pub(crate) fn try_acquire(lock_path: &Path) -> std::io::Result<Option<Self>> {
+        let file = Self::open_sidecar(lock_path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    fn open_sidecar(lock_path: &Path) -> std::io::Result<fs::File> {
+        fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(lock_path)?;
-        file.lock()?;
-        Ok(Self { file })
+            .open(lock_path)
     }
 }
 

@@ -30,6 +30,18 @@
 //! nothing is. It cannot advance past unfinished work by construction, at any
 //! processing duration and any drift.
 //!
+//! *Unfinished* means claimed and not yet terminal — which includes work
+//! [`CursorStore::abandon`]ed after a retryable failure. Dropping an abandoned
+//! event out of that set would let a newer completion raise the checkpoint past
+//! it and reintroduce the exact loss above through the retry path.
+//!
+//! There is a second way an event can be unfinished without being claimed: it
+//! is still queued in the relay's historical replay. Stored rows come back
+//! newest-first, so during a drain the *oldest* rows are the last to arrive,
+//! and a completed newer one must not raise the checkpoint past them. That is
+//! what the replay pin between [`CursorStore::resume`] and
+//! [`CursorStore::end_replay`] holds down.
+//!
 //! # Ordering
 //!
 //! The lowered checkpoint is persisted **before** the work starts
@@ -38,6 +50,34 @@
 //! mid-attempt replay the event and then dedupe it away unprocessed.
 //! Processing-first is safe because provider deploy is idempotent — a
 //! duplicate is a strict no-op.
+//!
+//! # Why this store owns its file for its whole lifetime
+//!
+//! The floor store shares a file safely by re-reading and deciding *inside*
+//! the fence ([`crate::floors::FloorStore::with_fence`]). That does not
+//! transfer here, because a checkpoint is a minimum over the in-flight set —
+//! in-memory state that a second handle cannot observe. The merge that looks
+//! conservative, `min(on_disk, mine)`, is a deadlock rather than a fix: a
+//! handle that lowered the file for `A` and then completes `A` computes
+//! `min(A_low, high_water)` and pins itself at its own stale value forever.
+//!
+//! So the cursor takes the fence once, in [`CursorStore::open_or_start`], and
+//! holds it. A second handle is refused with [`CursorError::Locked`] instead of
+//! silently overwriting a lowered checkpoint with its own cached high water and
+//! making the first handle's in-flight event unrecoverable.
+//!
+//! # Measuring staleness
+//!
+//! `checkpoint_secs` is an event timestamp and can be skewed either way by the
+//! relay's accepted drift, so it cannot measure how long the waker was gone.
+//! [`Cursor::covered_through_secs`] is the separate real-time watermark that
+//! can — the design's "runtime age alert" is about *real waker downtime*
+//! (`PLANS/BUZZ_WAKER_DESIGN.md` §5).
+//!
+//! That watermark is necessary but not sufficient, because event age and
+//! downtime are different quantities: a 1,100s outage can surface an event
+//! backdated 899s that is 1,999s old. So each recovered event is *also* checked
+//! against [`crate::WAKE_DELIVERABLE_AGE_SECS`] as it is admitted.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -82,6 +122,17 @@ pub enum CursorError {
         /// The offending event id.
         event_id: String,
     },
+
+    /// Another live handle already owns the cursor file.
+    ///
+    /// Fatal by design: the second handle could not make a correct checkpoint
+    /// decision anyway, since the first handle's in-flight set is in-memory.
+    /// See the module note on lifetime ownership.
+    #[error("cursor state at {path} is already owned by another handle; refusing to run a second")]
+    Locked {
+        /// The contended path.
+        path: String,
+    },
 }
 
 /// Where to resume, or why we cannot resume usefully.
@@ -100,7 +151,7 @@ pub enum Resume {
     GapTooOld {
         /// The resume point, still usable for the subscription.
         since: u64,
-        /// How far behind the checkpoint is, in seconds.
+        /// Real seconds since the feed was last known covered.
         behind_secs: u64,
         /// The bound it exceeded.
         max_age_secs: u64,
@@ -110,10 +161,31 @@ pub enum Resume {
 /// Whether an event still needs processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
-    /// Not seen before; now recorded in flight.
+    /// Not seen before; now recorded in flight. Process it.
     Fresh,
-    /// Already completed, or already in flight. Skip it.
+    /// Claimed exactly as [`Admission::Fresh`], but old enough that the
+    /// harness a wake starts is not guaranteed to be shown it.
+    ///
+    /// Still process it — the wake may well land, and skipping it would
+    /// guarantee the loss instead of risking it. But the attempt must be
+    /// reported as a failure rather than a healthy wake, for the reason given
+    /// on [`Resume::GapTooOld`].
+    FreshButUndeliverable {
+        /// The event's real age at admission.
+        age_secs: u64,
+        /// The bound it exceeded, [`crate::WAKE_DELIVERABLE_AGE_SECS`].
+        max_age_secs: u64,
+    },
+    /// Already completed, or already claimed. Skip it.
     Duplicate,
+}
+
+impl Admission {
+    /// Whether this admission claimed the event, under either fresh variant.
+    #[must_use]
+    pub fn is_fresh(self) -> bool {
+        !matches!(self, Admission::Duplicate)
+    }
 }
 
 /// The persisted resume state.
@@ -123,19 +195,36 @@ pub struct Cursor {
     pub checkpoint_secs: u64,
     /// Newest `created_at` that has reached a terminal outcome.
     pub high_water_secs: u64,
+    /// Real time through which the feed is known to have been covered.
+    ///
+    /// Distinct from the two above, which are event timestamps carrying up to
+    /// the relay's accepted drift in either direction. This one is the local
+    /// clock at the last point the waker knew it was current, so
+    /// `now - covered_through_secs` is real downtime and can be compared
+    /// against an age bound. Advanced by every durable transition and by
+    /// [`CursorStore::mark_covered`].
+    pub covered_through_secs: u64,
     /// Bounded ring of completed event ids, oldest first.
     pub completed: VecDeque<String>,
 }
 
-/// File-backed [`Cursor`] with the same fence discipline as the floor store.
+/// File-backed [`Cursor`], sole owner of its file for its lifetime.
 #[derive(Debug)]
 pub struct CursorStore {
     path: PathBuf,
-    lock_path: PathBuf,
+    /// Held from `open_or_start` to drop — see the module note on ownership.
+    fence: FenceGuard,
     state: Cursor,
     /// In-memory only. Lost on restart *by design*: the persisted checkpoint
     /// was already held down to the oldest of these, so they are re-delivered.
     in_flight: BTreeMap<String, u64>,
+    /// Claimed, released for retry, still not terminal. Also in-memory only,
+    /// and pins the checkpoint exactly as `in_flight` does.
+    abandoned: BTreeMap<String, u64>,
+    /// Ceiling on the checkpoint while historical replay is draining — see
+    /// [`CursorStore::resume`]. In-memory for the same reason as the two sets
+    /// above: what it protects is already on disk.
+    replay_pin: Option<u64>,
     capacity: usize,
 }
 
@@ -152,24 +241,51 @@ impl CursorStore {
     /// first run, and guessing a resume point from it would silently skip
     /// history.
     ///
+    /// A fresh cursor is **persisted before returning**. Leaving it in memory
+    /// would make the first claim undurable in the common case — a first live
+    /// event is normally at or after `now`, so it does not lower the
+    /// checkpoint, and a crash before it completes would leave no file at all.
+    /// The next start would then begin at its own later `now` and step over the
+    /// event. Writing at open also gives [`CursorStore::resume`] a coverage
+    /// watermark from the very first run.
+    ///
     /// # Errors
-    /// [`CursorError::Corrupt`] if the file exists but cannot be read.
+    /// [`CursorError::Corrupt`] if the file exists but cannot be read;
+    /// [`CursorError::Locked`] if another handle owns it;
+    /// [`CursorError::Persist`] if a fresh cursor could not be made durable.
     pub fn open_or_start(
         path: impl Into<PathBuf>,
         now: u64,
         capacity: usize,
     ) -> Result<Self, CursorError> {
         let path = path.into();
-        let state = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| CursorError::Corrupt {
+        let lock_path = lock_path_for(&path);
+        let fence = FenceGuard::try_acquire(&lock_path)
+            .map_err(|e| CursorError::Persist {
                 path: path.display().to_string(),
                 reason: e.to_string(),
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Cursor {
-                checkpoint_secs: now,
-                high_water_secs: now,
-                completed: VecDeque::new(),
-            },
+            })?
+            .ok_or_else(|| CursorError::Locked {
+                path: path.display().to_string(),
+            })?;
+
+        let (state, fresh) = match fs::read(&path) {
+            Ok(bytes) => (
+                serde_json::from_slice(&bytes).map_err(|e| CursorError::Corrupt {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?,
+                false,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                Cursor {
+                    checkpoint_secs: now,
+                    high_water_secs: now,
+                    covered_through_secs: now,
+                    completed: VecDeque::new(),
+                },
+                true,
+            ),
             Err(e) => {
                 return Err(CursorError::Corrupt {
                     path: path.display().to_string(),
@@ -177,13 +293,20 @@ impl CursorStore {
                 })
             }
         };
-        Ok(Self {
-            lock_path: lock_path_for(&path),
+
+        let store = Self {
             path,
+            fence,
             state,
             in_flight: BTreeMap::new(),
+            abandoned: BTreeMap::new(),
+            replay_pin: None,
             capacity: capacity.max(1),
-        })
+        };
+        if fresh {
+            store.persist(&store.state)?;
+        }
+        Ok(store)
     }
 
     /// The persisted state, as last read or written.
@@ -197,13 +320,34 @@ impl CursorStore {
     /// `since` is the checkpoint minus [`crate::RECONNECT_OVERLAP_SECS`],
     /// which is twice the relay's accepted drift — enough that a backdated
     /// event accepted after a future-dated one cannot fall behind the window.
-    #[must_use]
-    pub fn resume(&self, now: u64) -> Resume {
+    ///
+    /// Staleness is measured from [`Cursor::covered_through_secs`], never from
+    /// the checkpoint: the checkpoint is an event timestamp that the relay's
+    /// drift allows to sit up to 900s either side of real time, so a gap
+    /// measured against it can read as healthy while the waker was in fact down
+    /// for far longer. This bound is [`buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS`]
+    /// — an outage longer than that has certainly buried some of the window
+    /// beyond any woken harness's reach, whatever the wake pipeline then costs.
+    /// The narrower per-event question is [`CursorStore::admit`]'s.
+    ///
+    /// Asking this question **pins the checkpoint** at its current value until
+    /// [`CursorStore::end_replay`], and that is why it takes `&mut self`. The
+    /// low-water mark covers *admitted* work, and the history this `since` is
+    /// about to request has not been admitted yet — the relay returns stored
+    /// rows newest-first, so the oldest arrive last. Without the pin, a newer
+    /// replayed row could complete and raise the checkpoint past an older row
+    /// still queued behind it; a crash in that window would drop the older
+    /// mention out of the next `since` for good. Pinning at the pre-REQ
+    /// checkpoint — rather than at `since` — is exactly enough, because a
+    /// restart re-derives the same `since` from it and so re-requests the same
+    /// window, with no ratchet backwards on repeated crashes.
+    pub fn resume(&mut self, now: u64) -> Resume {
         let since = self
             .state
             .checkpoint_secs
             .saturating_sub(crate::RECONNECT_OVERLAP_SECS);
-        let behind = now.saturating_sub(self.state.checkpoint_secs);
+        self.replay_pin = Some(self.state.checkpoint_secs);
+        let behind = now.saturating_sub(self.state.covered_through_secs);
         let max_age = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
         if behind > max_age {
             return Resume::GapTooOld {
@@ -215,42 +359,127 @@ impl CursorStore {
         Resume::Since(since)
     }
 
+    /// Release the replay pin at EOSE, once all history has been admitted.
+    ///
+    /// Until this is called the checkpoint cannot rise above where
+    /// [`CursorStore::resume`] left it, so forgetting the call costs re-delivery
+    /// and eventually a stale-gap alert — never a lost mention. Calling it
+    /// before the last historical row has been admitted is the unsafe
+    /// direction, and is the caller's contract: EOSE is the relay's own
+    /// statement that the batch is drained.
+    ///
+    /// # Errors
+    /// [`CursorError::Persist`] if the released checkpoint could not be made
+    /// durable — the pin then stays in place and replay is repeated.
+    pub fn end_replay(&mut self, now: u64) -> Result<(), CursorError> {
+        if self.replay_pin.is_none() {
+            return Ok(());
+        }
+        let previous = self.replay_pin.take();
+        let mut next = self.state.clone();
+        next.checkpoint_secs = self.compute_checkpoint();
+        next.covered_through_secs = next.covered_through_secs.max(now);
+        if let Err(e) = self.persist(&next) {
+            self.replay_pin = previous;
+            return Err(e);
+        }
+        self.state = next;
+        Ok(())
+    }
+
+    /// Record that the feed is covered through `now`, without any event.
+    ///
+    /// The connection loop must call this while it is connected and idle:
+    /// [`CursorStore::resume`] cannot tell a quiet period from an outage, so a
+    /// silent stretch longer than [`buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS`]
+    /// raises a false stale-gap alert on the next restart. Erring that way is
+    /// deliberate — the alternative is an outage that reads as healthy.
+    ///
+    /// # Errors
+    /// [`CursorError::Persist`] if the watermark could not be made durable.
+    pub fn mark_covered(&mut self, now: u64) -> Result<(), CursorError> {
+        if now <= self.state.covered_through_secs {
+            return Ok(());
+        }
+        let mut next = self.state.clone();
+        next.covered_through_secs = now;
+        self.persist(&next)?;
+        self.state = next;
+        Ok(())
+    }
+
     /// Claim an event for processing, holding the checkpoint down to it.
     ///
-    /// Persists before returning `Fresh`, so a crash immediately afterwards
-    /// still resumes from at or before this event.
+    /// Persists before returning, so a crash immediately afterwards still
+    /// resumes from at or before this event.
+    ///
+    /// A claimed event is reported as [`Admission::FreshButUndeliverable`]
+    /// when it is already older than [`crate::WAKE_DELIVERABLE_AGE_SECS`] —
+    /// recovering it is still worth doing, but the wake it triggers cannot be
+    /// called healthy.
     ///
     /// # Errors
     /// [`CursorError::Persist`] if the lowered checkpoint could not be made
     /// durable — in which case the event is *not* claimed and the caller must
     /// not process it.
-    pub fn admit(&mut self, event_id: &str, created_at: u64) -> Result<Admission, CursorError> {
+    pub fn admit(
+        &mut self,
+        event_id: &str,
+        created_at: u64,
+        now: u64,
+    ) -> Result<Admission, CursorError> {
         if self.in_flight.contains_key(event_id)
             || self.state.completed.iter().any(|id| id == event_id)
         {
             return Ok(Admission::Duplicate);
         }
+        // Reclaiming an abandoned event is a fresh claim, not a duplicate: it
+        // was released precisely so it would be retried.
+        let previous = self.abandoned.remove(event_id);
+        let created_at = previous.map_or(created_at, |was| was.min(created_at));
         self.in_flight.insert(event_id.to_string(), created_at);
-        let next = self.with_checkpoint(self.compute_checkpoint());
-        if next.checkpoint_secs != self.state.checkpoint_secs {
-            if let Err(e) = self.persist(&next) {
-                // Do not hand out a claim we could not make durable.
-                self.in_flight.remove(event_id);
-                return Err(e);
+
+        let mut next = self.state.clone();
+        next.checkpoint_secs = self.compute_checkpoint();
+        next.covered_through_secs = next.covered_through_secs.max(now);
+        if let Err(e) = self.persist(&next) {
+            // Do not hand out a claim we could not make durable.
+            self.in_flight.remove(event_id);
+            if let Some(was) = previous {
+                self.abandoned.insert(event_id.to_string(), was);
             }
-            self.state = next;
+            return Err(e);
+        }
+        self.state = next;
+
+        let age = now.saturating_sub(created_at);
+        if age > crate::WAKE_DELIVERABLE_AGE_SECS {
+            return Ok(Admission::FreshButUndeliverable {
+                age_secs: age,
+                max_age_secs: crate::WAKE_DELIVERABLE_AGE_SECS,
+            });
         }
         Ok(Admission::Fresh)
     }
 
     /// Record a terminal outcome and let the checkpoint advance.
     ///
+    /// Terminal covers both a finished wake and a caller giving up on one:
+    /// an [`CursorStore::abandon`]ed event may be completed directly, which is
+    /// the only way to release its hold on the checkpoint without processing
+    /// it. Retryable failures use `abandon` and leave the hold in place.
+    ///
     /// # Errors
     /// [`CursorError::NotInFlight`] if the event was never admitted;
     /// [`CursorError::Persist`] if the advance could not be made durable — the
-    /// event then stays in flight and is retried after a restart.
-    pub fn complete(&mut self, event_id: &str) -> Result<(), CursorError> {
-        let Some(created_at) = self.in_flight.remove(event_id) else {
+    /// event then stays claimed and is retried after a restart.
+    pub fn complete(&mut self, event_id: &str, now: u64) -> Result<(), CursorError> {
+        let was_abandoned = self.abandoned.contains_key(event_id);
+        let Some(created_at) = self
+            .in_flight
+            .remove(event_id)
+            .or_else(|| self.abandoned.remove(event_id))
+        else {
             return Err(CursorError::NotInFlight {
                 event_id: event_id.to_string(),
             });
@@ -258,16 +487,22 @@ impl CursorStore {
 
         let mut next = self.state.clone();
         next.high_water_secs = next.high_water_secs.max(created_at);
+        next.covered_through_secs = next.covered_through_secs.max(now);
         next.completed.push_back(event_id.to_string());
         while next.completed.len() > self.capacity {
             next.completed.pop_front();
         }
-        // Recompute *after* removing this event from flight, so the checkpoint
-        // is free to move up to the next-oldest unfinished event.
+        // Recompute *after* dropping this event, so the checkpoint is free to
+        // move up to the next-oldest unfinished one.
         next.checkpoint_secs = self.compute_checkpoint_with(next.high_water_secs);
 
         if let Err(e) = self.persist(&next) {
-            self.in_flight.insert(event_id.to_string(), created_at);
+            let restore = if was_abandoned {
+                &mut self.abandoned
+            } else {
+                &mut self.in_flight
+            };
+            restore.insert(event_id.to_string(), created_at);
             return Err(e);
         }
         self.state = next;
@@ -276,34 +511,47 @@ impl CursorStore {
 
     /// Release a claim without completing it, so it is retried.
     ///
-    /// Leaves the checkpoint held down until something else moves it, which is
-    /// the conservative direction: an abandoned event must stay replayable.
+    /// The event keeps holding the checkpoint down until it is reclaimed or
+    /// completed. Dropping it out of the unfinished set instead would let the
+    /// next completion raise the checkpoint past it, which is the module's
+    /// headline loss reached through the retry path: a crash after that raise
+    /// leaves the abandoned event behind the resume window, unreplayable,
+    /// despite this method promising the opposite.
     pub fn abandon(&mut self, event_id: &str) {
-        self.in_flight.remove(event_id);
+        if let Some(created_at) = self.in_flight.remove(event_id) {
+            self.abandoned.insert(event_id.to_string(), created_at);
+        }
     }
 
-    /// Events currently claimed.
+    /// Events currently being processed.
     #[must_use]
     pub fn in_flight_len(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Events released for retry and still holding the checkpoint down.
+    #[must_use]
+    pub fn abandoned_len(&self) -> usize {
+        self.abandoned.len()
     }
 
     fn compute_checkpoint(&self) -> u64 {
         self.compute_checkpoint_with(self.state.high_water_secs)
     }
 
-    /// The low-water mark: the oldest unfinished event, else the high water.
+    /// The low-water mark: the oldest unfinished event, else the high water —
+    /// and never above an active replay pin, which stands in for the history
+    /// that has been requested but not yet admitted.
     fn compute_checkpoint_with(&self, high_water: u64) -> u64 {
-        match self.in_flight.values().min() {
+        let unfinished = self
+            .in_flight
+            .values()
+            .chain(self.abandoned.values())
+            .chain(self.replay_pin.iter())
+            .min();
+        match unfinished {
             Some(oldest) => (*oldest).min(high_water),
             None => high_water,
-        }
-    }
-
-    fn with_checkpoint(&self, checkpoint_secs: u64) -> Cursor {
-        Cursor {
-            checkpoint_secs,
-            ..self.state.clone()
         }
     }
 
@@ -312,9 +560,8 @@ impl CursorStore {
             path: self.path.display().to_string(),
             reason,
         };
-        let fence = FenceGuard::acquire(&self.lock_path).map_err(|e| fail(e.to_string()))?;
         let encoded = serde_json::to_vec(next).map_err(|e| fail(e.to_string()))?;
-        atomic_write(&fence, &self.path, &encoded).map_err(|e| fail(e.to_string()))?;
+        atomic_write(&self.fence, &self.path, &encoded).map_err(|e| fail(e.to_string()))?;
         Ok(())
     }
 }
@@ -352,10 +599,89 @@ mod tests {
         assert!(matches!(err, CursorError::Corrupt { .. }));
     }
 
+    /// A second handle cannot make a correct checkpoint decision — the first
+    /// handle's in-flight set is in memory — so it must be refused rather than
+    /// left to overwrite a lowered checkpoint with its own high water.
+    #[test]
+    fn a_second_handle_is_refused_while_the_first_is_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = store(&dir);
+        let err =
+            CursorStore::open_or_start(dir.path().join("cursor.json"), NOW, DEFAULT_COMPLETED_RING)
+                .expect_err("second handle must be refused");
+        assert!(matches!(err, CursorError::Locked { .. }));
+        drop(first);
+        reopen(&dir, NOW); // released on drop
+    }
+
+    /// The concrete lost update the refusal prevents: without it, B's cached
+    /// high water would replace A's lowered checkpoint on disk and A's
+    /// in-flight event would never be re-delivered.
+    #[test]
+    fn a_stale_handle_cannot_overwrite_a_lowered_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = NOW - buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+
+        let mut a = store(&dir);
+        a.admit("a", old, NOW).expect("A admits an old event");
+        assert!(CursorStore::open_or_start(
+            dir.path().join("cursor.json"),
+            NOW + 5_000,
+            DEFAULT_COMPLETED_RING
+        )
+        .is_err());
+
+        drop(a);
+        assert_eq!(
+            reopen(&dir, NOW).state().checkpoint_secs,
+            old,
+            "the lowered checkpoint must survive"
+        );
+    }
+
+    /// Finding 4: the first live event is normally at or after `now`, so it
+    /// does not lower the checkpoint and nothing else forces a write. If open
+    /// did not persist, a crash here would leave no file and the next start
+    /// would begin at its own later `now`, stepping over the event.
+    #[test]
+    fn a_fresh_cursor_is_durable_before_any_event_completes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut s = store(&dir);
+            s.admit("a", NOW + 5, NOW).expect("admit");
+            // crash: never completed
+        }
+        let much_later = NOW + 50_000;
+        let mut resumed = reopen(&dir, much_later);
+        assert_eq!(resumed.state().checkpoint_secs, NOW);
+        let (Resume::Since(since) | Resume::GapTooOld { since, .. }) = resumed.resume(much_later);
+        assert!(
+            NOW + 5 >= since,
+            "the uncompleted event at {} must still be inside since={since}",
+            NOW + 5
+        );
+    }
+
+    /// The other half of open-time durability, which no admission can cover:
+    /// with no file on disk, a restart resets the coverage watermark to its own
+    /// `now`, so an outage across the very first window reads as healthy no
+    /// matter how long it lasted.
+    #[test]
+    fn an_outage_before_the_first_event_is_still_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(store(&dir)); // starts, covers nothing, dies
+        let late = NOW + buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS + 1;
+        let mut resumed = reopen(&dir, late);
+        assert!(
+            matches!(resumed.resume(late), Resume::GapTooOld { .. }),
+            "the first run's coverage must be durable too"
+        );
+    }
+
     #[test]
     fn resume_subtracts_the_full_overlap() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let s = store(&dir);
+        let mut s = store(&dir);
         assert_eq!(
             s.resume(NOW),
             Resume::Since(NOW - crate::RECONNECT_OVERLAP_SECS)
@@ -366,17 +692,23 @@ mod tests {
     fn a_second_admit_of_the_same_event_is_a_duplicate() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
-        assert_eq!(s.admit("a", NOW).expect("admit"), Admission::Fresh);
-        assert_eq!(s.admit("a", NOW).expect("re-admit"), Admission::Duplicate);
+        assert_eq!(s.admit("a", NOW, NOW).expect("admit"), Admission::Fresh);
+        assert_eq!(
+            s.admit("a", NOW, NOW).expect("re-admit"),
+            Admission::Duplicate
+        );
     }
 
     #[test]
     fn a_completed_event_is_not_re_admitted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
-        s.admit("a", NOW).expect("admit");
-        s.complete("a").expect("complete");
-        assert_eq!(s.admit("a", NOW).expect("re-admit"), Admission::Duplicate);
+        s.admit("a", NOW, NOW).expect("admit");
+        s.complete("a", NOW).expect("complete");
+        assert_eq!(
+            s.admit("a", NOW, NOW).expect("re-admit"),
+            Admission::Duplicate
+        );
     }
 
     #[test]
@@ -384,7 +716,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
         assert!(matches!(
-            s.complete("ghost").expect_err("must refuse"),
+            s.complete("ghost", NOW).expect_err("must refuse"),
             CursorError::NotInFlight { .. }
         ));
     }
@@ -403,9 +735,9 @@ mod tests {
         let b_created = NOW + 700 + drift;
 
         let mut s = store(&dir);
-        s.admit("a", a_created).expect("admit A");
-        s.admit("b", b_created).expect("admit B");
-        s.complete("b").expect("complete B");
+        s.admit("a", a_created, NOW).expect("admit A");
+        s.admit("b", b_created, NOW).expect("admit B");
+        s.complete("b", NOW).expect("complete B");
 
         assert_eq!(
             s.state().checkpoint_secs,
@@ -414,7 +746,8 @@ mod tests {
         );
 
         // Crash and restart: A must still be inside the resume window.
-        let resumed = reopen(&dir, NOW + 700);
+        drop(s);
+        let mut resumed = reopen(&dir, NOW + 700);
         let Resume::Since(since) = resumed.resume(NOW + 700) else {
             panic!("gap should not be stale here");
         };
@@ -442,11 +775,11 @@ mod tests {
     fn the_checkpoint_advances_once_nothing_is_in_flight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
-        s.admit("a", NOW + 10).expect("admit A");
-        s.admit("b", NOW + 20).expect("admit B");
-        s.complete("b").expect("complete B");
+        s.admit("a", NOW + 10, NOW).expect("admit A");
+        s.admit("b", NOW + 20, NOW).expect("admit B");
+        s.complete("b", NOW).expect("complete B");
         assert_eq!(s.state().checkpoint_secs, NOW + 10);
-        s.complete("a").expect("complete A");
+        s.complete("a", NOW).expect("complete A");
         assert_eq!(s.state().checkpoint_secs, NOW + 20, "high water");
     }
 
@@ -455,8 +788,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         {
             let mut s = store(&dir);
-            s.admit("a", NOW + 50).expect("admit");
-            s.complete("a").expect("complete");
+            s.admit("a", NOW + 50, NOW).expect("admit");
+            s.complete("a", NOW).expect("complete");
         }
         assert_eq!(reopen(&dir, NOW + 60).state().high_water_secs, NOW + 50);
     }
@@ -468,7 +801,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         {
             let mut s = store(&dir);
-            s.admit("a", NOW + 5).expect("admit");
+            s.admit("a", NOW + 5, NOW).expect("admit");
             // crash: never completed
         }
         let resumed = reopen(&dir, NOW + 5);
@@ -484,9 +817,64 @@ mod tests {
     fn abandoning_releases_the_claim_for_retry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
-        s.admit("a", NOW).expect("admit");
+        s.admit("a", NOW, NOW).expect("admit");
         s.abandon("a");
-        assert_eq!(s.admit("a", NOW).expect("re-admit"), Admission::Fresh);
+        assert_eq!(s.admit("a", NOW, NOW).expect("re-admit"), Admission::Fresh);
+        assert_eq!(s.abandoned_len(), 0, "reclaimed, not still released");
+    }
+
+    /// The headline loss sequence reached through the retry path: `A` is
+    /// released for retry rather than completed, so it is still unfinished and
+    /// must keep pinning the checkpoint against `B`'s completion.
+    #[test]
+    fn an_abandoned_event_still_pins_the_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let drift = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+        let a_created = NOW - drift;
+        let b_created = NOW + 700 + drift;
+
+        let mut s = store(&dir);
+        s.admit("a", a_created, NOW).expect("admit A");
+        s.abandon("a"); // retryable failure
+        s.admit("b", b_created, NOW).expect("admit B");
+        s.complete("b", NOW).expect("complete B");
+        assert_eq!(
+            s.state().checkpoint_secs,
+            a_created,
+            "the abandoned A must still pin the checkpoint"
+        );
+
+        // Crash before the retry runs: A must still be inside the window.
+        drop(s);
+        let mut resumed = reopen(&dir, NOW + 700);
+        let (Resume::Since(since) | Resume::GapTooOld { since, .. }) = resumed.resume(NOW + 700);
+        assert!(
+            a_created >= since,
+            "A at {a_created} must be re-delivered by since={since}"
+        );
+    }
+
+    /// Giving up permanently is a terminal outcome, and the only way to
+    /// release the hold without processing the event.
+    #[test]
+    fn completing_an_abandoned_event_releases_its_pin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        s.admit("a", NOW - 100, NOW).expect("admit A");
+        s.admit("b", NOW + 20, NOW).expect("admit B");
+        s.complete("b", NOW).expect("complete B");
+        s.abandon("a");
+        assert_eq!(s.abandoned_len(), 1);
+        assert_eq!(s.state().checkpoint_secs, NOW - 100);
+
+        s.complete("a", NOW).expect("give up on A");
+        assert_eq!(s.abandoned_len(), 0);
+        assert_eq!(s.state().checkpoint_secs, NOW + 20, "high water");
+        assert_eq!(
+            s.admit("a", NOW - 100, NOW).expect("re-admit"),
+            Admission::Duplicate,
+            "a terminal event is deduped"
+        );
     }
 
     #[test]
@@ -496,8 +884,8 @@ mod tests {
             CursorStore::open_or_start(dir.path().join("cursor.json"), NOW, 3).expect("open");
         for i in 0..6u64 {
             let id = format!("e{i}");
-            s.admit(&id, NOW + i).expect("admit");
-            s.complete(&id).expect("complete");
+            s.admit(&id, NOW + i, NOW).expect("admit");
+            s.complete(&id, NOW).expect("complete");
         }
         assert_eq!(s.state().completed.len(), 3);
         assert!(s.state().completed.iter().any(|id| id == "e5"));
@@ -509,7 +897,7 @@ mod tests {
     #[test]
     fn a_gap_past_the_replay_floor_bound_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let s = store(&dir);
+        let mut s = store(&dir);
         let max_age = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
         let late = NOW + max_age + 1;
         match s.resume(late) {
@@ -528,9 +916,166 @@ mod tests {
     #[test]
     fn a_gap_exactly_at_the_bound_is_still_usable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let s = store(&dir);
+        let mut s = store(&dir);
         let at_bound = NOW + buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
         assert!(matches!(s.resume(at_bound), Resume::Since(_)));
+    }
+
+    /// A checkpoint is an event timestamp and can be future-dated by a full
+    /// drift, so measuring downtime against it under-reports by that much. Two
+    /// hours down with a checkpoint 900s ahead would read as 6,300s — inside
+    /// the bound is not the point; the quantity itself is wrong.
+    #[test]
+    fn staleness_is_measured_from_real_coverage_not_the_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let drift = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+        let bound = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
+        {
+            let mut s = store(&dir);
+            // A future-dated event pushes the checkpoint a full drift ahead.
+            s.admit("future", NOW + drift, NOW).expect("admit");
+            s.complete("future", NOW).expect("complete");
+            assert_eq!(s.state().checkpoint_secs, NOW + drift);
+        }
+
+        // Down for just over the bound, measured in real time.
+        let back = NOW + bound + 1;
+        let mut resumed = reopen(&dir, back);
+        assert!(
+            matches!(resumed.resume(back), Resume::GapTooOld { .. }),
+            "an outage past the bound must alert; against the checkpoint it \
+             would have measured {} and read as healthy",
+            back - (NOW + drift)
+        );
+    }
+
+    #[test]
+    fn marking_coverage_advances_the_watermark_monotonically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        s.mark_covered(NOW + 100).expect("advance");
+        assert_eq!(s.state().covered_through_secs, NOW + 100);
+        s.mark_covered(NOW + 50).expect("stale mark");
+        assert_eq!(s.state().covered_through_secs, NOW + 100, "never goes back");
+        drop(s);
+        assert_eq!(reopen(&dir, NOW).state().covered_through_secs, NOW + 100);
+    }
+
+    /// Alex's sequence, and the reason the coverage watermark alone is not
+    /// enough: an outage well inside the bound can still surface an event whose
+    /// own age is past it, because the relay accepts backdating.
+    #[test]
+    fn a_recovered_event_past_the_deliverable_age_is_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let drift = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+        let mut s = store(&dir);
+
+        let back = NOW + 1_100; // 1,100s of downtime — inside the resume bound
+        assert!(matches!(s.resume(back), Resume::Since(_)));
+
+        let recovered = NOW - drift + 1; // backdated a full drift at acceptance
+        match s.admit("a", recovered, back).expect("admit") {
+            Admission::FreshButUndeliverable {
+                age_secs,
+                max_age_secs,
+            } => {
+                assert_eq!(age_secs, back - recovered);
+                assert_eq!(max_age_secs, crate::WAKE_DELIVERABLE_AGE_SECS);
+            }
+            other => panic!("expected the age to be flagged, got {other:?}"),
+        }
+        assert_eq!(s.in_flight_len(), 1, "flagged, but still claimed");
+    }
+
+    /// A live trigger is at most the relay's past skew old when it arrives, so
+    /// the ordinary path must never be flagged — see the constant's docs.
+    #[test]
+    fn a_live_event_at_the_relay_skew_limit_is_not_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        let oldest_live = NOW - buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+        assert_eq!(
+            s.admit("a", oldest_live, NOW).expect("admit"),
+            Admission::Fresh
+        );
+    }
+
+    /// Historical rows arrive newest-first. Completing the newer one must not
+    /// raise the checkpoint past an older row that has not been delivered yet.
+    #[test]
+    fn replay_holds_the_checkpoint_until_eose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let drift = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+        let checkpoint = NOW + drift;
+        {
+            let mut seed = store(&dir);
+            seed.admit("seed", checkpoint, NOW).expect("admit");
+            seed.complete("seed", NOW).expect("complete");
+            assert_eq!(seed.state().checkpoint_secs, checkpoint);
+        }
+
+        let older = NOW - drift; // still queued behind the newer row
+        let newer = NOW + 2_000;
+        let mut s = reopen(&dir, NOW);
+        let Resume::Since(since) = s.resume(NOW) else {
+            panic!("gap should not be stale here");
+        };
+        assert!(older >= since, "precondition: the REQ covers the older row");
+
+        // The relay delivers `newer` first and it completes quickly.
+        s.admit("newer", newer, NOW).expect("admit");
+        s.complete("newer", NOW).expect("complete");
+        assert_eq!(
+            s.state().checkpoint_secs,
+            checkpoint,
+            "the pin must hold the checkpoint at its pre-REQ value"
+        );
+
+        // Crash before `older` is ever delivered.
+        drop(s);
+        let mut resumed = reopen(&dir, NOW);
+        let Resume::Since(next_since) = resumed.resume(NOW) else {
+            panic!("gap should not be stale here");
+        };
+        assert_eq!(next_since, since, "the same window is re-requested");
+        assert!(
+            older >= next_since,
+            "the undelivered row at {older} must survive since={next_since}"
+        );
+    }
+
+    /// The pin releases at EOSE and the checkpoint takes the advance it earned.
+    #[test]
+    fn eose_releases_the_pin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        s.resume(NOW);
+        s.admit("a", NOW + 40, NOW).expect("admit");
+        s.complete("a", NOW).expect("complete");
+        assert_eq!(s.state().checkpoint_secs, NOW, "pinned during replay");
+
+        s.end_replay(NOW).expect("eose");
+        assert_eq!(s.state().checkpoint_secs, NOW + 40);
+        drop(s);
+        assert_eq!(reopen(&dir, NOW).state().checkpoint_secs, NOW + 40);
+    }
+
+    /// An event still being worked outlives the replay batch, so releasing the
+    /// pin must not let the checkpoint jump over it.
+    #[test]
+    fn eose_does_not_release_an_in_flight_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        s.resume(NOW);
+        s.admit("slow", NOW + 10, NOW).expect("admit slow");
+        s.admit("fast", NOW + 90, NOW).expect("admit fast");
+        s.complete("fast", NOW).expect("complete fast");
+        s.end_replay(NOW).expect("eose");
+        assert_eq!(
+            s.state().checkpoint_secs,
+            NOW + 10,
+            "the unfinished event still pins the checkpoint"
+        );
     }
 
     impl CursorStore {

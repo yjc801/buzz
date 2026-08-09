@@ -43,6 +43,28 @@ pub use floors::{FloorError, FloorStore, Floors};
 /// defined against.
 pub const RECONNECT_OVERLAP_SECS: u64 = 2 * buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
 
+/// Age at which a recovered event can no longer be *guaranteed* to reach the
+/// agent a wake starts — **G4**.
+///
+/// The harness clamps its replay floor to
+/// `startup_watermark - REPLAY_FLOOR_MAX_AGE_SECS`
+/// (`apply_replay_floor`, `crates/buzz-acp/src/lib.rs`), and that watermark is
+/// captured *after* the wake pipeline runs, not when the waker decides to wake.
+/// So the whole pipeline budget is spent between this decision and the
+/// comparison the bound is actually made against, and only what is left over
+/// is available to the event's age. Written as that subtraction rather than as
+/// its value, because the value is a consequence of the two bounds and not a
+/// number in its own right — and because the subtraction refuses to compile if
+/// the budget ever grows past the bound it is taken out of.
+///
+/// It comes out at the relay's accepted past skew — which is the point. That
+/// is the design's construction (`PLANS/BUZZ_WAKER_DESIGN.md` §5): a *live*
+/// trigger is at most that old when it arrives, so live wakes are covered by
+/// definition and only recovery can exceed this. Every second of waker downtime
+/// spends the margin directly.
+pub const WAKE_DELIVERABLE_AGE_SECS: u64 = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS
+    - buzz_core::relay::WAKE_PIPELINE_LATENCY_BUDGET_SECS;
+
 #[cfg(test)]
 mod overlap_tests {
     /// Not a tautology: it pins the *relationship*, so a future change to the
@@ -53,6 +75,20 @@ mod overlap_tests {
         assert_eq!(
             super::RECONNECT_OVERLAP_SECS,
             2 * buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS
+        );
+    }
+
+    /// The deliverable age is what the floor bound has left after the wake
+    /// pipeline is paid for, and the design says that must land on the relay's
+    /// past skew. If a future change to either bound breaks that equality, the
+    /// claim "a live trigger is always deliverable" has stopped holding and
+    /// this must be re-derived rather than patched.
+    #[test]
+    fn a_live_trigger_is_always_deliverable() {
+        assert_eq!(
+            super::WAKE_DELIVERABLE_AGE_SECS,
+            buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS,
+            "the floor bound must leave exactly the relay's past skew"
         );
     }
 }

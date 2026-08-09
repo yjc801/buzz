@@ -1,0 +1,381 @@
+name: buzz-pr-mirror
+
+# Gives every PR on this fork its own Buzz channel (#buzz-pr-N):
+#   opened      → create the channel, seed it with a summary card, add and
+#                 mention Alex for review
+#   synchronize → post a compact update (new head, shortstat, files)
+#   closed      → post ✅ Merged / 🚫 Closed without merge, then archive
+#   reopened    → unarchive (creates the channel if it never existed)
+#
+# Ported from yjc801/velvet's buzz-pr-mirror.yml. Keep the two in sync when
+# fixing relay-behavior bugs — the hard-won invariants in the shell below
+# (search failure ≠ absence, CI-authored seed markers, write-outcome-driven
+# unarchive) were all paid for once already and apply identically here.
+#
+# CHANNEL NAMES CARRY THE PROJECT PREFIX: `buzz-pr-N`, never bare `pr-N`.
+# Every repo that mirrors into openvelvet prefixes with its own project name
+# (velvet uses `velvet-pr-N`), because the community is shared and PR numbers
+# are not. Unprefixed, velvet PR #57 and buzz PR #57 resolve to one channel —
+# `find_channel` would hand this workflow velvet's room and it would post buzz
+# diffs into it. Do not "tidy" the prefix away.
+#
+# Unlike velvet, this workflow has NO legacy-name fallback, and must not grow
+# one: it has never created a bare `pr-N`, so a fallback here would reach into
+# velvet's channels rather than recover its own.
+#
+# Requires two repo secrets (provision with scripts/buzz-mint-auth-tag.py):
+#   BUZZ_CI_PRIVATE_KEY — a DEDICATED Nostr key for CI (never the owner key).
+#   BUZZ_CI_AUTH_TAG    — NIP-OA auth tag for that key, signed by the community
+#     owner. Satisfies the relay's ViaOwner membership gate.
+# NIP-OA delegation carries no community clause, so velvet's existing CI
+# identity works here unchanged — copying those two secret values across is
+# enough, and minting a second identity is optional.
+#
+# Optional repo variable:
+#   BUZZ_FALLBACK_CHANNEL — channel UUID for close notices on PRs that predate
+#     this workflow (they have no #buzz-pr-N channel). Unset is fine and is the
+#     expected state: no PR was open when this landed, so every PR the workflow
+#     will ever see gets a channel at `opened`. When unset, the close path logs
+#     and exits cleanly instead of failing.
+#
+# The buzz CLI comes from Sprig — Block's static-musl multicall binary
+# (rolling release `sprig-latest`, rebuilt on every push to block/buzz main —
+# a hard checksum pin broke within hours). The tarball is verified against
+# the release's own .sha256 manifest: transport integrity, with the
+# block/buzz GitHub release as the trust root.
+#
+# Note this repo IS buzz, so building the CLI from the PR's own source is
+# possible — and is deliberately NOT done. The mirror must keep working for
+# exactly the PRs most worth discussing: the ones that do not compile.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: buzz-mirror-${{ github.event.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # PRs from forks of this fork run without secrets, so every buzz command
+    # would fail auth. Skip rather than fail: an unauthenticated run has
+    # nothing useful to do and a red X on a contributor's PR is misleading.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install buzz CLI (sprig multicall)
+        run: |
+          URL=https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz
+          curl -fsSL -o sprig.tar.gz "$URL"
+          curl -fsSL -o sprig.sha256 "$URL.sha256"
+          sed 's|  .*|  sprig.tar.gz|' sprig.sha256 | sha256sum -c -
+          echo "sprig sha256 (provenance): $(cut -c1-64 sprig.sha256)"
+          mkdir -p "$HOME/.sprig" && tar -xzf sprig.tar.gz -C "$HOME/.sprig"
+          ln -s "$HOME/.sprig/sprig" "$HOME/.sprig/buzz"
+          echo "$HOME/.sprig" >> "$GITHUB_PATH"
+
+      - name: Sync PR channel
+        env:
+          BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
+          BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          # Pre-workflow PRs have no #buzz-pr-N channel; close notices for them
+          # go here. Empty is supported — see the header.
+          FALLBACK_CHANNEL: ${{ vars.BUZZ_FALLBACK_CHANNEL }}
+          # Alex — the reviewer agent (mention by pubkey so notification doesn't
+          # depend on display-name resolution)
+          REVIEWER_NAME: Alex
+          REVIEWER_PUBKEY: 143bd5c0ffcfb82856dc3a9264269e719acc98ba7d5dc3cf07a51f9511162c4d
+          # Chris — the backend/infra coding agent; member of every task room
+          CODER_PUBKEY: ac1606bca896eb98107cebaacff649f29cb85fa5cba560b75a00e52947478e53
+          # Community owner — added to every new channel so it shows up in
+          # their sidebar (open channels are joinable but not auto-joined).
+          OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+        run: |
+          NAME="buzz-pr-${PR_NUMBER}"
+          RANGE="origin/${BASE_REF}...HEAD"
+
+          # CI's own pubkey — authenticates the seed marker (only a
+          # CI-authored card proves provisioning; the channel is open, so
+          # anyone authenticated can post the predictable prefix) and picks
+          # edit-vs-react in the close sweep. Derived from the runtime
+          # secret so nothing is hardcoded.
+          CI_PUB=$(NOSTR_SECRET="$BUZZ_PRIVATE_KEY" python3 scripts/buzz-mint-auth-tag.py pubkey)
+          printf '%s' "$CI_PUB" | grep -qE '^[0-9a-f]{64}$' || {
+            echo "CI pubkey derivation failed — failing so the rerun re-probes" >&2
+            exit 1
+          }
+
+          find_channel() {
+            # A failed search must fail the job, not read as "no channel" —
+            # an empty result on the create paths would mint a duplicate
+            # channel. Only a successful search may report absence.
+            local RESULTS
+            RESULTS=$(buzz channels search --query "$NAME" --exact --include-archived) || {
+              echo "channel search failed — failing so the rerun re-probes" >&2
+              exit 1
+            }
+            printf '%s' "$RESULTS" \
+              | jq -r --arg n "$NAME" '[.[] | select(.name == $n)] | first | .channel_id // empty'
+          }
+
+          create_channel() {
+            buzz channels create --name "$NAME" --type stream --visibility open \
+              --description "GitHub PR #${PR_NUMBER} (${GITHUB_REPOSITORY}): ${PR_TITLE}" \
+              | jq -r .channel_id
+          }
+
+          diff_files() {
+            git diff --name-status "$RANGE" | head -25
+            COUNT=$(git diff --name-only "$RANGE" | wc -l)
+            if [ "$COUNT" -gt 25 ]; then
+              printf '…and %s more files\n' "$((COUNT - 25))"
+            fi
+          }
+
+          seed_card() {
+            printf '**PR #%s — %s**\n' "$PR_NUMBER" "$PR_TITLE"
+            printf '`%s` → `%s` by %s\n' "$HEAD_REF" "$BASE_REF" "$PR_AUTHOR"
+            printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
+            printf '```\n%s\n```\n' "$(diff_files)"
+            if [ -n "$PR_BODY" ]; then
+              if [ "${#PR_BODY}" -gt 1500 ]; then
+                EXCERPT=$(printf '%s' "$PR_BODY" | head -c 1500 | sed '$d')
+                if [ -z "$EXCERPT" ]; then
+                  EXCERPT=$(printf '%s' "$PR_BODY" | head -c 1500)
+                fi
+                printf '\n---\n%s\n\n_…description truncated — full text on GitHub._\n' "$EXCERPT"
+              else
+                printf '\n---\n%s\n' "$PR_BODY"
+              fi
+            fi
+            printf '\n@%s please review.\n' "$REVIEWER_NAME"
+          }
+
+          provision_members() {
+            # Roleless add-member is the role-preserving upsert: the relay
+            # keeps an existing member's role and defaults only a genuinely
+            # NEW member to "member" (verified against the live relay). No
+            # discovery reads fence these writes — kind-39002 roster
+            # snapshots are optional and can stay stale indefinitely, so
+            # they can prove neither presence nor absence. Every add is
+            # REQUIRED: the seed marker is posted only after all three
+            # succeed, so any failed add leaves the channel unseeded and a
+            # later action retries provisioning instead of sealing the gap.
+            # The partial is left in place, never deleted — a soft-delete
+            # can strand a searchable-but-unwritable discovery ghost.
+            local CH="$1" P
+            for P in "$OWNER_PUBKEY" "$REVIEWER_PUBKEY" "$CODER_PUBKEY"; do
+              if ! buzz channels add-member --channel "$CH" --pubkey "$P"; then
+                echo "add-member failed for $P — job fails; the rerun resumes this partial channel"
+                exit 1
+              fi
+            done
+          }
+
+          channel_seed_state() {
+            # Prints "seeded" or "unseeded"; returns non-zero when the
+            # lookup itself fails, so callers retry instead of mistaking a
+            # transport error for a missing marker. Only a CI-AUTHORED
+            # marker counts: the channel is open, so any authenticated user
+            # could post the predictable prefix into a partial and seal it
+            # against recovery. The seed card is posted
+            # LAST in provisioning and is therefore the OLDEST message, so
+            # a bounded newest-page probe would eventually false-negative
+            # on any long-lived channel; this walks the full history
+            # backward with --before (an inclusive cursor). Message history
+            # is the relay's primary event store, unlike the kind-39002
+            # discovery snapshots, so the marker itself is trustworthy.
+            # Only an EMPTY page ends the walk — a count-based stop would
+            # misread a silent relay page cap as end-of-history — and a
+            # stalled full page (every message in one second) steps the
+            # cursor back one second rather than terminating.
+            local CH="$1" BEFORE="" PAGE OLDEST MATCH COUNT
+            while :; do
+              if [ -z "$BEFORE" ]; then
+                PAGE=$(buzz messages get --channel "$CH" --limit 100) || return 1
+              else
+                PAGE=$(buzz messages get --channel "$CH" --limit 100 --before "$BEFORE") || return 1
+              fi
+              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
+              if [ "$COUNT" -eq 0 ]; then
+                echo unseeded; return 0   # walked past the start of history
+              fi
+              MATCH=0
+              printf '%s' "$PAGE" | jq -e --arg p "**PR #${PR_NUMBER} —" --arg ci "$CI_PUB" \
+                '[(.messages? // .)[]? | select(.pubkey == $ci and (.content | startswith($p)))] | length > 0' \
+                >/dev/null || MATCH=$?
+              case "$MATCH" in
+                0) echo seeded; return 0 ;;
+                1) ;;             # valid page without the marker — keep paging
+                *) return 1 ;;    # page unparseable — lookup failure, not absence
+              esac
+              OLDEST=$(printf '%s' "$PAGE" \
+                | jq -r '[(.messages? // .)[]?.created_at] | min') || return 1
+              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
+                # Full page of one timestamp: step past it. A marker hidden
+                # beyond the page size inside a single second is unreachable,
+                # which would take >100 channel events in that second.
+                BEFORE=$((OLDEST - 1))
+              else
+                BEFORE="$OLDEST"
+              fi
+            done
+          }
+
+          ensure_provisioned() {
+            # Runs on EVERY action that finds an existing channel, not just
+            # opened reruns: with cancel-in-progress, a successor
+            # synchronize/reopened/closed run can be the first to arrive
+            # after a create-then-cancel partial, and skipping recovery
+            # there would launder an owner-less channel into green forever.
+            local CH="$1" STATE
+            if ! STATE=$(channel_seed_state "$CH"); then
+              echo "seed-marker lookup failed — failing so the rerun re-probes instead of guessing" >&2
+              exit 1
+            fi
+            if [ "$STATE" = seeded ]; then
+              echo "channel $NAME fully provisioned"
+              return 0
+            fi
+            echo "channel $NAME exists but is unseeded — resuming provisioning"
+            provision_members "$CH"
+            seed_card | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"
+          }
+
+          create_and_seed() {
+            CH=$(create_channel)
+            provision_members "$CH"
+            seed_card | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"
+          }
+
+          case "$PR_ACTION" in
+            opened)
+              CH=$(find_channel)
+              if [ -n "$CH" ]; then
+                ensure_provisioned "$CH"
+                exit 0
+              fi
+              create_and_seed
+              ;;
+            synchronize)
+              CH=$(find_channel)
+              if [ -z "$CH" ]; then
+                create_and_seed
+              else
+                ensure_provisioned "$CH"
+                {
+                  printf 'Updated to `%s` — %s\n' \
+                    "$(git rev-parse --short HEAD)" "$(git diff --shortstat "$RANGE")"
+                  printf '```\n%s\n```\n' "$(diff_files)"
+                } | buzz messages send --channel "$CH" --content -
+              fi
+              ;;
+            reopened)
+              CH=$(find_channel)
+              if [ -z "$CH" ]; then
+                create_and_seed
+              else
+                # Restoration is driven by write outcomes, not the search
+                # snapshot (the reaper commits archived_at before its
+                # discovery emission, so snapshots can be stale). Unarchive is
+                # best-effort — rejected harmlessly when the channel is still
+                # active in the TTL grace window. The TTL clear is mandatory
+                # and doubles as the fence: archived channels reject every
+                # write except unarchive, so its success proves the channel is
+                # active no matter what the snapshot said. Reconciliation runs
+                # after both.
+                buzz channels unarchive --channel "$CH" \
+                  || echo "unarchive rejected (channel likely already active) — proceeding"
+                buzz channels update --channel "$CH" --no-ttl
+                # Recovery runs after the fence: writes are only accepted on
+                # an active channel, and a create-then-cancel partial can
+                # reach reopened without ever having been provisioned.
+                ensure_provisioned "$CH"
+                printf 'PR #%s reopened on GitHub — channel unarchived.\n%s\n' \
+                  "$PR_NUMBER" "$PR_URL" | buzz messages send --channel "$CH" --content -
+              fi
+              ;;
+            closed)
+              if [ "$PR_MERGED" = "true" ]; then
+                STATUS="✅ **Merged**"; EMOJI="✅"
+              else
+                STATUS="🚫 **Closed without merge**"; EMOJI="🚫"
+              fi
+
+              # Annotate every visible chat message that referenced this PR.
+              # Nostr edits are author-signed: the bot can truly edit only its
+              # own messages; anyone else's get a status reaction + threaded
+              # reply. Coverage = channels the CI identity is a member of.
+              # The search key is repo-qualified, so velvet's PR #N and this
+              # repo's PR #N never annotate each other.
+              # ($CI_PUB is derived once at the top of this script.)
+              PR_PATH="github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
+              buzz messages search --query "$PR_PATH" --limit 100 2>/dev/null \
+                | jq -c '(.messages? // .)[]?' \
+                | while read -r HIT; do
+                    MID=$(printf '%s' "$HIT" | jq -r '.id // empty')
+                    [ -z "$MID" ] && continue
+                    printf '%s' "$HIT" | jq -e --arg p "$PR_PATH" \
+                      '.content | contains($p)' >/dev/null || continue
+                    MAUTHOR=$(printf '%s' "$HIT" | jq -r '.pubkey // empty')
+                    MCH=$(printf '%s' "$HIT" | jq -r \
+                      '[.tags[]? | select(.[0]=="h" or .[0]=="channel") | .[1]][0] // empty')
+                    if [ "$MAUTHOR" = "$CI_PUB" ]; then
+                      NEW=$(printf '%s\n\n%s' "$STATUS" \
+                        "$(printf '%s' "$HIT" | jq -r '.content' | grep -v '^✅ ' | grep -v '^🚫 ' || true)")
+                      buzz messages edit --event "$MID" --content "$NEW" || true
+                    else
+                      buzz reactions add --event "$MID" --emoji "$EMOJI" || true
+                      if [ -n "$MCH" ]; then
+                        printf '%s — PR #%s\n%s\n' "$STATUS" "$PR_NUMBER" "$PR_URL" \
+                          | buzz messages send --channel "$MCH" --content - --reply-to "$MID" || true
+                      fi
+                    fi
+                  done
+
+              CH=$(find_channel)
+              if [ -z "$CH" ]; then
+                if [ -z "$FALLBACK_CHANNEL" ]; then
+                  echo "no #${NAME} channel and no BUZZ_FALLBACK_CHANNEL set — nothing to archive"
+                  exit 0
+                fi
+                printf '%s — PR #%s: %s\n%s\n' "$STATUS" "$PR_NUMBER" "$PR_TITLE" "$PR_URL" \
+                  | buzz messages send --channel "$FALLBACK_CHANNEL" --content -
+                exit 0
+              fi
+              # Even the close path recovers a partial first, so an
+              # owner-less channel is never archived into invisibility.
+              ensure_provisioned "$CH"
+              printf '%s — archiving this channel.\n%s\n' "$STATUS" "$PR_URL" \
+                | buzz messages send --channel "$CH" --content -
+              # The hosted communities relay 404s the archive event ("no
+              # community is configured for this host") even though create/
+              # send/add-member on the same env succeed. Fall back to a short
+              # idle TTL so the relay archives the channel itself. The known
+              # archive rejection is tolerated, but a failed TTL fallback
+              # fails the job: nothing retries a silently-open channel.
+              buzz channels archive --channel "$CH" || {
+                echo "archive rejected — falling back to a 60s idle TTL"
+                buzz channels update --channel "$CH" --ttl 60
+              }
+              ;;
+          esac

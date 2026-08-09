@@ -1,3 +1,4 @@
+import { managedAgentBelongsToCommunity } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
@@ -51,16 +52,32 @@ export type WelcomeTeamAgents = [ManagedAgent, ManagedAgent, ManagedAgent];
 
 const welcomeTeamPromises = new Map<string, Promise<WelcomeTeamAgents>>();
 
+/** Welcome provisioning has no relay directory query to consult. */
+const NO_DIRECTORY_SIGNAL: ReadonlySet<string> = new Set<string>();
+
 function normalizeRelayUrl(relayUrl: string | null | undefined) {
   return relayUrl?.trim().replace(/\/+$/, "") ?? null;
 }
 
+/**
+ * Community membership for Welcome selection.
+ *
+ * Compares the agent's community binding, NOT the legacy `relayUrl` creation
+ * pin: moving an agent to another community rewrites `communityRelayUrl` and
+ * deliberately leaves the pin alone, so matching on the pin both missed the
+ * moved record here (its replacement create then hit the scoped name
+ * collision rule) and kept offering it in the community it left. The pin is
+ * a spawn-era artifact that `effective_agent_relay_url` already ignores.
+ *
+ * No directory signal is available on this path, so an empty set is passed:
+ * unscoped agents stay shared, an unresolved active community fails open.
+ */
 function isAgentScopedToRelay(agent: ManagedAgent, relayUrl?: string | null) {
-  const targetRelayUrl = normalizeRelayUrl(relayUrl);
-  if (!targetRelayUrl) {
-    return true;
-  }
-  return normalizeRelayUrl(agent.relayUrl) === targetRelayUrl;
+  return managedAgentBelongsToCommunity({
+    agent,
+    directoryAgentPubkeys: NO_DIRECTORY_SIGNAL,
+    activeCommunityRelayUrl: normalizeRelayUrl(relayUrl),
+  });
 }
 
 function isBuiltInWelcomeGuideAgent(agent: ManagedAgent) {

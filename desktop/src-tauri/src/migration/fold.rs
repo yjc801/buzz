@@ -36,7 +36,16 @@ pub fn fold_personas_into_agent_store(app: &tauri::AppHandle) {
 
 /// Core fold logic, decoupled from the Tauri `AppHandle` for testing.
 /// Operates on the raw JSON files — no keyring interaction: instance records
-/// are passed through byte-identical, and folded definitions carry no keys.
+/// keep their values, and folded definitions carry no keys.
+///
+/// NOT byte-identical for instance records: this deserializes the whole store
+/// into `ManagedAgentRecord` and re-serializes it, so a field that is
+/// `#[serde(default)]` without `skip_serializing_if` — `community_relay_url` —
+/// comes back as an explicit `null` where the key was absent. Any migration
+/// that distinguishes "key absent" from "explicitly null" must therefore run
+/// BEFORE this fold; see `backfill_agent_community_scope`'s placement in
+/// `migration.rs`.
+///
 /// Returns `Ok(None)` when there is no `personas.json` to fold.
 fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
     let personas_path = base_dir.join("personas.json");
@@ -143,6 +152,7 @@ pub(super) fn load_persona_runtimes(
 #[cfg(test)]
 mod tests {
     use super::fold_personas_in_dir;
+    use crate::migration::community_scope::backfill_community_scope_in_file;
     use crate::migration::load_persona_runtimes;
     use crate::migration::test_support::{
         read_agents_json, write_agents_json, write_personas_json,
@@ -311,6 +321,87 @@ mod tests {
         assert_eq!(
             records[0]["runtime"], "claude",
             "store copy wins over the stale file copy"
+        );
+    }
+
+    // ── Community-scope backfill must precede this fold ─────────────────────
+
+    /// The hazard that fixes the backfill's position in `run_migrations`.
+    /// The fold round-trips every instance record through
+    /// `ManagedAgentRecord`, and `community_relay_url` is
+    /// `#[serde(default)]` with no `skip_serializing_if`, so "key absent"
+    /// becomes an explicit `null` here.
+    #[test]
+    fn fold_turns_an_absent_community_key_into_an_explicit_null() {
+        let dir = tempfile::tempdir().unwrap();
+        write_personas_json(
+            dir.path(),
+            &serde_json::json!([custom_persona_json("custom:one", "goose")]),
+        );
+        let mut legacy = keyed_agent_json("Legacy", &"a".repeat(64));
+        legacy["relay_url"] = serde_json::json!("wss://one.example");
+        assert!(
+            !legacy
+                .as_object()
+                .unwrap()
+                .contains_key("community_relay_url"),
+            "fixture must start with the key absent"
+        );
+        write_agents_json(dir.path(), &serde_json::json!([legacy]));
+
+        fold_personas_in_dir(&dir.path().join("agents")).unwrap();
+
+        let records = read_agents_json(dir.path());
+        let instance = records
+            .iter()
+            .find(|r| r["name"] == "Legacy")
+            .expect("instance preserved");
+        assert!(
+            instance
+                .as_object()
+                .unwrap()
+                .contains_key("community_relay_url"),
+            "the fold stamps the key even though nothing set it"
+        );
+        assert!(instance["community_relay_url"].is_null());
+    }
+
+    /// Ordering regression: with the backfill running first, a legacy pinned
+    /// record keeps its derived binding across the fold. Running it the other
+    /// way round stranded the record as unscoped forever, because the fold's
+    /// explicit `null` reads as a deliberate unscope to the key-presence
+    /// idempotency guard.
+    #[test]
+    fn backfill_before_fold_keeps_the_pin_derived_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        write_personas_json(
+            dir.path(),
+            &serde_json::json!([custom_persona_json("custom:one", "goose")]),
+        );
+        let mut legacy = keyed_agent_json("Legacy", &"a".repeat(64));
+        legacy["relay_url"] = serde_json::json!("wss://one.example");
+        write_agents_json(dir.path(), &serde_json::json!([legacy]));
+
+        let base = dir.path().join("agents");
+        backfill_community_scope_in_file(&base.join("managed-agents.json"));
+        fold_personas_in_dir(&base).unwrap();
+
+        let records = read_agents_json(dir.path());
+        let instance = records
+            .iter()
+            .find(|r| r["name"] == "Legacy")
+            .expect("instance preserved");
+        assert_eq!(
+            instance["community_relay_url"], "wss://one.example",
+            "the pin-derived binding must survive the fold"
+        );
+        let definition = records
+            .iter()
+            .find(|r| r.get("slug").is_some())
+            .expect("folded definition present");
+        assert!(
+            definition["community_relay_url"].is_null(),
+            "folded definitions stay unscoped without needing the backfill"
         );
     }
 }

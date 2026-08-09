@@ -372,3 +372,103 @@ test("findReusableAgent: null personaId in input routes to generic", () => {
   });
   assert.equal(result, agent);
 });
+
+// ── Community scoping ───────────────────────────────────────────────────────
+// Reuse binds a channel to a specific identity, so it must never adopt a
+// record belonging to another community: provisioning a persona in B used to
+// attach and start the instance minted for A instead of minting B's own.
+
+const RELAY_A = "ws://localhost:3000";
+const RELAY_B = "ws://localhost:3001";
+
+test("findReusablePersonaAgent: refuses an instance bound to another community", () => {
+  const agent = makeAgent({ personaId: "p1", communityRelayUrl: RELAY_A });
+  assert.equal(
+    findReusablePersonaAgent([agent], "p1", new Set([PUB_B]), RELAY_B),
+    undefined,
+  );
+});
+
+test("findReusablePersonaAgent: reuses an instance bound to this community", () => {
+  const agent = makeAgent({ personaId: "p1", communityRelayUrl: RELAY_A });
+  assert.equal(
+    findReusablePersonaAgent([agent], "p1", new Set([PUB_B]), RELAY_A),
+    agent,
+  );
+});
+
+test("findReusablePersonaAgent: canonicalizes before comparing scopes", () => {
+  const agent = makeAgent({
+    personaId: "p1",
+    communityRelayUrl: `${RELAY_A}/`,
+  });
+  assert.equal(
+    findReusablePersonaAgent([agent], "p1", new Set([PUB_B]), RELAY_A),
+    agent,
+  );
+});
+
+test("findReusablePersonaAgent: unscoped instances stay shared across communities", () => {
+  const agent = makeAgent({ personaId: "p1", communityRelayUrl: null });
+  assert.equal(
+    findReusablePersonaAgent([agent], "p1", new Set([PUB_B]), RELAY_B),
+    agent,
+  );
+});
+
+test("findReusablePersonaAgent: fails closed on a bound instance when the community is unresolved", () => {
+  // Minting a duplicate is recoverable; adopting the wrong community's
+  // identity is the defect, so an unresolved community must not reuse.
+  const agent = makeAgent({ personaId: "p1", communityRelayUrl: RELAY_A });
+  assert.equal(
+    findReusablePersonaAgent([agent], "p1", new Set([PUB_B]), null),
+    undefined,
+  );
+});
+
+test("findReusableGenericAgent: refuses an instance bound to another community", () => {
+  const agent = makeAgent({
+    agentCommand: "goose",
+    personaId: null,
+    systemPrompt: null,
+    communityRelayUrl: RELAY_A,
+  });
+  assert.equal(
+    findReusableGenericAgent([agent], "goose", new Set([PUB_B]), RELAY_B),
+    undefined,
+  );
+});
+
+test("findReusableAgent: carries the community through both routes", () => {
+  const persona = makeAgent({ personaId: "p1", communityRelayUrl: RELAY_A });
+  const generic = makeAgent({
+    agentCommand: "goose",
+    personaId: null,
+    systemPrompt: null,
+    communityRelayUrl: RELAY_A,
+  });
+  const members = new Set([PUB_B]);
+
+  assert.equal(
+    findReusableAgent(
+      [persona],
+      members,
+      { personaId: "p1", command: "goose" },
+      RELAY_B,
+    ),
+    undefined,
+  );
+  assert.equal(
+    findReusableAgent([generic], members, { command: "goose" }, RELAY_B),
+    undefined,
+  );
+  assert.equal(
+    findReusableAgent(
+      [persona],
+      members,
+      { personaId: "p1", command: "goose" },
+      RELAY_A,
+    ),
+    persona,
+  );
+});

@@ -5,6 +5,7 @@ import {
   pickPreferredManagedAgent,
 } from "@/features/agents/agentReuse";
 export { findReusableAgent } from "@/features/agents/agentReuse";
+import { managedAgentIsReusableInCommunity } from "@/features/agents/lib/communityScope";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { resolveManagedAgentAvatarUrl } from "@/features/agents/ui/managedAgentAvatar";
 import {
@@ -173,7 +174,10 @@ function pickPreferredChannelPresetAgent(
   memberPubkeys: ReadonlySet<string>,
   runtimeCommand: string,
   expectedName: string,
+  activeCommunityRelayUrl: string | null | undefined,
 ) {
+  // Already in this channel: an established binding, not a fresh adoption —
+  // scoping it would strand a channel whose agent was later bound elsewhere.
   const inChannelAgent = pickPreferredManagedAgent(
     agents.filter(
       (agent) =>
@@ -185,11 +189,15 @@ function pickPreferredChannelPresetAgent(
     return inChannelAgent;
   }
 
+  // Name match outside the channel IS a fresh adoption, and preset names are
+  // deliberately generic (the runtime id), so without a community scope this
+  // reaches straight for another community's identically-named instance.
   return pickPreferredManagedAgent(
     agents.filter(
       (agent) =>
         commandsMatch(agent.agentCommand, runtimeCommand) &&
-        agent.name.trim().toLowerCase() === expectedName.trim().toLowerCase(),
+        agent.name.trim().toLowerCase() === expectedName.trim().toLowerCase() &&
+        managedAgentIsReusableInCommunity(agent, activeCommunityRelayUrl),
     ),
   );
 }
@@ -197,6 +205,7 @@ function pickPreferredChannelPresetAgent(
 export async function ensureChannelAgentPresetInChannel(
   channelId: string,
   input: EnsureChannelAgentPresetInput,
+  context?: { activeCommunityRelayUrl?: string | null },
 ): Promise<EnsureChannelAgentPresetResult> {
   const role = input.role ?? "bot";
   const ensureRunning = input.ensureRunning ?? true;
@@ -214,6 +223,7 @@ export async function ensureChannelAgentPresetInChannel(
     memberPubkeys,
     input.runtime.command,
     expectedName,
+    context?.activeCommunityRelayUrl,
   );
 
   if (existingAgent) {
@@ -257,6 +267,9 @@ export async function provisionChannelManagedAgent(
   context?: {
     managedAgents?: ManagedAgent[];
     channelMemberPubkeys?: ReadonlySet<string>;
+    /** Active community; reuse is scoped to it so an instance belonging to
+     * another community is never adopted instead of minting one here. */
+    activeCommunityRelayUrl?: string | null;
   },
 ): Promise<ProvisionChannelManagedAgentResult> {
   const trimmedName = input.name.trim();
@@ -277,6 +290,7 @@ export async function provisionChannelManagedAgent(
       context.managedAgents,
       input.personaId,
       context.channelMemberPubkeys,
+      context.activeCommunityRelayUrl,
     );
     if (reusable) {
       // Apply the caller's respondTo settings so the user's permission
@@ -317,6 +331,7 @@ export async function provisionChannelManagedAgent(
       context.managedAgents,
       input.runtime.command,
       context.channelMemberPubkeys,
+      context.activeCommunityRelayUrl,
     );
     if (reusable) {
       const needsRespondToUpdate =

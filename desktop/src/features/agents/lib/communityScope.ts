@@ -37,6 +37,32 @@ export function communityScopesCollide(
 }
 
 /**
+ * Whether an existing instance may be REUSED for a provisioning request in
+ * `activeCommunityRelayUrl`, instead of minting a new instance.
+ *
+ * Deliberately stricter than `managedAgentBelongsToCommunity`, which decides
+ * *visibility* and counts relay directory presence as proof an identity runs
+ * here. Reuse binds a channel to a specific identity, so a record belonging to
+ * another community must never be adopted just because it is running: that is
+ * precisely how provisioning a persona in B attached and started A's identity.
+ *
+ * Unscoped records are shared and reusable anywhere. An unresolved active
+ * community fails CLOSED for bound records — minting a second instance is a
+ * recoverable duplicate, whereas adopting the wrong community's identity is
+ * the defect.
+ */
+export function managedAgentIsReusableInCommunity(
+  agent: { communityRelayUrl?: string | null },
+  activeCommunityRelayUrl: string | null | undefined,
+) {
+  const bound = agent.communityRelayUrl?.trim();
+  if (!bound) return true;
+  const active = activeCommunityRelayUrl?.trim();
+  if (!active) return false;
+  return relayUrlsMatch(bound, active);
+}
+
+/**
  * Whether an instance already holds `name` in the given community scope.
  * Case-insensitive — the rule exists to disambiguate an @-mention picker.
  * Mirrors the authoritative backend check in `create_managed_agent`; this

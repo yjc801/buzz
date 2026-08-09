@@ -5,6 +5,7 @@ import {
   useManagedAgentsQuery,
 } from "@/features/agents/hooks";
 import { useChannelMembersQuery } from "@/features/channels/hooks";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type { AcpRuntime, ManagedAgent } from "@/shared/api/types";
 
@@ -25,6 +26,7 @@ export function useReusableAgentDetection(
 ): ManagedAgent | undefined {
   const managedAgentsQuery = useManagedAgentsQuery();
   const channelMembersQuery = useChannelMembersQuery(channelId, enabled);
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
 
   return React.useMemo(() => {
     const agents = managedAgentsQuery.data;
@@ -36,10 +38,15 @@ export function useReusableAgentDetection(
 
     // For persona selection: check the first selected persona
     if (selectedPersonas.length === 1 && !includeGeneric) {
-      return findReusableAgent(agents, memberPubkeys, {
-        personaId: selectedPersonas[0].id,
-        command: selectedRuntime.command,
-      });
+      return findReusableAgent(
+        agents,
+        memberPubkeys,
+        {
+          personaId: selectedPersonas[0].id,
+          command: selectedRuntime.command,
+        },
+        activeCommunityRelayUrl,
+      );
     }
 
     // For generic agent with no custom prompt
@@ -48,14 +55,20 @@ export function useReusableAgentDetection(
       selectedPersonas.length === 0 &&
       !customPrompt.trim()
     ) {
-      return findReusableAgent(agents, memberPubkeys, {
-        command: selectedRuntime.command,
-        systemPrompt: customPrompt,
-      });
+      return findReusableAgent(
+        agents,
+        memberPubkeys,
+        {
+          command: selectedRuntime.command,
+          systemPrompt: customPrompt,
+        },
+        activeCommunityRelayUrl,
+      );
     }
 
     return undefined;
   }, [
+    activeCommunityRelayUrl,
     managedAgentsQuery.data,
     channelMembersQuery.data,
     selectedRuntime,

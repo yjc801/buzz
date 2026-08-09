@@ -12,6 +12,7 @@ import {
   provisionChannelManagedAgent,
 } from "@/features/agents/channelAgents";
 import { resolveSnapshotAvatarPng } from "@/features/agents/ui/snapshotAvatarPng";
+import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import {
   channelsQueryKey,
   upsertCachedChannelMember,
@@ -682,6 +683,7 @@ export function useAttachManagedAgentToChannelMutation(
 
 export function useEnsureChannelAgentPresetMutation(channelId: string | null) {
   const queryClient = useQueryClient();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
 
   return useMutation({
     mutationFn: async (
@@ -691,7 +693,9 @@ export function useEnsureChannelAgentPresetMutation(channelId: string | null) {
         throw new Error("No channel selected.");
       }
 
-      return ensureChannelAgentPresetInChannel(channelId, input);
+      return ensureChannelAgentPresetInChannel(channelId, input, {
+        activeCommunityRelayUrl,
+      });
     },
     onSettled: () => {
       invalidateAgentQueriesInBackground(queryClient, channelId);
@@ -753,6 +757,7 @@ export function useProvisionChannelManagedAgentMutation(
   channelId: string | null,
 ) {
   const queryClient = useQueryClient();
+  const activeCommunityRelayUrl = useActiveCommunityRelayUrl();
 
   return useMutation({
     mutationFn: async (
@@ -773,6 +778,7 @@ export function useProvisionChannelManagedAgentMutation(
         channelMemberPubkeys: new Set(
           members.map((member) => normalizePubkey(member.pubkey)),
         ),
+        activeCommunityRelayUrl,
       });
     },
     onSuccess: (result) => {

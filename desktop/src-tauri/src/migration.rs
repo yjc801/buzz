@@ -169,6 +169,22 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     }
     migrate_persona_provider_to_runtime(app);
     reconcile_legacy_command_names(app);
+    // BEFORE the first typed rewrite of managed-agents.json (the fold below).
+    // This backfill is idempotent by KEY PRESENCE, and `community_relay_url`
+    // deserializes `#[serde(default)]` with no `skip_serializing_if` — so any
+    // typed load/save round-trip turns "key absent" into an explicit `null`
+    // that this backfill is then obliged to treat as a deliberate unscope.
+    // Running it after the fold therefore permanently stranded every
+    // pre-existing instance on an upgrade that still had personas.json: their
+    // non-empty legacy `relay_url` pin was never converted and they stayed
+    // globally visible. The steps above are raw JSON patches, so key absence
+    // still survives to here. Everything after this point sees a stamped key
+    // and round-trips its value unchanged.
+    //
+    // Records the fold and later steps ADD (folded/manufactured definitions)
+    // never reach this backfill, and must not: they serialize their own
+    // explicit `null`, which is the correct unscoped binding for a definition.
+    backfill_agent_community_scope(app);
     // Fold personas.json into the unified store HERE: after the JSON-level
     // personas.json migrations above (which must see the legacy file), and
     // before every consumer of the load/save_personas shims below —
@@ -191,9 +207,6 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     reconcile_provider_mcp_commands(app);
     reconcile_databricks_v1_to_v2(app);
     materialize_agent_runtimes(app);
-    // Last: needs no ambient state (pure record-local rewrite), but must run
-    // after the fold so folded definition records also get an explicit null.
-    backfill_agent_community_scope(app);
 }
 
 /// Copy one-time app state from the legacy app identifier directory to

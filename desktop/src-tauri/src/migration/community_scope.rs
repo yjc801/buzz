@@ -46,7 +46,7 @@ pub fn backfill_agent_community_scope(app: &tauri::AppHandle) {
     }
 }
 
-fn backfill_community_scope_in_file(path: &Path) {
+pub(super) fn backfill_community_scope_in_file(path: &Path) {
     patch_json_records(path, |obj| {
         if obj.contains_key("community_relay_url") {
             return false;

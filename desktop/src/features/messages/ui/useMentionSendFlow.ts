@@ -1,12 +1,14 @@
 import * as React from "react";
 import { toast } from "sonner";
 import {
-  type CreateChannelManagedAgentInput,
   useAttachManagedAgentToChannelMutation,
-  useAvailableAcpRuntimes,
   useCreateChannelManagedAgentMutation,
-  useManagedAgentsQuery,
   useProvisionChannelManagedAgentMutation,
+} from "@/features/agents/channelAgentMutations";
+import {
+  type CreateChannelManagedAgentInput,
+  useAvailableAcpRuntimes,
+  useManagedAgentsQuery,
   useStartManagedAgentMutation,
 } from "@/features/agents/hooks";
 import { resolvePersonaRuntime } from "@/features/agents/lib/resolvePersonaRuntime";

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,6 +51,78 @@ pub enum AuthState {
     Failed,
 }
 
+/// What a connection is allowed to do, declared by the client in its signed
+/// NIP-42 AUTH event and fixed for the connection's life.
+///
+/// The class only ever *removes* capability, never grants it. That is what
+/// makes it safe to accept from the client: asking for a class is asking for
+/// less, and an unrecognised request resolves to the most restricted class
+/// rather than to the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionClass {
+    /// A normal client: may publish, and its presence is real presence.
+    #[default]
+    Interactive,
+    /// Read-only and **non-presence-bearing** — subscribes and receives, may
+    /// not publish, and does not count as the principal being online.
+    ///
+    /// Exists for the wake daemon (`PLANS/BUZZ_WAKER_DESIGN.md` §4 option
+    /// (ii)), which holds a long-lived connection per agent it watches. Without
+    /// this class such a connection breaks presence in a way that is invisible
+    /// until an agent dies: presence is cleared only when *no* connection for
+    /// that pubkey remains, so a permanent watcher suppresses the clear and the
+    /// dead agent keeps reporting online until the presence TTL expires.
+    ///
+    /// Refusing publishes is the other half, and it is not a nicety: the daemon
+    /// holds every agent's key, so a connection that could publish could post
+    /// as every agent it watches.
+    ReadOnly,
+}
+
+impl ConnectionClass {
+    /// The `class` tag value a client sends to request this class.
+    ///
+    /// The strings live in `buzz-core` because the relay writes them and
+    /// clients compare against them; as separate literals in separate crates
+    /// nothing would keep the two sides equal.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => buzz_core::relay::CONNECTION_CLASS_INTERACTIVE,
+            Self::ReadOnly => buzz_core::relay::CONNECTION_CLASS_READ_ONLY,
+        }
+    }
+
+    /// Resolve a requested class from a NIP-42 AUTH event's `class` tag value.
+    ///
+    /// An absent tag is [`ConnectionClass::Interactive`] — every existing
+    /// client sends no tag and must keep its current behaviour. Anything
+    /// present but unrecognised resolves to [`ConnectionClass::ReadOnly`]:
+    /// since the class can only subtract capability, the safe reading of "a
+    /// class this build does not know" is the most restricted one, never the
+    /// permissive default.
+    #[must_use]
+    pub fn parse_requested(raw: Option<&str>) -> Self {
+        match raw {
+            None => Self::Interactive,
+            Some(value) if value == Self::Interactive.as_str() => Self::Interactive,
+            Some(_) => Self::ReadOnly,
+        }
+    }
+
+    /// May a connection of this class publish events?
+    #[must_use]
+    pub fn may_publish(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+
+    /// Does a connection of this class count as its principal being present?
+    #[must_use]
+    pub fn bears_presence(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+}
+
 /// Per-connection state split by access pattern:
 /// - `auth_state`: RwLock (read-heavy after initial auth)
 /// - `subscriptions`: Mutex (write-heavy during REQ/CLOSE)
@@ -82,9 +154,34 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
+    /// Whether this connection is read-only, set once when AUTH succeeds.
+    ///
+    /// A bare flag rather than the enum behind a lock: it is read on the hot
+    /// publish path, and a connection cannot re-authenticate (a second AUTH is
+    /// refused), so it is written exactly once and never contended.
+    ///
+    /// Read through [`ConnectionState::class`] and written through
+    /// [`ConnectionState::set_class`]; `pub(crate)` only so the crate's own
+    /// test fixtures can build a `ConnectionState` literal.
+    pub(crate) read_only: AtomicBool,
 }
 
 impl ConnectionState {
+    /// This connection's class.
+    pub fn class(&self) -> ConnectionClass {
+        if self.read_only.load(Ordering::Relaxed) {
+            ConnectionClass::ReadOnly
+        } else {
+            ConnectionClass::Interactive
+        }
+    }
+
+    /// Fix this connection's class. Called once, from the AUTH handler.
+    pub(crate) fn set_class(&self, class: ConnectionClass) {
+        self.read_only
+            .store(class == ConnectionClass::ReadOnly, Ordering::Relaxed);
+    }
+
     /// Sends a data message to this connection's outbound channel.
     ///
     /// On a full buffer, increments the backpressure counter. The first
@@ -187,6 +284,10 @@ async fn handle_active_connection(
         cancel: cancel.clone(),
         backpressure_count: Arc::clone(&backpressure_count),
         grace_limit: state.config.slow_client_grace_limit,
+        // Interactive until AUTH says otherwise. An unauthenticated connection
+        // can neither publish nor bear presence anyway, so the default is
+        // unobservable before auth.
+        read_only: AtomicBool::new(false),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -281,11 +382,15 @@ async fn handle_active_connection(
     }
     state.conn_manager.deregister(conn.conn_id);
     if let AuthState::Authenticated(ref auth_ctx) = *conn.auth_state.read().await {
-        let remaining = state.conn_manager.connection_ids_for_pubkey_in_community(
+        // Presence-bearing connections only. A read-only watcher (the wake
+        // daemon) holds a connection as this pubkey without being it, so
+        // counting it here would suppress the clear and leave a dead agent
+        // reporting online until the presence TTL expired.
+        let still_present = state.conn_manager.has_presence_bearing_connection(
             conn.tenant.community(),
             auth_ctx.pubkey.to_bytes().as_slice(),
         );
-        if remaining.is_empty() {
+        if !still_present {
             let _ = state
                 .pubsub
                 .clear_presence(&conn.tenant, &auth_ctx.pubkey)
@@ -533,6 +638,19 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                 .await;
         }
         ClientMessage::Event(event) => {
+            // A read-only connection may not publish, ever. This is the half of
+            // the class that is about authority rather than presence: the wake
+            // daemon holds every agent's key, so a watcher that could publish
+            // could post as every agent it watches. Refused before the handler
+            // semaphore so a refused publish costs no concurrency slot.
+            if !conn.class().may_publish() {
+                conn.send(RelayMessage::ok(
+                    &event.id.to_hex(),
+                    false,
+                    "restricted: read-only connection may not publish",
+                ));
+                return;
+            }
             let conn = Arc::clone(&conn);
             let state = Arc::clone(&state);
             let permit = match state.handler_semaphore.clone().try_acquire_owned() {

@@ -408,6 +408,109 @@ async fn test_send_event_and_receive_via_subscription() {
     client_b.disconnect().await.expect("disconnect B");
 }
 
+/// A read-only connection is refused every publish, and the refusal is about
+/// the class rather than about authority: the *same key* publishes fine on an
+/// ordinary connection in the same test.
+///
+/// This is the half of the class that is about authority. The wake daemon holds
+/// every agent's key, so a watcher that could publish could post as every agent
+/// it watches.
+#[tokio::test]
+#[ignore]
+async fn test_read_only_connection_cannot_publish() {
+    let url = relay_url();
+    let kind: u16 = 9;
+    let keys = Keys::generate();
+    let channel = create_test_channel(&keys).await;
+
+    // Baseline: this key, this channel, an ordinary connection — accepted.
+    let mut interactive = BuzzTestClient::connect(&url, &keys)
+        .await
+        .expect("interactive connect");
+    let ok = interactive
+        .send_text_message(&keys, &channel, "from an ordinary connection", kind)
+        .await
+        .expect("interactive send");
+    assert!(
+        ok.accepted,
+        "baseline publish must succeed, got: {}",
+        ok.message
+    );
+
+    // Same key, same channel, read-only connection — refused.
+    let mut watcher = BuzzTestClient::connect_read_only(&url, &keys)
+        .await
+        .expect("read-only connect");
+    let refused = watcher
+        .send_text_message(&keys, &channel, "from a read-only connection", kind)
+        .await
+        .expect("read-only send returns an OK frame");
+    assert!(
+        !refused.accepted,
+        "a read-only connection must not be able to publish"
+    );
+    assert!(
+        refused.message.starts_with("restricted:"),
+        "expected a restricted refusal, got: {}",
+        refused.message
+    );
+
+    interactive.disconnect().await.expect("disconnect");
+    watcher.disconnect().await.expect("disconnect");
+}
+
+/// A read-only connection still receives — otherwise the class would be
+/// useless for the thing it exists for. Read-only removes publishing and
+/// presence, not delivery.
+#[tokio::test]
+#[ignore]
+async fn test_read_only_connection_still_receives_live_events() {
+    let url = relay_url();
+    let kind: u16 = 9;
+    let author = Keys::generate();
+    let watcher_keys = Keys::generate();
+    let channel = create_test_channel(&author).await;
+
+    let mut watcher = BuzzTestClient::connect_read_only(&url, &watcher_keys)
+        .await
+        .expect("read-only connect");
+
+    let sid = sub_id("read-only-recv");
+    let filter = Filter::new()
+        .kind(Kind::Custom(kind))
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()]);
+    watcher
+        .subscribe(&sid, vec![filter])
+        .await
+        .expect("read-only subscribe");
+    watcher
+        .collect_until_eose(&sid, Duration::from_secs(5))
+        .await
+        .expect("read-only EOSE");
+
+    let mut publisher = BuzzTestClient::connect(&url, &author)
+        .await
+        .expect("publisher connect");
+    let content = format!("watched at {}", uuid::Uuid::new_v4());
+    let ok = publisher
+        .send_text_message(&author, &channel, &content, kind)
+        .await
+        .expect("publisher send");
+    assert!(ok.accepted, "publish rejected: {}", ok.message);
+
+    match watcher
+        .recv_event(Duration::from_secs(5))
+        .await
+        .expect("read-only recv")
+    {
+        RelayMessage::Event { event, .. } => assert_eq!(event.content, content),
+        other => panic!("expected Event, got {other:?}"),
+    }
+
+    watcher.disconnect().await.expect("disconnect");
+    publisher.disconnect().await.expect("disconnect");
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_large_event_frame_below_configured_limit_is_accepted() {

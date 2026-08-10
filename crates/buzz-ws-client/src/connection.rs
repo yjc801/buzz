@@ -8,10 +8,29 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::debug;
 
+use buzz_core::relay::{
+    CONNECTION_CLASS_CONFIRMATION_PREFIX, CONNECTION_CLASS_INTERACTIVE, CONNECTION_CLASS_TAG,
+};
+
 use crate::error::WsClientError;
-use crate::message::{build_auth_event, parse_relay_message, OkResponse, RelayMessage};
+use crate::message::{build_auth_event_with_tags, parse_relay_message, OkResponse, RelayMessage};
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The connection class these AUTH tags request, if any.
+///
+/// `None` means no `class` tag was sent, so no confirmation is owed. The
+/// default class is also `None`: it is what every connection gets anyway, so
+/// there is nothing for the relay to confirm and nothing for an older relay to
+/// get wrong.
+fn requested_class(extra_tags: &[Tag]) -> Option<String> {
+    let value = extra_tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some(CONNECTION_CLASS_TAG))
+            .then(|| parts.get(1).cloned().unwrap_or_default())
+    })?;
+    (value != CONNECTION_CLASS_INTERACTIVE).then_some(value)
+}
 
 /// Seconds to wait for the relay to send the NIP-42 AUTH challenge after connecting.
 pub const AUTH_CHALLENGE_TIMEOUT_SECS: u64 = 20;
@@ -72,11 +91,26 @@ impl NostrWsConnection {
         keys: &Keys,
         auth_tag: Option<&Tag>,
     ) -> Result<(), WsClientError> {
+        let extra: Vec<Tag> = auth_tag.into_iter().cloned().collect();
+        self.authenticate_with_tags(keys, &extra).await
+    }
+
+    /// Performs NIP-42 authentication with arbitrary extra tags on the AUTH
+    /// event.
+    ///
+    /// Used to request a restricted connection class (`["class", "read-only"]`)
+    /// alongside, or instead of, a NIP-OA attestation. The tags are signed, so
+    /// the relay can act on them.
+    pub async fn authenticate_with_tags(
+        &mut self,
+        keys: &Keys,
+        extra_tags: &[Tag],
+    ) -> Result<(), WsClientError> {
         let challenge = self
             .wait_for_auth_challenge(Duration::from_secs(AUTH_CHALLENGE_TIMEOUT_SECS))
             .await?;
 
-        let auth_event = build_auth_event(&challenge, &self.relay_url, keys, auth_tag)?;
+        let auth_event = build_auth_event_with_tags(&challenge, &self.relay_url, keys, extra_tags)?;
         let event_id = auth_event.id.to_hex();
 
         self.send_raw(&json!(["AUTH", auth_event])).await?;
@@ -86,6 +120,24 @@ impl NostrWsConnection {
             .await?;
         if !ok.accepted {
             return Err(WsClientError::AuthFailed(ok.message));
+        }
+
+        // A requested connection class must be confirmed, or the connection is
+        // not what the caller asked for. A relay predating the feature ignores
+        // the tag and answers `OK true` with an empty message — silently
+        // handing back a fully-capable, presence-bearing connection to a caller
+        // that asked for neither capability. Failing here is the whole point:
+        // the caller asked to be restricted, so an unrestricted connection is a
+        // failure, not a bonus.
+        if let Some(requested) = requested_class(extra_tags) {
+            let expected = format!("{CONNECTION_CLASS_CONFIRMATION_PREFIX}{requested}");
+            if ok.message != expected {
+                return Err(WsClientError::AuthFailed(format!(
+                    "relay did not confirm connection class {requested:?} \
+                     (answered {:?}) — it may not support connection classes",
+                    ok.message
+                )));
+            }
         }
 
         debug!("NIP-42 authentication successful");
@@ -310,5 +362,43 @@ mod tests {
     #[test]
     fn publish_ok_timeout_meets_floor() {
         const { assert!(PUBLISH_OK_TIMEOUT_SECS >= 30) };
+    }
+
+    fn tag(parts: &[&str]) -> Tag {
+        Tag::parse(parts.to_vec()).expect("parse tag")
+    }
+
+    /// Only a *restricted* request needs confirming. No tag, or the default
+    /// class, is what every connection gets anyway — demanding confirmation
+    /// there would break against every relay that has ever shipped.
+    #[test]
+    fn only_a_restricted_class_request_demands_confirmation() {
+        assert_eq!(requested_class(&[]), None);
+        assert_eq!(
+            requested_class(&[tag(&["auth", "deadbeef"])]),
+            None,
+            "an unrelated tag is not a class request"
+        );
+        assert_eq!(
+            requested_class(&[tag(&[CONNECTION_CLASS_TAG, CONNECTION_CLASS_INTERACTIVE])]),
+            None,
+            "the default class needs no confirmation"
+        );
+        assert_eq!(
+            requested_class(&[tag(&[CONNECTION_CLASS_TAG, "read-only"])]),
+            Some("read-only".to_string())
+        );
+    }
+
+    /// The confirmation string the client compares against is built from the
+    /// same `buzz-core` prefix the relay writes. Pinning it here means a change
+    /// to the prefix cannot silently make every restricted connection fail to
+    /// authenticate.
+    #[test]
+    fn the_confirmation_is_the_shared_prefix_plus_the_class() {
+        assert_eq!(
+            format!("{CONNECTION_CLASS_CONFIRMATION_PREFIX}read-only"),
+            "class: read-only"
+        );
     }
 }

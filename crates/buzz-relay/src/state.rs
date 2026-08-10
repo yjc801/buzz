@@ -59,6 +59,12 @@ struct ConnEntry {
     backpressure_count: Arc<AtomicU8>,
     subscriptions: ConnectionSubscriptions,
     authenticated_pubkey: Arc<std::sync::RwLock<Option<Vec<u8>>>>,
+    /// Whether this connection counts as its principal being present.
+    ///
+    /// Mirrors `ConnectionState`'s class so presence bookkeeping can be
+    /// answered from the manager alone, without reaching back into a
+    /// connection's auth lock during teardown.
+    presence_bearing: Arc<AtomicBool>,
     grace_limit: u8,
 }
 
@@ -232,6 +238,7 @@ impl ConnectionManager {
                 backpressure_count,
                 subscriptions,
                 authenticated_pubkey: Arc::new(std::sync::RwLock::new(None)),
+                presence_bearing: Arc::new(AtomicBool::new(true)),
                 grace_limit,
             },
         );
@@ -263,12 +270,63 @@ impl ConnectionManager {
         }
     }
 
+    /// Record this connection's class after NIP-42 succeeds.
+    ///
+    /// Only the presence half is mirrored here — publish authority is enforced
+    /// on the connection itself, where the publish path already is.
+    pub fn set_connection_class(&self, conn_id: Uuid, class: crate::connection::ConnectionClass) {
+        if let Some(entry) = self.connections.get(&conn_id) {
+            entry
+                .presence_bearing
+                .store(class.bears_presence(), Ordering::Relaxed);
+        }
+    }
+
+    /// Does `pubkey_bytes` still hold a **presence-bearing** connection in this
+    /// community?
+    ///
+    /// Deliberately a separate function rather than a filtered variant of
+    /// [`Self::connection_ids_for_pubkey_in_community`]. That one has two live
+    /// *delivery* call sites — ban disconnect ([`Self::disconnect_pubkey`]) and
+    /// live subscription eviction (`handlers::side_effects`) — and both must
+    /// keep seeing read-only connections: a banned or removed principal's
+    /// watcher has to be closed and evicted like any other socket. Filtering
+    /// the shared function would silently exempt exactly the connection class
+    /// that holds the most keys.
+    ///
+    /// This answer is used only to decide whether to clear presence on
+    /// teardown.
+    pub fn has_presence_bearing_connection(
+        &self,
+        community_id: CommunityId,
+        pubkey_bytes: &[u8],
+    ) -> bool {
+        self.connections.iter().any(|entry| {
+            entry.community_id == community_id
+                && entry.presence_bearing.load(Ordering::Relaxed)
+                && entry
+                    .authenticated_pubkey
+                    .read()
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .as_ref()
+                            .map(|stored| stored.as_slice() == pubkey_bytes)
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
     /// Return live connection IDs authenticated as `pubkey_bytes` in one community.
     ///
     /// The same Nostr key may be connected to multiple communities at once.
     /// Callers use this for tenant-visible cleanup such as presence clearing and
     /// subscription eviction, so a connection in B must not keep A's derived
     /// state alive.
+    ///
+    /// **Includes read-only connections, on purpose** — see
+    /// [`Self::has_presence_bearing_connection`] for why this must not be
+    /// filtered by class.
     pub fn connection_ids_for_pubkey_in_community(
         &self,
         community_id: CommunityId,
@@ -1457,6 +1515,7 @@ mod tests {
             cancel: cancel.clone(),
             backpressure_count: Arc::clone(&bp),
             grace_limit: 3,
+            read_only: AtomicBool::new(false),
         };
 
         let mgr = ConnectionManager::new();
@@ -1544,6 +1603,107 @@ mod tests {
         );
         assert!(mgr.subscriptions_for(conn_a).is_some());
         assert!(mgr.subscriptions_for(conn_b).is_some());
+    }
+
+    /// Register a bare connection for the class tests. Only the fields the
+    /// presence bookkeeping reads matter here.
+    fn register_bare(mgr: &ConnectionManager, community: CommunityId) -> Uuid {
+        let conn_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(1);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        // The receivers must outlive the senders or `send_to` sees a closed
+        // channel; these tests never send, so leaking them is enough.
+        std::mem::forget(rx);
+        std::mem::forget(ctrl_rx);
+        mgr.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            None,
+            CancellationToken::new(),
+            community,
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            3,
+        );
+        conn_id
+    }
+
+    #[tokio::test]
+    async fn a_read_only_connection_does_not_hold_presence_open() {
+        // The defect this class exists to fix: the wake daemon holds a
+        // permanent connection as each agent it watches. Counting it as
+        // presence means the clear never fires when the real harness dies, and
+        // a dead agent keeps reporting online until the presence TTL expires.
+        let mgr = ConnectionManager::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
+        let pubkey = vec![7u8; 32];
+
+        let watcher = register_bare(&mgr, community);
+        mgr.set_authenticated_pubkey(watcher, pubkey.clone());
+        mgr.set_connection_class(watcher, crate::connection::ConnectionClass::ReadOnly);
+
+        assert!(
+            !mgr.has_presence_bearing_connection(community, &pubkey),
+            "a read-only watcher must not keep presence alive on its own"
+        );
+
+        let harness = register_bare(&mgr, community);
+        mgr.set_authenticated_pubkey(harness, pubkey.clone());
+        assert!(
+            mgr.has_presence_bearing_connection(community, &pubkey),
+            "a live interactive connection is real presence"
+        );
+
+        // The harness dies; only the watcher remains.
+        mgr.deregister(harness);
+        assert!(
+            !mgr.has_presence_bearing_connection(community, &pubkey),
+            "the watcher must not suppress the clear once the harness is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_bearing_lookup_stays_inside_the_tenant_fence() {
+        // Same key, two communities. A live session in B must not report the
+        // principal present in A.
+        let mgr = ConnectionManager::new();
+        let community_a = CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
+        let community_b = CommunityId::from_uuid(Uuid::from_u128(0xBBBB));
+        let pubkey = vec![9u8; 32];
+
+        let in_b = register_bare(&mgr, community_b);
+        mgr.set_authenticated_pubkey(in_b, pubkey.clone());
+
+        assert!(mgr.has_presence_bearing_connection(community_b, &pubkey));
+        assert!(!mgr.has_presence_bearing_connection(community_a, &pubkey));
+    }
+
+    #[tokio::test]
+    async fn delivery_lookups_still_see_read_only_connections() {
+        // The rule that is easy to get wrong, so it is pinned rather than
+        // commented: `connection_ids_for_pubkey_in_community` feeds ban
+        // disconnect and live subscription eviction. Filtering it by class
+        // would exempt the connection class that holds the most keys from
+        // exactly the two enforcement paths that must reach it.
+        let mgr = ConnectionManager::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xCCCC));
+        let pubkey = vec![3u8; 32];
+
+        let watcher = register_bare(&mgr, community);
+        mgr.set_authenticated_pubkey(watcher, pubkey.clone());
+        mgr.set_connection_class(watcher, crate::connection::ConnectionClass::ReadOnly);
+
+        assert_eq!(
+            mgr.connection_ids_for_pubkey_in_community(community, &pubkey),
+            vec![watcher],
+            "a read-only connection must still be reachable by ban and eviction"
+        );
+        assert_eq!(
+            mgr.disconnect_pubkey(community, &pubkey, &"0".repeat(64), "banned"),
+            1,
+            "a ban must close a read-only connection like any other"
+        );
     }
 
     #[tokio::test]

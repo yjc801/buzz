@@ -128,6 +128,7 @@ pub(super) async fn deploy_to_provider(
             // deletion warns about orphaning infrastructure still in use.
             crate::managed_agents::reclaim_residual_deployment(
                 provider_id,
+                config,
                 &outcome.agent_id,
                 &mut rec.residual_deployments,
             );

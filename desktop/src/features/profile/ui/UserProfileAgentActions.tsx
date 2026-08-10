@@ -316,6 +316,17 @@ function AgentDeleteConfirmDialog({
   open: boolean;
 }) {
   const isProviderAgent = agent.backend.type === "provider";
+  // A migrated agent reads Local while a deployment it moved off still exists
+  // with a copy of its key. This dialog is the *only* disclosure on this path:
+  // `deleteManagedAgentWithRules` is called here with `skipRemoteDeleteConfirm`,
+  // which suppresses its own residual `window.confirm` while still sending
+  // `forceRemoteDelete`. Keyed on the backend alone, the list below would tell
+  // a user with orphanable infrastructure only that a local process would stop.
+  const residualProviders = [
+    ...new Set(
+      agent.residualDeployments.map((deployment) => deployment.providerId),
+    ),
+  ];
 
   return (
     <AlertDialog onOpenChange={onOpenChange} open={open}>
@@ -338,6 +349,15 @@ function AgentDeleteConfirmDialog({
               ? "Requests remote deletion; if it is online, Buzz first sends a shutdown command when possible. If the deployment cannot be reached through a channel, the remote process may keep running without local management."
               : "Stops any local agent process before deleting the record"}
           </li>
+          {residualProviders.length > 0 ? (
+            <li data-testid="agent-delete-residual-warning">
+              This agent was moved off {residualProviders.join(", ")}, and that
+              deployment still exists with a copy of its key. Deleting removes
+              the only record of it, so nothing here can reach or remove it
+              afterwards — clean it up on the provider first if you need it
+              gone.
+            </li>
+          ) : null}
         </ul>
         <p className="text-sm text-muted-foreground">
           You can also archive this agent from the profile settings menu if you

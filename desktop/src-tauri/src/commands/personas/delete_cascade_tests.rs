@@ -224,6 +224,7 @@ fn cascade_target_with_a_residual_deployment_blocks_delete() {
     migrated.residual_deployments = vec![ResidualDeployment {
         provider_id: "blox".to_string(),
         agent_id: "backend-1".to_string(),
+        config: serde_json::json!({"namespace": "team-a"}),
     }];
 
     let agents = vec![make_agent("pk-local", Some(PERSONA_ID), None), migrated];

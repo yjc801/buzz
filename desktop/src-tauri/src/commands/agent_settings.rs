@@ -209,9 +209,11 @@ pub async fn set_managed_agent_backend(
 
             // The deployment the agent is leaving still exists and still holds
             // a copy of its key, so its id is retired into
-            // `residual_deployments` *with the provider that issued it* rather
-            // than left behind on `backend_agent_id`, where nothing could tell
-            // which provider it belonged to.
+            // `residual_deployments` *with the provider and config that issued
+            // it* rather than left behind on `backend_agent_id`, where nothing
+            // could tell which provider — or which deployment scope within that
+            // provider — it belonged to. Must run before `record.backend` is
+            // overwritten: the old backend is the thing being retired.
             retire_deployment_pointer(
                 &record.backend,
                 &backend,

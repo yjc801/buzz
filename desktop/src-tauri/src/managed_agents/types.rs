@@ -390,15 +390,37 @@ pub struct RelayMeshConfig {
 
 /// A provider deployment the agent no longer runs on but which still exists.
 ///
-/// Both halves are required to be useful: `agent_id` alone cannot be acted on
-/// without knowing which provider issued it, and it is exactly that
-/// attribution that `backend_agent_id` loses the moment `backend` changes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// All three parts are required to name one deployment. `agent_id` alone
+/// cannot be acted on without knowing which provider issued it — that is the
+/// attribution `backend_agent_id` loses the moment `backend` changes — and the
+/// provider alone does not narrow it to one piece of infrastructure either:
+/// `docs/remote-agents.md` I4 guarantees at most one live instance per key per
+/// **deployment scope**, and says outright that the protocol cannot prevent the
+/// same key living in two scopes. For the Kubernetes provider the scope is the
+/// `context` and `namespace` in `provider_config`, and instance names are
+/// deterministic, so the same `(provider_id, agent_id)` names a different pod
+/// with a different copy of the key in each namespace.
+///
+/// So the config comes too. The desktop cannot tell a scope key from a tuning
+/// key — the deploy response carries only `agent_id` and `fresh_generation`,
+/// never a scope handle — so any difference counts as possibly-different
+/// infrastructure. That errs toward keeping a residual that is really live,
+/// which over-warns on deletion; the opposite error silently orphans a
+/// deployment holding the private key. Config is safe to persist here: I2
+/// forbids credentials from transiting `provider_config`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResidualDeployment {
     /// The provider that owns this deployment (`BackendKind::Provider::id`).
     pub provider_id: String,
     /// The provider-issued id, as last written to `backend_agent_id`.
     pub agent_id: String,
+    /// The `provider_config` this deployment was created with — its scope.
+    ///
+    /// Defaulted for records written before residuals were scope-qualified;
+    /// such an entry compares equal only to another scopeless one, so it is
+    /// never silently reclaimed by a deploy that carries real config.
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug)]

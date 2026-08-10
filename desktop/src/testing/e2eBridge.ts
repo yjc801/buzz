@@ -90,6 +90,10 @@ export type MockManagedAgentSeed = {
   channelNames?: string[];
   channelIds?: string[];
   backend?: RawManagedAgent["backend"];
+  /** The live provider deployment pointer, when the seed is deployed. */
+  backendAgentId?: string | null;
+  /** Deployments a migration left behind — see `retire_deployment_pointer`. */
+  residualDeployments?: RawManagedAgent["residual_deployments"];
   lastError?: string | null;
   lastErrorCode?: number | null;
   needsRestart?: boolean;
@@ -858,7 +862,12 @@ type RawManagedAgent = {
     | { type: "provider"; id: string; config: Record<string, unknown> };
   backend_agent_id: string | null;
   /** Deployments left behind by a migration. Omitted by the backend when empty. */
-  residual_deployments?: Array<{ provider_id: string; agent_id: string }>;
+  residual_deployments?: Array<{
+    provider_id: string;
+    agent_id: string;
+    /** The `provider_config` it was deployed with — its deployment scope. */
+    config?: Record<string, unknown>;
+  }>;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
 };
@@ -1689,6 +1698,11 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     auto_restart_on_config_change: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend ?? { type: "local" as const },
     backend_agent_id: agent.backend_agent_id ?? null,
+    // This clone is field-by-field, so omitting residuals here made the mock's
+    // retirement invisible to the app no matter what it wrote.
+    residual_deployments: (agent.residual_deployments ?? []).map(
+      (deployment) => ({ ...deployment }),
+    ),
     respond_to: agent.respond_to ?? "owner-only",
     respond_to_allowlist: agent.respond_to_allowlist
       ? [...agent.respond_to_allowlist]
@@ -2242,7 +2256,8 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     start_on_app_launch: true,
     auto_restart_on_config_change: seed.autoRestartOnConfigChange ?? true,
     backend: seed.backend ?? { type: "local" },
-    backend_agent_id: null,
+    backend_agent_id: seed.backendAgentId ?? null,
+    residual_deployments: seed.residualDeployments ?? [],
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
@@ -8669,19 +8684,32 @@ async function handleSetManagedAgentBackend(args: {
     );
   }
   // Retire the pointer to the deployment being left behind, attributed to the
-  // provider that issued it — see `retire_deployment_pointer`.
-  const leavingProvider =
+  // provider *and the config* that issued it — see `retire_deployment_pointer`.
+  // Config is part of the identity because it carries the deployment scope
+  // (Kubernetes `context`/`namespace`), so a same-provider config edit leaves
+  // real infrastructure behind exactly as switching providers does.
+  const sameDeployment =
+    args.backend.type === "provider" &&
     agent.backend.type === "provider" &&
-    !(args.backend.type === "provider" && args.backend.id === agent.backend.id);
-  if (leavingProvider && agent.backend_agent_id != null) {
+    args.backend.id === agent.backend.id &&
+    JSON.stringify(args.backend.config) ===
+      JSON.stringify(agent.backend.config);
+  if (
+    agent.backend.type === "provider" &&
+    !sameDeployment &&
+    agent.backend_agent_id != null
+  ) {
     const entry = {
-      provider_id: (agent.backend as { id: string }).id,
+      provider_id: agent.backend.id,
       agent_id: agent.backend_agent_id,
+      config: agent.backend.config,
     };
     const existing = agent.residual_deployments ?? [];
     agent.residual_deployments = existing.some(
       (d) =>
-        d.provider_id === entry.provider_id && d.agent_id === entry.agent_id,
+        d.provider_id === entry.provider_id &&
+        d.agent_id === entry.agent_id &&
+        JSON.stringify(d.config ?? {}) === JSON.stringify(entry.config),
     )
       ? existing
       : [...existing, entry];

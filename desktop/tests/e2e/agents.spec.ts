@@ -2637,3 +2637,54 @@ test("the run-location move is reachable from an agent's settings menu", async (
       .getByText("Move Relocatable instance", { exact: true }),
   ).toBeVisible();
 });
+
+test("deleting a migrated agent discloses the deployment it left behind", async ({
+  page,
+}) => {
+  // The profile delete path passes `skipRemoteDeleteConfirm`, so this dialog is
+  // the only disclosure a user gets — and it still sends `forceRemoteDelete`.
+  // Keyed on the backend alone it said only that a local process would stop,
+  // while the record's residual deployment kept a copy of the agent's key.
+  const personaId = "custom:migrated";
+  const pubkey = "af".repeat(32);
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: personaId,
+        displayName: "Migrated",
+        isActive: true,
+        systemPrompt: "An agent that moved back from a provider.",
+      },
+    ],
+    managedAgents: [
+      {
+        name: "Migrated instance",
+        personaId,
+        pubkey,
+        status: "stopped",
+        // Exactly what a Provider -> Local move leaves: local backend, no live
+        // pointer, and the retired deployment with its scope.
+        residualDeployments: [
+          {
+            provider_id: "kubernetes",
+            agent_id: "pod-x",
+            config: { context: "prod", namespace: "team-a" },
+          },
+        ],
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  await page.getByTestId(`persona-agent-row-${personaId}`).click();
+  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+  await page.getByTestId("user-profile-settings-menu-trigger").click();
+  await page.getByTestId(`user-profile-agent-delete-${pubkey}`).click();
+
+  const dialog = page.getByTestId("agent-delete-confirm-dialog");
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByTestId("agent-delete-residual-warning"),
+  ).toContainText("kubernetes");
+});

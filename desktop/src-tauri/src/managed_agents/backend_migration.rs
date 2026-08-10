@@ -97,20 +97,40 @@ pub fn validate_backend_migration(
 /// pointer to A.
 ///
 /// So the pointer moves rather than lingering: retired into
-/// `residual_deployments` with the provider that issued it, and cleared from
-/// `backend_agent_id`. Same provider with a different config is *not* a
-/// retirement — the deployment stays live and the next deploy updates it.
+/// `residual_deployments` with the provider *and the config* that issued it,
+/// and cleared from `backend_agent_id`.
+///
+/// Changing the config on the same provider is a retirement too. An earlier
+/// revision returned early whenever the provider ids matched, on the reasoning
+/// that a same-provider edit re-deploys the one live deployment. That holds
+/// only while the config does not name a different deployment scope — and
+/// `provider_config` is exactly where the Kubernetes provider's `context` and
+/// `namespace` live, so a namespace edit strands the old pod while the record
+/// keeps pointing at the new one (see [`ResidualDeployment`]). The desktop
+/// cannot distinguish that from a harmless tuning change, so every config
+/// change retires.
 pub fn retire_deployment_pointer(
     current: &BackendKind,
     target: &BackendKind,
     backend_agent_id: &mut Option<String>,
     residual: &mut Vec<ResidualDeployment>,
 ) {
-    let BackendKind::Provider { id: current_id, .. } = current else {
+    let BackendKind::Provider {
+        id: current_id,
+        config: current_config,
+    } = current
+    else {
         return;
     };
-    if let BackendKind::Provider { id: target_id, .. } = target {
-        if target_id == current_id {
+    if let BackendKind::Provider {
+        id: target_id,
+        config: target_config,
+    } = target
+    {
+        // Same provider *and* same scope is not a move at all —
+        // `validate_backend_migration` rejects it first. Kept so this stays
+        // total rather than relying on that ordering.
+        if target_id == current_id && target_config == current_config {
             return;
         }
     }
@@ -120,6 +140,7 @@ pub fn retire_deployment_pointer(
     let entry = ResidualDeployment {
         provider_id: current_id.clone(),
         agent_id,
+        config: current_config.clone(),
     };
     if !residual.contains(&entry) {
         residual.push(entry);
@@ -129,21 +150,28 @@ pub fn retire_deployment_pointer(
 /// Drop a residual entry that a fresh deploy has just taken over.
 ///
 /// A provider may issue a *deterministic* id — sprites derives it from the
-/// agent — so moving A → Local → A and redeploying returns the exact id that
-/// [`retire_deployment_pointer`] retired on the way out. Without this the same
-/// deployment is recorded as both current (`backend_agent_id`) and abandoned
-/// (`residual_deployments`), and deletion warns about orphaning infrastructure
-/// the agent is in fact still using.
+/// agent, Kubernetes names the pod from it — so moving A → Local → A and
+/// redeploying returns the exact id that [`retire_deployment_pointer`] retired
+/// on the way out. Without this the same deployment is recorded as both current
+/// (`backend_agent_id`) and abandoned (`residual_deployments`), and deletion
+/// warns about orphaning infrastructure the agent is in fact still using.
 ///
-/// Matching is exact on **both** halves. A different id on the same provider is
-/// a genuinely different deployment that the redeploy did not touch, and it
-/// must stay residual.
+/// Matching is exact on **all three** parts, and the config is the load-bearing
+/// one. Determinism is what makes ids repeat, and it repeats *per scope*: the
+/// same pod name exists independently in every namespace. Matching on
+/// `(provider_id, agent_id)` alone would let a redeploy into namespace B
+/// discard the residual naming the pod in namespace A — which still exists and
+/// still holds the key. A different id on the same provider, or the same id on
+/// a different provider, is likewise other infrastructure and stays.
 pub fn reclaim_residual_deployment(
     provider_id: &str,
+    config: &serde_json::Value,
     agent_id: &str,
     residual: &mut Vec<ResidualDeployment>,
 ) {
-    residual.retain(|entry| !(entry.provider_id == provider_id && entry.agent_id == agent_id));
+    residual.retain(|entry| {
+        !(entry.provider_id == provider_id && entry.agent_id == agent_id && &entry.config == config)
+    });
 }
 
 /// Whether deleting this agent would orphan provider infrastructure that still
@@ -383,9 +411,26 @@ mod tests {
     // ── retire_deployment_pointer ────────────────────────────────────────
 
     fn residual(provider_id: &str, agent_id: &str) -> ResidualDeployment {
+        scoped_residual(provider_id, agent_id, serde_json::json!({}))
+    }
+
+    fn scoped_residual(
+        provider_id: &str,
+        agent_id: &str,
+        config: serde_json::Value,
+    ) -> ResidualDeployment {
         ResidualDeployment {
             provider_id: provider_id.to_string(),
             agent_id: agent_id.to_string(),
+            config,
+        }
+    }
+
+    /// A Kubernetes-shaped backend: the scope lives in `provider_config`.
+    fn in_namespace(namespace: &str) -> BackendKind {
+        BackendKind::Provider {
+            id: "kubernetes".to_string(),
+            config: serde_json::json!({"context": "prod", "namespace": namespace}),
         }
     }
 
@@ -421,22 +466,42 @@ mod tests {
         assert_eq!(residuals, vec![residual("sprites", "sprite-1")]);
     }
 
-    /// Same provider, new config, is a re-deploy of the same deployment — the
-    /// pointer is still live and must not be retired.
+    /// A same-provider config edit retires too, because the config is where
+    /// the deployment scope lives. Editing the namespace strands the pod in the
+    /// old one; the desktop cannot tell that from an `inactivity_seconds` tweak,
+    /// so it keeps the pointer either way rather than guessing.
     #[test]
-    fn same_provider_with_a_new_config_keeps_the_pointer_live() {
-        let current = BackendKind::Provider {
-            id: "sprites".to_string(),
-            config: serde_json::json!({"inactivity_seconds": 7200}),
-        };
-        let target = BackendKind::Provider {
-            id: "sprites".to_string(),
-            config: serde_json::json!({"inactivity_seconds": 600}),
-        };
-        let mut backend_agent_id = Some("sprite-1".to_string());
+    fn a_same_provider_config_change_retires_the_old_scope() {
+        let current = in_namespace("team-a");
+        let target = in_namespace("team-b");
+        let mut backend_agent_id = Some("pod-x".to_string());
         let mut residuals = Vec::new();
         retire_deployment_pointer(&current, &target, &mut backend_agent_id, &mut residuals);
-        assert_eq!(backend_agent_id.as_deref(), Some("sprite-1"));
+        assert_eq!(backend_agent_id, None);
+        assert_eq!(
+            residuals,
+            vec![scoped_residual(
+                "kubernetes",
+                "pod-x",
+                serde_json::json!({"context": "prod", "namespace": "team-a"}),
+            )],
+            "the pod in team-a still exists and still holds the key"
+        );
+    }
+
+    /// Same provider *and* same config is not a move at all —
+    /// `validate_backend_migration` refuses it first, and this stays total.
+    #[test]
+    fn an_unchanged_backend_retires_nothing() {
+        let mut backend_agent_id = Some("pod-x".to_string());
+        let mut residuals = Vec::new();
+        retire_deployment_pointer(
+            &in_namespace("team-a"),
+            &in_namespace("team-a"),
+            &mut backend_agent_id,
+            &mut residuals,
+        );
+        assert_eq!(backend_agent_id.as_deref(), Some("pod-x"));
         assert!(residuals.is_empty());
     }
 
@@ -492,8 +557,87 @@ mod tests {
     #[test]
     fn redeploying_onto_a_retired_deployment_reclaims_it() {
         let mut residuals = vec![residual("sprites", "sprite-1")];
-        reclaim_residual_deployment("sprites", "sprite-1", &mut residuals);
+        reclaim_residual_deployment(
+            "sprites",
+            &serde_json::json!({}),
+            "sprite-1",
+            &mut residuals,
+        );
         assert!(residuals.is_empty());
+    }
+
+    /// The scope regression. Deterministic naming repeats the pod name in every
+    /// namespace, so `(provider, agent_id)` alone would let a deploy into
+    /// team-b discard the residual naming the pod in team-a — which still
+    /// exists, and still has the key.
+    #[test]
+    fn a_redeploy_into_another_scope_does_not_reclaim_the_old_one() {
+        let team_a = serde_json::json!({"context": "prod", "namespace": "team-a"});
+        let team_b = serde_json::json!({"context": "prod", "namespace": "team-b"});
+        let mut residuals = vec![scoped_residual("kubernetes", "pod-x", team_a.clone())];
+
+        reclaim_residual_deployment("kubernetes", &team_b, "pod-x", &mut residuals);
+
+        assert_eq!(
+            residuals,
+            vec![scoped_residual("kubernetes", "pod-x", team_a)],
+            "same provider and same deterministic id, different namespace"
+        );
+    }
+
+    /// A different cluster is a different scope even with the same namespace.
+    #[test]
+    fn a_redeploy_against_another_context_does_not_reclaim_either() {
+        let prod = serde_json::json!({"context": "prod", "namespace": "team-a"});
+        let staging = serde_json::json!({"context": "staging", "namespace": "team-a"});
+        let mut residuals = vec![scoped_residual("kubernetes", "pod-x", prod.clone())];
+
+        reclaim_residual_deployment("kubernetes", &staging, "pod-x", &mut residuals);
+
+        assert_eq!(
+            residuals,
+            vec![scoped_residual("kubernetes", "pod-x", prod)]
+        );
+    }
+
+    /// Returning to the *same* scope still reclaims — the round-2 fix survives
+    /// scope-qualification, and no false orphan warning comes back.
+    #[test]
+    fn returning_to_the_same_scope_still_reclaims() {
+        let team_a = serde_json::json!({"context": "prod", "namespace": "team-a"});
+        let mut residuals = vec![scoped_residual("kubernetes", "pod-x", team_a.clone())];
+
+        reclaim_residual_deployment("kubernetes", &team_a, "pod-x", &mut residuals);
+
+        assert!(residuals.is_empty());
+        // Deletion still warns — the agent is deployed right now — but the
+        // warning has one source, not a second one claiming it also abandoned
+        // infrastructure it is actively using.
+        assert!(deletion_orphans_infrastructure(
+            &in_namespace("team-a"),
+            Some("pod-x"),
+            &residuals,
+        ));
+        assert!(!deletion_orphans_infrastructure(
+            &BackendKind::Local,
+            None,
+            &residuals,
+        ));
+    }
+
+    /// A residual written before residuals carried scope has an empty config.
+    /// It must not be reclaimed by a deploy carrying real config — the safe
+    /// direction is to keep warning about a deployment we cannot place.
+    #[test]
+    fn a_scopeless_legacy_residual_is_not_reclaimed_by_a_scoped_deploy() {
+        let mut residuals = vec![residual("kubernetes", "pod-x")];
+        reclaim_residual_deployment(
+            "kubernetes",
+            &serde_json::json!({"namespace": "team-a"}),
+            "pod-x",
+            &mut residuals,
+        );
+        assert_eq!(residuals, vec![residual("kubernetes", "pod-x")]);
     }
 
     /// A new id on the same provider is different infrastructure — the old one
@@ -501,7 +645,12 @@ mod tests {
     #[test]
     fn a_new_id_on_the_same_provider_leaves_the_old_residual_alone() {
         let mut residuals = vec![residual("sprites", "sprite-1")];
-        reclaim_residual_deployment("sprites", "sprite-2", &mut residuals);
+        reclaim_residual_deployment(
+            "sprites",
+            &serde_json::json!({}),
+            "sprite-2",
+            &mut residuals,
+        );
         assert_eq!(residuals, vec![residual("sprites", "sprite-1")]);
         assert!(deletion_orphans_infrastructure(
             &provider("sprites"),
@@ -515,7 +664,7 @@ mod tests {
     #[test]
     fn an_identical_id_on_another_provider_is_not_the_same_deployment() {
         let mut residuals = vec![residual("blox", "agent-1")];
-        reclaim_residual_deployment("sprites", "agent-1", &mut residuals);
+        reclaim_residual_deployment("sprites", &serde_json::json!({}), "agent-1", &mut residuals);
         assert_eq!(residuals, vec![residual("blox", "agent-1")]);
     }
 

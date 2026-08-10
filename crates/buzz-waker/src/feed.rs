@@ -13,13 +13,18 @@
 //! filter, the reconnect ladder, what each relay frame means — are tested
 //! directly, and the transport is a thin adapter with nothing to reason about.
 //!
-//! # Two things that are not obvious
+//! # Three things that are not obvious
 //!
 //! - **The REQ must carry `kinds`.** A filter without them trips the relay's
 //!   p-gate and comes back 403 (`CLAUDE.md` § Common Gotchas), which reads as a
 //!   permission problem rather than a malformed query. [`WAKE_TRIGGER_KINDS`]
 //!   is the right set anyway: [`crate::decide`] discards everything else, so
 //!   asking for less traffic costs nothing.
+//! - **One feed per agent, bound to that agent's own connection.** See
+//!   [`wake_filter`]. This is §4's option (i)/(ii) as written — the design
+//!   already records that "a generic waker identity silently misses
+//!   private-channel mentions" — and the filter takes one pubkey so a watch
+//!   list cannot be folded into one subscription by accident.
 //! - **The waker connects interactive**, sending no `class` tag. The read-only
 //!   connection class exists in this repo's relay but is not deployed on the
 //!   relay we use, and the client fails closed when a requested class is not
@@ -67,6 +72,16 @@ pub const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 pub enum FeedSignal {
     /// An event on our subscription that parsed into a candidate trigger.
     Trigger(Box<TriggerEvent>),
+    /// An event on our subscription whose id or signature did not verify. The
+    /// relay either forged it or served something corrupted; either way none of
+    /// its fields may be believed.
+    Rejected {
+        /// The id the event claimed. Only useful for correlating relay logs —
+        /// on an id mismatch it is by definition not the event's real id.
+        event_id: String,
+        /// Why verification failed.
+        reason: String,
+    },
     /// Stored events are drained; the subscription is now live.
     ReplayComplete,
     /// The relay closed our subscription. Reconnect; do not treat as idle.
@@ -101,48 +116,68 @@ pub enum FeedFrame {
         /// The relay's stated reason.
         message: String,
     },
+    /// An EVENT the transport refused to project because its id or signature
+    /// did not verify — see [`crate::relay_feed`], which is the only place a
+    /// signature still exists to check.
+    Rejected {
+        /// The subscription the relay attributed it to.
+        subscription_id: String,
+        /// The id the event claimed.
+        event_id: String,
+        /// Why verification failed.
+        reason: String,
+    },
     /// Anything else — NOTICE, OK, COUNT, a late AUTH challenge.
     Other,
 }
 
-/// The REQ filter for the wake feed.
+/// The REQ filter for **one agent's** wake feed.
 ///
 /// `#p` is the addressing the harness itself keys on, so it is what the feed
 /// asks for; `kinds` is mandatory (see the module note); `since` comes from
 /// [`CursorStore::resume`], which has already subtracted the reconnect overlap.
 ///
-/// Watched pubkeys are normalized and de-duplicated. A duplicate would be
-/// harmless to the relay but makes the filter's size a poor proxy for how many
-/// agents are actually watched, which is the number an operator reads.
+/// # One agent per filter, because one agent per connection
 ///
-/// # Callers must not subscribe with nothing watched
+/// This takes a single pubkey rather than a watch list, and the difference is
+/// not cosmetic. The relay scopes a REQ's history to the channels the
+/// *authenticated* pubkey can reach (`apply_access_scope_to_query`, `req.rs`)
+/// and re-checks that same connection's membership on live private-channel
+/// fan-out. So a filter naming agents A and B, sent over a connection
+/// authenticated as A, returns A's mentions and **silently drops B's
+/// private-channel ones** — no error, no CLOSED, just a feed that looks healthy
+/// and misses the wakes that matter most.
 ///
-/// An empty `watched` yields `"#p": []`, which asks the relay for events
-/// p-tagging nobody. That is a subscription that can never deliver, and it
-/// would sit there looking healthy. A waker with no enrolled agents has
-/// nothing to do and should not open a feed at all; this function does not
-/// second-guess that, because "no agents yet" and "the enrolment file failed
-/// to load" are the caller's to tell apart and they are not the same incident.
+/// §4 of the design records this as the confirmed constraint behind option (i):
+/// per-agent, identity-bound connections. Each watched agent therefore gets its
+/// own connection, its own filter, and its own cursor — the replay and coverage
+/// state is per identity too, because one agent's EOSE says nothing about
+/// another's backlog.
+///
+/// A single-value `#p` is also the only form the relay can push into SQL, so
+/// one agent's mentions cannot be starved out of a page by traffic addressed
+/// to another.
+///
+/// [`FeedTransport::subscribe`] is the only path that reaches a relay, and it
+/// builds this from the identity it authenticated with rather than from an
+/// argument, so the filter and the connection cannot disagree.
 #[must_use]
-pub fn wake_filter(watched: &[String], since: u64) -> Value {
-    let mut seen = std::collections::BTreeSet::new();
-    let targets: Vec<String> = watched
-        .iter()
-        .map(|pubkey| normalize_pubkey(pubkey))
-        .filter(|pubkey| !pubkey.is_empty() && seen.insert(pubkey.clone()))
-        .collect();
-
+pub fn wake_filter(agent_pubkey: &str, since: u64) -> Value {
     json!({
         "kinds": WAKE_TRIGGER_KINDS,
-        "#p": targets,
+        "#p": [normalize_pubkey(agent_pubkey)],
         "since": since,
     })
 }
 
-/// The full REQ frame for the wake feed.
+/// The full REQ frame for one agent's wake feed.
 #[must_use]
-pub fn wake_req(watched: &[String], since: u64) -> Value {
-    json!(["REQ", WAKE_SUBSCRIPTION_ID, wake_filter(watched, since)])
+pub fn wake_req(agent_pubkey: &str, since: u64) -> Value {
+    json!([
+        "REQ",
+        WAKE_SUBSCRIPTION_ID,
+        wake_filter(agent_pubkey, since)
+    ])
 }
 
 /// Read a relay event into the fields a wake decision needs.
@@ -212,6 +247,14 @@ pub fn classify(frame: &FeedFrame) -> FeedSignal {
             subscription_id,
             message,
         } if subscription_id == WAKE_SUBSCRIPTION_ID => FeedSignal::Closed(message.clone()),
+        FeedFrame::Rejected {
+            subscription_id,
+            event_id,
+            reason,
+        } if subscription_id == WAKE_SUBSCRIPTION_ID => FeedSignal::Rejected {
+            event_id: event_id.clone(),
+            reason: reason.clone(),
+        },
         _ => FeedSignal::Ignored,
     }
 }
@@ -245,16 +288,37 @@ pub trait FeedTransport {
     /// Errors this transport can raise.
     type Error;
 
+    /// The pubkey this transport authenticates as.
+    ///
+    /// Exposed so callers can key per-agent state — the cursor, the enrolment
+    /// record — off the identity the socket actually holds rather than off a
+    /// list they carry separately.
+    fn agent_pubkey(&self) -> &str;
+
     /// Establish (or re-establish) the connection and authenticate.
     fn connect(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
-    /// Send a raw frame — in practice the REQ from [`wake_req`].
-    fn send(&mut self, frame: &Value)
-        -> impl std::future::Future<Output = Result<(), Self::Error>>;
+    /// Issue the wake REQ for `since` under [`WAKE_SUBSCRIPTION_ID`].
+    ///
+    /// The transport builds the filter from its **own** authenticated identity;
+    /// there is deliberately no way to hand it a pubkey. That is what makes the
+    /// authorization argument on [`wake_filter`] hold structurally rather than
+    /// by convention: the relay authorizes history and private-channel fan-out
+    /// against the connection's pubkey, so a filter naming anyone else is a
+    /// feed that quietly misses mentions.
+    fn subscribe(
+        &mut self,
+        since: u64,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
     /// Next frame, or `None` if `timeout_secs` passed with the connection
     /// still healthy. A dropped connection is an `Err`, not `None`: the
     /// difference decides between checkpointing coverage and reconnecting.
+    ///
+    /// The timeout is wall-clock across the whole call. A relay heartbeat is
+    /// not a frame the caller asked for, and must not postpone the idle cue
+    /// this returns — that cue is the only thing that advances coverage on a
+    /// quiet connection.
     fn next_frame(
         &mut self,
         timeout_secs: u64,
@@ -290,6 +354,16 @@ pub enum FeedStep {
     },
     /// A duplicate, or a frame the feed ignores. Nothing to do.
     Nothing,
+    /// The relay served an event whose id or signature did not verify. Nothing
+    /// was admitted and nothing will be woken; surfaced rather than dropped
+    /// because a relay serving forged events is an incident the daemon should
+    /// report, not a quiet no-op.
+    Rejected {
+        /// The id the event claimed.
+        event_id: String,
+        /// Why verification failed.
+        reason: String,
+    },
     /// The subscription is live; stored events are drained.
     ReplayComplete,
     /// The relay closed the subscription. The caller should reconnect.
@@ -330,6 +404,7 @@ pub fn step(
             cursor.end_replay(now)?;
             Ok(FeedStep::ReplayComplete)
         }
+        FeedSignal::Rejected { event_id, reason } => Ok(FeedStep::Rejected { event_id, reason }),
         FeedSignal::Closed(reason) => Ok(FeedStep::Closed(reason)),
         FeedSignal::Ignored => Ok(FeedStep::Nothing),
     }
@@ -358,43 +433,26 @@ mod tests {
     fn the_filter_always_names_kinds() {
         // Without `kinds` the relay's p-gate answers 403, which reads as an
         // auth failure rather than a bad filter. This is the guard for that.
-        let filter = wake_filter(&["AB".repeat(32)], 42);
+        let filter = wake_filter(&"ab".repeat(32), 42);
         let kinds = filter["kinds"].as_array().expect("kinds must be present");
         assert_eq!(kinds.len(), WAKE_TRIGGER_KINDS.len());
         assert_eq!(filter["since"], 42);
     }
 
     #[test]
-    fn watched_pubkeys_are_normalized_and_deduplicated() {
-        let filter = wake_filter(
-            &[
-                "AB".repeat(32),
-                format!("  {}  ", "ab".repeat(32)),
-                "cd".repeat(32),
-                String::new(),
-            ],
-            0,
-        );
+    fn the_filter_names_exactly_one_agent() {
+        // The authorization boundary, pinned as a type-level property rather
+        // than a convention: the relay scopes history and private-channel
+        // fan-out to the *connection's* pubkey, so a second `#p` value in one
+        // filter is a mention that silently never arrives. `wake_filter` takes
+        // one pubkey and there is no overload that takes a list.
+        let filter = wake_filter(&format!("  {}  ", "AB".repeat(32)), 0);
         let targets = filter["#p"].as_array().expect("#p must be present");
+        assert_eq!(targets.len(), 1, "one feed watches exactly one agent");
         assert_eq!(
-            targets.len(),
-            2,
-            "the same key in three spellings is one target, and blank is none"
-        );
-        assert_eq!(targets[0], "ab".repeat(32));
-    }
-
-    #[test]
-    fn watching_nothing_produces_a_filter_that_can_never_deliver() {
-        // Pinned so the property is visible rather than discovered in
-        // production: this filter is not an error the relay rejects, it is a
-        // healthy-looking subscription that returns nothing forever. The daemon
-        // must refuse to open a feed with no enrolled agents.
-        let filter = wake_filter(&[], 0);
-        assert_eq!(
-            filter["#p"].as_array().expect("#p is present").len(),
-            0,
-            "nothing watched must not silently widen into everything"
+            targets[0],
+            "ab".repeat(32),
+            "the pubkey is normalized to the one comparison form"
         );
     }
 
@@ -514,6 +572,37 @@ mod tests {
         assert!(
             cursor.state().covered_through_secs > before,
             "EOSE is evidence the feed is current, so coverage must advance"
+        );
+    }
+
+    #[test]
+    fn a_forged_event_is_surfaced_and_never_admitted() {
+        // The transport refuses to project an event whose signature does not
+        // check out, and the feed reports it rather than dropping it quietly:
+        // a relay serving forged events is an incident, not a no-op.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 1_700_000_000;
+        let mut cursor = cursor_at(&dir, now);
+
+        let step_result = step(
+            &mut cursor,
+            &FeedFrame::Rejected {
+                subscription_id: WAKE_SUBSCRIPTION_ID.to_string(),
+                event_id: "ff".repeat(32),
+                reason: "invalid signature".to_string(),
+            },
+            now,
+        )
+        .expect("rejecting an event touches no durable state");
+
+        match step_result {
+            FeedStep::Rejected { reason, .. } => assert!(reason.contains("signature")),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(
+            cursor.in_flight_len(),
+            0,
+            "a forged event must never be claimed"
         );
     }
 

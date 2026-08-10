@@ -1272,3 +1272,61 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
     };
     crate::managed_agents::ManagedAgentPairRuntime::starting(process)
 }
+
+// ── child_rust_log_filter tests ─────────────────────────────────────────
+
+/// Every root buzz-acp sets an explicit `target:` under. A target replaces the
+/// module path rather than extending it, so `buzz_acp=*` matches none of them
+/// and each root must be named. Kept as data so the regression test below
+/// reads as "the filter covers what the harness actually logs".
+const HARNESS_TARGET_ROOTS: &[&str] = &["pool", "acp", "engram", "canvas", "observer"];
+
+#[test]
+fn default_filter_covers_every_harness_target_root() {
+    let filter = super::child_rust_log_filter_from(None);
+    for root in HARNESS_TARGET_ROOTS {
+        assert!(
+            filter.contains(&format!("{root}=")),
+            "target root {root:?} is not covered by {filter:?} — lines logged \
+             with target: \"{root}::…\" would be silently dropped"
+        );
+    }
+    // The crate-name filter still has to be there: lines that DON'T override
+    // target fall back to the module path, which does start with buzz_acp.
+    assert!(filter.contains("buzz_acp="), "{filter}");
+}
+
+#[test]
+fn harness_targets_are_enabled_at_info_not_debug() {
+    // Deliberate: ~11 of these call sites are debug!, including acp::wire
+    // frame dumps. Raising them to debug would bloat every agent log.
+    let filter = super::child_rust_log_filter_from(None);
+    assert!(!filter.contains("debug"), "{filter}");
+    assert!(!filter.contains("trace"), "{filter}");
+}
+
+#[test]
+fn an_empty_or_blank_rust_log_is_treated_as_unset() {
+    let expected = super::child_rust_log_filter_from(None);
+    assert_eq!(super::child_rust_log_filter_from(Some("")), expected);
+    assert_eq!(super::child_rust_log_filter_from(Some("   \t ")), expected);
+}
+
+#[test]
+fn an_unrelated_rust_log_is_extended_not_replaced() {
+    let filter = super::child_rust_log_filter_from(Some("hyper=warn"));
+    assert!(filter.starts_with("hyper=warn,"), "{filter}");
+    assert!(filter.contains("pool=info"), "{filter}");
+}
+
+#[test]
+fn an_explicit_buzz_acp_filter_is_passed_through_untouched() {
+    // The operator escape hatch: someone debugging one target must be able to
+    // narrow the filter without this function widening it back out.
+    let operator = "buzz_acp=trace,pool::model=trace";
+    assert_eq!(
+        super::child_rust_log_filter_from(Some(operator)),
+        operator,
+        "an explicit buzz_acp filter must win outright"
+    );
+}

@@ -2,7 +2,7 @@
 //! socket.
 //!
 //! Deliberately thin. Everything with a rule in it lives in [`crate::feed`] and
-//! is tested there; what remains here is connect, subscribe, receive, signature
+//! is tested there; what remains here is connect, send, receive, signature
 //! verification, and the translation from the ws client's message set into
 //! [`FeedFrame`]. If this file starts making *wake* decisions, they belong
 //! upstairs — but authenticating the wire is the transport's own job, and it
@@ -24,7 +24,9 @@ use std::time::Duration;
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Keys, Tag};
 
-use crate::feed::{wake_req, FeedFrame, FeedTransport};
+use crate::feed::{
+    wake_backfill_close, wake_backfill_req, wake_live_req, FeedFrame, FeedTransport,
+};
 
 /// A NIP-42-authenticated connection to one relay, **as one agent**,
 /// reconnectable in place.
@@ -35,8 +37,8 @@ use crate::feed::{wake_req, FeedFrame, FeedTransport};
 /// One of these per watched agent. The relay authorizes both historical REQ
 /// visibility and live private-channel fan-out against the connection's own
 /// pubkey, so a single connection cannot serve a watch list — see
-/// [`crate::feed::wake_filter`]. [`FeedTransport::subscribe`] builds its filter
-/// from `keys`, which is what stops the two from ever disagreeing.
+/// [`crate::feed::wake_filter`]. Every subscribe method builds its filter from
+/// `keys`, which is what stops the two from ever disagreeing.
 pub struct RelayFeed {
     relay_url: String,
     keys: Keys,
@@ -99,11 +101,26 @@ impl FeedTransport for RelayFeed {
         Ok(())
     }
 
-    async fn subscribe(&mut self, since: u64) -> Result<(), Self::Error> {
+    async fn subscribe_live(&mut self, since: u64) -> Result<(), Self::Error> {
         // `self.agent_pubkey`, never an argument: the filter's `#p` and the
         // socket's authenticated identity are the same value by construction.
-        let req = wake_req(&self.agent_pubkey, since);
+        let req = wake_live_req(&self.agent_pubkey, since);
         self.connection_mut()?.send_raw(&req).await
+    }
+
+    async fn subscribe_backfill(&mut self, since: u64, until: u64) -> Result<(), Self::Error> {
+        let req = wake_backfill_req(&self.agent_pubkey, since, until);
+        self.connection_mut()?.send_raw(&req).await
+    }
+
+    async fn close_backfill(&mut self) -> Result<(), Self::Error> {
+        // Unconditional and harmless: CLOSE for an id the relay has no
+        // subscription under is answered with a CLOSED the feed ignores, which
+        // is why the caller can send this on every completion without tracking
+        // whether a backfill was ever opened.
+        self.connection_mut()?
+            .send_raw(&wake_backfill_close())
+            .await
     }
 
     async fn next_frame(&mut self, timeout_secs: u64) -> Result<Option<FeedFrame>, Self::Error> {
@@ -137,10 +154,10 @@ impl FeedTransport for RelayFeed {
 ///
 /// Verification is Schnorr and therefore CPU-bound. It runs inline rather than
 /// on a blocking pool, matching the other client-side consumer of relay events
-/// (`buzz-acp/src/lib.rs`); the relay's own ingest path uses `spawn_blocking`
-/// because it verifies every write in the community, whereas this feed sees one
-/// agent's mentions. Keeping it inline is what lets this crate stay free of an
-/// async runtime dependency.
+/// (`buzz-acp/src/lib.rs`); the relay's own ingest path uses
+/// `spawn_blocking` because it verifies every write in the community, whereas
+/// this feed sees one agent's mentions. Keeping it inline is what lets this
+/// crate stay free of an async runtime dependency.
 fn feed_frame(message: RelayMessage) -> Result<FeedFrame, WsClientError> {
     Ok(match message {
         RelayMessage::Event {

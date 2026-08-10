@@ -13,7 +13,7 @@
 //! filter, the reconnect ladder, what each relay frame means — are tested
 //! directly, and the transport is a thin adapter with nothing to reason about.
 //!
-//! # Three things that are not obvious
+//! # Four things that are not obvious
 //!
 //! - **The REQ must carry `kinds`.** A filter without them trips the relay's
 //!   p-gate and comes back 403 (`CLAUDE.md` § Common Gotchas), which reads as a
@@ -21,10 +21,14 @@
 //!   is the right set anyway: [`crate::decide`] discards everything else, so
 //!   asking for less traffic costs nothing.
 //! - **One feed per agent, bound to that agent's own connection.** See
-//!   [`wake_filter`]. This is §4's option (i)/(ii) as written — the design
+//!   [`WakeReplay`]. This is §4's option (i)/(ii) as written — the design
 //!   already records that "a generic waker identity silently misses
-//!   private-channel mentions" — and the filter takes one pubkey so a watch
-//!   list cannot be folded into one subscription by accident.
+//!   private-channel mentions" — and the type takes one pubkey so a watch list
+//!   cannot be folded into one filter by accident.
+//! - **EOSE is not the end of history.** The relay clamps every historical
+//!   filter to a page and orders it newest-first, so one `since` REQ recovers
+//!   only the newest page of an outage. [`WakeReplay`] pages down with `until`
+//!   and the caller must not treat replay as complete until it says so.
 //! - **The waker connects interactive**, sending no `class` tag. The read-only
 //!   connection class exists in this repo's relay but is not deployed on the
 //!   relay we use, and the client fails closed when a requested class is not
@@ -39,12 +43,44 @@ use serde_json::{json, Value};
 use crate::cursor::{Admission, CursorStore};
 use crate::decide::{normalize_pubkey, TriggerEvent, WAKE_TRIGGER_KINDS};
 
-/// Subscription id for the wake feed.
+/// Subscription id for the **live** feed: unbounded, opened once per
+/// connection, and never re-issued while that connection lasts.
 ///
-/// Fixed rather than random: re-issuing a REQ with the same id after a
-/// reconnect replaces the old subscription instead of accumulating one per
-/// attempt, and a fixed id keeps relay-side logs legible across restarts.
-pub const WAKE_SUBSCRIPTION_ID: &str = "buzz-waker-wake";
+/// Fixed rather than random so a reconnect replaces the old subscription
+/// instead of accumulating one per attempt, and so relay-side logs stay
+/// legible across restarts.
+pub const WAKE_LIVE_SUBSCRIPTION_ID: &str = "buzz-waker-live";
+
+/// Subscription id for the **backfill** walk: `until`-bounded, re-issued once
+/// per page, and closed when the backlog is drained.
+///
+/// Separate from [`WAKE_LIVE_SUBSCRIPTION_ID`] for a correctness reason, not a
+/// tidiness one — see [`WakeReplay`]. Paging on the live subscription's own id
+/// replaces it, and a replaced subscription stops receiving fan-out; every
+/// mention published while a bounded filter was standing in its place is then
+/// left to be recovered by a later historical query that is itself capped.
+pub const WAKE_BACKFILL_SUBSCRIPTION_ID: &str = "buzz-waker-backfill";
+
+/// Which of the feed's two subscriptions a frame arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeSubscription {
+    /// The unbounded subscription that stays registered for the connection.
+    Live,
+    /// The bounded subscription walking the stored backlog.
+    Backfill,
+}
+
+impl WakeSubscription {
+    /// Resolve a relay subscription id, or `None` if it is not one of ours.
+    #[must_use]
+    pub fn from_id(subscription_id: &str) -> Option<Self> {
+        match subscription_id {
+            WAKE_LIVE_SUBSCRIPTION_ID => Some(Self::Live),
+            WAKE_BACKFILL_SUBSCRIPTION_ID => Some(Self::Backfill),
+            _ => None,
+        }
+    }
+}
 
 /// How long to wait for a frame before treating the connection as idle.
 ///
@@ -70,22 +106,50 @@ pub const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 /// matching them at the call site keeps the loop honest about what it drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedSignal {
-    /// An event on our subscription that parsed into a candidate trigger.
-    Trigger(Box<TriggerEvent>),
-    /// An event on our subscription whose id or signature did not verify. The
-    /// relay either forged it or served something corrupted; either way none of
-    /// its fields may be believed.
+    /// An event on one of our subscriptions that parsed into a candidate
+    /// trigger.
+    Trigger {
+        /// Which subscription delivered it — the tally that drives paging is
+        /// per subscription, because the live one keeps delivering long after
+        /// its own stored page is drained.
+        sub: WakeSubscription,
+        /// The candidate.
+        event: Box<TriggerEvent>,
+    },
+    /// An event on one of our subscriptions the feed could not read. Distinct
+    /// from [`FeedSignal::Ignored`] because it still consumed a row of the
+    /// relay's page, which is what [`WakeReplay`] counts — but it offers no
+    /// `created_at`, so it cannot be paged on.
+    Unparsed {
+        /// Which subscription delivered it.
+        sub: WakeSubscription,
+    },
+    /// An event whose id or signature did not verify. The relay either forged
+    /// it or served something corrupted; either way none of its fields may be
+    /// believed, including its timestamp.
     Rejected {
+        /// Which subscription delivered it.
+        sub: WakeSubscription,
         /// The id the event claimed. Only useful for correlating relay logs —
         /// on an id mismatch it is by definition not the event's real id.
         event_id: String,
         /// Why verification failed.
         reason: String,
     },
-    /// Stored events are drained; the subscription is now live.
-    ReplayComplete,
-    /// The relay closed our subscription. Reconnect; do not treat as idle.
-    Closed(String),
+    /// Stored events for that subscription's current page are drained.
+    ReplayComplete {
+        /// Which subscription finished a page.
+        sub: WakeSubscription,
+    },
+    /// The relay closed one of our subscriptions. What that means depends on
+    /// which one — see [`step`].
+    Closed {
+        /// Which subscription was closed.
+        sub: WakeSubscription,
+        /// The relay's stated reason. Empty when it is merely acknowledging a
+        /// CLOSE we sent.
+        reason: String,
+    },
     /// Nothing the feed acts on.
     Ignored,
 }
@@ -141,12 +205,12 @@ pub enum FeedFrame {
 ///
 /// This takes a single pubkey rather than a watch list, and the difference is
 /// not cosmetic. The relay scopes a REQ's history to the channels the
-/// *authenticated* pubkey can reach (`apply_access_scope_to_query`, `req.rs`)
-/// and re-checks that same connection's membership on live private-channel
-/// fan-out. So a filter naming agents A and B, sent over a connection
-/// authenticated as A, returns A's mentions and **silently drops B's
-/// private-channel ones** — no error, no CLOSED, just a feed that looks healthy
-/// and misses the wakes that matter most.
+/// *authenticated* pubkey can reach (`req.rs:88-107`) and re-checks that same
+/// connection's membership on live private-channel fan-out (`event.rs:99+`).
+/// So a filter naming agents A and B, sent over a connection authenticated as
+/// A, returns A's mentions and **silently drops B's private-channel ones** —
+/// no error, no CLOSED, just a feed that looks healthy and misses the wakes
+/// that matter most.
 ///
 /// §4 of the design records this as the confirmed constraint behind option (i):
 /// per-agent, identity-bound connections. Each watched agent therefore gets its
@@ -154,30 +218,322 @@ pub enum FeedFrame {
 /// state is per identity too, because one agent's EOSE says nothing about
 /// another's backlog.
 ///
-/// A single-value `#p` is also the only form the relay can push into SQL, so
-/// one agent's mentions cannot be starved out of a page by traffic addressed
-/// to another.
+/// [`FeedTransport`]'s subscribe methods are the only paths that reach a relay,
+/// and they build this from the identity they authenticated with rather than
+/// from an argument, so the filter and the connection cannot disagree.
 ///
-/// [`FeedTransport::subscribe`] is the only path that reaches a relay, and it
-/// builds this from the identity it authenticated with rather than from an
-/// argument, so the filter and the connection cannot disagree.
+/// `until` bounds a backfill page — see [`WakeReplay`]. `None` is the live
+/// subscription, which is the only form that carries fan-out.
 #[must_use]
-pub fn wake_filter(agent_pubkey: &str, since: u64) -> Value {
-    json!({
+pub fn wake_filter(agent_pubkey: &str, since: u64, until: Option<u64>) -> Value {
+    let mut filter = json!({
         "kinds": WAKE_TRIGGER_KINDS,
         "#p": [normalize_pubkey(agent_pubkey)],
         "since": since,
-    })
+        "limit": REPLAY_PAGE_LIMIT,
+    });
+    if let (Some(until), Some(object)) = (until, filter.as_object_mut()) {
+        object.insert("until".to_string(), json!(until));
+    }
+    filter
 }
 
-/// The full REQ frame for one agent's wake feed.
+/// The REQ frame opening one agent's **live** subscription.
+///
+/// Unbounded, so it is the one that receives fan-out. Issued once per
+/// connection and never replaced while that connection lasts.
 #[must_use]
-pub fn wake_req(agent_pubkey: &str, since: u64) -> Value {
+pub fn wake_live_req(agent_pubkey: &str, since: u64) -> Value {
     json!([
         "REQ",
-        WAKE_SUBSCRIPTION_ID,
-        wake_filter(agent_pubkey, since)
+        WAKE_LIVE_SUBSCRIPTION_ID,
+        wake_filter(agent_pubkey, since, None)
     ])
+}
+
+/// The REQ frame for one page of the **backfill** walk.
+#[must_use]
+pub fn wake_backfill_req(agent_pubkey: &str, since: u64, until: u64) -> Value {
+    json!([
+        "REQ",
+        WAKE_BACKFILL_SUBSCRIPTION_ID,
+        wake_filter(agent_pubkey, since, Some(until))
+    ])
+}
+
+/// The CLOSE frame retiring the backfill subscription once the walk is done.
+#[must_use]
+pub fn wake_backfill_close() -> Value {
+    json!(["CLOSE", WAKE_BACKFILL_SUBSCRIPTION_ID])
+}
+
+/// Rows to ask for per replay page.
+///
+/// Sent explicitly rather than left to the relay's default because the whole
+/// paging protocol turns on one question — *did the relay clamp this page, or
+/// did it run out of events?* — and NIP-01 has no flag for it. A page that
+/// comes back with exactly the number of rows we asked for is the only
+/// available evidence that there is more behind it.
+///
+/// Chosen below the relay's own ceiling (`DEFAULT_MAX_PAGE_LIMIT` = 1000 in
+/// `buzz-db`) rather than equal to it, so the value we compare against is one
+/// we set. Not pinned to that constant by a contract test on purpose: the
+/// deployment amendment in §4 settles that **we do not host the relay we talk
+/// to**, so its page cap is not this repo's constant and asserting equality
+/// would be false precision.
+///
+/// # The bound this leaves
+///
+/// A relay that silently applies a cap *smaller* than this would return short
+/// pages forever and replay would stop early believing it had drained. That is
+/// the same failure the single-REQ version had unconditionally, now needing a
+/// relay with a sub-500 cap to trigger, and it is visible: §5's runtime
+/// coverage-age alert is what catches it.
+pub const REPLAY_PAGE_LIMIT: u32 = 500;
+
+/// Ceiling on REQs issued for one connection's replay.
+///
+/// At [`REPLAY_PAGE_LIMIT`] rows a page this is 32,000 events, which is far
+/// past any real outage backlog for one agent's mentions. It exists so a relay
+/// that keeps answering "here is a full page" can never hold the feed in
+/// replay indefinitely — a waker stuck draining history is a waker answering
+/// nobody, which is worse than a truncated backfill it reports.
+pub const MAX_REPLAY_PAGES: u32 = 64;
+
+/// What one page of replay contained.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PageTally {
+    /// Rows the relay served on our subscription, whether or not the feed
+    /// could read them. This is what the relay's clamp counts.
+    count: u32,
+    /// Oldest `created_at` in the page, and so the bound for the next one.
+    /// `None` when no row in the page could be parsed.
+    oldest: Option<u64>,
+}
+
+/// What the caller should do once a page's EOSE arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayStep {
+    /// Issue the backfill REQ with these bounds. The backlog is **not**
+    /// drained, and the cursor's replay pin must stay held.
+    Backfill {
+        /// Unchanged for the whole replay — the floor from
+        /// [`CursorStore::resume`].
+        since: u64,
+        /// The inclusive upper bound for this page.
+        until: u64,
+    },
+    /// The stored backlog is drained. Close the backfill subscription; the
+    /// live one stays up.
+    Complete {
+        /// The walk stopped before reaching `since`. Everything older than the
+        /// last page it managed to read was never delivered and never will be:
+        /// re-issuing the same request returns the same rows.
+        truncated: bool,
+    },
+}
+
+/// Drains the stored backlog one page at a time, **on a subscription of its
+/// own** — the thing EOSE alone does not tell you, and the thing one
+/// subscription cannot do safely.
+///
+/// # Why EOSE is not the end of history
+///
+/// The relay clamps every historical filter to a page
+/// (`buzz-db::DEFAULT_MAX_PAGE_LIMIT`), orders it `created_at DESC, id ASC`,
+/// and then sends EOSE. So after an outage that accumulated more than one page
+/// of mentions, one `since` REQ delivers the *newest* page and EOSE says
+/// "stored events drained" about that page, not about history. Treating it as
+/// the latter releases the cursor's replay pin over events that were never
+/// delivered, and because the request is deterministic, repeating it returns
+/// the same newest page forever — older mentions skipped permanently and
+/// silently.
+///
+/// # Why the walk needs its own subscription id
+///
+/// Re-issuing a REQ under an id **replaces** that subscription, and a replaced
+/// subscription stops receiving fan-out. Paging on the live id therefore takes
+/// the feed off the air for the whole walk: every mention published while a
+/// `until`-bounded filter stands in its place matches no bounded page, and is
+/// left to be recovered by the historical query of whatever REQ comes next —
+/// which is itself capped at one page. Publish more than a page of mentions
+/// during the walk and the oldest of them is neither replayed nor delivered
+/// live, and the replay then completes and advances coverage over the hole.
+///
+/// So there are two subscriptions. [`WAKE_LIVE_SUBSCRIPTION_ID`] is unbounded,
+/// opened once, and never replaced — the relay registers a subscription for
+/// fan-out *before* running its historical query (`req.rs:239` precedes
+/// `req.rs:312`), so from the moment it is opened there is no interval it can
+/// miss. [`WAKE_BACKFILL_SUBSCRIPTION_ID`] carries the `until` bounds and is
+/// closed when the walk finishes. The live subscription's own stored page is
+/// what starts the walk: if it came back clamped, there is history behind it.
+///
+/// Duplicate deliveries between the two are the normal case, and
+/// [`CursorStore::admit`] already collapses them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeReplay {
+    since: u64,
+    phase: ReplayPhase,
+    page: PageTally,
+    pages_issued: u32,
+}
+
+/// Which page is draining, and so what the next EOSE means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPhase {
+    /// The live subscription's stored page is still arriving. A clamped page
+    /// here is the evidence that starts the backfill walk.
+    LiveBacklog,
+    /// The backfill subscription is walking down. The live subscription is up
+    /// and delivering fan-out throughout, so nothing published during the walk
+    /// depends on the walk to find it.
+    Backfill {
+        /// The inclusive bound the standing backfill page carries.
+        until: u64,
+    },
+    /// The backlog is drained. Only live traffic remains.
+    Done,
+}
+
+impl WakeReplay {
+    /// Start a replay at `since`, which the caller has already taken from
+    /// [`CursorStore::resume`].
+    ///
+    /// One per connection attempt: `since` is re-derived on reconnect, and the
+    /// page budget should be spent per connection rather than for the lifetime
+    /// of the process. The caller opens the live subscription first — that is
+    /// the page this begins by draining.
+    #[must_use]
+    pub fn new(since: u64) -> Self {
+        Self {
+            since,
+            phase: ReplayPhase::LiveBacklog,
+            page: PageTally::default(),
+            // The caller's live subscribe is page one.
+            pages_issued: 1,
+        }
+    }
+
+    /// The floor every page of this replay asks from.
+    #[must_use]
+    pub fn since(&self) -> u64 {
+        self.since
+    }
+
+    /// The bound the standing backfill page carries, or `None` when no backfill
+    /// subscription is open.
+    #[must_use]
+    pub fn backfill_until(&self) -> Option<u64> {
+        match self.phase {
+            ReplayPhase::Backfill { until } => Some(until),
+            ReplayPhase::LiveBacklog | ReplayPhase::Done => None,
+        }
+    }
+
+    /// Whether the stored backlog is drained and only live traffic remains.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        matches!(self.phase, ReplayPhase::Done)
+    }
+
+    /// Count one row the relay served, if it belongs to the page currently
+    /// draining.
+    ///
+    /// Rows the live subscription delivers *after* its own EOSE are live
+    /// traffic, not a page, and must not be tallied — otherwise a busy channel
+    /// during the walk would look like a clamped page and send the walk off
+    /// after history that is already covered.
+    ///
+    /// `created_at` is `None` for a row the feed could not read or would not
+    /// believe: it still consumed a row of the relay's page, so it counts, but
+    /// it contributes no bound to page on.
+    fn observe_row(&mut self, sub: WakeSubscription, created_at: Option<u64>) {
+        let counts = matches!(
+            (self.phase, sub),
+            (ReplayPhase::LiveBacklog, WakeSubscription::Live)
+                | (ReplayPhase::Backfill { .. }, WakeSubscription::Backfill)
+        );
+        if !counts {
+            return;
+        }
+
+        self.page.count = self.page.count.saturating_add(1);
+        if let Some(created_at) = created_at {
+            self.page.oldest = Some(match self.page.oldest {
+                Some(oldest) => oldest.min(created_at),
+                None => created_at,
+            });
+        }
+    }
+
+    /// Fold an EOSE and say whether the backlog is actually drained.
+    ///
+    /// Returns `None` for an EOSE that does not move the replay — the live
+    /// subscription's EOSE arrives once and only its first one matters, and a
+    /// backfill EOSE after the walk has finished is not ours to act on.
+    pub fn on_eose(&mut self, sub: WakeSubscription) -> Option<ReplayStep> {
+        let expected = match self.phase {
+            ReplayPhase::LiveBacklog => WakeSubscription::Live,
+            ReplayPhase::Backfill { .. } => WakeSubscription::Backfill,
+            ReplayPhase::Done => return None,
+        };
+        if sub != expected {
+            return None;
+        }
+
+        let page = std::mem::take(&mut self.page);
+        // The only evidence available that the relay clamped rather than ran
+        // out of rows — NIP-01 has no "there is more" flag.
+        let clamped = page.count >= REPLAY_PAGE_LIMIT;
+
+        if !clamped {
+            // The relay ran out of rows before it ran out of page: nothing
+            // older is behind this one.
+            return Some(self.finish(false));
+        }
+
+        let standing_bound = self.backfill_until();
+        match page.oldest {
+            // `until` is inclusive, so a full page whose oldest row sits on the
+            // bound we already asked for cannot advance — more than a page of
+            // events share that one second, and asking again returns them
+            // again. Refusing to loop is the only correct move.
+            Some(oldest)
+                if standing_bound != Some(oldest) && self.pages_issued < MAX_REPLAY_PAGES =>
+            {
+                self.phase = ReplayPhase::Backfill { until: oldest };
+                self.pages_issued = self.pages_issued.saturating_add(1);
+                Some(ReplayStep::Backfill {
+                    since: self.since,
+                    until: oldest,
+                })
+            }
+            // Out of page budget, stalled on a tied second, or a full page in
+            // which nothing parsed and so left no bound to page on.
+            _ => Some(self.finish(true)),
+        }
+    }
+
+    /// The backfill subscription went away before the walk finished.
+    ///
+    /// Not a reconnect: the live subscription is untouched and still the one
+    /// that matters, so the feed keeps working and the backlog is simply
+    /// reported as cut short. Returns `None` when no walk was in progress —
+    /// which is the ordinary case, because the relay answers the CLOSE the
+    /// caller sends on completion with a CLOSED of its own
+    /// (`handlers/close.rs`), and reading that echo as a failure would put the
+    /// feed into a reconnect loop on every clean replay.
+    pub fn on_backfill_closed(&mut self) -> Option<ReplayStep> {
+        match self.phase {
+            ReplayPhase::Backfill { .. } => Some(self.finish(true)),
+            ReplayPhase::LiveBacklog | ReplayPhase::Done => None,
+        }
+    }
+
+    fn finish(&mut self, truncated: bool) -> ReplayStep {
+        self.phase = ReplayPhase::Done;
+        ReplayStep::Complete { truncated }
+    }
 }
 
 /// Read a relay event into the fields a wake decision needs.
@@ -233,29 +589,42 @@ pub fn trigger_event_from_json(event: &Value) -> Option<Box<TriggerEvent>> {
 /// this module never wrote.
 #[must_use]
 pub fn classify(frame: &FeedFrame) -> FeedSignal {
-    match frame {
+    let subscription_id = match frame {
         FeedFrame::Event {
-            subscription_id,
-            event,
-        } if subscription_id == WAKE_SUBSCRIPTION_ID => trigger_event_from_json(event)
-            .map(FeedSignal::Trigger)
-            .unwrap_or(FeedSignal::Ignored),
-        FeedFrame::Eose { subscription_id } if subscription_id == WAKE_SUBSCRIPTION_ID => {
-            FeedSignal::ReplayComplete
+            subscription_id, ..
         }
-        FeedFrame::Closed {
-            subscription_id,
-            message,
-        } if subscription_id == WAKE_SUBSCRIPTION_ID => FeedSignal::Closed(message.clone()),
+        | FeedFrame::Eose { subscription_id }
+        | FeedFrame::Closed {
+            subscription_id, ..
+        }
+        | FeedFrame::Rejected {
+            subscription_id, ..
+        } => subscription_id,
+        FeedFrame::Other => return FeedSignal::Ignored,
+    };
+    let Some(sub) = WakeSubscription::from_id(subscription_id) else {
+        return FeedSignal::Ignored;
+    };
+
+    match frame {
+        FeedFrame::Event { event, .. } => {
+            trigger_event_from_json(event).map_or(FeedSignal::Unparsed { sub }, |event| {
+                FeedSignal::Trigger { sub, event }
+            })
+        }
+        FeedFrame::Eose { .. } => FeedSignal::ReplayComplete { sub },
+        FeedFrame::Closed { message, .. } => FeedSignal::Closed {
+            sub,
+            reason: message.clone(),
+        },
         FeedFrame::Rejected {
-            subscription_id,
-            event_id,
-            reason,
-        } if subscription_id == WAKE_SUBSCRIPTION_ID => FeedSignal::Rejected {
+            event_id, reason, ..
+        } => FeedSignal::Rejected {
+            sub,
             event_id: event_id.clone(),
             reason: reason.clone(),
         },
-        _ => FeedSignal::Ignored,
+        FeedFrame::Other => FeedSignal::Ignored,
     }
 }
 
@@ -298,18 +667,40 @@ pub trait FeedTransport {
     /// Establish (or re-establish) the connection and authenticate.
     fn connect(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
-    /// Issue the wake REQ for `since` under [`WAKE_SUBSCRIPTION_ID`].
+    /// Open the unbounded live subscription under
+    /// [`WAKE_LIVE_SUBSCRIPTION_ID`]. Issue this once per connection, before
+    /// anything else, and never re-issue it while the connection lasts.
     ///
-    /// The transport builds the filter from its **own** authenticated identity;
-    /// there is deliberately no way to hand it a pubkey. That is what makes the
-    /// authorization argument on [`wake_filter`] hold structurally rather than
-    /// by convention: the relay authorizes history and private-channel fan-out
-    /// against the connection's pubkey, so a filter naming anyone else is a
-    /// feed that quietly misses mentions.
-    fn subscribe(
+    /// Every subscribe method here builds its filter from the transport's
+    /// **own** authenticated identity; there is deliberately no way to hand one
+    /// a pubkey. That is what makes the authorization argument on
+    /// [`wake_filter`] hold structurally rather than by convention: the relay
+    /// authorizes history and private-channel fan-out against the connection's
+    /// pubkey, so a filter naming anyone else is a feed that quietly misses
+    /// mentions.
+    fn subscribe_live(
         &mut self,
         since: u64,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
+
+    /// Issue one page of the backfill walk under
+    /// [`WAKE_BACKFILL_SUBSCRIPTION_ID`].
+    ///
+    /// Re-issuing replaces the previous page rather than adding a subscription.
+    /// It must not share an id with the live subscription: replacing that one
+    /// would take the feed off the air for the whole walk — see [`WakeReplay`].
+    fn subscribe_backfill(
+        &mut self,
+        since: u64,
+        until: u64,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
+
+    /// Retire the backfill subscription once the walk is done.
+    ///
+    /// Idempotent by design: the caller sends this on every
+    /// [`FeedStep::ReplayComplete`], including the common case where the live
+    /// page was short and no backfill was ever opened.
+    fn close_backfill(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
     /// Next frame, or `None` if `timeout_secs` passed with the connection
     /// still healthy. A dropped connection is an `Err`, not `None`: the
@@ -364,9 +755,26 @@ pub enum FeedStep {
         /// Why verification failed.
         reason: String,
     },
-    /// The subscription is live; stored events are drained.
-    ReplayComplete,
-    /// The relay closed the subscription. The caller should reconnect.
+    /// The stored backlog has another page behind it. Call
+    /// [`FeedTransport::subscribe_backfill`] with these bounds; the replay is
+    /// **not** complete and the cursor's replay pin stays held. The live
+    /// subscription is untouched and keeps delivering throughout.
+    Backfill {
+        /// The unchanged replay floor.
+        since: u64,
+        /// The inclusive bound for this page.
+        until: u64,
+    },
+    /// The stored backlog is drained; only live traffic remains. Call
+    /// [`FeedTransport::close_backfill`], which is a no-op when no backfill was
+    /// ever opened.
+    ReplayComplete {
+        /// The walk stopped before reaching the floor — see
+        /// [`ReplayStep::Complete`]. The events behind the cut are gone for
+        /// good, so this is an operational alert, not a debug detail.
+        truncated: bool,
+    },
+    /// The relay closed one of our subscriptions. The caller should reconnect.
     Closed(String),
 }
 
@@ -376,17 +784,25 @@ pub enum FeedStep {
 /// happens to the cursor for each kind of frame — is exercised without a
 /// socket.
 ///
+/// `replay` is folded here too, because whether an EOSE ends the replay depends
+/// on how many rows the page before it carried — see [`WakeReplay`]. Every row
+/// the relay serves on either subscription must reach this function, so pass
+/// unparseable and rejected frames as well as good ones; they count against the
+/// relay's page just the same.
+///
 /// # Errors
 /// Propagates [`crate::cursor::CursorError`] from the durable claim. A cursor
 /// that cannot be made durable is fatal by design: continuing would process
 /// events the next restart has no record of.
 pub fn step(
     cursor: &mut CursorStore,
+    replay: &mut WakeReplay,
     frame: &FeedFrame,
     now: u64,
 ) -> Result<FeedStep, crate::cursor::CursorError> {
     match classify(frame) {
-        FeedSignal::Trigger(event) => {
+        FeedSignal::Trigger { sub, event } => {
+            replay.observe_row(sub, Some(event.created_at));
             let admission = cursor.admit(&event.id, event.created_at, now)?;
             match admission {
                 Admission::Fresh => Ok(FeedStep::Admitted {
@@ -400,12 +816,55 @@ pub fn step(
                 Admission::Duplicate => Ok(FeedStep::Nothing),
             }
         }
-        FeedSignal::ReplayComplete => {
-            cursor.end_replay(now)?;
-            Ok(FeedStep::ReplayComplete)
+        FeedSignal::Unparsed { sub } => {
+            replay.observe_row(sub, None);
+            Ok(FeedStep::Nothing)
         }
-        FeedSignal::Rejected { event_id, reason } => Ok(FeedStep::Rejected { event_id, reason }),
-        FeedSignal::Closed(reason) => Ok(FeedStep::Closed(reason)),
+        // A forged event's `created_at` is as unbelievable as its author, so it
+        // contributes no paging bound — but it did occupy a row of the page.
+        FeedSignal::Rejected {
+            sub,
+            event_id,
+            reason,
+        } => {
+            replay.observe_row(sub, None);
+            Ok(FeedStep::Rejected { event_id, reason })
+        }
+        FeedSignal::ReplayComplete { sub } => match replay.on_eose(sub) {
+            Some(ReplayStep::Backfill { since, until }) => Ok(FeedStep::Backfill { since, until }),
+            // Coverage advances even on a truncated replay. Leaving the pin
+            // held would be the worse failure: it never clears by itself, so
+            // the checkpoint would stay stuck at this moment for the life of
+            // the process and every later restart would report `GapTooOld`.
+            // Ending it and saying so keeps the loss bounded and visible.
+            // (Alex settled this in round 3, on condition the daemon treats
+            // `truncated` as an operational incident.)
+            Some(ReplayStep::Complete { truncated }) => {
+                cursor.end_replay(now)?;
+                Ok(FeedStep::ReplayComplete { truncated })
+            }
+            // An EOSE that does not move the replay: the live subscription's
+            // second EOSE, or a backfill one after the walk finished.
+            None => Ok(FeedStep::Nothing),
+        },
+        // Only the live subscription going away is a reconnect. The backfill
+        // one is expendable: the caller closes it itself on every completion,
+        // and the relay answers that with a CLOSED — treating either as fatal
+        // would make a clean replay reconnect forever.
+        FeedSignal::Closed {
+            sub: WakeSubscription::Live,
+            reason,
+        } => Ok(FeedStep::Closed(reason)),
+        FeedSignal::Closed {
+            sub: WakeSubscription::Backfill,
+            ..
+        } => match replay.on_backfill_closed() {
+            Some(ReplayStep::Complete { truncated }) => {
+                cursor.end_replay(now)?;
+                Ok(FeedStep::ReplayComplete { truncated })
+            }
+            _ => Ok(FeedStep::Nothing),
+        },
         FeedSignal::Ignored => Ok(FeedStep::Nothing),
     }
 }
@@ -415,12 +874,12 @@ mod tests {
     use super::*;
     use buzz_core::kind::{KIND_REACTION, KIND_STREAM_MESSAGE};
 
-    fn event_json(id: &str, kind: u32, p_tags: &[&str]) -> Value {
+    fn event_json_at(id: &str, kind: u32, p_tags: &[&str], created_at: u64) -> Value {
         json!({
             "id": id,
             "pubkey": "aa".repeat(32),
             "kind": kind,
-            "created_at": 1_700_000_000_u64,
+            "created_at": created_at,
             "tags": p_tags
                 .iter()
                 .map(|p| json!(["p", p]))
@@ -429,11 +888,15 @@ mod tests {
         })
     }
 
+    fn event_json(id: &str, kind: u32, p_tags: &[&str]) -> Value {
+        event_json_at(id, kind, p_tags, 1_700_000_000)
+    }
+
     #[test]
     fn the_filter_always_names_kinds() {
         // Without `kinds` the relay's p-gate answers 403, which reads as an
         // auth failure rather than a bad filter. This is the guard for that.
-        let filter = wake_filter(&"ab".repeat(32), 42);
+        let filter = wake_filter(&"ab".repeat(32), 42, None);
         let kinds = filter["kinds"].as_array().expect("kinds must be present");
         assert_eq!(kinds.len(), WAKE_TRIGGER_KINDS.len());
         assert_eq!(filter["since"], 42);
@@ -446,7 +909,7 @@ mod tests {
         // fan-out to the *connection's* pubkey, so a second `#p` value in one
         // filter is a mention that silently never arrives. `wake_filter` takes
         // one pubkey and there is no overload that takes a list.
-        let filter = wake_filter(&format!("  {}  ", "AB".repeat(32)), 0);
+        let filter = wake_filter(&format!("  {}  ", "AB".repeat(32)), 0, None);
         let targets = filter["#p"].as_array().expect("#p must be present");
         assert_eq!(targets.len(), 1, "one feed watches exactly one agent");
         assert_eq!(
@@ -454,6 +917,23 @@ mod tests {
             "ab".repeat(32),
             "the pubkey is normalized to the one comparison form"
         );
+    }
+
+    #[test]
+    fn the_filter_bounds_a_page_only_when_paging() {
+        // `until` is what makes a filter historical, and a historical filter
+        // carries no live traffic — so the unbounded form must not grow one by
+        // accident.
+        let live = wake_filter(&"ab".repeat(32), 10, None);
+        assert!(
+            live.get("until").is_none(),
+            "the live subscription must not be bounded"
+        );
+        assert_eq!(live["limit"], REPLAY_PAGE_LIMIT);
+
+        let page = wake_filter(&"ab".repeat(32), 10, Some(99));
+        assert_eq!(page["until"], 99);
+        assert_eq!(page["since"], 10, "the floor never moves while paging");
     }
 
     #[test]
@@ -466,6 +946,25 @@ mod tests {
             event: event_json("ff".repeat(32).as_str(), KIND_STREAM_MESSAGE, &[]),
         };
         assert_eq!(classify(&frame), FeedSignal::Ignored);
+    }
+
+    #[test]
+    fn an_unreadable_event_on_our_subscription_is_not_the_same_as_a_foreign_frame() {
+        // Both end up waking nobody, but only one of them consumed a row of
+        // the relay's page — and the page count is what decides whether the
+        // replay keeps going.
+        let mut broken = event_json(&"ff".repeat(32), KIND_STREAM_MESSAGE, &[]);
+        broken.as_object_mut().expect("object").remove("created_at");
+        let frame = FeedFrame::Event {
+            subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
+            event: broken,
+        };
+        assert_eq!(
+            classify(&frame),
+            FeedSignal::Unparsed {
+                sub: WakeSubscription::Live
+            }
+        );
     }
 
     #[test]
@@ -527,7 +1026,7 @@ mod tests {
         let now = 1_700_000_000;
         let mut cursor = cursor_at(&dir, now);
         let frame = FeedFrame::Event {
-            subscription_id: WAKE_SUBSCRIPTION_ID.to_string(),
+            subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
             event: event_json(
                 &"ff".repeat(32),
                 KIND_STREAM_MESSAGE,
@@ -535,12 +1034,13 @@ mod tests {
             ),
         };
 
-        let first = step(&mut cursor, &frame, now).expect("first admission");
+        let mut replay = WakeReplay::new(now);
+        let first = step(&mut cursor, &mut replay, &frame, now).expect("first admission");
         assert!(
             matches!(first, FeedStep::Admitted { .. }),
             "the first delivery is the one that does the work"
         );
-        let second = step(&mut cursor, &frame, now).expect("second admission");
+        let second = step(&mut cursor, &mut replay, &frame, now).expect("second admission");
         assert!(
             matches!(second, FeedStep::Nothing),
             "the same event delivered again must not be claimed twice"
@@ -548,12 +1048,15 @@ mod tests {
     }
 
     #[test]
-    fn eose_ends_the_replay_and_advances_coverage() {
-        // EOSE is the only proof that the *stored* backlog is drained, which is
-        // what lets the checkpoint stop being pinned to the replay floor.
+    fn eose_on_a_short_page_ends_the_replay_and_advances_coverage() {
+        // EOSE on an *unbounded, unclamped* page is the proof that the stored
+        // backlog is drained, which is what lets the checkpoint stop being
+        // pinned to the replay floor. The qualifiers matter — see the paging
+        // tests below for the EOSE that proves nothing.
         let dir = tempfile::tempdir().expect("tempdir");
         let now = 1_700_000_000;
         let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now);
         // The pin only exists while a replay is draining, and `resume` is what
         // sets it — the loop's own order: resume, REQ, then EOSE.
         let _ = cursor.resume(now);
@@ -561,14 +1064,18 @@ mod tests {
 
         let step_result = step(
             &mut cursor,
+            &mut replay,
             &FeedFrame::Eose {
-                subscription_id: WAKE_SUBSCRIPTION_ID.to_string(),
+                subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
             },
             now + 30,
         )
         .expect("end_replay persists");
 
-        assert!(matches!(step_result, FeedStep::ReplayComplete));
+        assert!(matches!(
+            step_result,
+            FeedStep::ReplayComplete { truncated: false }
+        ));
         assert!(
             cursor.state().covered_through_secs > before,
             "EOSE is evidence the feed is current, so coverage must advance"
@@ -576,18 +1083,262 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_event_is_surfaced_and_never_admitted() {
-        // The transport refuses to project an event whose signature does not
-        // check out, and the feed reports it rather than dropping it quietly:
-        // a relay serving forged events is an incident, not a no-op.
+    fn a_clamped_live_page_starts_a_backfill_on_its_own_subscription() {
+        // The relay clamps a historical filter to a page and orders it
+        // newest-first, so EOSE after a full page means "this page is drained",
+        // not "history is". Releasing the cursor's replay pin there skips the
+        // rest permanently: the request is deterministic, so repeating it
+        // returns the same newest page.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 2_000_000_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now - 10_000);
+        let _ = cursor.resume(now);
+        let covered_before = cursor.state().covered_through_secs;
+
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_LIVE_SUBSCRIPTION_ID,
+            REPLAY_PAGE_LIMIT,
+            |row| now - u64::from(row),
+            0,
+        );
+
+        let oldest = now - u64::from(REPLAY_PAGE_LIMIT - 1);
+        match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_LIVE_SUBSCRIPTION_ID),
+            now,
+        )
+        .expect("folds")
+        {
+            FeedStep::Backfill { since, until } => {
+                assert_eq!(since, now - 10_000, "the floor must not move while paging");
+                assert_eq!(until, oldest, "the walk starts at this page's oldest row");
+            }
+            other => panic!("a clamped live page has history behind it, got {other:?}"),
+        }
+        assert_eq!(
+            cursor.state().covered_through_secs,
+            covered_before,
+            "coverage must not advance while the backlog is still draining"
+        );
+
+        // A short backfill page drains the backlog. No closing unbounded REQ:
+        // the live subscription was never replaced, so the feed is already on
+        // live traffic and there is nothing to return to.
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_BACKFILL_SUBSCRIPTION_ID,
+            2,
+            |row| oldest - u64::from(row),
+            9_000,
+        );
+        match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_BACKFILL_SUBSCRIPTION_ID),
+            now + 5,
+        )
+        .expect("folds")
+        {
+            FeedStep::ReplayComplete { truncated: false } => {}
+            other => panic!("a short backfill page ends the walk, got {other:?}"),
+        }
+        assert!(
+            cursor.state().covered_through_secs > covered_before,
+            "coverage advances once, at the end of the whole replay"
+        );
+    }
+
+    #[test]
+    fn mentions_arriving_during_the_walk_are_admitted_from_the_live_subscription() {
+        // The finding this pins, and the reason there are two subscription ids
+        // at all. Re-issuing a REQ under an id *replaces* that subscription and
+        // a replaced subscription stops receiving fan-out — so paging on the
+        // live id takes the feed off the air for the whole walk. Anything
+        // published in that window matches no bounded page, and the next
+        // unbounded query is itself capped at one page, so past a page of them
+        // the oldest is neither replayed nor delivered. The replay would then
+        // complete and advance coverage straight over the hole.
+        //
+        // With the walk on its own id the live subscription is never replaced,
+        // so those mentions arrive as ordinary fan-out while the walk runs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 2_000_000_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now - 10_000);
+        let _ = cursor.resume(now);
+
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_LIVE_SUBSCRIPTION_ID,
+            REPLAY_PAGE_LIMIT,
+            |row| now - u64::from(row),
+            0,
+        );
+        let bound = match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_LIVE_SUBSCRIPTION_ID),
+            now,
+        )
+        .expect("folds")
+        {
+            FeedStep::Backfill { until, .. } => until,
+            other => panic!("expected a backfill, got {other:?}"),
+        };
+
+        // While the bounded page is standing, more than a page of new mentions
+        // is published — all newer than the bound, so no backfill page can
+        // carry them.
+        let arrivals = REPLAY_PAGE_LIMIT + 1;
+        let mut admitted = 0_u32;
+        for row in 0..arrivals {
+            let frame = FeedFrame::Event {
+                subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
+                event: event_json_at(
+                    &format!("{:064x}", 500_000 + row),
+                    KIND_STREAM_MESSAGE,
+                    &["bb".repeat(32).as_str()],
+                    now + 1 + u64::from(row),
+                ),
+            };
+            if matches!(
+                step(&mut cursor, &mut replay, &frame, now).expect("admits"),
+                FeedStep::Admitted { .. }
+            ) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, arrivals,
+            "every mention published during the walk must be admitted live, \
+             including the {arrivals}th that no capped historical page could \
+             have recovered"
+        );
+
+        // Those live arrivals are not a page: tallying them would look like a
+        // clamp and send the walk after history it has already covered.
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_BACKFILL_SUBSCRIPTION_ID,
+            2,
+            |row| bound - u64::from(row),
+            9_000,
+        );
+        match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_BACKFILL_SUBSCRIPTION_ID),
+            now + 5,
+        )
+        .expect("folds")
+        {
+            FeedStep::ReplayComplete { truncated: false } => {}
+            other => panic!("the walk drained cleanly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closing_the_backfill_is_not_a_reconnect() {
+        // The caller closes the backfill subscription on every completion, and
+        // the relay answers a CLOSE with a CLOSED of its own
+        // (`handlers/close.rs`). Reading that echo as a failed subscription
+        // would put a perfectly clean replay into a reconnect loop.
         let dir = tempfile::tempdir().expect("tempdir");
         let now = 1_700_000_000;
         let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now);
+        let _ = cursor.resume(now);
+
+        // Drain the live page short, so the replay is already complete.
+        step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_LIVE_SUBSCRIPTION_ID),
+            now,
+        )
+        .expect("folds");
+        assert!(replay.is_complete());
+
+        let echo = FeedFrame::Closed {
+            subscription_id: WAKE_BACKFILL_SUBSCRIPTION_ID.to_string(),
+            message: String::new(),
+        };
+        match step(&mut cursor, &mut replay, &echo, now).expect("folds") {
+            FeedStep::Nothing => {}
+            other => panic!("the CLOSE echo must be inert, got {other:?}"),
+        }
+
+        // The live subscription going away is still a reconnect.
+        let live_closed = FeedFrame::Closed {
+            subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
+            message: "restricted: not authorized".to_string(),
+        };
+        match step(&mut cursor, &mut replay, &live_closed, now).expect("folds") {
+            FeedStep::Closed(reason) => assert!(reason.contains("restricted")),
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_backfill_closed_mid_walk_ends_the_replay_short_rather_than_reconnecting() {
+        // The live subscription is the one that matters; losing the walk costs
+        // history, not the feed. Report the cut and carry on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 2_000_000_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now - 10_000);
+        let _ = cursor.resume(now);
+
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_LIVE_SUBSCRIPTION_ID,
+            REPLAY_PAGE_LIMIT,
+            |row| now - u64::from(row),
+            0,
+        );
+        step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_LIVE_SUBSCRIPTION_ID),
+            now,
+        )
+        .expect("folds");
+
+        let closed = FeedFrame::Closed {
+            subscription_id: WAKE_BACKFILL_SUBSCRIPTION_ID.to_string(),
+            message: "error: too many subscriptions".to_string(),
+        };
+        match step(&mut cursor, &mut replay, &closed, now + 5).expect("folds") {
+            FeedStep::ReplayComplete { truncated: true } => {}
+            other => panic!("a lost walk is a truncated replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forged_event_is_surfaced_and_never_admitted() {
+        // The transport refuses to project an event whose signature does not
+        // check out. It still occupied a row of the relay's page, so it counts
+        // toward paging — but it contributes no timestamp to page on, because
+        // a forged `created_at` is exactly as trustworthy as its forged author.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 1_700_000_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now);
 
         let step_result = step(
             &mut cursor,
+            &mut replay,
             &FeedFrame::Rejected {
-                subscription_id: WAKE_SUBSCRIPTION_ID.to_string(),
+                subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
                 event_id: "ff".repeat(32),
                 reason: "invalid signature".to_string(),
             },
@@ -606,6 +1357,90 @@ mod tests {
         );
     }
 
+    fn eose(subscription_id: &str) -> FeedFrame {
+        FeedFrame::Eose {
+            subscription_id: subscription_id.to_string(),
+        }
+    }
+
+    /// Feed `rows` events down `subscription_id`, timestamped by `stamp` and
+    /// given distinct ids via `salt`, exactly as the relay would serve a page.
+    fn deliver_page(
+        cursor: &mut CursorStore,
+        replay: &mut WakeReplay,
+        subscription_id: &str,
+        rows: u32,
+        stamp: impl Fn(u32) -> u64,
+        salt: u32,
+    ) {
+        for row in 0..rows {
+            let frame = FeedFrame::Event {
+                subscription_id: subscription_id.to_string(),
+                event: event_json_at(
+                    &format!("{:064x}", row + salt),
+                    KIND_STREAM_MESSAGE,
+                    &["bb".repeat(32).as_str()],
+                    stamp(row),
+                ),
+            };
+            step(cursor, replay, &frame, 2_000_000_000).expect("admits");
+        }
+    }
+
+    #[test]
+    fn paging_stops_rather_than_looping_on_a_tied_second() {
+        // `until` is inclusive. If more than a page of events share one second,
+        // the next page's oldest row is the bound we just asked for and no
+        // progress is possible. Re-requesting forever would hold the feed in
+        // replay and answer nobody, so it stops and reports the cut.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 2_000_000_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now - 10_000);
+        let _ = cursor.resume(now);
+
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_LIVE_SUBSCRIPTION_ID,
+            REPLAY_PAGE_LIMIT,
+            |_| now - 1,
+            0,
+        );
+        match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_LIVE_SUBSCRIPTION_ID),
+            now,
+        )
+        .expect("folds")
+        {
+            FeedStep::Backfill { until, .. } => assert_eq!(until, now - 1),
+            other => panic!("expected a backfill, got {other:?}"),
+        }
+
+        // The backfill page is the same second again — `until` cannot advance.
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_BACKFILL_SUBSCRIPTION_ID,
+            REPLAY_PAGE_LIMIT,
+            |_| now - 1,
+            REPLAY_PAGE_LIMIT,
+        );
+        match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_BACKFILL_SUBSCRIPTION_ID),
+            now + 5,
+        )
+        .expect("folds")
+        {
+            FeedStep::ReplayComplete { truncated: true } => {}
+            other => panic!("a stalled walk must report the cut, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_closed_subscription_is_not_mistaken_for_a_quiet_one() {
         // CLOSED and idle look alike from the loop's perspective and must not:
@@ -613,11 +1448,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let now = 1_700_000_000;
         let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now);
 
         let step_result = step(
             &mut cursor,
+            &mut replay,
             &FeedFrame::Closed {
-                subscription_id: WAKE_SUBSCRIPTION_ID.to_string(),
+                subscription_id: WAKE_LIVE_SUBSCRIPTION_ID.to_string(),
                 message: "restricted: not authorized".to_string(),
             },
             now,

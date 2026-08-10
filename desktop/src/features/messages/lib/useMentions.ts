@@ -40,6 +40,7 @@ import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { useManagedAgentMentionMaps } from "./managedAgentMentionMaps";
 import { hasMention } from "./hasMention";
+import { extractMentionPubkeys } from "./extractMentionPubkeys";
 import { useDraftMentionRouting } from "./useDraftMentionRouting";
 import { useMentionAgentPubkeys } from "./useMentionAgentPubkeys";
 import { rankMentionCandidates } from "./mentionRanking";
@@ -78,6 +79,7 @@ function appendUniqueName(current: string[], name: string): string[] {
     ? current
     : [...current, name];
 }
+
 export function useMentions(
   channelId: string | null,
   externalMembers?: ChannelMember[],
@@ -752,43 +754,14 @@ export function useMentions(
     [],
   );
 
-  const extractMentionPubkeys = React.useCallback(
-    (text: string): string[] => {
-      const pubkeys: string[] = [];
-      const selectedDisplayNames = new Set(
-        [
-          ...mentionMapRef.current.keys(),
-          ...personaMentionMapRef.current.keys(),
-        ].map((name) => name.trim().toLowerCase()),
-      );
-
-      for (const [displayName, pubkey] of mentionMapRef.current) {
-        if (hasMention(text, displayName)) {
-          pubkeys.push(pubkey);
-        }
-      }
-
-      for (const candidate of mentionCandidates) {
-        if (!candidate.pubkey) {
-          continue;
-        }
-        if (!candidate.isMember) {
-          continue;
-        }
-        if (pubkeys.includes(candidate.pubkey)) {
-          continue;
-        }
-        const name = candidate.displayName;
-        if (name && selectedDisplayNames.has(name.trim().toLowerCase())) {
-          continue;
-        }
-        if (name && hasMention(text, name)) {
-          pubkeys.push(candidate.pubkey);
-        }
-      }
-
-      return [...new Set(pubkeys)];
-    },
+  const extractMentionPubkeysForCurrentMentions = React.useCallback(
+    (text: string): string[] =>
+      extractMentionPubkeys({
+        text,
+        selectedMentions: mentionMapRef.current,
+        selectedDisplayNames: personaMentionMapRef.current.keys(),
+        memberCandidates: mentionCandidates,
+      }),
     [mentionCandidates],
   );
 
@@ -933,7 +906,7 @@ export function useMentions(
     cancelMentionAutocomplete,
     clearMentions,
     extractMentionPersonas,
-    extractMentionPubkeys,
+    extractMentionPubkeys: extractMentionPubkeysForCurrentMentions,
     getDraftMentionRefs,
     getMentionDisplayName,
     handleMentionKeyDown,

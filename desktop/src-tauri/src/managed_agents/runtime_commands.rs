@@ -236,6 +236,46 @@ pub fn start_managed_agent_runtime(
     start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
 }
 
+/// Refuse to start an agent on a relay that is not its assigned community.
+///
+/// The runtime is keyed on `(pubkey, relay_url)`, so the same identity can hold
+/// a separate harness per relay. Assigning `community_relay_url` scopes which
+/// community *renders* an agent, but on its own it does not scope the runtime:
+/// connecting to another community would start a second harness for the same
+/// identity on a relay where that agent has no row in the UI. The result is an
+/// agent that is live and answering in a community that insists it does not
+/// exist there — invisible, and unstoppable from the app, because stopping is
+/// driven from the row that was never drawn.
+///
+/// Applied on the start path only. `stop_managed_agent_runtime` stays
+/// unguarded on purpose: an instance already running off-home must remain
+/// killable, and a guard there would strand exactly the processes this is
+/// meant to prevent.
+///
+/// An agent with no `community_relay_url` is unassigned and may run anywhere,
+/// which is the pre-assignment behaviour and what keeps this backward
+/// compatible.
+fn home_community_allows(
+    record: &super::ManagedAgentRecord,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<(), String> {
+    let Some(home) = record.community_relay_url.as_deref() else {
+        return Ok(());
+    };
+    // Normalize both sides: the stored value is whatever was assigned, while
+    // the key is already canonical, so a trailing slash alone must not read as
+    // a different community.
+    let home =
+        buzz_core_pkg::relay::normalize_relay_url(home).map_err(|error| error.to_string())?;
+    if home == key.relay_url {
+        return Ok(());
+    }
+    Err(format!(
+        "{} belongs to {home} and will not be started on {}",
+        record.name, key.relay_url
+    ))
+}
+
 fn start_pair(
     pubkey: String,
     relay_url: String,
@@ -264,6 +304,7 @@ fn start_pair(
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    home_community_allows(record, &key)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -712,5 +753,69 @@ mod tests {
             Some("unexpected"),
         );
         assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
+    }
+
+    // ── home_community_allows ───────────────────────────────────────────────
+
+    const HOME: &str = "wss://openvelvet.communities.buzz.xyz";
+    const OTHER: &str = "wss://devenish.communities.buzz.xyz";
+
+    fn record_with_home(home: Option<&str>) -> super::super::ManagedAgentRecord {
+        let mut record = record_with_relay(HOME);
+        record.community_relay_url = home.map(str::to_owned);
+        record.name = "Will".into();
+        record
+    }
+
+    fn key_on(relay_url: &str) -> ManagedAgentRuntimeKey {
+        ManagedAgentRuntimeKey::new("aa".repeat(32), relay_url).expect("valid key")
+    }
+
+    #[test]
+    fn an_unassigned_agent_may_run_on_any_relay() {
+        // Pre-assignment behaviour: no home means no restriction. Tightening
+        // this would strand every agent created before community scoping.
+        let record = record_with_home(None);
+        assert!(home_community_allows(&record, &key_on(HOME)).is_ok());
+        assert!(home_community_allows(&record, &key_on(OTHER)).is_ok());
+    }
+
+    #[test]
+    fn an_assigned_agent_may_run_on_its_own_community() {
+        let record = record_with_home(Some(HOME));
+        assert!(home_community_allows(&record, &key_on(HOME)).is_ok());
+    }
+
+    #[test]
+    fn an_assigned_agent_is_refused_on_another_community() {
+        // The regression: connecting to another community used to start a
+        // second harness for this identity, with no row in that community's UI
+        // to stop it from.
+        let record = record_with_home(Some(HOME));
+        let error = home_community_allows(&record, &key_on(OTHER))
+            .expect_err("must refuse a relay that is not the agent's home");
+        // The message has to name both ends — "cannot start" alone leaves you
+        // guessing which community is the blocker, which is the failure mode
+        // that made this expensive to diagnose in the first place.
+        assert!(error.contains("Will"), "{error}");
+        assert!(error.contains("openvelvet"), "{error}");
+        assert!(error.contains("devenish"), "{error}");
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_a_different_community() {
+        // The stored home is whatever was assigned; the key is already
+        // canonical. Comparing raw strings would refuse an agent from its own
+        // community over punctuation.
+        let record = record_with_home(Some(&format!("{HOME}/")));
+        assert!(home_community_allows(&record, &key_on(HOME)).is_ok());
+    }
+
+    #[test]
+    fn an_unparseable_home_is_refused_rather_than_ignored() {
+        // Fail closed: a home we cannot normalize must not silently widen into
+        // "runs anywhere", which is the exact bug this guard exists to stop.
+        let record = record_with_home(Some("not a relay url"));
+        assert!(home_community_allows(&record, &key_on(HOME)).is_err());
     }
 }

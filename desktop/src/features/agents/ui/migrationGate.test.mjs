@@ -116,7 +116,7 @@ test("editing the current provider's settings is a change", () => {
   // The regression: `set_managed_agent_backend` accepts same-provider with a
   // new config as a real transition (save, then redeploy), and the dialog
   // renders those settings as editable fields. Comparing only the provider id
-  // left "Move agent" disabled and the supported path unreachable.
+  // left "Migrate agent" disabled and the supported path unreachable.
   assert.equal(
     backendUnchanged(
       { type: "provider", id: "sprites", config: { idle_seconds: 7200 } },

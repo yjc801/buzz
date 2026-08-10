@@ -8,7 +8,7 @@ import { summarizeRunOn } from "./runOnSummary";
  * Read-only *here* on purpose: `UpdateManagedAgentRequest` deliberately has no
  * backend field, so an ordinary save can never change where an agent runs.
  * Moving one is its own operation — `set_managed_agent_backend`, surfaced as
- * the "Move…" item in the profile panel's settings menu — because it carries
+ * the "Migrate" item in the profile panel's settings menu — because it carries
  * preconditions an edit dialog has no way to enforce (nothing may be running,
  * and leaving a provider requires confirming by presence that the remote
  * harness stopped).
@@ -70,7 +70,7 @@ export function RunOnSummarySection({
       )}
       <p className="text-xs text-muted-foreground">
         These are the settings saved when the agent was created. To run this
-        agent somewhere else, use &ldquo;Move…&rdquo; in its profile settings
+        agent somewhere else, use &ldquo;Migrate&rdquo; in its profile settings
         menu — it keeps the same identity.
       </p>
     </div>

@@ -114,6 +114,15 @@ pub enum FeedFrame {
 /// Watched pubkeys are normalized and de-duplicated. A duplicate would be
 /// harmless to the relay but makes the filter's size a poor proxy for how many
 /// agents are actually watched, which is the number an operator reads.
+///
+/// # Callers must not subscribe with nothing watched
+///
+/// An empty `watched` yields `"#p": []`, which asks the relay for events
+/// p-tagging nobody. That is a subscription that can never deliver, and it
+/// would sit there looking healthy. A waker with no enrolled agents has
+/// nothing to do and should not open a feed at all; this function does not
+/// second-guess that, because "no agents yet" and "the enrolment file failed
+/// to load" are the caller's to tell apart and they are not the same incident.
 #[must_use]
 pub fn wake_filter(watched: &[String], since: u64) -> Value {
     let mut seen = std::collections::BTreeSet::new();
@@ -262,6 +271,14 @@ pub enum FeedStep {
     /// A fresh trigger, already claimed in the cursor. The caller must reach a
     /// terminal outcome and then call [`CursorStore::complete`] — or
     /// [`CursorStore::abandon`] — or the checkpoint stays pinned to it.
+    ///
+    /// **Including when the decision is to do nothing.** The feed admits every
+    /// event the relay delivers on our filter, and most of them will wake
+    /// nobody: `select_wake_candidates` refuses agent-authored events and
+    /// authors outside an agent's respond-to policy. "Refused" is a terminal
+    /// outcome like any other, and an event left in flight because it was
+    /// uninteresting pins the checkpoint exactly as hard as one left in flight
+    /// because it crashed.
     Admitted {
         /// The event to decide on.
         event: Box<TriggerEvent>,
@@ -365,6 +382,20 @@ mod tests {
             "the same key in three spellings is one target, and blank is none"
         );
         assert_eq!(targets[0], "ab".repeat(32));
+    }
+
+    #[test]
+    fn watching_nothing_produces_a_filter_that_can_never_deliver() {
+        // Pinned so the property is visible rather than discovered in
+        // production: this filter is not an error the relay rejects, it is a
+        // healthy-looking subscription that returns nothing forever. The daemon
+        // must refuse to open a feed with no enrolled agents.
+        let filter = wake_filter(&[], 0);
+        assert_eq!(
+            filter["#p"].as_array().expect("#p is present").len(),
+            0,
+            "nothing watched must not silently widen into everything"
+        );
     }
 
     #[test]

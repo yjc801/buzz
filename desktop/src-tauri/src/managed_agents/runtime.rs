@@ -20,6 +20,9 @@ pub(crate) use path::{compose_path_entries, should_skip_claude_executable, shoul
 
 pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
 
+mod log_filter;
+use log_filter::child_rust_log_filter;
+
 mod metadata;
 pub(crate) use metadata::{
     apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
@@ -910,51 +913,6 @@ pub fn spawn_agent_child(
         adapter_availability: spawned_adapter_availability,
         start_nonce,
     })
-}
-
-/// Log targets the spawned harness is asked to emit.
-///
-/// `buzz_acp=info` alone is not enough, and the reason is easy to miss:
-/// `EnvFilter` matches on a span's *target*, which defaults to the module path
-/// — but buzz-acp sets an explicit `target:` on its diagnostic lines, and an
-/// explicit target **replaces** the module path rather than extending it. None
-/// of those targets begin with `buzz_acp`, so none of them ever matched.
-///
-/// That silenced 19 targets under five roots: `pool::` (prompt, session,
-/// model, permission, metrics), `acp::` (wire, update, usage, permission,
-/// tool, cancel, thought, stream, session, plan, init), `canvas::fetch`,
-/// `engram::core`, and `observer`. Among the casualties were the only records
-/// of session rotation ("created session … for channel …") and of a
-/// model-override miss — so two questions that logs exist to answer were
-/// unanswerable from the log.
-///
-/// `info` is deliberate rather than incidental: across these targets the call
-/// sites are ~11 `debug`, 7 `info`, 6 `warn`, 2 `error`. At `info` the debug
-/// lines stay off — including the chatty `acp::wire` frame dumps — so this
-/// surfaces the lines worth reading without inflating every agent's log.
-///
-/// Local agents only. A provider-backed agent's harness is launched by its
-/// backend from a separate env, never through this path, and
-/// `get_managed_agent_log` refuses remote agents outright.
-const CHILD_LOG_TARGETS: &str =
-    "buzz_acp=info,pool=info,acp=info,engram=info,canvas=info,observer=info";
-
-fn child_rust_log_filter() -> String {
-    child_rust_log_filter_from(std::env::var("RUST_LOG").ok().as_deref())
-}
-
-/// Env-free half, so the rule is testable without mutating process state that
-/// parallel tests share.
-fn child_rust_log_filter_from(existing: Option<&str>) -> String {
-    match existing {
-        // An operator who names buzz_acp explicitly owns the whole filter —
-        // don't append and quietly override what they asked for.
-        Some(existing) if existing.contains("buzz_acp") => existing.to_string(),
-        Some(existing) if !existing.trim().is_empty() => {
-            format!("{existing},{CHILD_LOG_TARGETS}")
-        }
-        _ => CHILD_LOG_TARGETS.to_string(),
-    }
 }
 
 pub fn start_managed_agent_process(

@@ -771,6 +771,7 @@ pub fn run() {
             set_managed_agent_start_on_app_launch,
             set_managed_agent_auto_restart,
             set_managed_agent_community,
+            set_managed_agent_backend,
             delete_managed_agent,
             get_managed_agent_log,
             get_agent_models,

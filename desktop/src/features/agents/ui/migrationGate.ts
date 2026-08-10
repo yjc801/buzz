@@ -1,4 +1,8 @@
-import type { ManagedAgent, PresenceStatus } from "@/shared/api/types";
+import type {
+  ManagedAgent,
+  ManagedAgentBackend,
+  PresenceStatus,
+} from "@/shared/api/types";
 
 /**
  * Whether an agent may be moved between local and provider execution right
@@ -71,4 +75,43 @@ export function migrationGate({
   }
 
   return { allowed: true, remoteConfirmedStopped: true };
+}
+
+/**
+ * Whether a proposed backend describes the same deployment the agent already
+ * has — i.e. whether the migrate dialog's confirmation should stay disabled.
+ *
+ * The provider id alone is not enough. `set_managed_agent_backend` accepts
+ * same-provider-different-config as a real change (it is a save-then-redeploy,
+ * not a move, so `retire_deployment_pointer` deliberately keeps the deployment
+ * live), and the dialog renders that config as editable fields. Comparing only
+ * the id would render those fields unusable.
+ *
+ * Config comparison is by value over a flat record: provider config schemas
+ * describe scalar fields, and `coerceConfigValues` has already converted the
+ * draft's strings back to the schema's types, so the two sides are directly
+ * comparable. Nested values are compared structurally via JSON rather than
+ * assumed absent.
+ */
+export function backendUnchanged(
+  current: ManagedAgentBackend,
+  target: ManagedAgentBackend,
+): boolean {
+  if (current.type !== target.type) return false;
+  if (current.type === "local" || target.type === "local") return true;
+  return current.id === target.id && configEqual(current.config, target.config);
+}
+
+function configEqual(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): boolean {
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every(
+    (key) =>
+      Object.hasOwn(b, key) &&
+      (Object.is(a[key], b[key]) ||
+        JSON.stringify(a[key] ?? null) === JSON.stringify(b[key] ?? null)),
+  );
 }

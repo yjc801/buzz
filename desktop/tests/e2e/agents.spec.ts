@@ -2589,3 +2589,51 @@ test("duplicate instances move from the agents gallery into the agent profile", 
     page.getByTestId(`user-profile-agent-delete-${additionalPubkey}`),
   ).toBeVisible();
 });
+
+test("the run-location move is reachable from an agent's settings menu", async ({
+  page,
+}) => {
+  // Reachability is the point. The migration UI first shipped mounted only on
+  // ManagedAgentRow, which nothing renders — AgentsView renders
+  // UnifiedAgentsSection — so no user could open the dialog at all. This also
+  // pins the dialog surviving the menu: it is rendered outside
+  // DropdownMenuContent because opening it moves focus out of the menu, and a
+  // dialog mounted inside would unmount with the menu that closes.
+  const personaId = "custom:relocatable";
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: personaId,
+        displayName: "Relocatable",
+        isActive: true,
+        systemPrompt: "An agent that can be moved between backends.",
+      },
+    ],
+    managedAgents: [
+      {
+        name: "Relocatable instance",
+        personaId,
+        pubkey: "ae".repeat(32),
+        status: "stopped",
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  await page.getByTestId(`persona-agent-row-${personaId}`).click();
+  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+  await page.getByTestId("user-profile-settings-menu-trigger").click();
+
+  const move = page.getByTestId("agent-move-run-location");
+  await expect(move).toBeVisible();
+  await expect(move).toBeEnabled();
+
+  await move.click();
+  await expect(page.getByTestId("migrate-agent-dialog")).toBeVisible();
+  await expect(
+    page
+      .getByTestId("migrate-agent-dialog")
+      .getByText("Move Relocatable instance", { exact: true }),
+  ).toBeVisible();
+});

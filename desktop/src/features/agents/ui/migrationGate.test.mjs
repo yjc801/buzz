@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { migrationGate } from "./migrationGate.ts";
+import { backendUnchanged, migrationGate } from "./migrationGate.ts";
 
 const local = { type: "local" };
 const provider = { type: "provider", id: "sprites", config: {} };
@@ -88,4 +88,95 @@ test("provider status never substitutes for presence", () => {
     presenceLoaded: true,
   });
   assert.equal(gate.allowed, false);
+});
+
+// ── backendUnchanged ────────────────────────────────────────────────────────
+
+test("a different destination is always a change", () => {
+  assert.equal(backendUnchanged(local, provider), false);
+  assert.equal(backendUnchanged(provider, local), false);
+  assert.equal(
+    backendUnchanged(provider, { type: "provider", id: "blox", config: {} }),
+    false,
+  );
+});
+
+test("staying put with untouched settings is not a change", () => {
+  assert.equal(backendUnchanged(local, { type: "local" }), true);
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { idle_seconds: 600 } },
+      { type: "provider", id: "sprites", config: { idle_seconds: 600 } },
+    ),
+    true,
+  );
+});
+
+test("editing the current provider's settings is a change", () => {
+  // The regression: `set_managed_agent_backend` accepts same-provider with a
+  // new config as a real transition (save, then redeploy), and the dialog
+  // renders those settings as editable fields. Comparing only the provider id
+  // left "Move agent" disabled and the supported path unreachable.
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { idle_seconds: 7200 } },
+      { type: "provider", id: "sprites", config: { idle_seconds: 600 } },
+    ),
+    false,
+  );
+});
+
+test("adding or dropping a settings key is a change", () => {
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: {} },
+      { type: "provider", id: "sprites", config: { idle_seconds: 600 } },
+    ),
+    false,
+  );
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { idle_seconds: 600 } },
+      { type: "provider", id: "sprites", config: {} },
+    ),
+    false,
+  );
+});
+
+test("settings are compared by value, not by key order or identity", () => {
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { a: 1, b: "two" } },
+      { type: "provider", id: "sprites", config: { b: "two", a: 1 } },
+    ),
+    true,
+  );
+  // Nested values compare structurally rather than by reference.
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { tags: ["x", "y"] } },
+      { type: "provider", id: "sprites", config: { tags: ["x", "y"] } },
+    ),
+    true,
+  );
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { tags: ["x"] } },
+      { type: "provider", id: "sprites", config: { tags: ["y"] } },
+    ),
+    false,
+  );
+});
+
+test("a string and the number it coerces to are different settings", () => {
+  // `coerceConfigValues` turns the draft's strings back into schema types, so
+  // a surviving string here means the schema changed under the record — a
+  // real difference, not a formatting one.
+  assert.equal(
+    backendUnchanged(
+      { type: "provider", id: "sprites", config: { idle_seconds: "600" } },
+      { type: "provider", id: "sprites", config: { idle_seconds: 600 } },
+    ),
+    false,
+  );
 });

@@ -126,6 +126,26 @@ pub fn retire_deployment_pointer(
     }
 }
 
+/// Drop a residual entry that a fresh deploy has just taken over.
+///
+/// A provider may issue a *deterministic* id — sprites derives it from the
+/// agent — so moving A → Local → A and redeploying returns the exact id that
+/// [`retire_deployment_pointer`] retired on the way out. Without this the same
+/// deployment is recorded as both current (`backend_agent_id`) and abandoned
+/// (`residual_deployments`), and deletion warns about orphaning infrastructure
+/// the agent is in fact still using.
+///
+/// Matching is exact on **both** halves. A different id on the same provider is
+/// a genuinely different deployment that the redeploy did not touch, and it
+/// must stay residual.
+pub fn reclaim_residual_deployment(
+    provider_id: &str,
+    agent_id: &str,
+    residual: &mut Vec<ResidualDeployment>,
+) {
+    residual.retain(|entry| !(entry.provider_id == provider_id && entry.agent_id == agent_id));
+}
+
 /// Whether deleting this agent would orphan provider infrastructure that still
 /// holds a copy of its private key — the condition `delete_managed_agent`
 /// refuses without `force_remote_delete`.
@@ -462,6 +482,41 @@ mod tests {
             &mut residuals,
         );
         assert_eq!(residuals, vec![residual("sprites", "sprite-1")]);
+    }
+
+    // ── reclaim_residual_deployment ──────────────────────────────────────
+
+    /// The round trip that produces a double-counted deployment: sprites hands
+    /// back the id it issued before, so the entry retired on the way out names
+    /// the deployment the agent is using again.
+    #[test]
+    fn redeploying_onto_a_retired_deployment_reclaims_it() {
+        let mut residuals = vec![residual("sprites", "sprite-1")];
+        reclaim_residual_deployment("sprites", "sprite-1", &mut residuals);
+        assert!(residuals.is_empty());
+    }
+
+    /// A new id on the same provider is different infrastructure — the old one
+    /// still exists, still holds the key, and must keep blocking deletion.
+    #[test]
+    fn a_new_id_on_the_same_provider_leaves_the_old_residual_alone() {
+        let mut residuals = vec![residual("sprites", "sprite-1")];
+        reclaim_residual_deployment("sprites", "sprite-2", &mut residuals);
+        assert_eq!(residuals, vec![residual("sprites", "sprite-1")]);
+        assert!(deletion_orphans_infrastructure(
+            &provider("sprites"),
+            Some("sprite-2"),
+            &residuals,
+        ));
+    }
+
+    /// Same id, different provider: coincidental collision between two
+    /// providers' id spaces must not retire the other provider's deployment.
+    #[test]
+    fn an_identical_id_on_another_provider_is_not_the_same_deployment() {
+        let mut residuals = vec![residual("blox", "agent-1")];
+        reclaim_residual_deployment("sprites", "agent-1", &mut residuals);
+        assert_eq!(residuals, vec![residual("blox", "agent-1")]);
     }
 
     // ── deletion_orphans_infrastructure ──────────────────────────────────

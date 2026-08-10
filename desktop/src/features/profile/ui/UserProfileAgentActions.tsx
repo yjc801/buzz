@@ -9,6 +9,7 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { useAgentRunLocationMove } from "@/features/agents/ui/useAgentRunLocationMove";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
 import { ArchiveConfirmDialog } from "@/features/profile/ui/ArchiveConfirmDialog";
 import type { ManagedAgent } from "@/shared/api/types";
@@ -55,6 +56,7 @@ export function UserProfileAgentSettingsMenu({
 }) {
   const [archiveConfirmOpen, setArchiveConfirmOpen] = React.useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
+  const runLocationMove = useAgentRunLocationMove(managedAgent);
   const actionKey = managedAgent?.pubkey ?? "persona-draft";
   const personaKey = personaActionKey ?? actionKey;
   const canToggleAutoStart =
@@ -62,13 +64,18 @@ export function UserProfileAgentSettingsMenu({
     managedAgent.backend.type === "local" &&
     onToggleAutoStart !== undefined;
   const autoStartSwitchId = `user-profile-agent-auto-start-${actionKey}`;
+  // Moving needs a real record to move: a persona draft has no backend, and
+  // `UserProfileAgentSettingsMenuSlot` passes `managedAgent` only on the branch
+  // where the viewer owns it.
+  const canMoveRunLocation = managedAgent !== undefined;
   const hasPrimaryActions = Boolean(onDuplicatePersona || onExportPersona);
   const hasArchiveAction =
     archiveActions?.canArchive === true &&
     archiveActions.isArchived !== undefined;
   const shouldConfirmAgentDelete =
     managedAgent !== undefined && onDelete !== undefined;
-  const hasManageActions = hasArchiveAction || Boolean(onDelete);
+  const hasManageActions =
+    hasArchiveAction || Boolean(onDelete) || canMoveRunLocation;
   const hasActions =
     canToggleAutoStart || hasPrimaryActions || hasManageActions;
 
@@ -145,6 +152,7 @@ export function UserProfileAgentSettingsMenu({
           {hasManageActions && (canToggleAutoStart || hasPrimaryActions) ? (
             <DropdownMenuSeparator />
           ) : null}
+          {runLocationMove.menuItem}
           {hasArchiveAction && archiveActions ? (
             archiveActions.isArchived ? (
               <DropdownMenuItem
@@ -186,6 +194,9 @@ export function UserProfileAgentSettingsMenu({
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
+      {/* Outside the menu on purpose — see `useAgentRunLocationMove`, and the
+          two confirmations below it, which are hoisted for the same reason. */}
+      {runLocationMove.dialog}
       {hasArchiveAction && archiveActions ? (
         <ArchiveConfirmDialog
           isBot={isBot}

@@ -9,30 +9,44 @@ import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   applyProbeResult,
   emptyWhereToRunDraft,
+  runOnOptions,
   type WhereToRunDraft,
 } from "./whereToRunIntent";
 
 /** Optional remote-backend selector. Buzz shared compute is an LLM provider, not a run destination. */
 export function WhereToRunSection({
+  currentProviderId,
   draft,
   isPending,
   onDraftChange,
 }: {
+  /**
+   * The provider this agent runs on *today*, when the section is editing an
+   * existing agent rather than creating one.
+   *
+   * Passing it changes two things, both only reachable from the migrate flow.
+   * The section renders even when discovery finds nothing — in the create flow
+   * an empty provider list means there is nothing to choose and "local" is
+   * already the answer, but for an agent that is *already* remote it would
+   * remove the only way back to this computer, which needs no provider binary
+   * at all. And the current provider stays in the list even when it is not
+   * discoverable, so "where it runs now" is always representable and the user
+   * can back out of a move without cancelling the dialog.
+   */
+  currentProviderId?: string | null;
   draft: WhereToRunDraft;
   isPending: boolean;
   onDraftChange: (next: WhereToRunDraft) => void;
 }) {
   const backendProviders = useBackendProvidersQuery().data ?? [];
   const [probeError, setProbeError] = React.useState<string | null>(null);
-  const runOnOptions = React.useMemo(
-    () => [
-      { label: "This computer", value: "local" },
-      ...backendProviders.map((provider) => ({
-        label: provider.id,
-        value: provider.id,
-      })),
-    ],
-    [backendProviders],
+  const options = React.useMemo(
+    () =>
+      runOnOptions(
+        backendProviders.map((provider) => provider.id),
+        currentProviderId,
+      ),
+    [backendProviders, currentProviderId],
   );
   const isProviderMode = draft.runOn !== "local";
   const selectedBackendProvider = React.useMemo(
@@ -83,7 +97,9 @@ export function WhereToRunSection({
     };
   }, [selectedBinaryPath, draft.probedProvider]);
 
-  if (backendProviders.length === 0) return null;
+  // One option is not a choice: nothing to run on but this computer, and this
+  // computer is where the agent already is. See `runOnOptions`.
+  if (options.length < 2) return null;
 
   return (
     <div className="space-y-4">
@@ -100,11 +116,28 @@ export function WhereToRunSection({
               runOn,
             })
           }
-          options={runOnOptions}
+          options={options}
           placeholder="Choose where to run"
           value={draft.runOn}
         />
       </div>
+
+      {isProviderMode && !selectedBackendProvider ? (
+        // Selected but undiscoverable — only reachable via `currentProviderId`,
+        // i.e. the provider this agent already runs on has gone missing. Say so
+        // instead of rendering an empty section: the settings cannot be shown
+        // (there is no binary to read the schema from) and staying here is not
+        // a move, but leaving for this computer still works.
+        <p
+          className="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"
+          data-testid="agent-run-on-provider-missing"
+        >
+          <span className="font-mono font-medium">{draft.runOn}</span>{" "}
+          isn&apos;t available on this computer, so its settings can&apos;t be
+          shown or changed. Choose &ldquo;This computer&rdquo; to bring the
+          agent back here.
+        </p>
+      ) : null}
 
       {isProviderMode && selectedBackendProvider ? (
         <div className="space-y-4">

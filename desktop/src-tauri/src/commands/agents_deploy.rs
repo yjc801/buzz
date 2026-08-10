@@ -121,6 +121,16 @@ pub(super) async fn deploy_to_provider(
 
     let fresh_generation = match deploy_result {
         Ok(outcome) => {
+            // A provider that derives its id from the agent hands back the same
+            // id after A → Local → A, which is precisely the entry the outbound
+            // move retired. Reclaim it before it becomes the live pointer, or
+            // the record calls one deployment both current and abandoned and
+            // deletion warns about orphaning infrastructure still in use.
+            crate::managed_agents::reclaim_residual_deployment(
+                provider_id,
+                &outcome.agent_id,
+                &mut rec.residual_deployments,
+            );
             rec.backend_agent_id = Some(outcome.agent_id);
             rec.last_started_at = Some(now_iso());
             rec.updated_at = now_iso();

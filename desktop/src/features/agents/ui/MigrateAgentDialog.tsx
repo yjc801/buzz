@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/shared/ui/dialog";
 
+import { backendUnchanged } from "./migrationGate";
 import { WhereToRunSection } from "./WhereToRunSection";
 import {
   canSubmitWhereToRun,
@@ -74,10 +75,9 @@ export function MigrateAgentDialog({
     type: "local",
   };
   const movingToProvider = target.type === "provider";
-  const unchanged =
-    target.type === agent.backend.type &&
-    (target.type === "local" ||
-      (agent.backend.type === "provider" && target.id === agent.backend.id));
+  // Config counts. Staying on the same provider with different settings is a
+  // supported transition (save, then redeploy) — see `backendUnchanged`.
+  const unchanged = backendUnchanged(agent.backend, target);
 
   const submit = async () => {
     try {
@@ -111,6 +111,9 @@ export function MigrateAgentDialog({
         </DialogHeader>
 
         <WhereToRunSection
+          currentProviderId={
+            agent.backend.type === "provider" ? agent.backend.id : null
+          }
           draft={draft}
           isPending={migrate.isPending}
           onDraftChange={setDraft}

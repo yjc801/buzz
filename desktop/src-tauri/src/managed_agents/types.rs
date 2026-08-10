@@ -236,6 +236,20 @@ pub struct ManagedAgentRecord {
     pub backend: BackendKind,
     #[serde(default)]
     pub backend_agent_id: Option<String>,
+    /// Provider deployments this agent has left behind but that still exist —
+    /// and still hold a copy of its private key.
+    ///
+    /// `backend_agent_id` names only the deployment on the *current* backend,
+    /// so it cannot describe one the agent has moved off. Buzz has no provider
+    /// `undeploy` operation (see `build_managed_agent_summary`'s two-axis
+    /// status note), so leaving a provider strands live infrastructure; this
+    /// records which provider owns it and under what id, which is what keeps
+    /// the deletion guard in `delete_managed_agent` able to see it.
+    ///
+    /// Written only by [`crate::managed_agents::retire_deployment_pointer`]
+    /// during a backend migration. Empty for every agent that has never moved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_deployments: Vec<ResidualDeployment>,
     #[serde(default)]
     pub provider_binary_path: Option<String>,
     /// Installed team directory path (absolute). Set when agent was created from a team persona.
@@ -374,6 +388,19 @@ pub struct RelayMeshConfig {
     pub model_ref: String,
 }
 
+/// A provider deployment the agent no longer runs on but which still exists.
+///
+/// Both halves are required to be useful: `agent_id` alone cannot be acted on
+/// without knowing which provider issued it, and it is exactly that
+/// attribution that `backend_agent_id` loses the moment `backend` changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResidualDeployment {
+    /// The provider that owns this deployment (`BackendKind::Provider::id`).
+    pub provider_id: String,
+    /// The provider-issued id, as last written to `backend_agent_id`.
+    pub agent_id: String,
+}
+
 #[derive(Debug)]
 pub struct ManagedAgentProcess {
     pub child: Child,
@@ -472,6 +499,11 @@ pub struct ManagedAgentSummary {
     pub env_vars: BTreeMap<String, String>,
     pub backend: BackendKind,
     pub backend_agent_id: Option<String>,
+    /// Provider deployments left behind by a migration. Surfaced because the
+    /// delete flow must warn about — and force past — infrastructure that
+    /// still holds this agent's key even when it now runs locally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_deployments: Vec<ResidualDeployment>,
     pub status: String,
     pub pid: Option<u32>,
     pub created_at: String,

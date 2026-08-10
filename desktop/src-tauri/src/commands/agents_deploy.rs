@@ -40,6 +40,23 @@ pub struct StartManagedAgentOutcome {
 /// (`None` when the provider gave none — see `ProviderDeployOutcome`),
 /// Err(message) on failure. Either way the record is updated and saved
 /// before returning.
+///
+/// # Fenced against migration
+///
+/// Every caller resolves the provider under the store lock, releases it, and
+/// only then calls this — and the deploy itself is an external process that
+/// can run for minutes. `set_managed_agent_backend` could otherwise move the
+/// agent to Local inside that window: the move lands first, this function
+/// afterwards writes `backend_agent_id` and leaves a remote harness running
+/// for a record that says Local, which then permits a second, local harness
+/// on the same key.
+///
+/// So the per-agent transition fence is taken here, before the store lock and
+/// before the external call, and the record's backend is re-read under it. A
+/// migration that beat us aborts this deploy; one that arrives while the fence
+/// is held is refused and can be retried. Only the provider *id* is compared —
+/// a same-provider config change is an ordinary re-deploy that the deploy
+/// itself reconciles.
 pub(super) async fn deploy_to_provider(
     app: &AppHandle,
     state: &AppState,
@@ -49,6 +66,28 @@ pub(super) async fn deploy_to_provider(
     agent_json: serde_json::Value,
     cached_binary_path: Option<&str>,
 ) -> Result<Option<bool>, String> {
+    let _transition = crate::managed_agents::begin_backend_transition(pubkey)?;
+    {
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let records = load_managed_agents(app)?;
+        let record = records
+            .iter()
+            .find(|r| r.pubkey == pubkey)
+            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        match &record.backend {
+            crate::managed_agents::BackendKind::Provider { id, .. } if id == provider_id => {}
+            _ => {
+                return Err(format!(
+                    "agent {pubkey} no longer runs on {provider_id} — it was moved while this \
+                     deploy was starting"
+                ))
+            }
+        }
+    }
+
     // Resolve via discovered candidates only. Cached path must match BOTH
     // "is a discovered candidate" AND "belongs to this provider_id". A tampered
     // record cannot redirect deploys to a different provider's binary.

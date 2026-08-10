@@ -4,10 +4,11 @@ use tauri::{AppHandle, Manager, State};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        build_managed_agent_summary, current_instance_id, find_managed_agent_mut,
-        load_managed_agents, load_personas, resolve_provider_binary, save_managed_agents,
-        sync_managed_agent_processes, validate_backend_migration, validate_provider_config,
-        BackendKind, ManagedAgentSummary, MigrationPreconditions,
+        begin_backend_transition, build_managed_agent_summary, current_instance_id,
+        find_managed_agent_mut, load_managed_agents, load_personas, resolve_provider_binary,
+        retire_deployment_pointer, save_managed_agents, sync_managed_agent_processes,
+        validate_backend_migration, validate_provider_config, BackendKind, ManagedAgentSummary,
+        MigrationPreconditions,
     },
     util::now_iso,
 };
@@ -88,8 +89,12 @@ pub async fn set_managed_agent_start_on_app_launch(
 /// The two directions are not symmetric, because liveness is only observable
 /// for local agents:
 ///
-/// - **Local**: `sync_managed_agent_processes` reconciles real processes, so a
-///   surviving pair or live pid is authoritative. Enforced here.
+/// - **Local**: the runtime map and this instance's pair receipts track real
+///   children, so a surviving pair is authoritative. Enforced here via
+///   `local_harness_alive`. Note `record.runtime_pid` is *not* usable for this
+///   — `sync_managed_agent_processes` clears it as legacy bookkeeping on every
+///   record it touches, which is exactly what made the first version of this
+///   guard read false for a healthy running agent.
 /// - **Provider**: [`build_managed_agent_summary`] reports `deployed` /
 ///   `not_deployed` from `backend_agent_id` — that is *infrastructure
 ///   existence*, not liveness. A sprite stays "deployed" after `!shutdown`, and
@@ -106,6 +111,21 @@ pub async fn set_managed_agent_start_on_app_launch(
 /// `remote_confirmed_stopped` is that assertion, made by the caller against
 /// relay presence. It is required only when leaving a provider backend and
 /// ignored otherwise.
+///
+/// # Serialization against provider deploys
+///
+/// Both this command and `deploy_to_provider` take the per-agent
+/// [`crate::managed_agents::begin_backend_transition`] fence before the store
+/// lock. Without it, a deploy — which runs outside the store lock and may take
+/// minutes — could complete after a move to Local had already been persisted,
+/// starting a remote harness for a record that then also permits a local one.
+///
+/// # Deployments left behind
+///
+/// A provider deployment survives the agent moving off it (Buzz has no
+/// `undeploy`) and keeps a copy of the private key. Its id is retired into
+/// `residual_deployments` alongside the provider that issued it, so
+/// `delete_managed_agent` can still see it and demand `force_remote_delete`.
 #[tauri::command]
 pub async fn set_managed_agent_backend(
     pubkey: String,
@@ -123,6 +143,14 @@ pub async fn set_managed_agent_backend(
 
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
+
+        // Fence first, store lock second — always this order, everywhere (see
+        // `BackendTransitionGuard`). A provider deploy started by
+        // `start_managed_agent` releases the store lock across the external
+        // call, so the lock alone cannot keep this move from landing inside a
+        // deploy that then starts a remote harness for a now-Local record.
+        let _transition = begin_backend_transition(&pubkey)?;
+
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -142,36 +170,54 @@ pub async fn set_managed_agent_backend(
             state.clear_agent_session_caches(pubkey);
         }
 
+        let personas = load_personas(&app).unwrap_or_default();
+        let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+
         {
             let record = find_managed_agent_mut(&mut records, &pubkey)?;
 
-            // `sync_managed_agent_processes` has already reconciled the record
-            // against real processes, so a surviving pid is authoritative for
-            // local agents. There is no equivalent signal for remote ones —
-            // hence `remote_confirmed_stopped`.
+            // Liveness comes from the runtime map and the pair receipts, never
+            // from `record.runtime_pid` — `sync_managed_agent_processes` above
+            // clears that field on every record before this line runs. There
+            // is no equivalent signal for remote harnesses, hence
+            // `remote_confirmed_stopped`.
+            //
+            // Shared compute likewise resolves through the effective config:
+            // `record.relay_mesh` is a legacy marker that a linked instance or
+            // a global default can contradict in either direction.
             let observed = MigrationPreconditions {
-                local_process_alive: record
-                    .runtime_pid
-                    .is_some_and(crate::managed_agents::process_is_running),
+                local_harness_alive: crate::managed_agents::local_harness_alive(
+                    &app, &runtimes, &pubkey,
+                ),
                 remote_confirmed_stopped,
-                uses_relay_mesh: record.relay_mesh.is_some(),
+                uses_relay_mesh:
+                    crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
+                        record, &personas, &global,
+                    )
+                    .is_some(),
             };
             validate_backend_migration(&record.backend, &backend, &observed)?;
 
             record.provider_binary_path = match backend {
                 // Cache the discovered path for `deploy_to_provider`, the same
                 // way creation does.
-                BackendKind::Provider { ref id, .. } => {
-                    resolve_provider_binary(id).ok().map(|p| p.display().to_string())
-                }
+                BackendKind::Provider { ref id, .. } => resolve_provider_binary(id)
+                    .ok()
+                    .map(|p| p.display().to_string()),
                 BackendKind::Local => None,
             };
 
-            // `backend_agent_id` is deliberately preserved when leaving a
-            // provider: it is the only pointer back to infrastructure that
-            // still exists and still holds a copy of this agent's key. Clearing
-            // it would strand the deployment with nothing able to name it. It
-            // is ignored for display while the backend is Local.
+            // The deployment the agent is leaving still exists and still holds
+            // a copy of its key, so its id is retired into
+            // `residual_deployments` *with the provider that issued it* rather
+            // than left behind on `backend_agent_id`, where nothing could tell
+            // which provider it belonged to.
+            retire_deployment_pointer(
+                &record.backend,
+                &backend,
+                &mut record.backend_agent_id,
+                &mut record.residual_deployments,
+            );
 
             // Provider agents are managed externally — creation forces this
             // false and so must we, or a migrated agent would try to launch
@@ -186,14 +232,7 @@ pub async fn set_managed_agent_backend(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
-        let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        build_managed_agent_summary(&app, record, &runtimes, &personas, &global)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

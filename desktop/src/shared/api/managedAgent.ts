@@ -4,6 +4,19 @@ export type ManagedAgentBackend =
   | { type: "local" }
   | { type: "provider"; id: string; config: Record<string, unknown> };
 
+/**
+ * A provider deployment the agent has moved off but which still exists — and
+ * still holds a copy of its private key. Buzz has no `undeploy` operation, so
+ * leaving a provider strands infrastructure; this is what still names it once
+ * `backendAgentId` has moved on.
+ */
+export type ResidualDeployment = {
+  /** The provider that owns the deployment. */
+  providerId: string;
+  /** The provider-issued id. */
+  agentId: string;
+};
+
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
 export type RespondToMode = "owner-only" | "allowlist" | "anyone";
 
@@ -84,6 +97,12 @@ export type ManagedAgent = {
   autoRestartOnConfigChange: boolean;
   backend: ManagedAgentBackend;
   backendAgentId: string | null;
+  /**
+   * Provider deployments left behind by a migration. Non-empty means deleting
+   * this agent orphans infrastructure that still holds its key, even when it
+   * now runs locally — the delete flow warns and forces on this too.
+   */
+  residualDeployments: ResidualDeployment[];
   /** Who the agent should respond to. Maps to `buzz-acp --respond-to`. */
   respondTo: RespondToMode;
   /**

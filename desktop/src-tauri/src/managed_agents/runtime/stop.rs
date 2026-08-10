@@ -19,6 +19,39 @@ pub(crate) fn managed_agent_runtime_keys<T>(
         .collect()
 }
 
+/// Whether any local harness for this agent is still alive, across every
+/// community.
+///
+/// The authoritative sources are the tracked runtime map and the pair receipts
+/// this desktop instance wrote at spawn time. `record.runtime_pid` is **not**
+/// one of them: `sync_managed_agent_processes` clears it on every record it
+/// touches as legacy bookkeeping, so a check that reads it after a sync always
+/// sees `None` — including for a perfectly healthy running pair.
+///
+/// Deliberately not workspace-scoped, unlike `build_managed_agent_summary`:
+/// callers here ask "may I change this identity's execution location", and a
+/// pair alive in another community answers that just as fatally as one in this
+/// community would.
+pub(crate) fn local_harness_alive<T>(
+    app: &AppHandle,
+    runtimes: &HashMap<ManagedAgentRuntimeKey, T>,
+    pubkey: &str,
+) -> bool {
+    if !managed_agent_runtime_keys(runtimes, pubkey).is_empty() {
+        return true;
+    }
+    // A pair spawned by this instance whose runtime entry is missing (an
+    // untracked pair — see `terminate_untracked_pair_runtime`) is still a live
+    // harness signing as this key.
+    let instance_id = current_instance_id(app);
+    super::super::read_all_agent_runtime_receipts(app)
+        .iter()
+        .any(|(path, receipt)| {
+            receipt.key.pubkey.eq_ignore_ascii_case(pubkey)
+                && super::valid_agent_runtime_receipt(path, receipt, &instance_id)
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn managed_agent_runtime_relay_urls<T>(
     runtimes: &HashMap<ManagedAgentRuntimeKey, T>,

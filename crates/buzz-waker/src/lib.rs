@@ -22,11 +22,16 @@
 
 pub mod bundle;
 pub mod cursor;
+pub mod decide;
 mod fence;
 pub mod floors;
 
 pub use bundle::{BundleError, LaunchBundleBody, ProviderEnvelope, SignedLaunchBundle};
 pub use cursor::{Admission, Cursor, CursorError, CursorStore, Resume};
+pub use decide::{
+    agent_responds_to_author, compute_wake_replay_floor, event_addresses_agent,
+    is_covered_by_replay_floor, select_wake_candidates, RespondTo, TriggerEvent, WakeCandidate,
+};
 pub use floors::{FloorError, FloorStore, Floors};
 
 /// Seconds of overlap to subtract from the persisted cursor when re-issuing a

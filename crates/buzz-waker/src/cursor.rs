@@ -201,8 +201,13 @@ pub struct Cursor {
     /// the relay's accepted drift in either direction. This one is the local
     /// clock at the last point the waker knew it was current, so
     /// `now - covered_through_secs` is real downtime and can be compared
-    /// against an age bound. Advanced by every durable transition and by
-    /// [`CursorStore::mark_covered`].
+    /// against an age bound.
+    ///
+    /// Only evidence that the feed is *current* may advance it: a live event
+    /// ([`CursorStore::admit`] outside a replay drain), EOSE
+    /// ([`CursorStore::end_replay`]), or an explicit heartbeat
+    /// ([`CursorStore::mark_covered`]). Notably not [`CursorStore::complete`],
+    /// and not a row arriving mid-drain — see those two for why.
     pub covered_through_secs: u64,
     /// Bounded ring of completed event ids, oldest first.
     pub completed: VecDeque<String>,
@@ -441,7 +446,14 @@ impl CursorStore {
 
         let mut next = self.state.clone();
         next.checkpoint_secs = self.compute_checkpoint();
-        next.covered_through_secs = next.covered_through_secs.max(now);
+        if self.replay_pin.is_none() {
+            // A *live* event proves the feed is current through `now`. A row
+            // arriving during a replay drain proves only that the connection
+            // is up, not that everything before it has been seen — the batch
+            // is still landing, and EOSE is the relay's own statement that it
+            // is not. `end_replay` is where a drain's coverage is recorded.
+            next.covered_through_secs = next.covered_through_secs.max(now);
+        }
         if let Err(e) = self.persist(&next) {
             // Do not hand out a claim we could not make durable.
             self.in_flight.remove(event_id);
@@ -469,11 +481,18 @@ impl CursorStore {
     /// the only way to release its hold on the checkpoint without processing
     /// it. Retryable failures use `abandon` and leave the hold in place.
     ///
+    /// Deliberately takes no `now`: a wake outlives its connection, so the
+    /// moment one finishes says nothing about whether the feed was live for
+    /// it. Feeding that time into [`Cursor::covered_through_secs`] would let a
+    /// wake that ran straight through an outage report the outage as shorter
+    /// than it was and suppress the alert. Not accepting the argument is what
+    /// keeps that from being reintroduced.
+    ///
     /// # Errors
     /// [`CursorError::NotInFlight`] if the event was never admitted;
     /// [`CursorError::Persist`] if the advance could not be made durable — the
     /// event then stays claimed and is retried after a restart.
-    pub fn complete(&mut self, event_id: &str, now: u64) -> Result<(), CursorError> {
+    pub fn complete(&mut self, event_id: &str) -> Result<(), CursorError> {
         let was_abandoned = self.abandoned.contains_key(event_id);
         let Some(created_at) = self
             .in_flight
@@ -487,7 +506,6 @@ impl CursorStore {
 
         let mut next = self.state.clone();
         next.high_water_secs = next.high_water_secs.max(created_at);
-        next.covered_through_secs = next.covered_through_secs.max(now);
         next.completed.push_back(event_id.to_string());
         while next.completed.len() > self.capacity {
             next.completed.pop_front();
@@ -704,7 +722,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
         s.admit("a", NOW, NOW).expect("admit");
-        s.complete("a", NOW).expect("complete");
+        s.complete("a").expect("complete");
         assert_eq!(
             s.admit("a", NOW, NOW).expect("re-admit"),
             Admission::Duplicate
@@ -716,7 +734,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
         assert!(matches!(
-            s.complete("ghost", NOW).expect_err("must refuse"),
+            s.complete("ghost").expect_err("must refuse"),
             CursorError::NotInFlight { .. }
         ));
     }
@@ -737,7 +755,7 @@ mod tests {
         let mut s = store(&dir);
         s.admit("a", a_created, NOW).expect("admit A");
         s.admit("b", b_created, NOW).expect("admit B");
-        s.complete("b", NOW).expect("complete B");
+        s.complete("b").expect("complete B");
 
         assert_eq!(
             s.state().checkpoint_secs,
@@ -777,9 +795,9 @@ mod tests {
         let mut s = store(&dir);
         s.admit("a", NOW + 10, NOW).expect("admit A");
         s.admit("b", NOW + 20, NOW).expect("admit B");
-        s.complete("b", NOW).expect("complete B");
+        s.complete("b").expect("complete B");
         assert_eq!(s.state().checkpoint_secs, NOW + 10);
-        s.complete("a", NOW).expect("complete A");
+        s.complete("a").expect("complete A");
         assert_eq!(s.state().checkpoint_secs, NOW + 20, "high water");
     }
 
@@ -789,7 +807,7 @@ mod tests {
         {
             let mut s = store(&dir);
             s.admit("a", NOW + 50, NOW).expect("admit");
-            s.complete("a", NOW).expect("complete");
+            s.complete("a").expect("complete");
         }
         assert_eq!(reopen(&dir, NOW + 60).state().high_water_secs, NOW + 50);
     }
@@ -837,7 +855,7 @@ mod tests {
         s.admit("a", a_created, NOW).expect("admit A");
         s.abandon("a"); // retryable failure
         s.admit("b", b_created, NOW).expect("admit B");
-        s.complete("b", NOW).expect("complete B");
+        s.complete("b").expect("complete B");
         assert_eq!(
             s.state().checkpoint_secs,
             a_created,
@@ -862,12 +880,12 @@ mod tests {
         let mut s = store(&dir);
         s.admit("a", NOW - 100, NOW).expect("admit A");
         s.admit("b", NOW + 20, NOW).expect("admit B");
-        s.complete("b", NOW).expect("complete B");
+        s.complete("b").expect("complete B");
         s.abandon("a");
         assert_eq!(s.abandoned_len(), 1);
         assert_eq!(s.state().checkpoint_secs, NOW - 100);
 
-        s.complete("a", NOW).expect("give up on A");
+        s.complete("a").expect("give up on A");
         assert_eq!(s.abandoned_len(), 0);
         assert_eq!(s.state().checkpoint_secs, NOW + 20, "high water");
         assert_eq!(
@@ -885,7 +903,7 @@ mod tests {
         for i in 0..6u64 {
             let id = format!("e{i}");
             s.admit(&id, NOW + i, NOW).expect("admit");
-            s.complete(&id, NOW).expect("complete");
+            s.complete(&id).expect("complete");
         }
         assert_eq!(s.state().completed.len(), 3);
         assert!(s.state().completed.iter().any(|id| id == "e5"));
@@ -934,7 +952,7 @@ mod tests {
             let mut s = store(&dir);
             // A future-dated event pushes the checkpoint a full drift ahead.
             s.admit("future", NOW + drift, NOW).expect("admit");
-            s.complete("future", NOW).expect("complete");
+            s.complete("future").expect("complete");
             assert_eq!(s.state().checkpoint_secs, NOW + drift);
         }
 
@@ -947,6 +965,69 @@ mod tests {
              would have measured {} and read as healthy",
             back - (NOW + drift)
         );
+    }
+
+    /// A wake outlives its connection: it can still be running minutes after
+    /// the relay dropped. Its completion time is evidence that processing
+    /// finished, never that the feed was live for it, so counting it as
+    /// coverage would let a wake that ran straight through an outage report
+    /// that outage as shorter than it was and suppress the alert.
+    #[test]
+    fn a_completed_wake_is_not_evidence_that_the_feed_was_covered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bound = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
+        {
+            let mut s = store(&dir);
+            s.admit("a", NOW, NOW).expect("admit"); // delivered: covered to NOW
+                                                    // The relay drops here. The wake keeps running for another 1,000s
+                                                    // and only then reaches a terminal outcome.
+            s.complete("a").expect("complete");
+            assert_eq!(
+                s.state().covered_through_secs,
+                NOW,
+                "completion must not move the coverage watermark"
+            );
+        }
+
+        // The feed was uncovered for the whole span, and that must surface.
+        let back = NOW + bound + 1;
+        let mut resumed = reopen(&dir, back);
+        assert!(
+            matches!(resumed.resume(back), Resume::GapTooOld { .. }),
+            "an outage a wake ran through is still an outage"
+        );
+    }
+
+    /// The same principle one step earlier: a row delivered while the drain is
+    /// still running says the connection is up, not that the backlog is gone.
+    /// Counting it as coverage would let a crash mid-drain clear the alert for
+    /// a window that has not been drained.
+    #[test]
+    fn a_row_arriving_mid_drain_is_not_evidence_the_feed_is_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bound = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
+        let back = NOW + bound + 1;
+        {
+            let mut s = store(&dir);
+            // Back after an outage past the bound: the drain starts here.
+            assert!(matches!(s.resume(back), Resume::GapTooOld { .. }));
+
+            s.admit("replayed", NOW + 10, back).expect("admit");
+            assert_eq!(
+                s.state().covered_through_secs,
+                NOW,
+                "a mid-drain row must not clear the outage"
+            );
+            assert!(
+                matches!(s.resume(back), Resume::GapTooOld { .. }),
+                "still uncovered until EOSE"
+            );
+
+            s.end_replay(back).expect("eose");
+            assert_eq!(s.state().covered_through_secs, back, "EOSE covers it");
+        }
+        let mut after = reopen(&dir, back + 1);
+        assert!(matches!(after.resume(back + 1), Resume::Since(_)));
     }
 
     #[test]
@@ -1010,7 +1091,7 @@ mod tests {
         {
             let mut seed = store(&dir);
             seed.admit("seed", checkpoint, NOW).expect("admit");
-            seed.complete("seed", NOW).expect("complete");
+            seed.complete("seed").expect("complete");
             assert_eq!(seed.state().checkpoint_secs, checkpoint);
         }
 
@@ -1024,7 +1105,7 @@ mod tests {
 
         // The relay delivers `newer` first and it completes quickly.
         s.admit("newer", newer, NOW).expect("admit");
-        s.complete("newer", NOW).expect("complete");
+        s.complete("newer").expect("complete");
         assert_eq!(
             s.state().checkpoint_secs,
             checkpoint,
@@ -1051,7 +1132,7 @@ mod tests {
         let mut s = store(&dir);
         s.resume(NOW);
         s.admit("a", NOW + 40, NOW).expect("admit");
-        s.complete("a", NOW).expect("complete");
+        s.complete("a").expect("complete");
         assert_eq!(s.state().checkpoint_secs, NOW, "pinned during replay");
 
         s.end_replay(NOW).expect("eose");
@@ -1069,7 +1150,7 @@ mod tests {
         s.resume(NOW);
         s.admit("slow", NOW + 10, NOW).expect("admit slow");
         s.admit("fast", NOW + 90, NOW).expect("admit fast");
-        s.complete("fast", NOW).expect("complete fast");
+        s.complete("fast").expect("complete fast");
         s.end_replay(NOW).expect("eose");
         assert_eq!(
             s.state().checkpoint_secs,

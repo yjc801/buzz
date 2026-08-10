@@ -369,6 +369,9 @@ function wakeHarness({
   abortDuringDeploy = false,
   evidenceOnDeploy = true,
   deployFails = false,
+  // How long the provider call occupies the clock. Non-zero exercises a
+  // deploy allowed to run longer than the whole debounce window.
+  deployDurationMs = 0,
 } = {}) {
   const deployed = [];
   const delays = [];
@@ -421,6 +424,10 @@ function wakeHarness({
     heartbeatEvidence: (pubkey) => evidence.get(pubkey.toLowerCase()),
     startManagedAgent: async (pubkey) => {
       deployed.push(pubkey);
+      // Time the provider spends before answering. Not a `delay` call: it
+      // moves the clock without touching the delay bookkeeping the phase
+      // assertions read.
+      clockNow += deployDurationMs;
       if (abortDuringDeploy) {
         controller.abort();
       }
@@ -805,6 +812,29 @@ test("a failed deploy reports the error and still holds the debounce", async () 
   const second = await runWakeAttempt({ agent: agent(), ...harness });
   assert.equal(second.outcome, "debounced");
   assert.deepEqual(harness.deployed, [AGENT]);
+});
+
+test("a deploy that fails slower than the debounce window still holds it", async () => {
+  // invoke_provider gives the deploy 600s against a 120s window, so a refusal
+  // can settle with the pre-call stamp already expired. Cooling down from
+  // settlement is what keeps a provider outage from becoming a stream of long,
+  // failing deploys — one per fresh mention.
+  const harness = wakeHarness({
+    deployFails: true,
+    deployDurationMs: WAKE_ATTEMPT_DEBOUNCE_MS * 2,
+  });
+
+  const first = await runWakeAttempt({ agent: agent(), ...harness });
+  assert.equal(first.outcome, "deploy-failed");
+
+  const second = await runWakeAttempt({ agent: agent(), ...harness });
+
+  assert.equal(second.outcome, "debounced");
+  assert.deepEqual(
+    harness.deployed,
+    [AGENT],
+    "the next mention must not spend a second deploy against a refusing provider",
+  );
 });
 
 test("a deploy that never produces evidence releases the debounce", async () => {

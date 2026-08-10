@@ -526,6 +526,31 @@ impl WakeAttemptState {
         self.book().last_attempt_at.insert(key.to_string(), at_ms);
     }
 
+    /// Move our stamp forward to when the deploy actually settled — but
+    /// **only if it is still ours**, on the same reasoning as
+    /// [`Self::release_stamp`].
+    ///
+    /// The stamp is taken *before* the provider call, because the attempt is
+    /// what the debounce counts. That is only sound while the call is shorter
+    /// than the window, and it is not: the deploy deadline is 600s (the
+    /// desktop's `invoke_provider`) against a 120s
+    /// [`WAKE_ATTEMPT_DEBOUNCE_MS`]. A refusal that arrives after the window
+    /// has already lapsed would leave no cooldown at all, and the next mention
+    /// would immediately spend another slow, failing deploy — turning a
+    /// provider outage into a stream of expensive calls. Re-measuring from
+    /// settlement is what makes "hold the debounce after a refusal" actually
+    /// hold.
+    ///
+    /// Never moves the stamp backwards: a clock that jumped back would
+    /// otherwise *shorten* the window it is here to guarantee.
+    fn refresh_stamp(&self, key: &str, stamped_at: u64, settled_at: u64) {
+        let mut book = self.book();
+        if book.last_attempt_at.get(key).copied() == Some(stamped_at) {
+            book.last_attempt_at
+                .insert(key.to_string(), settled_at.max(stamped_at));
+        }
+    }
+
     /// Release a stamp, but **only if it is still ours** — a later attempt may
     /// have re-stamped, and clearing its window would let a burst through.
     fn release_stamp(&self, key: &str, stamped_at: u64) {
@@ -646,7 +671,9 @@ pub trait WakeEffects {
 /// 5. **Re-validate the author**, then and only then.
 /// 6. **Stamp, then deploy.** Stamping first is deliberate: the *attempt* is
 ///    what the debounce counts, and a slow deploy must not let a burst through
-///    behind it.
+///    behind it. A *failed* deploy then re-stamps from settlement, because the
+///    provider is allowed to take longer to refuse than the whole window
+///    ([`WakeAttemptState::refresh_stamp`]).
 /// 7. **Converge on a beat delivered after the deploy completed.** A deploy
 ///    return alone can be a no-op against a process that was still dying. If
 ///    nothing appears, release our own stamp so the next mention retries
@@ -772,7 +799,12 @@ pub async fn run_wake_attempt<E: WakeEffects>(
             return WakeAttemptResult::plain(WakeOutcome::Cancelled, reconcile);
         }
         // Holding the debounce after a refusal is deliberate: a provider that
-        // just refused will refuse the next mention too.
+        // just refused will refuse the next mention too. Measured from
+        // *settlement*, because a provider call is allowed to outlast the
+        // window it is supposed to close (600s deploy deadline, 120s debounce)
+        // and a stamp that expired while the call was still pending is not a
+        // cooldown at all.
+        state.refresh_stamp(&key, stamped_at, effects.now_ms());
         return WakeAttemptResult::failed(WakeOutcome::DeployFailed, reconcile, error);
     }
     if effects.is_cancelled() {
@@ -840,6 +872,10 @@ mod tests {
         cancel_during_deploy: bool,
         evidence_on_deploy: bool,
         deploy_fails: bool,
+        /// How long the provider call occupies the clock. Non-zero exercises
+        /// the case the constants do not cover on their own: a deploy allowed
+        /// to run five times the debounce window.
+        deploy_duration_ms: u64,
         author_is_agent: bool,
         author_check_fails: bool,
         presence_fails: bool,
@@ -872,6 +908,7 @@ mod tests {
                 cancel_during_deploy: false,
                 evidence_on_deploy: true,
                 deploy_fails: false,
+                deploy_duration_ms: 0,
                 author_is_agent: false,
                 author_check_fails: false,
                 presence_fails: false,
@@ -993,6 +1030,10 @@ mod tests {
         async fn start_managed_agent(&self) -> Result<(), Self::Error> {
             self.deploys.set(self.deploys.get() + 1);
             self.delays_before_deploy.set(Some(self.delay_count.get()));
+            // Time the provider spends before answering. Not a `delay`: it
+            // moves the clock without touching the delay bookkeeping the
+            // phase assertions read.
+            self.advance(self.deploy_duration_ms);
             if self.cancel_during_deploy {
                 self.cancelled.set(true);
             }
@@ -1169,6 +1210,62 @@ mod tests {
         assert_eq!(result.outcome, WakeOutcome::DeployFailed);
         assert_eq!(result.error, Some(EffectError("provider refused")));
         assert!(state.last_attempt_at(AGENT).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_deploy_that_fails_slower_than_the_debounce_window_still_holds_it() {
+        // The provider's deploy deadline is 600s against a 120s window, so a
+        // refusal can settle with the pre-call stamp already expired. Cooling
+        // down from settlement is what keeps a provider outage from becoming a
+        // stream of long, failing deploys — one per fresh mention.
+        let harness = Harness {
+            deploy_fails: true,
+            deploy_duration_ms: WAKE_ATTEMPT_DEBOUNCE_MS * 2,
+            ..Harness::default()
+        };
+        let state = WakeAttemptState::new();
+
+        let first = attempt(&harness, &state).await;
+        assert_eq!(first.outcome, WakeOutcome::DeployFailed);
+        // The failure path runs no convergence polls, so the clock has not
+        // moved since the provider answered.
+        let settled_at = harness.clock.get();
+        assert_eq!(
+            state.last_attempt_at(AGENT),
+            Some(settled_at),
+            "the failure cooldown is measured from settlement, not from the pre-call stamp"
+        );
+
+        let second = attempt(&harness, &state).await;
+
+        assert_eq!(second.outcome, WakeOutcome::Debounced);
+        assert_eq!(
+            harness.deploys.get(),
+            1,
+            "the next mention must not spend a second deploy against a refusing provider"
+        );
+    }
+
+    #[test]
+    fn a_settlement_stamp_never_moves_the_window_backwards() {
+        // A clock that jumped back while the provider was answering must not
+        // shorten the window the refusal is there to guarantee.
+        let state = WakeAttemptState::new();
+        state.stamp(AGENT, CLOCK);
+        state.refresh_stamp(AGENT, CLOCK, CLOCK - 60_000);
+
+        assert_eq!(state.last_attempt_at(AGENT), Some(CLOCK));
+    }
+
+    #[test]
+    fn a_settlement_stamp_belonging_to_an_earlier_attempt_is_left_alone() {
+        // Same reasoning as release_stamp: clearing or moving a *successor's*
+        // window would let a burst through behind this attempt's failure.
+        let state = WakeAttemptState::new();
+        state.stamp(AGENT, CLOCK + 1_000);
+        state.refresh_stamp(AGENT, CLOCK, CLOCK + 500_000);
+
+        assert_eq!(state.last_attempt_at(AGENT), Some(CLOCK + 1_000));
     }
 
     #[tokio::test]

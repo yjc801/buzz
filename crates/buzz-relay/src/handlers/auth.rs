@@ -323,16 +323,23 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 class = requested_class.as_str(),
                 "NIP-42 auth successful"
             );
-            *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
-            state
-                .conn_manager
-                .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());
             // Both halves of the class, set only after the signature verified —
             // the tag is only trustworthy because the AUTH event carries it.
+            // Recorded *before* the connection becomes discoverable as this
+            // pubkey, in either direction: publish authority before the auth
+            // state that gates publishing, and presence weight in the same
+            // write that publishes the pubkey to the manager. A watcher that
+            // were briefly visible as a presence-bearing connection for this
+            // key could make a concurrent teardown skip its presence clear,
+            // stranding presence until the TTL — the window this class exists
+            // to close.
             conn.set_class(requested_class);
-            state
-                .conn_manager
-                .set_connection_class(conn_id, requested_class);
+            *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
+            state.conn_manager.set_authenticated_principal(
+                conn_id,
+                pubkey.to_bytes().to_vec(),
+                requested_class,
+            );
             // Confirm a restricted class back to the client, so a client that
             // asked for one can tell whether it got it. A relay that predates
             // this feature ignores the tag and answers with the empty message,

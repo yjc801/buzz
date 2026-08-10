@@ -58,14 +58,30 @@ struct ConnEntry {
     /// broadcasts track the same consecutive-full counter.
     backpressure_count: Arc<AtomicU8>,
     subscriptions: ConnectionSubscriptions,
-    authenticated_pubkey: Arc<std::sync::RwLock<Option<Vec<u8>>>>,
+    /// Who this connection authenticated as, `None` until NIP-42 succeeds.
+    principal: Arc<std::sync::RwLock<Option<AuthenticatedPrincipal>>>,
+    grace_limit: u8,
+}
+
+/// A connection's authenticated identity and the presence weight its class
+/// carries.
+///
+/// The two live in one slot on purpose. Presence teardown asks "is any
+/// presence-bearing connection still authenticated as this pubkey?", so it
+/// reads both together. Publishing them as separate fields left a window in
+/// which a read-only watcher was already discoverable by pubkey while still
+/// carrying `register`'s presence-bearing default — long enough for a
+/// concurrent teardown of the real connection to skip the clear, after which
+/// nothing revisits it and presence stands until the TTL expires. That is the
+/// exact stale-presence window the read-only class exists to remove.
+struct AuthenticatedPrincipal {
+    pubkey: Vec<u8>,
     /// Whether this connection counts as its principal being present.
     ///
     /// Mirrors `ConnectionState`'s class so presence bookkeeping can be
     /// answered from the manager alone, without reaching back into a
     /// connection's auth lock during teardown.
-    presence_bearing: Arc<AtomicBool>,
-    grace_limit: u8,
+    presence_bearing: bool,
 }
 
 /// Community-scoped lifecycle registry shared by every long-lived socket type.
@@ -237,8 +253,7 @@ impl ConnectionManager {
                 community_id,
                 backpressure_count,
                 subscriptions,
-                authenticated_pubkey: Arc::new(std::sync::RwLock::new(None)),
-                presence_bearing: Arc::new(AtomicBool::new(true)),
+                principal: Arc::new(std::sync::RwLock::new(None)),
                 grace_limit,
             },
         );
@@ -261,25 +276,42 @@ impl ConnectionManager {
         self.connections.remove(&conn_id);
     }
 
-    /// Record the authenticated pubkey for a connection after NIP-42 succeeds.
-    pub fn set_authenticated_pubkey(&self, conn_id: Uuid, pubkey_bytes: Vec<u8>) {
+    /// Record the authenticated pubkey **and** class for a connection after
+    /// NIP-42 succeeds.
+    ///
+    /// Both halves land in a single write, so the pubkey never becomes
+    /// discoverable ahead of the class that qualifies it — see
+    /// [`AuthenticatedPrincipal`] for the presence bug that ordering caused.
+    /// This is the only way to record a principal; there is deliberately no
+    /// setter for either half alone.
+    ///
+    /// Only the presence half of the class is mirrored here — publish
+    /// authority is enforced on the connection itself, where the publish path
+    /// already is.
+    pub fn set_authenticated_principal(
+        &self,
+        conn_id: Uuid,
+        pubkey_bytes: Vec<u8>,
+        class: crate::connection::ConnectionClass,
+    ) {
         if let Some(entry) = self.connections.get(&conn_id) {
-            if let Ok(mut slot) = entry.authenticated_pubkey.write() {
-                *slot = Some(pubkey_bytes);
+            if let Ok(mut slot) = entry.principal.write() {
+                *slot = Some(AuthenticatedPrincipal {
+                    pubkey: pubkey_bytes,
+                    presence_bearing: class.bears_presence(),
+                });
             }
         }
     }
 
-    /// Record this connection's class after NIP-42 succeeds.
-    ///
-    /// Only the presence half is mirrored here — publish authority is enforced
-    /// on the connection itself, where the publish path already is.
-    pub fn set_connection_class(&self, conn_id: Uuid, class: crate::connection::ConnectionClass) {
-        if let Some(entry) = self.connections.get(&conn_id) {
-            entry
-                .presence_bearing
-                .store(class.bears_presence(), Ordering::Relaxed);
-        }
+    /// Record an [`ConnectionClass::Interactive`] principal — the class a
+    /// connection that declares nothing gets.
+    pub fn set_authenticated_pubkey(&self, conn_id: Uuid, pubkey_bytes: Vec<u8>) {
+        self.set_authenticated_principal(
+            conn_id,
+            pubkey_bytes,
+            crate::connection::ConnectionClass::Interactive,
+        );
     }
 
     /// Does `pubkey_bytes` still hold a **presence-bearing** connection in this
@@ -303,15 +335,14 @@ impl ConnectionManager {
     ) -> bool {
         self.connections.iter().any(|entry| {
             entry.community_id == community_id
-                && entry.presence_bearing.load(Ordering::Relaxed)
                 && entry
-                    .authenticated_pubkey
+                    .principal
                     .read()
                     .ok()
                     .and_then(|value| {
-                        value
-                            .as_ref()
-                            .map(|stored| stored.as_slice() == pubkey_bytes)
+                        value.as_ref().map(|stored| {
+                            stored.presence_bearing && stored.pubkey.as_slice() == pubkey_bytes
+                        })
                     })
                     .unwrap_or(false)
         })
@@ -337,13 +368,13 @@ impl ConnectionManager {
             .filter_map(|entry| {
                 let matches = entry.community_id == community_id
                     && entry
-                        .authenticated_pubkey
+                        .principal
                         .read()
                         .ok()
                         .and_then(|value| {
                             value
                                 .as_ref()
-                                .map(|stored| stored.as_slice() == pubkey_bytes)
+                                .map(|stored| stored.pubkey.as_slice() == pubkey_bytes)
                         })
                         .unwrap_or(false);
                 matches.then_some(*entry.key())
@@ -355,7 +386,7 @@ impl ConnectionManager {
     pub fn pubkey_for_conn(&self, conn_id: Uuid) -> Option<Vec<u8>> {
         self.connections
             .get(&conn_id)
-            .and_then(|entry| entry.authenticated_pubkey.read().ok()?.clone())
+            .and_then(|entry| Some(entry.principal.read().ok()?.as_ref()?.pubkey.clone()))
     }
 
     /// Disconnect every live connection authenticated as `pubkey` **in
@@ -558,11 +589,11 @@ impl ConnectionManager {
         // community_id → set of pubkey bytes
         let mut seen: HashMap<CommunityId, HashSet<Vec<u8>>> = HashMap::new();
         for entry in self.connections.iter() {
-            if let Ok(lock) = entry.authenticated_pubkey.read() {
-                if let Some(pk) = lock.as_ref() {
+            if let Ok(lock) = entry.principal.read() {
+                if let Some(stored) = lock.as_ref() {
                     seen.entry(entry.community_id)
                         .or_default()
-                        .insert(pk.clone());
+                        .insert(stored.pubkey.clone());
                 }
             }
         }
@@ -575,7 +606,7 @@ impl ConnectionManager {
     pub fn pubkey_for(&self, conn_id: Uuid) -> Option<Vec<u8>> {
         self.connections
             .get(&conn_id)
-            .and_then(|entry| entry.authenticated_pubkey.read().ok()?.clone())
+            .and_then(|entry| Some(entry.principal.read().ok()?.as_ref()?.pubkey.clone()))
     }
 
     /// Sends a text message to the given connection.
@@ -1640,8 +1671,11 @@ mod tests {
         let pubkey = vec![7u8; 32];
 
         let watcher = register_bare(&mgr, community);
-        mgr.set_authenticated_pubkey(watcher, pubkey.clone());
-        mgr.set_connection_class(watcher, crate::connection::ConnectionClass::ReadOnly);
+        mgr.set_authenticated_principal(
+            watcher,
+            pubkey.clone(),
+            crate::connection::ConnectionClass::ReadOnly,
+        );
 
         assert!(
             !mgr.has_presence_bearing_connection(community, &pubkey),
@@ -1691,8 +1725,11 @@ mod tests {
         let pubkey = vec![3u8; 32];
 
         let watcher = register_bare(&mgr, community);
-        mgr.set_authenticated_pubkey(watcher, pubkey.clone());
-        mgr.set_connection_class(watcher, crate::connection::ConnectionClass::ReadOnly);
+        mgr.set_authenticated_principal(
+            watcher,
+            pubkey.clone(),
+            crate::connection::ConnectionClass::ReadOnly,
+        );
 
         assert_eq!(
             mgr.connection_ids_for_pubkey_in_community(community, &pubkey),
@@ -1703,6 +1740,46 @@ mod tests {
             mgr.disconnect_pubkey(community, &pubkey, &"0".repeat(64), "banned"),
             1,
             "a ban must close a read-only connection like any other"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watcher_is_never_discoverable_before_its_class_is_known() {
+        // Recording the pubkey and the class as two writes left a window in
+        // which the watcher answered a pubkey lookup while still carrying
+        // `register`'s presence-bearing default. A teardown landing inside that
+        // window sees presence still held, skips `clear_presence`, and nothing
+        // revisits the decision — presence stands until the 180s TTL, which is
+        // the exact failure the read-only class exists to remove.
+        //
+        // The single-writer invariant that closes it: the moment the watcher is
+        // visible by pubkey at all, it is already visible as non-presence-bearing.
+        let mgr = ConnectionManager::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xDDDD));
+        let pubkey = vec![5u8; 32];
+
+        let watcher = register_bare(&mgr, community);
+        assert!(
+            mgr.connection_ids_for_pubkey_in_community(community, &pubkey)
+                .is_empty(),
+            "an unauthenticated connection answers to no pubkey"
+        );
+
+        mgr.set_authenticated_principal(
+            watcher,
+            pubkey.clone(),
+            crate::connection::ConnectionClass::ReadOnly,
+        );
+
+        assert_eq!(
+            mgr.connection_ids_for_pubkey_in_community(community, &pubkey),
+            vec![watcher],
+            "the pubkey is discoverable only after the single publishing write"
+        );
+        assert!(
+            !mgr.has_presence_bearing_connection(community, &pubkey),
+            "and that same write already carried the class — there is no \
+             intermediate state in which the watcher bears presence"
         );
     }
 

@@ -224,6 +224,21 @@ one.
   agent offline while a deploy against it correctly no-ops — a known UX
   boundary (the cross-scope boundary I4 admits, seen from the status side),
   stated here so the two honest-but-conflicting readouts are diagnosable.
+  A third consequence (c): the relay clears presence when the *last*
+  connection for a pubkey goes away, so anything holding a long-lived
+  connection **as** an agent without **being** it suppresses that prompt
+  clear. This does **not** unbound the window — the presence key carries its
+  own `PRESENCE_TTL_SECS` expiry and a watcher that never publishes never
+  refreshes it, so the dot still goes out within 180s. What it destroys is
+  the *avoidable* part of the window that the paragraph above commits to
+  minimizing: a clean death that should have cleared presence in
+  milliseconds instead reads online until the TTL runs out. Such a watcher
+  (the wake daemon is the live example) MUST declare the read-only
+  connection class in its signed NIP-42 AUTH event
+  (`["class", "read-only"]`). The class is non-presence-bearing, so it never
+  suppresses the clear, and it may not publish — which also means it can
+  never refresh the TTL *for* the agent whose key it holds, the one way a
+  watcher genuinely could have made the window indefinite.
 
 - **(I4) At most one live instance per agent key per deployment scope.**
   Within one provider's deployment scope (for Kubernetes: one namespace),

@@ -61,6 +61,37 @@ pub const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 135 + 10 + 10 + 600 + 300;
 pub const REPLAY_FLOOR_MAX_AGE_SECS: u64 =
     MAX_TIMESTAMP_DRIFT_SECS + WAKE_PIPELINE_LATENCY_BUDGET_SECS;
 
+/// Tag a client puts in its signed NIP-42 AUTH event to request a restricted
+/// connection class.
+///
+/// The AUTH event is the only place connection-scoped intent can be stated and
+/// trusted, because the Schnorr signature covers the tags.
+pub const CONNECTION_CLASS_TAG: &str = "class";
+
+/// The default connection class: may publish, and bears presence. What every
+/// connection gets when no [`CONNECTION_CLASS_TAG`] is sent.
+pub const CONNECTION_CLASS_INTERACTIVE: &str = "interactive";
+
+/// A connection that may subscribe and receive but may not publish, and does
+/// not count as its principal being present.
+///
+/// For processes that hold a connection **as** an agent without **being** it —
+/// the wake daemon. See `docs/remote-agents.md` §I3(c).
+pub const CONNECTION_CLASS_READ_ONLY: &str = "read-only";
+
+/// Prefix the relay uses to confirm an applied connection class in the AUTH
+/// `OK` message, e.g. `class: read-only`.
+///
+/// The confirmation exists so a client can tell a relay that *applied* the
+/// class from one that has never heard of it — an older relay ignores the tag
+/// and answers `OK true` with an empty message, which would silently hand a
+/// watcher the fully-capable connection it asked not to have.
+///
+/// Defined here for the same reason as the drift bound above: the relay writes
+/// this string and the client compares against it, and as two independent
+/// literals in two crates nothing would keep them equal.
+pub const CONNECTION_CLASS_CONFIRMATION_PREFIX: &str = "class: ";
+
 /// Errors returned while canonicalizing a relay URL for runtime identity.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NormalizeRelayUrlError {

@@ -18,16 +18,21 @@
 //! - [`floors`] — the **durable anti-rollback floors**. A signature
 //!   authenticates an old bundle just as well as a current one, so accepting
 //!   one has to be gated on state that survives a restart.
+//! - [`feed`] — the **event feed**: the subscription that supplies the
+//!   mentions, and the fold from a relay frame into a claimed trigger. Its
+//!   socket lives behind a trait, implemented once in [`relay_feed`].
 //!
-//! Both exist because of specific review findings; each carries the gate id
-//! (`G1`–`G3`) it discharges so the reason is not lost.
+//! Each exists because of a specific review finding and carries the gate id
+//! (`G1`–`G4`) it discharges, so the reason is not lost.
 
 pub mod attempt;
 pub mod bundle;
 pub mod cursor;
 pub mod decide;
+pub mod feed;
 mod fence;
 pub mod floors;
+pub mod relay_feed;
 
 pub use attempt::{
     is_managed_agent_live, is_presumed_delivered_by_floor, is_wake_attempt_debounced,

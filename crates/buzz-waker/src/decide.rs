@@ -109,7 +109,7 @@ pub struct WakeCandidate {
 }
 
 /// The event fields a wake decision reads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerEvent {
     /// Event id, hex.
     pub id: String,

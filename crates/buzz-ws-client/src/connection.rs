@@ -182,8 +182,27 @@ impl NostrWsConnection {
             return Ok(msg);
         }
 
+        // One deadline for the whole call, not one per WebSocket frame.
+        //
+        // This loop skips control frames, and answering a Ping is not the
+        // caller's message arriving. Restarting the timer on each one made any
+        // `timeout_dur` longer than the relay's heartbeat interval — 30s, see
+        // `heartbeat_loop` in `buzz-relay/src/connection.rs` — unreachable on a
+        // healthy connection: the caller waited forever instead of being told
+        // the subscription was quiet. `wait_for_auth_challenge` below already
+        // holds a single deadline for the same reason.
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+
         loop {
-            let raw = timeout(timeout_dur, self.ws.next())
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+
+            if remaining.is_zero() {
+                return Err(WsClientError::Timeout);
+            }
+
+            let raw = timeout(remaining, self.ws.next())
                 .await
                 .map_err(|_| WsClientError::Timeout)?
                 .ok_or(WsClientError::ConnectionClosed)?
@@ -362,6 +381,61 @@ mod tests {
     #[test]
     fn publish_ok_timeout_meets_floor() {
         const { assert!(PUBLISH_OK_TIMEOUT_SECS >= 30) };
+    }
+
+    /// A server that pings faster than the caller's timeout and never sends a
+    /// relay message — the shape of a healthy but quiet Buzz relay, which
+    /// heartbeats every 30s.
+    async fn ping_only_server(ping_every: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            loop {
+                tokio::time::sleep(ping_every).await;
+                if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        format!("ws://{addr}")
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pings_do_not_postpone_the_idle_timeout() {
+        // The regression this pins: `recv_one` used to restart its timer on
+        // every control frame, so a relay pinging every 30s made any timeout
+        // above 30s unreachable. `buzz-waker`'s feed asks for 60s of idle to
+        // decide it should checkpoint coverage, and never got it — the cursor
+        // went stale on a connection that was working the whole time.
+        let url = ping_only_server(Duration::from_millis(50)).await;
+        let mut conn = NostrWsConnection::connect(&url)
+            .await
+            .expect("connect to the local ping-only server");
+
+        // Bounded from the outside so the pre-fix behaviour fails this test
+        // rather than hanging the suite: without one deadline, `next_event`
+        // never returns while the pings keep coming.
+        let result = timeout(
+            Duration::from_secs(2),
+            conn.next_event(Duration::from_millis(300)),
+        )
+        .await
+        .expect("next_event must return, not be postponed by every ping");
+
+        assert!(
+            matches!(result, Err(WsClientError::Timeout)),
+            "a quiet connection must report idle even while answering pings"
+        );
     }
 
     fn tag(parts: &[&str]) -> Tag {

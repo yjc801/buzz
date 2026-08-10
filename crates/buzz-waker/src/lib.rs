@@ -13,6 +13,8 @@
 //! - [`bundle`] — the **signed launch bundle**. The desktop stays the single
 //!   resolver of an agent's deploy payload and hands the waker a signed,
 //!   fully-resolved artifact; the waker resolves nothing.
+//! - [`attempt`] — the **wake attempt** itself: the effectful state machine
+//!   that turns a decision into a deploy, or into a defensible refusal.
 //! - [`floors`] — the **durable anti-rollback floors**. A signature
 //!   authenticates an old bundle just as well as a current one, so accepting
 //!   one has to be gated on state that survives a restart.
@@ -20,12 +22,19 @@
 //! Both exist because of specific review findings; each carries the gate id
 //! (`G1`–`G3`) it discharges so the reason is not lost.
 
+pub mod attempt;
 pub mod bundle;
 pub mod cursor;
 pub mod decide;
 mod fence;
 pub mod floors;
 
+pub use attempt::{
+    is_managed_agent_live, is_presumed_delivered_by_floor, is_wake_attempt_debounced,
+    push_bounded_pending_trigger, run_wake_attempt, should_retry_collapsed_triggers, HasEventId,
+    HeartbeatObservation, LiveEvidenceTracker, WakeAttemptResult, WakeAttemptState, WakeEffects,
+    WakeOutcome, WakeSettlement,
+};
 pub use bundle::{BundleError, LaunchBundleBody, ProviderEnvelope, SignedLaunchBundle};
 pub use cursor::{Admission, Cursor, CursorError, CursorStore, Resume};
 pub use decide::{

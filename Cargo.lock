@@ -1367,6 +1367,7 @@ dependencies = [
 name = "buzz-waker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "buzz-core",
  "buzz-ws-client",
  "futures-util",
@@ -1378,6 +1379,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

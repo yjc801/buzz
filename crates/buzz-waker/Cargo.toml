@@ -11,6 +11,14 @@ license.workspace = true
 repository.workspace = true
 description = "Headless wake daemon for remote Buzz agents: signed launch bundles and durable anti-rollback state"
 
+[lib]
+name = "buzz_waker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-waker"
+path = "src/main.rs"
+
 [dependencies]
 buzz-core  = { workspace = true }
 nostr       = { workspace = true }
@@ -23,12 +31,20 @@ uuid        = { workspace = true }
 # decision core, the cursor and the attempt state machine stay effect-free —
 # `feed::FeedTransport` is the seam, and `relay_feed` is its one implementation.
 buzz-ws-client = { workspace = true }
+# The connection loop (`wake_loop`), the presence tap (`presence_feed`) and
+# the daemon binary (`main`) all need a runtime — spawning one wake attempt
+# per trigger onto its own task, timing reconnects, and driving graceful
+# shutdown. The pure decision core (`decide`, `attempt`'s sequencing itself,
+# `cursor`, `floors`, `bundle`) stays runtime-agnostic; only the socket-facing
+# layer pulls tokio in as a real dependency rather than a dev one.
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow      = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-# Tests only: the attempt state machine is generic over its effects, so the
-# crate itself pulls in no runtime — but driving an async test needs one.
-tokio       = { workspace = true }
 # For relay_feed's mock-relay transport test: a real (local, in-process)
 # WebSocket peer to drive `RelayFeed` against, the same server-side halves
 # `buzz-ws-client`'s own connection tests already use.

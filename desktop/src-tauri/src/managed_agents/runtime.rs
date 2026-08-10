@@ -20,6 +20,9 @@ pub(crate) use path::{compose_path_entries, should_skip_claude_executable, shoul
 
 pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
 
+mod log_filter;
+use log_filter::child_rust_log_filter;
+
 mod metadata;
 pub(crate) use metadata::{
     apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
@@ -911,14 +914,6 @@ pub fn spawn_agent_child(
         adapter_availability: spawned_adapter_availability,
         start_nonce,
     })
-}
-
-fn child_rust_log_filter() -> String {
-    match std::env::var("RUST_LOG") {
-        Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
-    }
 }
 
 pub fn start_managed_agent_process(

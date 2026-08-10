@@ -155,3 +155,9 @@ tokio = { version = "1", features = ["test-util"] }
 # The relay's media validation, so the snapshot-sharing tests can prove the
 # full export → sanitize → relay-accept → import contract end to end.
 buzz_media_pkg = { package = "buzz-media", path = "../../crates/buzz-media" }
+# `filter::Targets` — the same directive set that backs `EnvFilter`'s static
+# directives, so `managed_agents::runtime::log_filter` can assert what the
+# harness's RUST_LOG actually resolves to instead of what the string looks like.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "std",
+] }

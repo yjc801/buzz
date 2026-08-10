@@ -673,7 +673,8 @@ export async function runWakeAttempt({
     }
 
     // Stamp before the deploy, not after: the attempt is what the debounce
-    // counts, and a slow deploy must not let a burst through behind it.
+    // counts, and a slow deploy must not let a burst through behind it. A
+    // FAILED deploy then re-stamps from settlement — see the catch below.
     const stampedAt = now();
     state.lastAttemptAt.set(key, stampedAt);
     try {
@@ -685,7 +686,17 @@ export async function runWakeAttempt({
         return { outcome: "cancelled", reconcile };
       }
       // Holding the debounce after a refusal is deliberate: a provider that
-      // just refused will refuse the next mention too.
+      // just refused will refuse the next mention too. Measure it from
+      // SETTLEMENT, not from the pre-call stamp: the deploy deadline
+      // (invoke_provider, 600s) is five times WAKE_ATTEMPT_DEBOUNCE_MS, so a
+      // slow refusal would otherwise return with its own cooldown already
+      // lapsed and the next mention would immediately spend another long,
+      // failing deploy. Only our own stamp moves (a concurrent future attempt
+      // may have re-stamped), and never backwards (a clock that jumped back
+      // must not shorten the window).
+      if (state.lastAttemptAt.get(key) === stampedAt) {
+        state.lastAttemptAt.set(key, Math.max(stampedAt, now()));
+      }
       return { outcome: "deploy-failed", reconcile, error };
     }
     if (aborted()) {

@@ -64,8 +64,21 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          LAST=$(gh release list --limit 1 --json tagName,targetCommitish \
-                   --jq '.[0].targetCommitish // empty' 2>/dev/null || true)
+          # `gh release list --json` cannot return targetCommitish (supported
+          # fields: createdAt, isDraft, isImmutable, isLatest, isPrerelease,
+          # name, publishedAt, tagName). Pick the newest fork tag from the
+          # list, then read its target with `gh release view`, which does
+          # expose targetCommitish. These releases are prereleases, so
+          # `isLatest` never matches them — filter on the tag prefix instead.
+          LAST_TAG=$(gh release list --limit 100 --order desc --exclude-drafts \
+                       --json tagName \
+                       --jq 'map(select(.tagName | startswith("fork-desktop-v")))
+                             | .[0].tagName // empty')
+          LAST=""
+          if [[ -n "$LAST_TAG" ]]; then
+            LAST=$(gh release view "$LAST_TAG" --json targetCommitish \
+                     --jq '.targetCommitish // empty')
+          fi
           if [[ "$FORCE" == "true" ]]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "Forced build requested."
@@ -165,6 +178,11 @@ jobs:
         if: steps.freshness.outputs.build == 'true'
         run: cd desktop && pnpm tauri build --verbose --no-sign --config src-tauri/tauri.fork.conf.json
         env:
+          # audiopus_sys (via the desktop crate's `opus` dep) bundles Opus with
+          # `cmake_minimum_required(VERSION 3.1)`, which CMake 4 on the current
+          # macOS ARM runner image rejects. Every other native build workflow
+          # here carries the same override.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           MACOSX_DEPLOYMENT_TARGET: "10.15"
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
           TAURI_BUNDLER_DMG_IGNORE_CI: "true"

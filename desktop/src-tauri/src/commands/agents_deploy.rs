@@ -121,17 +121,14 @@ pub(super) async fn deploy_to_provider(
 
     let fresh_generation = match deploy_result {
         Ok(outcome) => {
-            // A provider that derives its id from the agent hands back the same
-            // id after A → Local → A, which is precisely the entry the outbound
-            // move retired. Reclaim it before it becomes the live pointer, or
-            // the record calls one deployment both current and abandoned and
-            // deletion warns about orphaning infrastructure still in use.
-            crate::managed_agents::reclaim_residual_deployment(
-                provider_id,
-                config,
-                &outcome.agent_id,
-                &mut rec.residual_deployments,
-            );
+            // Deliberately does *not* clear a residual that looks like the
+            // deployment this call just landed on. An id repeating after
+            // A → Local → A cannot be told apart from the same id in another
+            // cluster, because an omitted Kubernetes `context` resolves from the
+            // machine's current kubeconfig at deploy time — see the note above
+            // `deletion_orphans_infrastructure`. Retaining an entry that may be
+            // this deployment costs a duplicate warning; dropping one that is
+            // not loses the last pointer to a pod holding the private key.
             rec.backend_agent_id = Some(outcome.agent_id);
             rec.last_started_at = Some(now_iso());
             rec.updated_at = now_iso();

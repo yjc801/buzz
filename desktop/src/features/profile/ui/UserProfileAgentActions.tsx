@@ -327,6 +327,15 @@ function AgentDeleteConfirmDialog({
       agent.residualDeployments.map((deployment) => deployment.providerId),
     ),
   ];
+  // Residuals are never cleared on redeploy, because a repeated deterministic
+  // id cannot be told apart from the same id in another cluster (an omitted
+  // Kubernetes `context` resolves from the machine's current kubeconfig). So a
+  // residual naming the provider the agent runs on right now *may* be that same
+  // deployment. Say that instead of asserting it was abandoned — the entry is
+  // kept precisely because Buzz cannot tell.
+  const residualMayBeCurrent =
+    agent.backend.type === "provider" &&
+    residualProviders.includes(agent.backend.id);
 
   return (
     <AlertDialog onOpenChange={onOpenChange} open={open}>
@@ -352,10 +361,13 @@ function AgentDeleteConfirmDialog({
           {residualProviders.length > 0 ? (
             <li data-testid="agent-delete-residual-warning">
               This agent was moved off {residualProviders.join(", ")}, and that
-              deployment still exists with a copy of its key. Deleting removes
-              the only record of it, so nothing here can reach or remove it
-              afterwards — clean it up on the provider first if you need it
-              gone.
+              deployment still exists with a copy of its key.{" "}
+              {residualMayBeCurrent
+                ? "Buzz can't tell whether that is the deployment it runs on now or a separate one left behind. "
+                : ""}
+              Deleting removes the only record of it, so nothing here can reach
+              or remove it afterwards — clean it up on the provider first if you
+              need it gone.
             </li>
           ) : null}
         </ul>

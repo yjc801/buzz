@@ -425,7 +425,10 @@ export async function deleteManagedAgentWithRules({
     ].join(", ");
     const confirmed = window.confirm(
       `This agent was moved off ${providers}, and that deployment still exists ` +
-        "with a copy of its key. Deleting removes the local record and orphans it. Continue?",
+        "with a copy of its key. Buzz keeps the pointer even when the agent is " +
+        "deployed there again, because it cannot tell one deployment from " +
+        "another in a different cluster. Deleting removes the local record and " +
+        "orphans it. Continue?",
     );
     if (!confirmed) {
       return { cancelled: true };

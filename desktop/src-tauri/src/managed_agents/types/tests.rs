@@ -731,6 +731,7 @@ fn summary_fixture(
         env_vars: Default::default(),
         backend: super::BackendKind::Local,
         backend_agent_id: None,
+        residual_deployments: Vec::new(),
         status: "running".into(),
         pid: Some(4242),
         created_at: "2026-01-01T00:00:00Z".into(),

@@ -90,6 +90,10 @@ export type MockManagedAgentSeed = {
   channelNames?: string[];
   channelIds?: string[];
   backend?: RawManagedAgent["backend"];
+  /** The live provider deployment pointer, when the seed is deployed. */
+  backendAgentId?: string | null;
+  /** Deployments a migration left behind — see `retire_deployment_pointer`. */
+  residualDeployments?: RawManagedAgent["residual_deployments"];
   lastError?: string | null;
   lastErrorCode?: number | null;
   needsRestart?: boolean;
@@ -857,6 +861,13 @@ type RawManagedAgent = {
     | { type: "local" }
     | { type: "provider"; id: string; config: Record<string, unknown> };
   backend_agent_id: string | null;
+  /** Deployments left behind by a migration. Omitted by the backend when empty. */
+  residual_deployments?: Array<{
+    provider_id: string;
+    agent_id: string;
+    /** The `provider_config` it was deployed with — its deployment scope. */
+    config?: Record<string, unknown>;
+  }>;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
 };
@@ -1687,6 +1698,11 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     auto_restart_on_config_change: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend ?? { type: "local" as const },
     backend_agent_id: agent.backend_agent_id ?? null,
+    // This clone is field-by-field, so omitting residuals here made the mock's
+    // retirement invisible to the app no matter what it wrote.
+    residual_deployments: (agent.residual_deployments ?? []).map(
+      (deployment) => ({ ...deployment }),
+    ),
     respond_to: agent.respond_to ?? "owner-only",
     respond_to_allowlist: agent.respond_to_allowlist
       ? [...agent.respond_to_allowlist]
@@ -2240,7 +2256,8 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     start_on_app_launch: true,
     auto_restart_on_config_change: seed.autoRestartOnConfigChange ?? true,
     backend: seed.backend ?? { type: "local" },
-    backend_agent_id: null,
+    backend_agent_id: seed.backendAgentId ?? null,
+    residual_deployments: seed.residualDeployments ?? [],
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
@@ -8631,14 +8648,15 @@ async function handleDeleteManagedAgent(args: {
   forceRemoteDelete?: boolean | null;
 }): Promise<void> {
   // Model the backend invariant: reject deletion of deployed remote agents
-  // unless force_remote_delete is true.
+  // unless force_remote_delete is true. A deployment the agent has migrated
+  // *off* counts too — it still exists and still holds the agent's key, even
+  // though the record now reads local.
   const agent = mockManagedAgents.find((a) => a.pubkey === args.pubkey);
-  if (
-    agent &&
-    agent.backend.type === "provider" &&
-    agent.backend_agent_id != null &&
-    !args.forceRemoteDelete
-  ) {
+  const orphansInfrastructure =
+    agent != null &&
+    ((agent.backend.type === "provider" && agent.backend_agent_id != null) ||
+      (agent.residual_deployments?.length ?? 0) > 0);
+  if (orphansInfrastructure && !args.forceRemoteDelete) {
     throw new Error(
       "cannot delete a deployed remote agent without force_remote_delete: true",
     );
@@ -8647,6 +8665,62 @@ async function handleDeleteManagedAgent(args: {
     (candidate) => candidate.pubkey !== args.pubkey,
   );
   syncMockRelayAgentsFromManagedAgents();
+}
+
+async function handleSetManagedAgentBackend(args: {
+  pubkey: string;
+  backend: RawManagedAgent["backend"];
+  remoteConfirmedStopped: boolean;
+}): Promise<RawManagedAgent> {
+  const agent = getMockManagedAgent(args.pubkey);
+  // Mirror the two backend guards that decide whether the move is safe. The
+  // remote half cannot be observed from a status field — the caller asserts it.
+  if (agent.status === "running") {
+    throw new Error("stop the agent before moving it");
+  }
+  if (agent.backend.type === "provider" && !args.remoteConfirmedStopped) {
+    throw new Error(
+      "send `!shutdown` and wait for the agent to go offline before moving it back",
+    );
+  }
+  // Retire the pointer to the deployment being left behind, attributed to the
+  // provider *and the config* that issued it — see `retire_deployment_pointer`.
+  // Config is part of the identity because it carries the deployment scope
+  // (Kubernetes `context`/`namespace`), so a same-provider config edit leaves
+  // real infrastructure behind exactly as switching providers does.
+  const sameDeployment =
+    args.backend.type === "provider" &&
+    agent.backend.type === "provider" &&
+    args.backend.id === agent.backend.id &&
+    JSON.stringify(args.backend.config) ===
+      JSON.stringify(agent.backend.config);
+  if (
+    agent.backend.type === "provider" &&
+    !sameDeployment &&
+    agent.backend_agent_id != null
+  ) {
+    const entry = {
+      provider_id: agent.backend.id,
+      agent_id: agent.backend_agent_id,
+      config: agent.backend.config,
+    };
+    const existing = agent.residual_deployments ?? [];
+    agent.residual_deployments = existing.some(
+      (d) =>
+        d.provider_id === entry.provider_id &&
+        d.agent_id === entry.agent_id &&
+        JSON.stringify(d.config ?? {}) === JSON.stringify(entry.config),
+    )
+      ? existing
+      : [...existing, entry];
+    agent.backend_agent_id = null;
+  }
+  agent.backend = args.backend;
+  agent.start_on_app_launch = false;
+  agent.status = args.backend.type === "provider" ? "not_deployed" : "stopped";
+  agent.updated_at = new Date().toISOString();
+  syncMockRelayAgentsFromManagedAgents();
+  return cloneManagedAgent(agent);
 }
 
 async function handleSetManagedAgentStartOnAppLaunch(args: {
@@ -12281,6 +12355,10 @@ export function maybeInstallE2eTauriMocks() {
           payload as Parameters<
             typeof handleSetManagedAgentStartOnAppLaunch
           >[0],
+        );
+      case "set_managed_agent_backend":
+        return handleSetManagedAgentBackend(
+          payload as Parameters<typeof handleSetManagedAgentBackend>[0],
         );
       case "delete_managed_agent":
         return handleDeleteManagedAgent(

@@ -778,6 +778,7 @@ pub async fn create_managed_agent(
             runtime_pid: None,
             backend: input.backend.clone(),
             backend_agent_id: None,
+            residual_deployments: Vec::new(),
             provider_binary_path,
             persona_team_dir: None,
             persona_name_in_team: None,
@@ -1213,16 +1214,13 @@ pub async fn delete_managed_agent(
                 state.clear_agent_session_caches(pubkey);
             }
 
-            // Guard: reject deletion of deployed remote agents unless explicitly forced.
-            // This turns "don't orphan remote infra" from a UI convention into a backend
-            // invariant — a buggy or compromised IPC caller cannot silently orphan a live
-            // remote deployment. The frontend sends force_remote_delete: true only after
-            // the user confirms the orphan warning.
+            // Guard: never silently orphan provider infrastructure that still holds
+            // this agent's key — including a deployment it has *migrated off*, whose
+            // record now reads Local (see `deletion_orphans_infrastructure`). A backend
+            // invariant, not a UI convention: a buggy or compromised IPC caller cannot
+            // bypass it. The frontend sends force_remote_delete after the orphan warning.
             if let Some(record) = records.iter().find(|r| r.pubkey == pubkey) {
-                if record.backend != BackendKind::Local
-                    && record.backend_agent_id.is_some()
-                    && !force_remote_delete.unwrap_or(false)
-                {
+                if record.orphans_infrastructure() && !force_remote_delete.unwrap_or(false) {
                     return Err(
                         "cannot delete a deployed remote agent without force_remote_delete: true"
                             .to_string(),

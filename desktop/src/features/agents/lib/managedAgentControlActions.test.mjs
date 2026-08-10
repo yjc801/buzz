@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  deleteManagedAgentWithRules,
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
   isManagedAgentLive,
@@ -40,6 +41,7 @@ function agent(overrides = {}) {
     startOnAppLaunch: false,
     backend: { type: "local" },
     backendAgentId: null,
+    residualDeployments: [],
     respondTo: "owner-only",
     respondToAllowlist: [],
     ...overrides,
@@ -607,4 +609,79 @@ test("the runtime dot's claim must match reality: 'Running' means the harness ru
     isManagedAgentLive(remote({ status: "deployed" }), "online"),
     true,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Residual deployments. Migrating off a provider leaves infrastructure that
+// still holds this agent's private key — Buzz has no undeploy. The record now
+// reads `local`, so a delete gated on `backend.type` alone would skip both the
+// warning and the force flag, and the backend would refuse the call outright.
+// ---------------------------------------------------------------------------
+
+function withConfirm(answer, body) {
+  const previous = globalThis.window;
+  globalThis.window = { confirm: () => answer };
+  try {
+    return body();
+  } finally {
+    if (previous === undefined) delete globalThis.window;
+    else globalThis.window = previous;
+  }
+}
+
+const migratedOffProvider = () =>
+  agent({
+    backend: { type: "local" },
+    backendAgentId: null,
+    residualDeployments: [{ providerId: "kubernetes", agentId: "abc123" }],
+  });
+
+test("deleting a migrated agent warns about the deployment it left behind", async () => {
+  const calls = [];
+  await withConfirm(true, () =>
+    deleteManagedAgentWithRules({
+      agent: migratedOffProvider(),
+      channels: [],
+      deleteManagedAgent: async (args) => {
+        calls.push(args);
+      },
+      relayAgents: [],
+    }),
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].forceRemoteDelete,
+    true,
+    "the backend refuses this delete without the force flag",
+  );
+});
+
+test("declining the residual-deployment warning cancels the delete", async () => {
+  const calls = [];
+  const result = await withConfirm(false, () =>
+    deleteManagedAgentWithRules({
+      agent: migratedOffProvider(),
+      channels: [],
+      deleteManagedAgent: async (args) => {
+        calls.push(args);
+      },
+      relayAgents: [],
+    }),
+  );
+  assert.deepEqual(result, { cancelled: true });
+  assert.equal(calls.length, 0);
+});
+
+test("an agent that never deployed anywhere deletes without forcing", async () => {
+  const calls = [];
+  await deleteManagedAgentWithRules({
+    agent: agent(),
+    channels: [],
+    deleteManagedAgent: async (args) => {
+      calls.push(args);
+    },
+    relayAgents: [],
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].forceRemoteDelete, undefined);
 });

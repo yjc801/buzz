@@ -9,6 +9,7 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { useAgentRunLocationMove } from "@/features/agents/ui/useAgentRunLocationMove";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
 import { ArchiveConfirmDialog } from "@/features/profile/ui/ArchiveConfirmDialog";
 import type { ManagedAgent } from "@/shared/api/types";
@@ -55,6 +56,7 @@ export function UserProfileAgentSettingsMenu({
 }) {
   const [archiveConfirmOpen, setArchiveConfirmOpen] = React.useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
+  const runLocationMove = useAgentRunLocationMove(managedAgent);
   const actionKey = managedAgent?.pubkey ?? "persona-draft";
   const personaKey = personaActionKey ?? actionKey;
   const canToggleAutoStart =
@@ -62,13 +64,18 @@ export function UserProfileAgentSettingsMenu({
     managedAgent.backend.type === "local" &&
     onToggleAutoStart !== undefined;
   const autoStartSwitchId = `user-profile-agent-auto-start-${actionKey}`;
+  // Moving needs a real record to move: a persona draft has no backend, and
+  // `UserProfileAgentSettingsMenuSlot` passes `managedAgent` only on the branch
+  // where the viewer owns it.
+  const canMoveRunLocation = managedAgent !== undefined;
   const hasPrimaryActions = Boolean(onDuplicatePersona || onExportPersona);
   const hasArchiveAction =
     archiveActions?.canArchive === true &&
     archiveActions.isArchived !== undefined;
   const shouldConfirmAgentDelete =
     managedAgent !== undefined && onDelete !== undefined;
-  const hasManageActions = hasArchiveAction || Boolean(onDelete);
+  const hasManageActions =
+    hasArchiveAction || Boolean(onDelete) || canMoveRunLocation;
   const hasActions =
     canToggleAutoStart || hasPrimaryActions || hasManageActions;
 
@@ -145,6 +152,7 @@ export function UserProfileAgentSettingsMenu({
           {hasManageActions && (canToggleAutoStart || hasPrimaryActions) ? (
             <DropdownMenuSeparator />
           ) : null}
+          {runLocationMove.menuItem}
           {hasArchiveAction && archiveActions ? (
             archiveActions.isArchived ? (
               <DropdownMenuItem
@@ -186,6 +194,9 @@ export function UserProfileAgentSettingsMenu({
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
+      {/* Outside the menu on purpose — see `useAgentRunLocationMove`, and the
+          two confirmations below it, which are hoisted for the same reason. */}
+      {runLocationMove.dialog}
       {hasArchiveAction && archiveActions ? (
         <ArchiveConfirmDialog
           isBot={isBot}
@@ -305,6 +316,26 @@ function AgentDeleteConfirmDialog({
   open: boolean;
 }) {
   const isProviderAgent = agent.backend.type === "provider";
+  // A migrated agent reads Local while a deployment it moved off still exists
+  // with a copy of its key. This dialog is the *only* disclosure on this path:
+  // `deleteManagedAgentWithRules` is called here with `skipRemoteDeleteConfirm`,
+  // which suppresses its own residual `window.confirm` while still sending
+  // `forceRemoteDelete`. Keyed on the backend alone, the list below would tell
+  // a user with orphanable infrastructure only that a local process would stop.
+  const residualProviders = [
+    ...new Set(
+      agent.residualDeployments.map((deployment) => deployment.providerId),
+    ),
+  ];
+  // Residuals are never cleared on redeploy, because a repeated deterministic
+  // id cannot be told apart from the same id in another cluster (an omitted
+  // Kubernetes `context` resolves from the machine's current kubeconfig). So a
+  // residual naming the provider the agent runs on right now *may* be that same
+  // deployment. Say that instead of asserting it was abandoned — the entry is
+  // kept precisely because Buzz cannot tell.
+  const residualMayBeCurrent =
+    agent.backend.type === "provider" &&
+    residualProviders.includes(agent.backend.id);
 
   return (
     <AlertDialog onOpenChange={onOpenChange} open={open}>
@@ -327,6 +358,18 @@ function AgentDeleteConfirmDialog({
               ? "Requests remote deletion; if it is online, Buzz first sends a shutdown command when possible. If the deployment cannot be reached through a channel, the remote process may keep running without local management."
               : "Stops any local agent process before deleting the record"}
           </li>
+          {residualProviders.length > 0 ? (
+            <li data-testid="agent-delete-residual-warning">
+              This agent was moved off {residualProviders.join(", ")}, and that
+              deployment still exists with a copy of its key.{" "}
+              {residualMayBeCurrent
+                ? "Buzz can't tell whether that is the deployment it runs on now or a separate one left behind. "
+                : ""}
+              Deleting removes the only record of it, so nothing here can reach
+              or remove it afterwards — clean it up on the provider first if you
+              need it gone.
+            </li>
+          ) : null}
         </ul>
         <p className="text-sm text-muted-foreground">
           You can also archive this agent from the profile settings menu if you

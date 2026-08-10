@@ -189,6 +189,7 @@ fn local_agent() -> ManagedAgentRecord {
             config: serde_json::json!({ "api_key": "localproviderkey" }),
         },
         backend_agent_id: Some("local-remote-id".to_string()),
+        residual_deployments: Vec::new(),
         provider_binary_path: Some("/local/bin".to_string()),
         team_id: None,
         persona_team_dir: None,

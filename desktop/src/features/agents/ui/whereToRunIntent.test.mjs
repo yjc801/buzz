@@ -7,6 +7,7 @@ import {
   emptyWhereToRunDraft,
   providerConfigComplete,
   resolveBackendIntent,
+  runOnOptions,
 } from "./whereToRunIntent.ts";
 
 const probed = {
@@ -128,4 +129,33 @@ test("probe resolution preserves unrelated draft fields", () => {
     applyProbeResult(unprobedDraft, probeWithDefaults).runOn,
     "kubernetes",
   );
+});
+
+// ── runOnOptions ────────────────────────────────────────────────────────────
+
+test("with no providers installed there is nothing to choose", () => {
+  // The create flow: one option means WhereToRunSection renders nothing.
+  assert.deepEqual(runOnOptions([]), [
+    { label: "This computer", value: "local" },
+  ]);
+});
+
+test("an agent's current provider stays offerable after its binary is gone", () => {
+  // The trap this closes: discovery finds nothing for a remote agent, the
+  // section renders nothing, and the identity is stuck on a provider it can
+  // no longer reach — even though moving back needs no provider binary.
+  const options = runOnOptions([], "blox");
+  assert.deepEqual(options, [
+    { label: "This computer", value: "local" },
+    { label: "blox", value: "blox" },
+  ]);
+  assert.ok(options.length > 1, "a real choice, so the section renders");
+});
+
+test("a discovered current provider is listed once, not twice", () => {
+  assert.deepEqual(runOnOptions(["sprites", "blox"], "blox"), [
+    { label: "This computer", value: "local" },
+    { label: "sprites", value: "sprites" },
+    { label: "blox", value: "blox" },
+  ]);
 });

@@ -1,6 +1,13 @@
 import type { RestartDiffEntry as RawRestartDiffEntry } from "./restartDiff";
 import type { ManagedAgent, ManagedAgentBackend } from "./types";
 
+/** Wire shape of a residual provider deployment (snake_case mirror of the
+ * Rust `ResidualDeployment`). */
+export type RawResidualDeployment = {
+  provider_id: string;
+  agent_id: string;
+};
+
 /** Wire shape of a managed agent as serialized by the Tauri backend
  * (snake_case mirror of the Rust `ManagedAgentSummary`). */
 export type RawManagedAgent = {
@@ -47,6 +54,8 @@ export type RawManagedAgent = {
   auto_restart_on_config_change?: boolean;
   backend: ManagedAgentBackend;
   backend_agent_id: string | null;
+  /** Omitted by the backend when empty (`skip_serializing_if`). */
+  residual_deployments?: RawResidualDeployment[];
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
@@ -94,6 +103,12 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     autoRestartOnConfigChange: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend,
     backendAgentId: agent.backend_agent_id,
+    residualDeployments: (agent.residual_deployments ?? []).map(
+      (deployment) => ({
+        providerId: deployment.provider_id,
+        agentId: deployment.agent_id,
+      }),
+    ),
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
   };

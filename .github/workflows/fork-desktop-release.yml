@@ -1,0 +1,231 @@
+name: Fork Desktop Release
+
+# Builds an unsigned Apple Silicon DMG from this fork and publishes it as a
+# GitHub Release on the fork itself.
+#
+# This file deliberately does not exist upstream. Keeping the fork's release
+# path in its own file (rather than patching release.yml) means `git merge
+# upstream/main` never conflicts here.
+#
+# Differences from upstream release.yml, and why:
+#
+#   * Unsigned. Signing runs through block/apple-codesign-action, which
+#     authenticates via OIDC to Block infrastructure a fork cannot reach.
+#     Gatekeeper will quarantine the result — the release notes below carry the
+#     one-line fix for that.
+#   * No updater artifacts. Upstream injects an updater endpoint + pubkey via
+#     desktop/scripts/build-release-config.mjs. A fork enabling that would need
+#     its own signing keypair, and pointing it at the upstream feed would
+#     auto-update this build back into an official one, silently discarding the
+#     fork's changes. Update by downloading a new DMG instead.
+#   * No mesh-llm. That feature compiles llama.cpp from source and dominates
+#     build time. Upstream's Intel and Windows jobs ship without it too, so
+#     this is a supported configuration. Add `--features mesh-llm` to the build
+#     step if the fork needs local inference.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if no new commits since the last fork release"
+        type: boolean
+        default: false
+  schedule:
+    # Mondays 14:00 UTC. Scheduled runs skip themselves when main has not moved.
+    - cron: "0 14 * * 1"
+
+concurrency:
+  group: fork-desktop-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned macOS release
+    # Forks only. Guards against this ever running upstream if the file is
+    # merged there by accident.
+    if: github.repository != 'block/buzz'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write # create the release and upload the DMG
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Skip if nothing new since the last fork release
+        id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          LAST=$(gh release list --limit 1 --json tagName,targetCommitish \
+                   --jq '.[0].targetCommitish // empty' 2>/dev/null || true)
+          if [[ "$FORCE" == "true" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Forced build requested."
+          elif [[ -n "$LAST" && "$LAST" == "$GITHUB_SHA" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HEAD ($GITHUB_SHA) already released; skipping."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+        if: steps.freshness.outputs.build == 'true'
+
+      - name: Get pnpm store directory
+        if: steps.freshness.outputs.build == 'true'
+        id: pnpm-cache
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store cache
+        if: steps.freshness.outputs.build == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      - name: Install desktop dependencies
+        if: steps.freshness.outputs.build == 'true'
+        run: just desktop-install-ci
+
+      - name: Derive fork version
+        if: steps.freshness.outputs.build == 'true'
+        id: version
+        run: |
+          set -euo pipefail
+          BASE=$(node -p "require('./desktop/package.json').version")
+          if ! [[ "$BASE" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            echo "::error::Desktop version '$BASE' is not semver"
+            exit 1
+          fi
+          # Pre-release suffix keeps fork builds sorting below the upstream
+          # version they are based on, and makes the provenance obvious in the
+          # About window.
+          VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}-fork.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION from $GITHUB_SHA"
+
+      - name: Patch version
+        if: steps.freshness.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
+          cd src-tauri && cargo update --workspace
+
+      - name: Restore Cargo cache
+        if: steps.freshness.outputs.build == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/src-tauri/target
+            !desktop/src-tauri/target/**/release/bundle
+          key: fork-release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
+          restore-keys: fork-release-${{ runner.os }}-
+
+      - name: Generate non-updating bundle config
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          cat > desktop/src-tauri/tauri.fork.conf.json <<'JSON'
+          {
+            "bundle": {
+              "macOS": {
+                "minimumSystemVersion": "10.15"
+              },
+              "createUpdaterArtifacts": false
+            }
+          }
+          JSON
+
+      # The step that matters most. Tauri's bundler will happily package
+      # zero-byte sidecar stubs, producing an app that launches fine and then
+      # fails at runtime with "ACP harness command `buzz-acp` was not found"
+      # the first time anyone starts a local agent. bundle-sidecars.sh hard-
+      # fails on a missing binary, so this must run before the Tauri build.
+      - name: Build sidecars
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh
+
+      - name: Build unsigned Tauri app
+        if: steps.freshness.outputs.build == 'true'
+        run: cd desktop && pnpm tauri build --verbose --no-sign --config src-tauri/tauri.fork.conf.json
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+
+      - name: Stage DMG
+        if: steps.freshness.outputs.build == 'true'
+        id: dmg
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SRC=$(find desktop/src-tauri/target/release/bundle/dmg -name '*.dmg' -type f | head -1)
+          if [[ -z "$SRC" ]]; then
+            echo "::error::No DMG produced"
+            exit 1
+          fi
+          NAME="Buzz_${VERSION}_aarch64-unsigned.dmg"
+          cp "$SRC" "$RUNNER_TEMP/$NAME"
+          echo "path=$RUNNER_TEMP/$NAME" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # Verifies the sidecars actually made it in, so a stub regression fails
+      # the build instead of shipping.
+      - name: Verify bundled sidecars
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          APP=desktop/src-tauri/target/release/bundle/macos/Buzz.app/Contents/MacOS
+          for bin in buzz-acp buzz-agent buzz buzz-dev-mcp; do
+            if [[ ! -s "$APP/$bin" ]]; then
+              echo "::error::sidecar $bin missing or empty in the bundle"
+              exit 1
+            fi
+            echo "ok: $bin ($(stat -f%z "$APP/$bin") bytes)"
+          done
+
+      - name: Publish release
+        if: steps.freshness.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DMG_PATH: ${{ steps.dmg.outputs.path }}
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<EOF
+          Unsigned Apple Silicon build from \`$GITHUB_SHA\`.
+
+          **macOS will refuse to open this on first launch** — it is not signed
+          or notarized, because signing runs through Block infrastructure a fork
+          cannot reach. After dragging Buzz to /Applications:
+
+          \`\`\`
+          xattr -dr com.apple.quarantine /Applications/Buzz.app
+          \`\`\`
+
+          No auto-updater: install a newer DMG from this page to update.
+          EOF
+          )
+          gh release create "fork-desktop-v${VERSION}" \
+            --title "Buzz Desktop ${VERSION} (fork, unsigned)" \
+            --notes "$NOTES" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            "$DMG_PATH"

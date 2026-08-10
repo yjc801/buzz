@@ -415,11 +415,33 @@ export async function deleteManagedAgentWithRules({
     }
   }
 
+  // A deployment the agent has *moved off* still exists and still holds a copy
+  // of its key, so deleting the record orphans it exactly as deleting a
+  // currently-deployed agent would. The backend guards on this too, and would
+  // refuse the delete outright without the force flag.
+  if (agent.residualDeployments.length > 0 && !skipRemoteDeleteConfirm) {
+    const providers = [
+      ...new Set(agent.residualDeployments.map((d) => d.providerId)),
+    ].join(", ");
+    const confirmed = window.confirm(
+      `This agent was moved off ${providers}, and that deployment still exists ` +
+        "with a copy of its key. Buzz keeps the pointer even when the agent is " +
+        "deployed there again, because it cannot tell one deployment from " +
+        "another in a different cluster. Deleting removes the local record and " +
+        "orphans it. Continue?",
+    );
+    if (!confirmed) {
+      return { cancelled: true };
+    }
+  }
+
   const isDeployedRemote =
     agent.backend.type === "provider" && agent.backendAgentId;
+  const hasResidualDeployment = agent.residualDeployments.length > 0;
   await deleteManagedAgent({
     pubkey: agent.pubkey,
-    forceRemoteDelete: isDeployedRemote ? true : undefined,
+    forceRemoteDelete:
+      isDeployedRemote || hasResidualDeployment ? true : undefined,
   });
 
   return {};

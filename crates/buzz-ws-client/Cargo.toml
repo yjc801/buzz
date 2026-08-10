@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# For the connection-class protocol vocabulary, so the relay's strings and the
+# client's comparison cannot drift apart.
+buzz-core = { workspace = true }
 nostr = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }

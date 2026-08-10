@@ -191,6 +191,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         runtime_pid: None,
         backend: crate::managed_agents::BackendKind::Local,
         backend_agent_id: None,
+        residual_deployments: Vec::new(),
         provider_binary_path: None,
         persona_team_dir: None,
         persona_name_in_team: None,

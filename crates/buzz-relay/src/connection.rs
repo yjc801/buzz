@@ -46,9 +46,93 @@ pub enum AuthState {
         challenge: String,
     },
     /// Client has successfully authenticated.
-    Authenticated(AuthContext),
+    ///
+    /// The principal and the class carry together because publish authority
+    /// needs both and reading them separately is a race: an EVENT that arrives
+    /// before AUTH is refused for want of a principal, but a handler that read
+    /// the class first and the principal later could pair a pre-AUTH class with
+    /// a post-AUTH principal and publish on a connection that asked to be
+    /// read-only. One variant means one observation.
+    Authenticated {
+        /// Who the connection authenticated as, and with what scopes.
+        ctx: AuthContext,
+        /// What this connection is allowed to do, from its signed AUTH event.
+        class: ConnectionClass,
+    },
     /// Authentication attempt was rejected.
     Failed,
+}
+
+/// What a connection is allowed to do, declared by the client in its signed
+/// NIP-42 AUTH event and fixed for the connection's life.
+///
+/// The class only ever *removes* capability, never grants it. That is what
+/// makes it safe to accept from the client: asking for a class is asking for
+/// less, and an unrecognised request resolves to the most restricted class
+/// rather than to the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionClass {
+    /// A normal client: may publish, and its presence is real presence.
+    #[default]
+    Interactive,
+    /// Read-only and **non-presence-bearing** — subscribes and receives, may
+    /// not publish, and does not count as the principal being online.
+    ///
+    /// Exists for the wake daemon (`PLANS/BUZZ_WAKER_DESIGN.md` §4 option
+    /// (ii)), which holds a long-lived connection per agent it watches. Without
+    /// this class such a connection breaks presence in a way that is invisible
+    /// until an agent dies: presence is cleared only when *no* connection for
+    /// that pubkey remains, so a permanent watcher suppresses the clear and the
+    /// dead agent keeps reporting online until the presence TTL expires.
+    ///
+    /// Refusing publishes is the other half, and it is not a nicety: the daemon
+    /// holds every agent's key, so a connection that could publish could post
+    /// as every agent it watches.
+    ReadOnly,
+}
+
+impl ConnectionClass {
+    /// The `class` tag value a client sends to request this class.
+    ///
+    /// The strings live in `buzz-core` because the relay writes them and
+    /// clients compare against them; as separate literals in separate crates
+    /// nothing would keep the two sides equal.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => buzz_core::relay::CONNECTION_CLASS_INTERACTIVE,
+            Self::ReadOnly => buzz_core::relay::CONNECTION_CLASS_READ_ONLY,
+        }
+    }
+
+    /// Resolve a requested class from a NIP-42 AUTH event's `class` tag value.
+    ///
+    /// An absent tag is [`ConnectionClass::Interactive`] — every existing
+    /// client sends no tag and must keep its current behaviour. Anything
+    /// present but unrecognised resolves to [`ConnectionClass::ReadOnly`]:
+    /// since the class can only subtract capability, the safe reading of "a
+    /// class this build does not know" is the most restricted one, never the
+    /// permissive default.
+    #[must_use]
+    pub fn parse_requested(raw: Option<&str>) -> Self {
+        match raw {
+            None => Self::Interactive,
+            Some(value) if value == Self::Interactive.as_str() => Self::Interactive,
+            Some(_) => Self::ReadOnly,
+        }
+    }
+
+    /// May a connection of this class publish events?
+    #[must_use]
+    pub fn may_publish(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+
+    /// Does a connection of this class count as its principal being present?
+    #[must_use]
+    pub fn bears_presence(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
 }
 
 /// Per-connection state split by access pattern:
@@ -243,7 +327,7 @@ async fn handle_active_connection(
             _ = tokio::time::sleep(AUTH_TIMEOUT) => {
                 let authenticated = matches!(
                     *auth_timeout_conn.auth_state.read().await,
-                    AuthState::Authenticated(_)
+                    AuthState::Authenticated { .. }
                 );
                 if !authenticated {
                     warn!(
@@ -280,12 +364,19 @@ async fn handle_active_connection(
             .await;
     }
     state.conn_manager.deregister(conn.conn_id);
-    if let AuthState::Authenticated(ref auth_ctx) = *conn.auth_state.read().await {
-        let remaining = state.conn_manager.connection_ids_for_pubkey_in_community(
+    if let AuthState::Authenticated {
+        ctx: ref auth_ctx, ..
+    } = *conn.auth_state.read().await
+    {
+        // Presence-bearing connections only. A read-only watcher (the wake
+        // daemon) holds a connection as this pubkey without being it, so
+        // counting it here would suppress the clear and leave a dead agent
+        // reporting online until the presence TTL expired.
+        let still_present = state.conn_manager.has_presence_bearing_connection(
             conn.tenant.community(),
             auth_ctx.pubkey.to_bytes().as_slice(),
         );
-        if remaining.is_empty() {
+        if !still_present {
             let _ = state
                 .pubsub
                 .clear_presence(&conn.tenant, &auth_ctx.pubkey)
@@ -533,6 +624,14 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                 .await;
         }
         ClientMessage::Event(event) => {
+            // The read-only class is enforced inside `handle_event`, in the same
+            // read of `auth_state` that resolves the principal — not here.
+            // Refusing before the spawn would be cheaper, but this frame can
+            // arrive before the AUTH event that fixes the class, so a check here
+            // would have to guess a class for a connection that has not declared
+            // one yet. `handle_event` already refuses a pre-AUTH publish for
+            // want of a principal, and by the time it has one the class came
+            // with it.
             let conn = Arc::clone(&conn);
             let state = Arc::clone(&state);
             let permit = match state.handler_semaphore.clone().try_acquire_owned() {
@@ -629,7 +728,7 @@ async fn enforce_ws_admission(
     let (pubkey, is_agent) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
-            AuthState::Authenticated(ctx) => (ctx.pubkey, ctx.agent_owner_pubkey.is_some()),
+            AuthState::Authenticated { ctx, .. } => (ctx.pubkey, ctx.agent_owner_pubkey.is_some()),
             _ => return true,
         }
     };

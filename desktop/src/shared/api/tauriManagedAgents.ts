@@ -5,6 +5,7 @@ import {
 } from "@/shared/api/tauri";
 import type {
   ManagedAgent,
+  ManagedAgentBackend,
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
 
@@ -78,6 +79,33 @@ export async function setManagedAgentAutoRestart(
  * Assign a managed agent to a community (pass a relay URL) or unscope it
  * (`null` = offered in every community). Display/uniqueness scope only.
  */
+/**
+ * Move an agent between running locally and running on a provider, keeping its
+ * identity — pubkey, channel grants, git ACL, auth tag and engrams all follow.
+ *
+ * `remoteConfirmedStopped` is an assertion, not a request: the Rust command
+ * cannot see whether a remote harness is live (provider status reports
+ * `deployed`/`not_deployed`, which is infrastructure existence, and relay
+ * presence never reaches that process). Pass `true` ONLY after confirming the
+ * agent is offline by presence — a still-running deployment would keep
+ * answering as this agent alongside the newly-local process.
+ */
+export async function setManagedAgentBackend(
+  pubkey: string,
+  backend: ManagedAgentBackend,
+  remoteConfirmedStopped: boolean,
+): Promise<ManagedAgent> {
+  const response = await invokeTauri<RawManagedAgent>(
+    "set_managed_agent_backend",
+    {
+      pubkey,
+      backend,
+      remoteConfirmedStopped,
+    },
+  );
+  return fromRawManagedAgent(response);
+}
+
 export async function setManagedAgentCommunity(
   pubkey: string,
   communityRelayUrl: string | null,

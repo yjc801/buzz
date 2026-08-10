@@ -177,14 +177,25 @@ pub fn build_auth_event(
     keys: &Keys,
     auth_tag: Option<&Tag>,
 ) -> Result<Event, WsClientError> {
+    let extra: Vec<Tag> = auth_tag.into_iter().cloned().collect();
+    build_auth_event_with_tags(challenge, relay_url, keys, &extra)
+}
+
+/// Build a signed NIP-42 AUTH event carrying arbitrary extra tags.
+///
+/// The AUTH event is the only place a client can state connection-scoped
+/// intent that the relay will trust, because the Schnorr signature covers the
+/// tags. Two things ride there today: the NIP-OA `auth` attestation, and the
+/// `class` tag that requests a restricted connection class.
+pub fn build_auth_event_with_tags(
+    challenge: &str,
+    relay_url: &str,
+    keys: &Keys,
+    extra_tags: &[Tag],
+) -> Result<Event, WsClientError> {
     let url = RelayUrl::parse(relay_url).map_err(|e| WsClientError::Url(e.to_string()))?;
-    let builder = EventBuilder::auth(challenge, url);
-    let builder = if let Some(tag) = auth_tag {
-        builder.tags([tag.clone()])
-    } else {
-        builder
-    };
-    builder
+    EventBuilder::auth(challenge, url)
+        .tags(extra_tags.to_vec())
         .sign_with_keys(keys)
         .map_err(|e| WsClientError::EventBuilder(e.to_string()))
 }

@@ -27,7 +27,7 @@ pub(crate) use metadata::{
 };
 
 mod stop;
-pub(crate) use stop::managed_agent_runtime_keys;
+pub(crate) use stop::{local_harness_alive, managed_agent_runtime_keys};
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
 
 mod sweep;
@@ -325,6 +325,7 @@ pub fn build_managed_agent_summary(
         env_vars: record.env_vars.clone(),
         backend: record.backend.clone(),
         backend_agent_id: record.backend_agent_id.clone(),
+        residual_deployments: record.residual_deployments.clone(),
         status,
         pid,
         created_at: record.created_at.clone(),

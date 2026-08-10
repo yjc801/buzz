@@ -106,6 +106,29 @@ impl BuzzTestClient {
         Ok(())
     }
 
+    /// Connects and authenticates as a **read-only** connection: it may
+    /// subscribe and receive, but may not publish, and does not count as the
+    /// principal being present.
+    pub async fn connect_read_only(url: &str, keys: &Keys) -> Result<Self, TestClientError> {
+        let mut client = Self::connect_unauthenticated(url).await?;
+        client.authenticate_read_only(keys).await?;
+        Ok(client)
+    }
+
+    /// Performs NIP-42 authentication requesting the **read-only** class on an
+    /// already-connected socket.
+    ///
+    /// Separate from [`Self::connect_read_only`] so a test can put frames on
+    /// the wire *before* the AUTH event that declares the class — the ordering
+    /// a class must survive, since nothing stops a client from publishing
+    /// first.
+    pub async fn authenticate_read_only(&mut self, keys: &Keys) -> Result<(), TestClientError> {
+        let class = Tag::parse(["class", "read-only"])
+            .map_err(|e| TestClientError::EventBuilder(e.to_string()))?;
+        self.inner.authenticate_with_tags(keys, &[class]).await?;
+        Ok(())
+    }
+
     /// Performs NIP-42 authentication with a NIP-OA `auth` tag, establishing
     /// the agent→owner relationship in the relay's DB.  Call this as the
     /// *agent* connection; the tag must be signed by `owner_keys`.

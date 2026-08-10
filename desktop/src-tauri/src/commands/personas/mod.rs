@@ -72,23 +72,26 @@ fn collect_cascade_pubkeys(agents: &[ManagedAgentRecord], persona_id: &str) -> V
         .collect()
 }
 
-/// Names of cascade agents that are provider-deployed: non-local backend with
-/// a live `backend_agent_id`.
+/// Names of cascade agents whose deletion would orphan provider infrastructure
+/// that still holds a copy of the agent's private key.
 ///
 /// Pure helper used by `delete_persona`'s pre-flight: the cascade is refused
-/// while any exist, because deleting the local record would orphan the remote
-/// deployment. Mirrors `delete_managed_agent`'s `force_remote_delete` guard.
+/// while any exist. Delegates to the same predicate `delete_managed_agent`
+/// guards on ([`ManagedAgentRecord::orphans_infrastructure`]) rather than
+/// re-deriving it, because the two ways to qualify are easy to get wrong and
+/// this call site had only the first: an agent migrated off a provider reads
+/// `backend == Local` with a cleared `backend_agent_id`, so a backend-only
+/// check admits the cascade and Buzz destroys the record — and the key — while
+/// the provider deployment recorded in `residual_deployments` still runs with a
+/// copy of it. There is no second pointer; that infrastructure becomes
+/// unmanageable.
 fn collect_remote_deployed(
     agents: &[ManagedAgentRecord],
     cascade: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     agents
         .iter()
-        .filter(|a| {
-            cascade.contains(&a.pubkey)
-                && a.backend != crate::managed_agents::BackendKind::Local
-                && a.backend_agent_id.is_some()
-        })
+        .filter(|a| cascade.contains(&a.pubkey) && a.orphans_infrastructure())
         .map(|a| a.name.clone())
         .collect()
 }
@@ -171,13 +174,15 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
                 collect_cascade_pubkeys(&agents, &id).into_iter().collect();
 
             // Remote-agent pre-flight: refuse the cascade before any destructive
-            // work while any target is provider-deployed. Nothing in
-            // create_managed_agent forbids a persona-linked provider agent, so
-            // this must be a runtime guard, not an assumed invariant.
+            // work while any target still has provider infrastructure holding
+            // its key — deployed on its current provider, or left behind on one
+            // it has migrated off. Nothing in create_managed_agent forbids a
+            // persona-linked provider agent, so this must be a runtime guard,
+            // not an assumed invariant.
             let remote_deployed = collect_remote_deployed(&agents, &cascade);
             if !remote_deployed.is_empty() {
                 return Err(format!(
-                    "persona {id} has provider-deployed agent instances ({}); delete those agent instances first",
+                    "persona {id} has agent instances with provider deployments ({}); delete those agent instances first",
                     remote_deployed.join(", ")
                 ));
             }

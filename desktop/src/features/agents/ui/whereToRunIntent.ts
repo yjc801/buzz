@@ -73,3 +73,35 @@ export function resolveBackendIntent(
     ),
   };
 }
+
+export type RunOnOption = { label: string; value: string };
+
+/**
+ * The "Run on" choices: this computer, plus every provider that can be chosen.
+ *
+ * `currentProviderId` is the provider an *existing* agent runs on today, and is
+ * passed only by the migrate flow. It is listed even when discovery did not
+ * find it — the binary can be uninstalled after the agent was created — so that
+ * "where it runs now" stays representable and the user can back out of a move
+ * without cancelling the dialog. It is never duplicated when discovery does
+ * find it.
+ *
+ * A single option means there is nothing to decide, which is what
+ * `WhereToRunSection` keys its own visibility on. That distinction matters:
+ * with no providers installed, creating an agent has no choice to offer, but an
+ * agent that is already remote must still be able to come back to this
+ * computer — a move that needs no provider binary at all.
+ */
+export function runOnOptions(
+  discoveredProviderIds: string[],
+  currentProviderId?: string | null,
+): RunOnOption[] {
+  const ids = [...discoveredProviderIds];
+  if (currentProviderId && !ids.includes(currentProviderId)) {
+    ids.unshift(currentProviderId);
+  }
+  return [
+    { label: "This computer", value: "local" },
+    ...ids.map((id) => ({ label: id, value: id })),
+  ];
+}

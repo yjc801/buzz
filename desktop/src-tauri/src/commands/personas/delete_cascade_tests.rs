@@ -7,7 +7,7 @@
 //! in-memory data structures (no `AppHandle` required).
 
 use super::{collect_cascade_pubkeys, collect_remote_deployed, commit_cascade_agents};
-use crate::managed_agents::{BackendKind, ManagedAgentRecord, RespondTo};
+use crate::managed_agents::{BackendKind, ManagedAgentRecord, ResidualDeployment, RespondTo};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
@@ -43,6 +43,7 @@ fn make_agent(
         runtime_pid,
         backend: BackendKind::Local,
         backend_agent_id: None,
+        residual_deployments: Vec::new(),
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
@@ -201,5 +202,42 @@ fn remote_deployed_cascade_target_blocks_delete() {
         blockers,
         vec!["Deployed Agent".to_string()],
         "only the deployed provider agent blocks the cascade"
+    );
+}
+
+/// A cascade target that has *migrated off* a provider must block too.
+///
+/// Migration clears `backend_agent_id` and retires the deployment into
+/// `residual_deployments`, so the record reads `Local` while the provider still
+/// runs a harness holding this agent's private key. A backend-only pre-flight
+/// admits the cascade, and Phase 3 then deletes the record and the key — Buzz
+/// loses its only pointer to infrastructure that can still act as this agent.
+/// This is the exact state a Provider → Local move leaves behind, so it is not
+/// a hypothetical.
+#[test]
+fn cascade_target_with_a_residual_deployment_blocks_delete() {
+    let mut migrated = make_agent("pk-migrated", Some(PERSONA_ID), None);
+    migrated.name = "Migrated Agent".to_string();
+    // Exactly what retire_deployment_pointer leaves behind on Provider → Local.
+    migrated.backend = BackendKind::Local;
+    migrated.backend_agent_id = None;
+    migrated.residual_deployments = vec![ResidualDeployment {
+        provider_id: "blox".to_string(),
+        agent_id: "backend-1".to_string(),
+        config: serde_json::json!({"namespace": "team-a"}),
+    }];
+
+    let agents = vec![make_agent("pk-local", Some(PERSONA_ID), None), migrated];
+    let cascade: HashSet<String> = collect_cascade_pubkeys(&agents, PERSONA_ID)
+        .into_iter()
+        .collect();
+
+    let blockers = collect_remote_deployed(&agents, &cascade);
+
+    assert_eq!(
+        blockers,
+        vec!["Migrated Agent".to_string()],
+        "a Local record whose deployment survives in residual_deployments must \
+         still block the cascade"
     );
 }

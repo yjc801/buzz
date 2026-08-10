@@ -10,6 +10,7 @@ pub(crate) use agent_env::{
     baked_build_env, build_buzz_agent_provider_defaults, discovery_env_with_baked_floor,
 };
 mod backend;
+mod backend_migration;
 mod community_scope;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
@@ -54,6 +55,7 @@ pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use backend::*;
+pub use backend_migration::*;
 pub use community_scope::*;
 pub use discovery::*;
 pub use env_vars::*;

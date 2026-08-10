@@ -6,6 +6,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { Badge } from "@/shared/ui/badge";
 import { AgentCommunityScopeBadge } from "@/features/agents/ui/AgentCommunityScopeBadge";
+import { AgentRunLocationControl } from "@/features/agents/ui/AgentRunLocationControl";
 import { AgentStatusBadge } from "@/features/agents/ui/AgentStatusBadge";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
@@ -117,6 +118,7 @@ export function ManagedAgentRow({
                 isExpandable
                 isLogSelected={isLogSelected}
                 personaLabel={personaLabel}
+                presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
               />
               <StatusBlock
@@ -140,6 +142,7 @@ export function ManagedAgentRow({
                 isExpandable={false}
                 isLogSelected={false}
                 personaLabel={personaLabel}
+                presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
               />
               <StatusBlock
@@ -207,6 +210,7 @@ function AgentSummary({
   isExpandable,
   isLogSelected,
   personaLabel,
+  presenceLoaded,
   presenceStatus,
 }: {
   activeWorkingChannels: { id: string; name: string; anchorAt: number }[];
@@ -215,6 +219,9 @@ function AgentSummary({
   isExpandable: boolean;
   isLogSelected: boolean;
   personaLabel: string | null;
+  /** Needed alongside `presenceStatus` because the run-location gate must
+   * distinguish "offline" from "not loaded yet" — see `migrationGate`. */
+  presenceLoaded: boolean;
   presenceStatus: PresenceStatus | undefined;
 }) {
   const { goChannel } = useAppNavigation();
@@ -245,6 +252,11 @@ function AgentSummary({
             ) : null}
             <AgentOriginBadge agent={agent} />
             <AgentCommunityScopeBadge agent={agent} />
+            <AgentRunLocationControl
+              agent={agent}
+              presenceLoaded={presenceLoaded}
+              presenceStatus={presenceStatus}
+            />
             {agent.personaOrphaned ? (
               <Badge className="gap-1" variant="warning">
                 <AlertTriangle className="h-3 w-3" />

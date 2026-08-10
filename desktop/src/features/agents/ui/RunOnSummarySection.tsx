@@ -5,12 +5,16 @@ import { summarizeRunOn } from "./runOnSummary";
 /**
  * Read-only "Run on" summary for the edit-agent dialog.
  *
- * Read-only on purpose: `UpdateManagedAgentRequest` has no backend field —
- * where an agent runs is fixed at creation (a provider-backed agent's
- * deployment holds its private key; there is no migrate operation). This
- * section shows the *saved* provider config from the record, without probing
- * the provider binary: an edit dialog must not do executable work as a side
- * effect, and a live probe would show today's schema defaults instead of
+ * Read-only *here* on purpose: `UpdateManagedAgentRequest` deliberately has no
+ * backend field, so an ordinary save can never change where an agent runs.
+ * Moving one is its own operation — `set_managed_agent_backend`, surfaced as
+ * the "Move" control on the Agents page — because it carries preconditions an
+ * edit dialog has no way to enforce (nothing may be running, and leaving a
+ * provider requires confirming by presence that the remote harness stopped).
+ *
+ * This section shows the *saved* provider config from the record, without
+ * probing the provider binary: an edit dialog must not do executable work as a
+ * side effect, and a live probe would show today's schema defaults instead of
  * what this agent actually deployed with.
  *
  * Named "Run on" (matching the create flow) rather than "Provider" because

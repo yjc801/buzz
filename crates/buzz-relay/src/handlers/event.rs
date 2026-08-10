@@ -631,15 +631,16 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     )
     .increment(1);
 
-    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids) = {
+    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids, class) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
-            AuthState::Authenticated(ctx) => (
+            AuthState::Authenticated { ctx, class } => (
                 conn.conn_id,
                 ctx.pubkey.to_bytes().to_vec(),
                 ctx.pubkey,
                 ctx.scopes.clone(),
                 ctx.channel_ids.clone(),
+                *class,
             ),
             _ => {
                 reject("auth");
@@ -652,6 +653,25 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             }
         }
     };
+
+    // A read-only connection may not publish, ever. This is the half of the
+    // class that is about authority rather than presence: the wake daemon holds
+    // every agent's key, so a watcher that could publish could post as every
+    // agent it watches.
+    //
+    // Checked from the same read that resolved the principal, so there is no
+    // ordering to get right. This frame may have been parsed before the AUTH
+    // event that declared the class — a check taken any earlier would either
+    // have no class to consult or an obsolete one.
+    if !class.may_publish() {
+        reject("restricted");
+        conn.send(RelayMessage::ok(
+            &event_id_hex,
+            false,
+            "restricted: read-only connection may not publish",
+        ));
+        return;
+    }
 
     // Must run before both ephemeral and persistent branches. Persistent
     // events get a second check inside ingest_event() (step 3), but
@@ -999,7 +1019,7 @@ async fn handle_agent_observer_event(
     // owner matches the observer frame's target owner, skip the DB lookup entirely.
     let session_owner_match = {
         let auth = conn.auth_state.read().await;
-        if let crate::connection::AuthState::Authenticated(ctx) = &*auth {
+        if let crate::connection::AuthState::Authenticated { ctx, .. } = &*auth {
             ctx.agent_owner_pubkey.as_ref() == Some(&route.owner)
         } else {
             false
@@ -1386,22 +1406,22 @@ mod tests {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::TenantContext::resolved(community_b, "b.example"),
             remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
-            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
-                buzz_auth::AuthContext {
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
                     pubkey: agent.public_key(),
                     scopes: vec![],
                     channel_ids: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
                 },
-            )),
+                class: crate::connection::ConnectionClass::Interactive,
+            }),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
-            read_only: std::sync::atomic::AtomicBool::new(false),
         });
 
         super::handle_agent_observer_event(
@@ -1425,6 +1445,70 @@ mod tests {
             frame[3],
             "restricted: observer frame is not authorized for this agent owner"
         );
+    }
+
+    /// A read-only connection is refused *inside* the event handler, from the
+    /// same read of `auth_state` that resolves the principal.
+    ///
+    /// Where the refusal happens is the whole point. An EVENT frame can be
+    /// parsed before the AUTH event that declares the class, and the handler
+    /// runs on a spawned task, so a check taken in the read loop would consult
+    /// a class the connection had not chosen yet while the spawned handler went
+    /// on to publish under the principal that AUTH installed a moment later.
+    /// Reading the class out of `AuthState::Authenticated` makes that
+    /// interleaving unrepresentable: there is no class to read until there is a
+    /// principal, and they arrive in one observation.
+    #[tokio::test]
+    async fn a_read_only_connection_may_not_publish() {
+        let state = fanout_access::test_state().await;
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "from a read-only connection")
+            .tags([Tag::parse(["h", &Uuid::new_v4().to_string()]).expect("h tag")])
+            .sign_with_keys(&author)
+            .expect("sign event");
+
+        let (send_tx, mut send_rx) = mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+                "read-only.example",
+            ),
+            remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
+                    pubkey: author.public_key(),
+                    // Deliberately a principal that *may* publish: the refusal
+                    // under test has to be the class, not a scope gate standing
+                    // in for it.
+                    scopes: vec![buzz_auth::Scope::MessagesWrite],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+                class: crate::connection::ConnectionClass::ReadOnly,
+            }),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 3,
+        });
+
+        super::handle_event(event.clone(), conn, state).await;
+
+        let axum::extract::ws::Message::Text(text) =
+            send_rx.try_recv().expect("read-only refusal sent")
+        else {
+            panic!("expected text relay message");
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("relay frame JSON");
+        assert_eq!(frame[0], "OK");
+        assert_eq!(frame[1], event.id.to_hex());
+        assert_eq!(frame[2], false);
+        assert_eq!(frame[3], "restricted: read-only connection may not publish");
     }
 
     mod pubsub_fanout {

@@ -1546,7 +1546,6 @@ mod tests {
             cancel: cancel.clone(),
             backpressure_count: Arc::clone(&bp),
             grace_limit: 3,
-            read_only: AtomicBool::new(false),
         };
 
         let mgr = ConnectionManager::new();

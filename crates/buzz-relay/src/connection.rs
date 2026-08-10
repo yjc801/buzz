@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +46,19 @@ pub enum AuthState {
         challenge: String,
     },
     /// Client has successfully authenticated.
-    Authenticated(AuthContext),
+    ///
+    /// The principal and the class carry together because publish authority
+    /// needs both and reading them separately is a race: an EVENT that arrives
+    /// before AUTH is refused for want of a principal, but a handler that read
+    /// the class first and the principal later could pair a pre-AUTH class with
+    /// a post-AUTH principal and publish on a connection that asked to be
+    /// read-only. One variant means one observation.
+    Authenticated {
+        /// Who the connection authenticated as, and with what scopes.
+        ctx: AuthContext,
+        /// What this connection is allowed to do, from its signed AUTH event.
+        class: ConnectionClass,
+    },
     /// Authentication attempt was rejected.
     Failed,
 }
@@ -154,34 +166,9 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
-    /// Whether this connection is read-only, set once when AUTH succeeds.
-    ///
-    /// A bare flag rather than the enum behind a lock: it is read on the hot
-    /// publish path, and a connection cannot re-authenticate (a second AUTH is
-    /// refused), so it is written exactly once and never contended.
-    ///
-    /// Read through [`ConnectionState::class`] and written through
-    /// [`ConnectionState::set_class`]; `pub(crate)` only so the crate's own
-    /// test fixtures can build a `ConnectionState` literal.
-    pub(crate) read_only: AtomicBool,
 }
 
 impl ConnectionState {
-    /// This connection's class.
-    pub fn class(&self) -> ConnectionClass {
-        if self.read_only.load(Ordering::Relaxed) {
-            ConnectionClass::ReadOnly
-        } else {
-            ConnectionClass::Interactive
-        }
-    }
-
-    /// Fix this connection's class. Called once, from the AUTH handler.
-    pub(crate) fn set_class(&self, class: ConnectionClass) {
-        self.read_only
-            .store(class == ConnectionClass::ReadOnly, Ordering::Relaxed);
-    }
-
     /// Sends a data message to this connection's outbound channel.
     ///
     /// On a full buffer, increments the backpressure counter. The first
@@ -284,10 +271,6 @@ async fn handle_active_connection(
         cancel: cancel.clone(),
         backpressure_count: Arc::clone(&backpressure_count),
         grace_limit: state.config.slow_client_grace_limit,
-        // Interactive until AUTH says otherwise. An unauthenticated connection
-        // can neither publish nor bear presence anyway, so the default is
-        // unobservable before auth.
-        read_only: AtomicBool::new(false),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -344,7 +327,7 @@ async fn handle_active_connection(
             _ = tokio::time::sleep(AUTH_TIMEOUT) => {
                 let authenticated = matches!(
                     *auth_timeout_conn.auth_state.read().await,
-                    AuthState::Authenticated(_)
+                    AuthState::Authenticated { .. }
                 );
                 if !authenticated {
                     warn!(
@@ -381,7 +364,10 @@ async fn handle_active_connection(
             .await;
     }
     state.conn_manager.deregister(conn.conn_id);
-    if let AuthState::Authenticated(ref auth_ctx) = *conn.auth_state.read().await {
+    if let AuthState::Authenticated {
+        ctx: ref auth_ctx, ..
+    } = *conn.auth_state.read().await
+    {
         // Presence-bearing connections only. A read-only watcher (the wake
         // daemon) holds a connection as this pubkey without being it, so
         // counting it here would suppress the clear and leave a dead agent
@@ -638,19 +624,14 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                 .await;
         }
         ClientMessage::Event(event) => {
-            // A read-only connection may not publish, ever. This is the half of
-            // the class that is about authority rather than presence: the wake
-            // daemon holds every agent's key, so a watcher that could publish
-            // could post as every agent it watches. Refused before the handler
-            // semaphore so a refused publish costs no concurrency slot.
-            if !conn.class().may_publish() {
-                conn.send(RelayMessage::ok(
-                    &event.id.to_hex(),
-                    false,
-                    "restricted: read-only connection may not publish",
-                ));
-                return;
-            }
+            // The read-only class is enforced inside `handle_event`, in the same
+            // read of `auth_state` that resolves the principal — not here.
+            // Refusing before the spawn would be cheaper, but this frame can
+            // arrive before the AUTH event that fixes the class, so a check here
+            // would have to guess a class for a connection that has not declared
+            // one yet. `handle_event` already refuses a pre-AUTH publish for
+            // want of a principal, and by the time it has one the class came
+            // with it.
             let conn = Arc::clone(&conn);
             let state = Arc::clone(&state);
             let permit = match state.handler_semaphore.clone().try_acquire_owned() {
@@ -747,7 +728,7 @@ async fn enforce_ws_admission(
     let (pubkey, is_agent) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
-            AuthState::Authenticated(ctx) => (ctx.pubkey, ctx.agent_owner_pubkey.is_some()),
+            AuthState::Authenticated { ctx, .. } => (ctx.pubkey, ctx.agent_owner_pubkey.is_some()),
             _ => return true,
         }
     };

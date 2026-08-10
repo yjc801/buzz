@@ -459,6 +459,65 @@ async fn test_read_only_connection_cannot_publish() {
     watcher.disconnect().await.expect("disconnect");
 }
 
+/// The refusal does not depend on the client sending AUTH first.
+///
+/// Nothing stops a client from putting an EVENT on the wire before the AUTH
+/// event that declares its class, and the relay handles EVENT on a spawned
+/// task. So the frame order here — EVENT, then read-only AUTH — is the one that
+/// can hand a handler a principal that AUTH installed after the frame arrived.
+/// Whichever way that interleaving lands, the event must not be published:
+/// either the handler has no principal yet and refuses for want of auth, or it
+/// has one and the class came with it.
+#[tokio::test]
+#[ignore]
+async fn test_event_sent_before_read_only_auth_is_never_published() {
+    let url = relay_url();
+    let kind: u16 = 9;
+    let keys = Keys::generate();
+    let channel = create_test_channel(&keys).await;
+
+    let mut watcher = BuzzTestClient::connect_unauthenticated(&url)
+        .await
+        .expect("connect");
+
+    let event = EventBuilder::new(Kind::Custom(kind), "sent before the AUTH that restricts me")
+        .tags([Tag::parse(["h", &channel]).expect("h tag")])
+        .sign_with_keys(&keys)
+        .expect("sign event");
+    let event_id = event.id.to_hex();
+
+    watcher
+        .send_raw(&serde_json::json!(["EVENT", event]))
+        .await
+        .expect("send EVENT ahead of AUTH");
+    watcher
+        .authenticate_read_only(&keys)
+        .await
+        .expect("read-only auth");
+
+    // The OK for the event may arrive before or after the AUTH OK; the client
+    // buffers whatever it did not ask for, so drain until this event's answer.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let refusal = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no OK for the pre-AUTH event within 10s"
+        );
+        match watcher.recv_event(Duration::from_secs(5)).await {
+            Ok(RelayMessage::Ok(ok)) if ok.event_id == event_id => break ok,
+            Ok(_) => continue,
+            Err(e) => panic!("relay closed before answering the pre-AUTH event: {e}"),
+        }
+    };
+    assert!(
+        !refusal.accepted,
+        "an event that raced its own read-only AUTH must not be published, got: {}",
+        refusal.message
+    );
+
+    watcher.disconnect().await.expect("disconnect");
+}
+
 /// A read-only connection still receives — otherwise the class would be
 /// useless for the thing it exists for. Read-only removes publishing and
 /// presence, not delivery.

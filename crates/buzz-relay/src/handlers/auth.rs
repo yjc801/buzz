@@ -83,7 +83,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Pending { challenge } => (challenge.clone(), conn.conn_id),
-            AuthState::Authenticated(_) => {
+            AuthState::Authenticated { .. } => {
                 debug!(conn_id = %conn.conn_id, "AUTH received but already authenticated");
                 conn.send(RelayMessage::ok(
                     &event_id_hex,
@@ -325,16 +325,18 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             );
             // Both halves of the class, set only after the signature verified —
             // the tag is only trustworthy because the AUTH event carries it.
-            // Recorded *before* the connection becomes discoverable as this
-            // pubkey, in either direction: publish authority before the auth
-            // state that gates publishing, and presence weight in the same
-            // write that publishes the pubkey to the manager. A watcher that
-            // were briefly visible as a presence-bearing connection for this
-            // key could make a concurrent teardown skip its presence clear,
-            // stranding presence until the TTL — the window this class exists
-            // to close.
-            conn.set_class(requested_class);
-            *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
+            // Each half travels inside the write that makes this connection
+            // usable as this pubkey, never as a second write beside it:
+            // publish authority inside the auth state that gates publishing,
+            // presence weight inside the write that publishes the pubkey to the
+            // manager. A connection briefly visible as a fully-capable or
+            // presence-bearing connection for this key could publish as it, or
+            // make a concurrent teardown skip its presence clear and strand
+            // presence until the TTL — the windows this class exists to close.
+            *conn.auth_state.write().await = AuthState::Authenticated {
+                ctx: auth_ctx,
+                class: requested_class,
+            };
             state.conn_manager.set_authenticated_principal(
                 conn_id,
                 pubkey.to_bytes().to_vec(),

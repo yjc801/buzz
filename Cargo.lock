@@ -1365,6 +1365,7 @@ name = "buzz-waker"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-ws-client",
  "hex",
  "nostr",
  "serde",

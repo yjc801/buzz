@@ -1238,11 +1238,26 @@ name = "buzz-waker"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-ws-client",
  "hex",
  "nostr",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "buzz-ws-client"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "nostr",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "url",
 ]
 
 [[package]]

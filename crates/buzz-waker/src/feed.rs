@@ -47,35 +47,57 @@
 //! for good. The backfill walk itself does not depend on this order — it is
 //! `#h`-less and access-scoped server-side — but the live fence around it
 //! does, and starting backfill first is exactly the gap this note exists to
-//! prevent.
+//! prevent. Every one of these calls takes the *same* `since` — the cursor's
+//! replay floor — never connect time; see "Why every live subscription's
+//! `since` is the cursor floor" below for the race that requirement closes.
 //!
 //! An empty discovered-channel set changes nothing about this order: the
 //! backfill REQ is unconditional, never gated on how many (if any) live
 //! subscriptions are open. See [`WakeReplay::new`].
 //!
-//! # Why live subscriptions carry no history
+//! # Why every live subscription's `since` is the cursor floor, not connect time
 //!
-//! A per-channel live REQ could instead reuse the cursor's `since` floor and
-//! let each channel replay its own historical page, the way the old single
-//! filter did. That was considered and rejected: it would mean N independent
-//! clamped-or-not signals instead of one, and the backfill walk would need to
-//! wait for all of them before it could safely start — real state-machine
-//! complexity for a signal the walk does not need, since it already owns
-//! history unconditionally. Instead every [`FeedTransport::subscribe_channel_live`]
-//! call binds `since` to connect time: these subscriptions exist purely to
-//! catch fan-out from the moment they open, and their EOSE means nothing —
-//! [`WakeReplay`] never looks at it. The cost is one guaranteed-short first
-//! backfill page per connection where a live-only design would have skipped
-//! it; that is cheaper than the aggregation state machine it avoids.
+//! An earlier version of this design bound each per-channel live REQ's
+//! `since` to connect time — reasoning that these subscriptions exist purely
+//! to catch fan-out from the moment they open, so nothing older should
+//! matter to them. That is wrong, and the bug it left is a real event loss,
+//! not a cosmetic one: a mention's `created_at` is client-signed, and
+//! ordinary clock skew or a brief queue-then-publish delay (both within the
+//! relay's accepted drift) can leave it a few seconds *behind* wall-clock
+//! "now" even though it is being published live, right now. A live
+//! subscription whose `since` is connect time rejects that event outright
+//! (`created_at < since`), and if the backfill walk has already paged past
+//! that timestamp by the time the event lands, nothing will ever fetch it —
+//! backfill pages strictly backward and never revisits a window once it has
+//! moved past it. The event is gone for good, silently.
+//!
+//! The fix: every subscribe call that can carry a `since` —
+//! [`FeedTransport::subscribe_channel_live`] and
+//! [`FeedTransport::subscribe_membership`], same as
+//! [`FeedTransport::subscribe_backfill`] — uses the **same** value, the one
+//! [`CursorStore::resume`] produces (already overlap-adjusted for exactly
+//! this class of skew, see [`crate::RECONNECT_OVERLAP_SECS`]) and that
+//! [`WakeReplay::since`] then holds for the life of the connection attempt.
+//! That floor sits far enough in the past that ordinary drift can never push
+//! a live event's `created_at` behind it, which is what actually closes the
+//! race — using "now" was the bug, not the idea of a live-only subscription.
+//!
+//! This does mean a per-channel live REQ can carry a real historical
+//! component again — up to one clamped page, same as the old single filter
+//! did — but that no longer needs a state machine to reason about: its EOSE
+//! still means nothing to [`WakeReplay`] (only the backfill subscription's
+//! EOSE gates the walk), and any of that page's rows the backfill walk also
+//! covers are exactly the ordinary duplicate case below. The one difference
+//! from connect time is by design: a first, real historical page per
+//! channel, redundant with backfill, instead of a guaranteed-empty one.
 //!
 //! # Duplicate delivery is normal
 //!
-//! A mention published while backfill is walking arrives once, live, on its
-//! channel's own subscription. Older mentions can arrive twice — once from
-//! backfill, once from a live subscription's connect-time-onward window if
-//! the two windows overlap — and [`CursorStore::admit`] already collapses
-//! that. Nothing here tries to prevent the overlap; it is cheaper to dedupe
-//! than to coordinate.
+//! A mention published while backfill is walking can arrive twice — once
+//! live, once from backfill's own paging, since both windows can now
+//! overlap all the way back to the shared floor — and [`CursorStore::admit`]
+//! already collapses that. Nothing here tries to prevent the overlap; it is
+//! cheaper to dedupe than to coordinate.
 //!
 //! # Three more things that are not obvious
 //!
@@ -298,9 +320,11 @@ pub enum FeedFrame {
 /// and/or scoped to one channel.
 ///
 /// `#p` is the addressing the harness itself keys on, so it is what the feed
-/// asks for; `kinds` is mandatory (see the module note); `since` comes from
-/// [`CursorStore::resume`] for the backfill walk, or from connect time for a
-/// per-channel live subscription — see the module docs on why those differ.
+/// asks for; `kinds` is mandatory (see the module note); `since` is
+/// [`CursorStore::resume`]'s output for every subscription this builds a
+/// filter for — backfill, a per-channel live subscription, or the membership
+/// watch all share the one floor. See the module docs on why a per-channel
+/// live subscription must not use connect time instead.
 ///
 /// # One agent per filter, because one agent per connection
 ///
@@ -347,8 +371,10 @@ pub fn wake_filter(
 
 /// The REQ frame opening one channel's live subscription.
 ///
-/// `since` is connect time, not the cursor floor — see the module docs on why
-/// these carry no historical component.
+/// `since` must be the cursor's replay floor ([`CursorStore::resume`]'s
+/// output) — the same value passed to [`wake_backfill_req`] and
+/// [`wake_membership_req`] for this connection attempt, never connect time.
+/// See the module docs for the race a connect-time `since` opens.
 #[must_use]
 pub fn wake_live_req(agent_pubkey: &str, channel_id: Uuid, since: u64) -> Value {
     json!([
@@ -505,10 +531,12 @@ pub enum ReplayStep {
 /// [`WakeReplay::new`], which always starts already walking.
 ///
 /// Rows delivered on a live subscription are never tallied here — see
-/// [`WakeSubscription::Live`] and the module docs on why live subscriptions
-/// carry no historical component in the first place. Duplicate deliveries
-/// between backfill and a live subscription's connect-time-onward window are
-/// the normal case, and [`CursorStore::admit`] already collapses them.
+/// [`WakeSubscription::Live`] — even though a live subscription now shares
+/// the backfill floor and so can carry a real historical page of its own
+/// (see the module docs on why connect time was the wrong bound). Duplicate
+/// deliveries between backfill's paging and a live subscription's own
+/// floor-onward page are the normal case, and [`CursorStore::admit`] already
+/// collapses them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeReplay {
     since: u64,
@@ -858,15 +886,22 @@ pub trait FeedTransport {
     /// [`WAKE_MEMBERSHIP_SUBSCRIPTION_ID`]. Issue this once per connection,
     /// after [`discover_channels`](Self::discover_channels) and before any
     /// [`subscribe_channel_live`](Self::subscribe_channel_live) call, so a
-    /// membership change racing with startup is never missed.
+    /// membership change racing with startup is never missed. `since` is the
+    /// cursor's replay floor — same value, same reason, as
+    /// [`subscribe_channel_live`](Self::subscribe_channel_live) below.
     fn subscribe_membership(
         &mut self,
         since: u64,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 
     /// Open one channel's live subscription under
-    /// [`wake_live_subscription_id`]. `since` is connect time — see the
-    /// module docs on why these carry no historical component.
+    /// [`wake_live_subscription_id`]. `since` **must** be the cursor's replay
+    /// floor ([`CursorStore::resume`]'s output) — the same value passed to
+    /// [`subscribe_backfill`](Self::subscribe_backfill) for this connection
+    /// attempt, never connect time. See the module docs for the race a
+    /// connect-time `since` opens: an event whose `created_at` lands a few
+    /// seconds behind wall-clock now (ordinary skew or publish delay) is
+    /// silently unrecoverable once backfill has paged past it.
     ///
     /// Idempotent: re-issuing for a channel already open replaces its
     /// subscription rather than adding a second one (same relay semantics as
@@ -1206,6 +1241,70 @@ mod tests {
         let ch = a_channel();
         let scoped = wake_filter(&"ab".repeat(32), 10, None, Some(ch));
         assert_eq!(scoped["#h"], json!([ch.to_string()]));
+    }
+
+    /// Alex's review finding on `2aa51a6e6`, pinned as a regression against the
+    /// exact matching logic the relay runs (`buzz_core::filter::filters_match`,
+    /// not a stand-in): a per-channel live REQ bound to connect time silently
+    /// drops a mention whose signed `created_at` lands a few seconds behind
+    /// wall-clock now — ordinary clock skew or a queue-then-publish delay, both
+    /// within the relay's accepted drift, not malicious backdating. If that
+    /// timestamp also falls behind wherever the backfill walk has already
+    /// paged to, the event is unrecoverable: backfill never revisits a window
+    /// it has moved past. Binding `since` to the cursor's replay floor instead
+    /// — the same floor [`WakeReplay::since`] holds and `subscribe_backfill`
+    /// uses — closes it, because the floor sits far enough in the past that
+    /// ordinary drift can never cross it.
+    #[test]
+    fn a_replay_floor_since_would_have_caught_a_delayed_event_that_connect_time_would_miss() {
+        // Two distinct identities: a mention is authored by someone other
+        // than the agent it addresses. Using the same key for both would let
+        // the nostr crate's own self-mention dedup silently drop the `#p` tag
+        // before it ever reaches the filter, masking the thing this test
+        // exists to prove.
+        let author_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let ch = a_channel();
+
+        let now: u64 = 2_000_000_000;
+        // A few seconds behind "now" — within accepted drift, not a forgery.
+        let event_created_at = now - 3;
+
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(WAKE_TRIGGER_KINDS[1] as u16), "hello")
+                .tags([
+                    nostr::Tag::parse(["h", &ch.to_string()]).expect("valid h tag"),
+                    nostr::Tag::parse(["p", &agent_pubkey]).expect("valid p tag"),
+                ])
+                .custom_created_at(nostr::Timestamp::from(event_created_at))
+                .sign_with_keys(&author_keys)
+                .expect("signs");
+        let stored = buzz_core::StoredEvent::new(event, Some(ch));
+
+        // The cursor's replay floor: comfortably behind `now`, the way
+        // `CursorStore::resume` (already overlap-adjusted) actually produces
+        // it — never anywhere near connect time.
+        let floor = now - 10_000;
+
+        let floor_filter: nostr::Filter =
+            serde_json::from_value(wake_filter(&agent_pubkey, floor, None, Some(ch)))
+                .expect("wake_filter always produces a valid NIP-01 filter");
+        assert!(
+            buzz_core::filter::filters_match(&[floor_filter], &stored),
+            "a live subscription bound to the cursor's replay floor must catch \
+             a delayed event even though its created_at sits behind wall-clock now"
+        );
+
+        // The rejected design, pinned so a regression back to it fails loudly.
+        let connect_time_filter: nostr::Filter =
+            serde_json::from_value(wake_filter(&agent_pubkey, now, None, Some(ch)))
+                .expect("wake_filter always produces a valid NIP-01 filter");
+        assert!(
+            !buzz_core::filter::filters_match(&[connect_time_filter], &stored),
+            "connect-time `since` is exactly the gap Alex's review caught — a \
+             live subscription bound to it silently drops this event"
+        );
     }
 
     #[test]

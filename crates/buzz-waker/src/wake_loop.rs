@@ -280,14 +280,29 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                     continue 'reconnect;
                                 }
                                 Ok(FeedStep::ChannelLiveClosed { channel_id, reason }) => {
-                                    // Not a reconnect — see the module docs.
-                                    // A later membership event or the next
-                                    // reconnect's discovery re-opens it if
-                                    // the agent is still a member.
+                                    // Not a full reconnect — see the module
+                                    // docs — but left unresubscribed until an
+                                    // unrelated reconnect or membership event
+                                    // fired would silently degrade coverage
+                                    // for this channel indefinitely. Retry
+                                    // the one subscription immediately; if
+                                    // that itself fails, fall back to the
+                                    // ordinary reconnect ladder.
                                     tracing::warn!(
                                         agent = %agent_pubkey, %channel_id, %reason,
-                                        "buzz-waker: channel live subscription closed"
+                                        "buzz-waker: channel live subscription closed; \
+                                         re-subscribing"
                                     );
+                                    if let Err(error) =
+                                        transport.subscribe_channel_live(channel_id, since).await
+                                    {
+                                        tracing::warn!(
+                                            agent = %agent_pubkey, %channel_id, %error,
+                                            "buzz-waker: channel live re-subscribe failed"
+                                        );
+                                        consecutive_failures = consecutive_failures.saturating_add(1);
+                                        continue 'reconnect;
+                                    }
                                 }
                                 Ok(FeedStep::ChannelMembershipChanged { channel_id, added }) => {
                                     if added {

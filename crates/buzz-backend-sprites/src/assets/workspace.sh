@@ -286,22 +286,26 @@ cmd_path() {
 
     # Selection above already excludes a live foreign claim unless --force
     # was passed, so a claim can only still be live here in the --force case
-    # -- worth a warning since it means taking the slot from whoever holds it.
-    local chosen_i existing_claim age
+    # -- worth a warning since it means taking the slot from whoever holds it,
+    # and it is why a forced takeover resets below even on the exact-sha path.
+    local chosen_i existing_claim age took_foreign_claim=0
     chosen_i="$(basename "$chosen")"
     existing_claim=$(cat "$(claim_file "$slots" "$chosen_i")" 2>/dev/null || true)
     age=$(hold_age "$slots" "$chosen_i" "$now")
     if [ -n "$existing_claim" ] && [ "$age" -lt "$HOLD_SECONDS" ] && [ "$existing_claim" != "$claim_arg" ]; then
         note "warning: taking $chosen from a live claim ($((age / 60))m old) -- --force was passed"
+        took_foreign_claim=1
     fi
 
-    # An exact-sha slot is handed back untouched. Checking it out again would be
-    # a no-op for git but `--force` would discard whatever the agent had already
-    # edited there — the one case where the fast path must not also be the
-    # destructive one.
+    # An exact-sha slot is handed back untouched -- checking it out again would
+    # be a no-op for git but `--force` would discard whatever the agent had
+    # already edited there -- UNLESS this hand-out just took the slot from a
+    # different owner: --force taking over a slot promises a clean checkout of
+    # the requested sha to its new owner, not the previous owner's dirty files
+    # that happen to already be sitting at the same commit.
     if [ ! -e "$chosen/.git" ]; then
         git -C "$canon" worktree add --quiet --detach "$chosen" "$sha"
-    elif [ "$reused" != "already at this commit" ]; then
+    elif [ "$reused" != "already at this commit" ] || [ "$took_foreign_claim" = "1" ]; then
         git -C "$chosen" checkout --quiet --detach --force "$sha"
     fi
 

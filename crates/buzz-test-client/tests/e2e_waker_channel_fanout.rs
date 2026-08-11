@@ -24,7 +24,10 @@ use std::time::Duration;
 
 use buzz_waker::cursor::{CursorStore, DEFAULT_COMPLETED_RING};
 use buzz_waker::decide::WAKE_TRIGGER_KINDS;
-use buzz_waker::feed::{step, FeedStep, FeedTransport, WakeReplay, REPLAY_PAGE_LIMIT};
+use buzz_waker::feed::{
+    step, wake_live_subscription_id, FeedFrame, FeedStep, FeedTransport, WakeReplay,
+    REPLAY_PAGE_LIMIT,
+};
 use buzz_waker::relay_feed::RelayFeed;
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use uuid::Uuid;
@@ -131,17 +134,44 @@ fn mention_event(
         .expect("sign mention event")
 }
 
+/// Same as [`mention_event`], but with an explicit `created_at` instead of
+/// whatever second the signing call happens to land in.
+///
+/// Needed for bulk filler history: events signed back-to-back in a tight
+/// loop can land on the same wall-clock second depending on machine speed,
+/// and if enough of them tie at exactly the page boundary,
+/// `WakeReplay::on_eose`'s "stalled on a tied second" guard reports the walk
+/// truncated instead of paging — a flake that has nothing to do with what
+/// the test is actually checking.
+fn mention_event_at(
+    author_keys: &Keys,
+    channel_id: Uuid,
+    agent_pubkey_hex: &str,
+    label: &str,
+    created_at: u64,
+) -> nostr::Event {
+    EventBuilder::new(Kind::Custom(WAKE_TRIGGER_KINDS[1] as u16), label)
+        .tags(vec![
+            Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            Tag::parse(["p", agent_pubkey_hex]).unwrap(),
+        ])
+        .custom_created_at(nostr::Timestamp::from(created_at))
+        .sign_with_keys(author_keys)
+        .expect("sign mention event")
+}
+
 /// Compact one-line summary of a step batch — a bulk-history test can collect
-/// well over a thousand `Admitted` steps, and dumping the full `Vec<FeedStep>`
+/// well over a thousand `Admitted` steps, and dumping the full step list
 /// into a panic message is unreadable at that size.
-fn summarize(steps: &[FeedStep]) -> String {
+fn summarize(steps: &[(FeedFrame, FeedStep)]) -> String {
     let admitted = steps
         .iter()
-        .filter(|s| matches!(s, FeedStep::Admitted { .. }))
+        .filter(|(_, s)| matches!(s, FeedStep::Admitted { .. }))
         .count();
     let non_admitted: Vec<&FeedStep> = steps
         .iter()
-        .filter(|s| !matches!(s, FeedStep::Admitted { .. }))
+        .filter(|(_, s)| !matches!(s, FeedStep::Admitted { .. }))
+        .map(|(_, s)| s)
         .collect();
     format!(
         "{} steps total ({admitted} Admitted, not shown); non-Admitted: {non_admitted:?}",
@@ -149,8 +179,14 @@ fn summarize(steps: &[FeedStep]) -> String {
     )
 }
 
-/// Drive `feed`'s frames through `step`, collecting every outcome, until
-/// `stop` returns `true` for one of them or `budget` elapses.
+/// Drive `feed`'s frames through `step`, collecting every (raw frame, fold
+/// outcome) pair, until `stop` returns `true` for one outcome or `budget`
+/// elapses.
+///
+/// Returns the raw [`FeedFrame`] alongside each [`FeedStep`] — `FeedStep`
+/// alone does not name the subscription an admitted trigger arrived on, and
+/// a test proving delivery came specifically via a live subscription (rather
+/// than, say, racing with backfill's own historical query) needs that.
 ///
 /// Panics on a transport error or timeout — both are real test failures
 /// here, never a quiet "maybe it just didn't happen yet".
@@ -160,7 +196,7 @@ async fn drain_until(
     replay: &mut WakeReplay,
     budget: Duration,
     mut stop: impl FnMut(&FeedStep) -> bool,
-) -> Vec<FeedStep> {
+) -> Vec<(FeedFrame, FeedStep)> {
     let mut steps = Vec::new();
     let deadline = tokio::time::Instant::now() + budget;
     loop {
@@ -181,14 +217,18 @@ async fn drain_until(
         // see feed.rs's module docs): a clamped page means the walk isn't
         // done, and `FeedStep::Backfill` is the caller's cue to issue the
         // next page. Skipping this would strand the walk after page one on
-        // any backlog over `REPLAY_PAGE_LIMIT` rows.
+        // any backlog over `REPLAY_PAGE_LIMIT` rows. Awaiting this before
+        // `stop` can return also gives callers a happens-before guarantee:
+        // once this call returns having observed a `Backfill` step, the next
+        // page's REQ — with its `until` bound already fixed below whatever
+        // "now" was when page one ran — has already been sent.
         if let FeedStep::Backfill { since, until } = &outcome {
             feed.subscribe_backfill(*since, Some(*until))
                 .await
                 .expect("subscribe next backfill page");
         }
         let done = stop(&outcome);
-        steps.push(outcome);
+        steps.push((frame, outcome));
         if done {
             return steps;
         }
@@ -278,9 +318,10 @@ async fn a_mention_published_after_the_channel_live_subscription_opens_is_delive
     assert!(
         steps
             .iter()
-            .any(|s| matches!(s, FeedStep::Admitted { event, .. } if event.id == mention_id)),
+            .any(|(_, s)| matches!(s, FeedStep::Admitted { event, .. } if event.id == mention_id)),
         "the mention published after the live subscription opened must be \
-         admitted — got {steps:?}"
+         admitted — {}",
+        summarize(&steps)
     );
 }
 
@@ -291,9 +332,30 @@ async fn a_mention_published_after_the_channel_live_subscription_opens_is_delive
 /// bounds all older than "now").
 ///
 /// Publishes just over one page of filler history so the walk genuinely
-/// takes more than one REQ, then publishes the probe mention immediately
-/// after issuing the *first* backfill REQ — while it is provably still
-/// walking, not after.
+/// takes more than one REQ. Two things this test got wrong on first review
+/// (Alex, on `7ce0f88a9`) and now guards against:
+///
+/// - Sending backfill's first (unbounded) REQ over the WebSocket and then
+///   publishing the probe over a *separate* HTTP connection does not order
+///   the relay's DB query before the insert. If the relay happens to run
+///   that query after the probe lands, the unbounded first page legitimately
+///   contains the probe — the test would then pass even with live fan-out
+///   completely broken, because `FeedStep::Admitted` alone cannot say which
+///   subscription delivered it. Fixed by publishing the probe only *after*
+///   `drain_until` has already observed `FeedStep::Backfill` for page one:
+///   that step means the second page's REQ — carrying an `until` bound fixed
+///   below whatever "now" was when page one ran — has already been sent, so
+///   nothing published from this point on can ever appear in a later page,
+///   full stop, not just probably. And separately, this test now asserts the
+///   raw frame's subscription id for the probe's admission equals
+///   `wake_live_subscription_id(probe_channel)` directly, rather than
+///   inferring the source from timing alone.
+/// - Filler events signed back-to-back in a tight loop can tie to the same
+///   wall-clock second depending on machine speed; enough ties exactly at
+///   the page boundary make `WakeReplay::on_eose`'s "stalled on a tied
+///   second" guard report `truncated` instead of paging. Fixed by giving
+///   filler deterministic, one-second-apart `created_at` values instead of
+///   relying on signing-time `now()`.
 #[tokio::test]
 #[ignore]
 async fn a_mention_published_during_an_active_backfill_walk_is_still_delivered_live() {
@@ -315,15 +377,19 @@ async fn a_mention_published_during_an_active_backfill_walk_is_still_delivered_l
     add_channel_member(&owner_keys, probe_channel, &agent_pubkey).await;
 
     // Just over one page, published and settled before the agent ever
-    // connects — enough to force backfill past its first page.
+    // connects — enough to force backfill past its first page. Deterministic,
+    // strictly increasing timestamps one second apart: see the "tied second"
+    // note above.
     let filler_count = REPLAY_PAGE_LIMIT + 20;
+    let filler_base = now_secs().saturating_sub(u64::from(filler_count) + 60);
     let mut filler = Vec::with_capacity(filler_count as usize);
     for i in 0..filler_count {
-        filler.push(mention_event(
+        filler.push(mention_event_at(
             &owner_keys,
             backlog_channel,
             &agent_pubkey,
             &format!("filler-{i}"),
+            filler_base + u64::from(i),
         ));
     }
     // Bounded concurrency so this does not serialize into a multi-minute
@@ -353,37 +419,74 @@ async fn a_mention_published_during_an_active_backfill_walk_is_still_delivered_l
         .await
         .expect("subscribe backfill — page one, unbounded");
 
-    // Published immediately after backfill's first REQ, before draining a
-    // single frame: the walk is provably still outstanding at this instant.
-    // Its created_at will be newer than every backfill page's bound, so it
-    // can only ever arrive via probe_channel's live subscription.
+    // Wait for page one's clamp to be diagnosed. `drain_until` reacts to
+    // `FeedStep::Backfill` by sending the second page's REQ *before*
+    // returning, so by the time this call is done, that bounded `until` has
+    // already gone out to the relay — a real happens-before, not a timing
+    // hope.
+    let first_page_steps = drain_until(
+        &mut feed,
+        &mut cursor,
+        &mut replay,
+        Duration::from_secs(30),
+        |s| matches!(s, FeedStep::Backfill { .. }),
+    )
+    .await;
+    assert!(
+        first_page_steps
+            .iter()
+            .any(|(_, s)| matches!(s, FeedStep::Backfill { .. })),
+        "filler history must be large enough to force a second backfill page, \
+         or this test proves nothing about an *active* walk — {}",
+        summarize(&first_page_steps)
+    );
+
+    // Safe now: the probe's created_at (now) is newer than every backfill
+    // page's bound already committed to a REQ, so it can never appear in a
+    // later page — only probe_channel's live subscription can deliver it.
     let probe = mention_event(&owner_keys, probe_channel, &agent_pubkey, "mid-walk-probe");
     let probe_id = probe.id.to_hex();
     submit_event(&owner_keys, &probe).await;
 
-    let steps = drain_until(
+    // Stop on the probe's own admission specifically, not on
+    // `ReplayComplete`: the probe arrives via a delivery path independent of
+    // backfill's page-2 pipeline, and the two frames can interleave in
+    // either order. Waiting for `ReplayComplete` risked the drain ending
+    // right as page two finished but before the live-delivered probe frame
+    // had arrived — a false failure with nothing wrong underneath.
+    let rest_steps = drain_until(
         &mut feed,
         &mut cursor,
         &mut replay,
         Duration::from_secs(60),
-        |s| matches!(s, FeedStep::ReplayComplete { .. }),
+        |s| matches!(s, FeedStep::Admitted { event, .. } if event.id == probe_id),
     )
     .await;
 
-    assert!(
-        steps.iter().any(|s| matches!(s, FeedStep::Backfill { .. })),
-        "filler history must be large enough to force a second backfill page, \
-         or this test proves nothing about an *active* walk — got {} steps",
-        steps.len()
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|s| matches!(s, FeedStep::Admitted { event, .. } if event.id == probe_id)),
-        "a mention newer than every backfill page's bound can only arrive via \
-         the live subscription — it must be admitted despite the walk still \
-         running when it was published. {}",
-        summarize(&steps)
+    let (probe_frame, _) = rest_steps
+        .iter()
+        .find(|(_, s)| matches!(s, FeedStep::Admitted { event, .. } if event.id == probe_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "a mention newer than every backfill page's bound can only arrive via \
+                 the live subscription — it must be admitted despite the walk still \
+                 running when it was published. {}",
+                summarize(&rest_steps)
+            )
+        });
+    let probe_subscription_id = match probe_frame {
+        FeedFrame::Event {
+            subscription_id, ..
+        } => subscription_id.as_str(),
+        other => panic!("expected an Event frame for the admitted probe, got {other:?}"),
+    };
+    assert_eq!(
+        probe_subscription_id,
+        wake_live_subscription_id(probe_channel),
+        "the probe must be delivered specifically on probe_channel's live \
+         subscription, not merely admitted from some subscription — the \
+         backfill walk (still running when the probe was published) must \
+         never be able to produce it"
     );
 }
 
@@ -427,12 +530,13 @@ async fn membership_add_and_remove_open_and_close_the_live_subscription() {
     })
     .await;
     assert!(
-        steps.iter().any(|s| matches!(
+        steps.iter().any(|(_, s)| matches!(
             s,
             FeedStep::ChannelMembershipChanged { channel_id: c, added: true } if *c == channel_id
         )),
         "adding the agent must surface ChannelMembershipChanged{{added:true}} \
-         for this channel — got {steps:?}"
+         for this channel — {}",
+        summarize(&steps)
     );
 
     feed.subscribe_channel_live(channel_id, since)
@@ -458,9 +562,10 @@ async fn membership_add_and_remove_open_and_close_the_live_subscription() {
     assert!(
         steps
             .iter()
-            .any(|s| matches!(s, FeedStep::Admitted { event, .. } if event.id == present_id)),
+            .any(|(_, s)| matches!(s, FeedStep::Admitted { event, .. } if event.id == present_id)),
         "a mention published while the agent is a member with a live \
-         subscription open must be admitted — got {steps:?}"
+         subscription open must be admitted — {}",
+        summarize(&steps)
     );
 
     // --- Remove: the membership watch must report it, and unsubscribing
@@ -472,12 +577,13 @@ async fn membership_add_and_remove_open_and_close_the_live_subscription() {
     })
     .await;
     assert!(
-        steps.iter().any(|s| matches!(
+        steps.iter().any(|(_, s)| matches!(
             s,
             FeedStep::ChannelMembershipChanged { channel_id: c, added: false } if *c == channel_id
         )),
         "removing the agent must surface ChannelMembershipChanged{{added:false}} \
-         for this channel — got {steps:?}"
+         for this channel — {}",
+        summarize(&steps)
     );
 
     feed.unsubscribe_channel_live(channel_id)

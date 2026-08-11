@@ -323,7 +323,25 @@ pub async fn handle_req(
             Ok(evs) => evs,
             Err(e) => {
                 warn!(conn_id = %conn_id, sub_id = %sub_id, "Historical query failed: {e}");
-                conn.send(RelayMessage::eose(&sub_id));
+                // A failed page must never look like a drained one — a bare
+                // EOSE here is indistinguishable from "no more events" to a
+                // paging client (e.g. buzz-waker's backfill), which would
+                // treat a transient DB error as a clean end of backlog. Close
+                // the subscription instead, unregistering it the same way
+                // `evict_conn_channel_subscriptions` does for relay-initiated
+                // CLOSED, so the client's retry sees a fresh REQ rather than
+                // a duplicate sub_id.
+                {
+                    let mut subs = conn.subscriptions.lock().await;
+                    subs.remove(&sub_id);
+                }
+                if let Some(removed) = state.sub_registry.remove_subscription(conn_id, &sub_id) {
+                    state
+                        .pubsub
+                        .release_topic(&conn.tenant, topic_for_subscription(removed.channel_id))
+                        .await;
+                }
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
                 return;
             }
         };
@@ -1359,6 +1377,148 @@ mod tests {
             order,
             (0..n).collect::<Vec<_>>(),
             "buffered pipeline must preserve input (filter) order regardless of completion order"
+        );
+    }
+
+    /// Builds an `AppState` whose Postgres pool points at nothing reachable.
+    /// `connect_lazy` never dials during construction, so this succeeds
+    /// unconditionally; the pool only fails once a query actually runs —
+    /// which is exactly the historical-query failure this test drives.
+    async fn test_state_with_unreachable_db() -> Arc<AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.database_url = "postgres://nobody:nothing@127.0.0.1:1/nonexistent".to_string();
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    /// Alex's P1 #2: a historical-query failure must CLOSE the subscription,
+    /// not EOSE it — a bare EOSE is indistinguishable from a drained page to a
+    /// paging client (buzz-waker's backfill), which would treat a transient
+    /// DB error as a clean end of backlog. Also asserts the subscription is
+    /// evicted from both the connection-local map and the registry, the same
+    /// cleanup `evict_conn_channel_subscriptions` performs for relay-initiated
+    /// CLOSED.
+    #[tokio::test]
+    async fn a_failed_historical_query_closes_rather_than_eoses() {
+        let state = test_state_with_unreachable_db().await;
+
+        let community_id = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        let tenant =
+            buzz_core::tenant::TenantContext::resolved(community_id, "test.local".to_string());
+        let keys = nostr::Keys::generate();
+        let pubkey = keys.public_key();
+        let pubkey_bytes = pubkey.to_bytes().to_vec();
+
+        // Pre-seed the accessible-channels cache so this test isolates the
+        // historical-query failure — without it, the earlier accessible-channels
+        // DB call would fail first and take the pre-existing CLOSED path.
+        state
+            .accessible_channels_cache
+            .insert((community_id, pubkey_bytes.clone()), Vec::new());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(16);
+        let conn_id = uuid::Uuid::new_v4();
+        let conn = Arc::new(ConnectionState {
+            conn_id,
+            tenant,
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: tokio::sync::RwLock::new(AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
+                    pubkey,
+                    scopes: Vec::new(),
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+                class: crate::connection::ConnectionClass::Interactive,
+            }),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            send_tx: tx,
+            ctrl_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+        });
+
+        let sub_id = "sub-under-test".to_string();
+        let filters = vec![Filter::new().kind(nostr::Kind::TextNote)];
+
+        handle_req(
+            sub_id.clone(),
+            filters,
+            Arc::clone(&conn),
+            Arc::clone(&state),
+        )
+        .await;
+
+        let mut saw_closed = false;
+        while let Ok(msg) = rx.try_recv() {
+            let axum::extract::ws::Message::Text(text) = msg else {
+                continue;
+            };
+            assert!(
+                !text.contains("\"EOSE\""),
+                "a failed page must never be reported as drained: {text}"
+            );
+            if text.contains("\"CLOSED\"") {
+                assert!(
+                    text.contains(&sub_id),
+                    "CLOSED must name this sub_id: {text}"
+                );
+                assert!(
+                    text.contains("error: database error"),
+                    "CLOSED must carry the DB-failure reason: {text}"
+                );
+                saw_closed = true;
+            }
+        }
+        assert!(
+            saw_closed,
+            "expected a CLOSED frame after the historical query failed"
+        );
+
+        assert!(
+            conn.subscriptions.lock().await.is_empty(),
+            "failed subscription must be evicted from the connection-local map"
+        );
+        assert!(
+            state
+                .sub_registry
+                .remove_subscription(conn_id, &sub_id)
+                .is_none(),
+            "failed subscription must be evicted from the registry"
         );
     }
 

@@ -22,7 +22,7 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 /// a known event id) still cannot read another user's private event.
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
-    if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
+    if !crate::kind::RESULT_GATED_KINDS.contains(&kind) {
         return true;
     }
     let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
@@ -295,6 +295,47 @@ mod tests {
         assert!(
             !reader_authorized_for_event(&metric, &agent_keys.public_key().to_hex()),
             "the authoring agent must NOT be authorized to read its own metric event (owner-only)"
+        );
+    }
+
+    /// Bundle transport (`PLANS/BUZZ_WAKER_DESIGN.md` §11) implementation
+    /// gate 4, kindless-`ids` half: even knowing a launch bundle's event id
+    /// must not authorize reading it — the cleartext envelope alone (owner
+    /// pubkey, agent d-tag) is metadata worth protecting, before even
+    /// touching the NIP-44 ciphertext.
+    #[test]
+    fn reader_authorized_for_event_gates_waker_launch_bundle_by_p() {
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_hex();
+        let agent = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let attacker = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        // Bundle event: pubkey=owner (real key, per §11's P1 fix), d/p tag=agent.
+        let bundle = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_WAKER_LAUNCH_BUNDLE as u16),
+            "nip44-ciphertext",
+        )
+        .tags([
+            Tag::parse(["d", agent]).unwrap(),
+            Tag::parse(["p", agent]).unwrap(),
+        ])
+        .sign_with_keys(&owner_keys)
+        .expect("sign");
+
+        assert!(
+            reader_authorized_for_event(&bundle, agent),
+            "the target agent must be authorized to read its own launch bundle"
+        );
+        assert!(
+            !reader_authorized_for_event(&bundle, attacker),
+            "a third party must NOT be authorized to read a launch bundle via kindless ids"
+        );
+        // The owner does not get read-back either — the recipient is the agent,
+        // not the owner (NIP-AM's owner-only shape is the mirror image of this).
+        assert!(
+            !reader_authorized_for_event(&bundle, &owner),
+            "the issuing owner must NOT be authorized to read the bundle back via this gate \
+             (the owner already has the plaintext; this checks the relay-enforced reader set)"
         );
     }
 }

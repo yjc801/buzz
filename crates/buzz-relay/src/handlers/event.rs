@@ -454,37 +454,29 @@ async fn dispatch_persistent_event_inner(
             return 0;
         }
     };
-    // For viewer-private events (kind:30622 DM visibility, kind:44200 agent turn
-    // metrics), live fan-out must reach only the owner — a kindless `ids:[…]`
-    // subscription can otherwise match it. Pull paths (HTTP /query, WS historical)
-    // are gated separately by reader_authorized_for_event.
-    let owner_only_kind = kind_u32 == buzz_core::kind::KIND_DM_VISIBILITY
-        || kind_u32 == buzz_core::kind::KIND_AGENT_TURN_METRIC;
-    let private_event_owner: Option<String> = owner_only_kind
-        .then(|| {
-            let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
-            stored_event
-                .event
-                .tags
-                .filter(nostr::TagKind::SingleLetter(p))
-                .find_map(|t| t.content().map(|s| s.to_string()))
-        })
-        .flatten();
+    // For result-gated events (kind:30622 DM visibility, kind:44200 agent turn
+    // metrics, kind:30180 waker launch bundles), live fan-out must reach only
+    // the authorized reader — a kindless `ids:[…]` subscription can otherwise
+    // match it. This is the same `reader_authorized_for_event` gate pull paths
+    // (HTTP /query, WS historical) apply, so the two can't drift apart.
+    //
     // Author-only delivery gating (NIP-ER reminders) is enforced centrally in
     // filter_fanout_by_access, applied to `matches` above before this loop. The
-    // DM visibility owner gate is an additional delivery fence, so build shared
+    // result-gated owner gate is an additional delivery fence, so build shared
     // frames only after applying it to the already access-filtered recipient set.
     let recipients: Vec<_> = matches
         .iter()
         .filter_map(|(target_conn_id, sub_id)| {
-            if let Some(ref owner_hex) = private_event_owner {
-                let is_owner = state
-                    .conn_manager
-                    .pubkey_for(*target_conn_id)
-                    .is_some_and(|pk| hex::encode(pk) == *owner_hex);
-                if !is_owner {
-                    return None;
-                }
+            let reader_pubkey_hex = state
+                .conn_manager
+                .pubkey_for(*target_conn_id)
+                .map(hex::encode)
+                .unwrap_or_default();
+            if !buzz_core::filter::reader_authorized_for_event(
+                &stored_event.event,
+                &reader_pubkey_hex,
+            ) {
+                return None;
             }
             Some((*target_conn_id, sub_id.as_str()))
         })
@@ -2072,7 +2064,7 @@ mod tests {
         use std::sync::Arc;
 
         use buzz_core::StoredEvent;
-        use nostr::{EventBuilder, Keys, Kind};
+        use nostr::{EventBuilder, Filter, Keys, Kind, Tag};
         use tokio::sync::{mpsc, Mutex};
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
@@ -2427,6 +2419,114 @@ mod tests {
             )
             .await;
             assert_eq!(out, matches);
+        }
+
+        /// Registers a connection like `register_conn`, but keeps the
+        /// outbound receiver so a test can observe what fan-out actually
+        /// delivers to it (`register_conn`'s receiver is dropped, since
+        /// none of its callers need to inspect delivered frames).
+        fn register_conn_observed(
+            state: &AppState,
+            pubkey: Option<Vec<u8>>,
+        ) -> (Uuid, mpsc::Receiver<axum::extract::ws::Message>) {
+            let conn_id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(1);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+            state.conn_manager.register(
+                conn_id,
+                tx,
+                ctrl_tx,
+                None,
+                CancellationToken::new(),
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
+                3,
+            );
+            if let Some(pk) = pubkey {
+                state.conn_manager.set_authenticated_pubkey(conn_id, pk);
+            }
+            (conn_id, rx)
+        }
+
+        /// Live-fan-out regression for Alex's P1 finding on PR #24: a
+        /// kindless `ids:[bundle_id]` subscription must not receive a
+        /// kind:30180 waker launch bundle unless the subscribing connection
+        /// IS the bundle's target agent (`reader_authorized_for_event`'s #p
+        /// gate). Before the fix, `dispatch_persistent_event_inner`'s
+        /// owner-only fence hardcoded only kind:30622/44200, so a non-agent
+        /// connection subscribed by id alone received the full bundle the
+        /// instant the owner published it.
+        #[tokio::test]
+        async fn waker_launch_bundle_live_fanout_reaches_only_the_target_agent() {
+            let state = test_state().await;
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+            let tenant =
+                buzz_core::tenant::TenantContext::resolved(community_id, "bundle-fanout.example");
+
+            let owner_keys = Keys::generate();
+            let agent_keys = Keys::generate();
+            let agent_hex = agent_keys.public_key().to_hex();
+
+            let bundle = EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE as u16),
+                "nip44-ciphertext",
+            )
+            .tags([
+                Tag::parse(["d", &agent_hex]).expect("d tag"),
+                Tag::parse(["p", &agent_hex]).expect("p tag"),
+            ])
+            .sign_with_keys(&owner_keys)
+            .expect("sign bundle");
+            let bundle_id = bundle.id;
+            let stored = StoredEvent::new(bundle.clone(), None);
+
+            // Three sockets, all subscribed the same kindless way — by id
+            // alone, no kind filter — the exact shape the finding calls out.
+            let (agent_conn, mut agent_rx) =
+                register_conn_observed(&state, Some(agent_keys.public_key().to_bytes().to_vec()));
+            let (other_conn, mut other_rx) = register_conn_observed(&state, Some(vec![9u8; 32]));
+            let (unauthed_conn, mut unauthed_rx) = register_conn_observed(&state, None);
+            for conn_id in [agent_conn, other_conn, unauthed_conn] {
+                state.sub_registry.register(
+                    conn_id,
+                    "s".to_string(),
+                    vec![Filter::new().id(bundle_id)],
+                    None,
+                );
+            }
+
+            super::super::dispatch_persistent_event_inner(
+                &tenant,
+                &state,
+                &stored,
+                buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE,
+                &owner_keys.public_key().to_hex(),
+                false,
+                None,
+            )
+            .await;
+
+            let axum::extract::ws::Message::Text(text) = agent_rx
+                .try_recv()
+                .expect("target agent must receive the bundle")
+            else {
+                panic!("expected text relay frame");
+            };
+            assert!(
+                text.contains(&bundle_id.to_hex()),
+                "delivered frame must carry the bundle event"
+            );
+            assert!(
+                other_rx.try_recv().is_err(),
+                "a non-agent authenticated connection subscribed by kindless ids \
+                 must NOT receive the launch bundle"
+            );
+            assert!(
+                unauthed_rx.try_recv().is_err(),
+                "an unauthenticated connection subscribed by kindless ids \
+                 must NOT receive the launch bundle"
+            );
         }
     }
 

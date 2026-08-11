@@ -5269,6 +5269,114 @@ mod tests {
         );
     }
 
+    /// Bundle transport (`PLANS/BUZZ_WAKER_DESIGN.md` §11) implementation
+    /// gates 2 and 3: replacement leaves exactly one live row for
+    /// `(owner, kind, agent d-tag)`, and a different owner cannot replace or
+    /// bury another owner's row for the same agent d-tag — they land at a
+    /// different `(pubkey, kind, d_tag)` coordinate entirely, same mechanism
+    /// `mesh_status_replacement_keeps_one_physical_row` above pins for its
+    /// own kind.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn waker_launch_bundle_replacement_is_scoped_to_owner_and_agent() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let owner = Keys::generate();
+        let other_owner = Keys::generate();
+        let agent_pubkey = "a".repeat(64);
+        let tags = vec![
+            Tag::parse(["d", agent_pubkey.as_str()]).expect("d tag"),
+            Tag::parse(["p", agent_pubkey.as_str()]).expect("p tag"),
+        ];
+        let base = Timestamp::now().as_secs();
+        let kind = buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE as i32;
+
+        // Gate 2: the owner's own reissue replaces, leaving exactly one row.
+        for (offset, content) in [(0, "bundle-v1-ciphertext"), (1, "bundle-v2-ciphertext")] {
+            let event = EventBuilder::new(Kind::Custom(kind as u16), content)
+                .tags(tags.clone())
+                .custom_created_at(Timestamp::from(base + offset))
+                .sign_with_keys(&owner)
+                .expect("sign bundle version");
+            assert!(
+                db.replace_parameterized_event(community, &event, &agent_pubkey, None)
+                    .await
+                    .expect("replace bundle version")
+                    .1
+            );
+        }
+
+        // This kind isn't in `replace_parameterized_event`'s hard-delete
+        // special case (that's NIP-RS and buzz-mesh-status only) — an ordinary
+        // NIP-33 replace soft-deletes the superseded row rather than physically
+        // removing it, same as e.g. `KIND_PERSONA`/`KIND_MANAGED_AGENT`. So the
+        // invariant to pin is "exactly one *live* row", not "exactly one row".
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FILTER (WHERE deleted_at IS NULL) FROM events \
+             WHERE community_id=$1 AND kind=$2 AND pubkey=$3 AND d_tag=$4",
+        )
+        .bind(community.as_uuid())
+        .bind(kind)
+        .bind(owner.public_key().to_bytes())
+        .bind(&agent_pubkey)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count owner's live bundle rows");
+        assert_eq!(
+            live, 1,
+            "reissuing under the same owner must leave exactly one live row"
+        );
+
+        // Gate 3: a different owner publishing for the SAME agent d-tag lands
+        // at a different (pubkey, kind, d_tag) coordinate — it must not
+        // replace, bury, or otherwise disturb the first owner's row.
+        let attacker_event = EventBuilder::new(Kind::Custom(kind as u16), "attacker-ciphertext")
+            .tags(tags.clone())
+            .custom_created_at(Timestamp::from(base + 100))
+            .sign_with_keys(&other_owner)
+            .expect("sign attacker bundle");
+        assert!(
+            db.replace_parameterized_event(community, &attacker_event, &agent_pubkey, None)
+                .await
+                .expect("insert other owner's row")
+                .1,
+            "a different owner's first event for this d-tag is a normal insert, not a replacement"
+        );
+
+        let owner_live_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FILTER (WHERE deleted_at IS NULL) FROM events \
+             WHERE community_id=$1 AND kind=$2 AND pubkey=$3 AND d_tag=$4",
+        )
+        .bind(community.as_uuid())
+        .bind(kind)
+        .bind(owner.public_key().to_bytes())
+        .bind(&agent_pubkey)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count owner's bundle rows after attacker publish");
+        assert_eq!(
+            owner_live_after, 1,
+            "another owner publishing to the same agent d-tag must not disturb the real owner's row"
+        );
+
+        let total_live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FILTER (WHERE deleted_at IS NULL) FROM events \
+             WHERE community_id=$1 AND kind=$2 AND d_tag=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(kind)
+        .bind(&agent_pubkey)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count all live rows for this d-tag");
+        assert_eq!(
+            total_live, 2,
+            "two different owners for the same agent d-tag are two separate rows, not one contested slot"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn coordinate_delete_spares_head_newer_than_the_deletion() {

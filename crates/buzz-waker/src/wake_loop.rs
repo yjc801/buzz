@@ -72,6 +72,11 @@ pub struct WakeLoopConfig {
     /// doc for why this is the accepted `confirm_author_not_known_agent`
     /// baseline.
     pub watch_list: Arc<[String]>,
+    /// This agent's signed launch bundle, if this daemon has one. `None`
+    /// until bundle transport is wired in — see `effects`'s module doc.
+    /// Shared across every attempt in this loop rather than fetched fresh:
+    /// there is no live source to fetch it from yet.
+    pub bundle: Option<Arc<crate::bundle::LaunchBundleBody>>,
 }
 
 fn now_secs() -> u64 {
@@ -231,6 +236,7 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                         Arc::clone(&attempt_state),
                                         Arc::clone(&config.presence_state),
                                         Arc::clone(&config.watch_list),
+                                        config.bundle.clone(),
                                         cancel.clone(),
                                     );
                                 }
@@ -445,6 +451,7 @@ fn spawn_attempt(
     attempt_state: Arc<WakeAttemptState>,
     presence_state: Arc<PresenceState>,
     watch_list: Arc<[String]>,
+    bundle: Option<Arc<crate::bundle::LaunchBundleBody>>,
     cancel: CancellationToken,
 ) {
     attempts.spawn(async move {
@@ -455,6 +462,8 @@ fn spawn_attempt(
             presence_state,
             watch_list,
             &event.author,
+            event.created_at,
+            bundle,
             cancel,
             move || {
                 tracing::info!(

@@ -21,6 +21,10 @@ path = "src/main.rs"
 
 [dependencies]
 buzz-core  = { workspace = true }
+# The provider deploy wire protocol itself (stage, negotiate, invoke) — the
+# same implementation the desktop app links, so both callers talk to a
+# `buzz-backend-<id>` binary identically. See `effects.rs`.
+buzz-provider-deploy = { workspace = true }
 nostr       = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

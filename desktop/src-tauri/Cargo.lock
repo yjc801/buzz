@@ -1094,6 +1094,7 @@ dependencies = [
  "buzz-core",
  "buzz-media",
  "buzz-persona",
+ "buzz-provider-deploy",
  "buzz-sdk",
  "buzz-terminal",
  "buzz-voice",
@@ -1216,6 +1217,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-provider-deploy"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "buzz-sdk"
 version = "0.1.0"
 dependencies = [
@@ -1261,9 +1275,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "buzz-core",
+ "buzz-provider-deploy",
  "buzz-ws-client",
  "hex",
- "nostr",
+ "nostr 0.44.7",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1280,7 +1295,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-core",
  "futures-util",
- "nostr",
+ "nostr 0.44.7",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

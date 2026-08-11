@@ -971,7 +971,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "hex",
- "nostr",
+ "nostr 0.44.7",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "rustls",
@@ -1168,6 +1168,19 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "buzz-provider-deploy"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1397,10 +1410,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "buzz-core",
+ "buzz-provider-deploy",
  "buzz-ws-client",
  "futures-util",
  "hex",
- "nostr",
+ "nostr 0.44.7",
  "serde",
  "serde_json",
  "tempfile",

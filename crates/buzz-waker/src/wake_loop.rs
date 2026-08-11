@@ -491,19 +491,28 @@ fn spawn_attempt(
             );
         }
 
-        if result.outcome == WakeOutcome::Woken && result.floor_adopted == Some(false) {
-            // The provider proved this deploy was a strict no-op against an
-            // already-running generation: the heartbeat that satisfied
-            // `Woken` is that old generation's, not proof this deploy's
-            // `BUZZ_ACP_REPLAY_FLOOR` env is in effect anywhere. A recovered
-            // mention may fall outside that generation's subscription
-            // window — the same operational gap as the undeliverable case
-            // above, from a different cause.
+        if result.outcome == WakeOutcome::Woken && result.floor_adopted != Some(true) {
+            // Only `Some(true)` proves this deploy's `BUZZ_ACP_REPLAY_FLOOR`
+            // env is in effect anywhere. `Some(false)` is the provider
+            // proving a strict no-op against an already-running generation;
+            // `None` is a provider that gave no classification at all
+            // (reachable for any provider predating this optional wire
+            // field) — both are unproven, not just the former. Either way
+            // the heartbeat that satisfied `Woken` may be the old
+            // generation's, so a recovered mention may fall outside that
+            // generation's subscription window — the same operational gap
+            // as the undeliverable case above, from a different cause.
+            let reason = if result.floor_adopted == Some(false) {
+                "the provider proved this deploy was a strict no-op against an \
+                 already-running generation"
+            } else {
+                "the provider gave no fresh-generation classification for this deploy"
+            };
             tracing::error!(
                 agent = %agent_pubkey,
                 event_id = %event_id,
-                "buzz-waker: wake attempt reported Woken from a strict no-op deploy — this \
-                 attempt's replay floor was never adopted by any generation, so the \
+                reason,
+                "buzz-waker: wake attempt reported Woken with an unproven replay floor — the \
                  triggering mention is not guaranteed to reach the already-running harness"
             );
         }

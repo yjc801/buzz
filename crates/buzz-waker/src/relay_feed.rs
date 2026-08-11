@@ -291,6 +291,142 @@ fn feed_frame(message: RelayMessage) -> Result<FeedFrame, WsClientError> {
 mod tests {
     use super::*;
     use buzz_ws_client::OkResponse;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// A real, local, in-process WebSocket relay double: completes the NIP-42
+    /// handshake for real, then forwards every subsequent client frame
+    /// (parsed as a raw JSON array) to the returned receiver.
+    ///
+    /// Exists because a synthetic [`FeedFrame`]/[`RelayMessage`] test cannot
+    /// prove anything about what [`RelayFeed`] actually puts on the wire — the
+    /// same blind spot that hid the original per-channel fan-out bug this
+    /// module's design responds to (see `crate::feed`'s module docs). Driving
+    /// the real `NostrWsConnection` handshake and `send_raw` path against a
+    /// real (if minimal) server closes that gap without needing a full relay,
+    /// Postgres, or Redis — nothing here inspects delivery, only what
+    /// `RelayFeed`'s own methods choose to send.
+    async fn recording_relay_server() -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+
+            // NIP-42: challenge, then the client's signed AUTH event, then OK.
+            // No `class` tag is ever requested by `RelayFeed` (see its `new`
+            // doc), so a bare `OK true ""` is the correct reply — nothing here
+            // needs to confirm a restricted class.
+            let challenge = json!(["AUTH", "mock-relay-challenge"]).to_string();
+            if ws.send(WsMessage::Text(challenge.into())).await.is_err() {
+                return;
+            }
+            let auth_event_id = loop {
+                let Some(Ok(WsMessage::Text(text))) = ws.next().await else {
+                    return;
+                };
+                let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text) else {
+                    continue;
+                };
+                if arr.first().and_then(Value::as_str) == Some("AUTH") {
+                    let Some(id) = arr.get(1).and_then(|e| e.get("id")).and_then(Value::as_str)
+                    else {
+                        return;
+                    };
+                    break id.to_string();
+                }
+            };
+            let ok = json!(["OK", auth_event_id, true, ""]).to_string();
+            if ws.send(WsMessage::Text(ok.into())).await.is_err() {
+                return;
+            }
+
+            // Post-handshake: record every frame, replying to nothing. The
+            // tests here only assert on what was sent, not on delivery.
+            while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text) {
+                    if tx.send(Value::Array(arr)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        (format!("ws://{addr}"), rx)
+    }
+
+    /// Pull the next client frame the mock relay observed, bounded so a bug
+    /// that stops sending fails the test instead of hanging the suite.
+    async fn next_sent_frame(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the mock relay must observe a frame within the test timeout")
+            .expect("the recorder channel must not close mid-test")
+    }
+
+    /// Alex's review on `2aa51a6e6`/`9ac4d6a09`: the unit-level filter
+    /// regression proves a floor-bound filter is correct in isolation, but
+    /// proves nothing about whether `RelayFeed`'s three separate subscribe
+    /// methods actually receive and forward the *same* floor when driven for
+    /// real. This drives the genuine `RelayFeed` — real NIP-42 handshake,
+    /// real `send_raw` calls — against [`recording_relay_server`] and reads
+    /// back exactly what went out over the wire.
+    #[tokio::test]
+    async fn membership_live_and_backfill_requests_all_carry_the_same_since() {
+        let (url, mut sent) = recording_relay_server().await;
+        let keys = Keys::generate();
+        let mut feed = RelayFeed::new(url, keys, None);
+        feed.connect()
+            .await
+            .expect("connects and authenticates against the mock relay");
+
+        let since = 1_700_000_000_u64;
+        let channel_a = Uuid::from_u128(0xAAAA);
+        let channel_b = Uuid::from_u128(0xBBBB);
+
+        feed.subscribe_membership(since)
+            .await
+            .expect("subscribes membership");
+        feed.subscribe_channel_live(channel_a, since)
+            .await
+            .expect("subscribes channel a live");
+        feed.subscribe_channel_live(channel_b, since)
+            .await
+            .expect("subscribes channel b live");
+        feed.subscribe_backfill(since, None)
+            .await
+            .expect("subscribes backfill");
+
+        let mut observed = Vec::new();
+        for _ in 0..4 {
+            let frame = next_sent_frame(&mut sent).await;
+            assert_eq!(
+                frame[0], "REQ",
+                "every call here issues a REQ, got {frame:?}"
+            );
+            let observed_since = frame[2]["since"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("filter must carry `since`: {frame:?}"));
+            observed.push((
+                frame[1].as_str().unwrap_or_default().to_string(),
+                observed_since,
+            ));
+        }
+
+        assert!(
+            observed.iter().all(|(_, s)| *s == since),
+            "membership, every per-channel live subscription, and backfill must \
+             all carry the identical replay floor — got {observed:?}"
+        );
+    }
 
     #[test]
     fn an_event_frame_keeps_its_subscription_and_json() {

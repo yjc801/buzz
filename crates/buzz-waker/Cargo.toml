@@ -29,3 +29,8 @@ tempfile = "3"
 # Tests only: the attempt state machine is generic over its effects, so the
 # crate itself pulls in no runtime — but driving an async test needs one.
 tokio       = { workspace = true }
+# For relay_feed's mock-relay transport test: a real (local, in-process)
+# WebSocket peer to drive `RelayFeed` against, the same server-side halves
+# `buzz-ws-client`'s own connection tests already use.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

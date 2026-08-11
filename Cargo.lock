@@ -1367,6 +1367,7 @@ version = "0.1.0"
 dependencies = [
  "buzz-core",
  "buzz-ws-client",
+ "futures-util",
  "hex",
  "nostr",
  "serde",
@@ -1374,6 +1375,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "uuid",
 ]
 

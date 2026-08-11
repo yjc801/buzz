@@ -23,10 +23,31 @@ use std::time::Duration;
 
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Keys, Tag};
+use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::feed::{
-    wake_backfill_close, wake_backfill_req, wake_live_req, FeedFrame, FeedTransport,
+    wake_backfill_close, wake_backfill_req, wake_live_close, wake_live_req, wake_membership_req,
+    FeedFrame, FeedTransport,
 };
+
+/// Subscription id for the one-shot channel-discovery query
+/// ([`RelayFeed::discover_channels`]) — kind:39002 (NIP-29 group members)
+/// filtered to `#p` = this agent. Never appears in [`WakeSubscription`],
+/// because discovery runs to completion before the feed's main loop ever
+/// calls [`FeedTransport::next_frame`] for real, so no other code needs to
+/// recognise it.
+///
+/// [`WakeSubscription`]: crate::feed::WakeSubscription
+const DISCOVER_CHANNELS_SUBSCRIPTION_ID: &str = "buzz-waker-discover";
+
+/// How long to wait for the discovery query's EOSE before giving up.
+///
+/// A relay that never answers would otherwise hang connection setup
+/// indefinitely; the reconnect ladder is what actually recovers from this,
+/// so failing the connection attempt here is the correct behaviour, not a
+/// missing feature.
+const DISCOVER_CHANNELS_TIMEOUT_SECS: u64 = 20;
 
 /// A NIP-42-authenticated connection to one relay, **as one agent**,
 /// reconnectable in place.
@@ -101,14 +122,74 @@ impl FeedTransport for RelayFeed {
         Ok(())
     }
 
-    async fn subscribe_live(&mut self, since: u64) -> Result<(), Self::Error> {
-        // `self.agent_pubkey`, never an argument: the filter's `#p` and the
-        // socket's authenticated identity are the same value by construction.
-        let req = wake_live_req(&self.agent_pubkey, since);
+    async fn discover_channels(&mut self) -> Result<Vec<Uuid>, Self::Error> {
+        // `self.agent_pubkey`, never an argument — same reasoning as every
+        // other subscribe method: the query's `#p` and the socket's
+        // authenticated identity must be the same value by construction, or
+        // this could discover a channel list that does not belong to the
+        // connection that will go on to subscribe live to it.
+        let filter = json!({
+            "kinds": [buzz_core::kind::KIND_NIP29_GROUP_MEMBERS],
+            "#p": [self.agent_pubkey],
+        });
+        let req = json!(["REQ", DISCOVER_CHANNELS_SUBSCRIPTION_ID, filter]);
+        self.connection_mut()?.send_raw(&req).await?;
+
+        let mut channel_ids = Vec::new();
+        loop {
+            match self.next_frame(DISCOVER_CHANNELS_TIMEOUT_SECS).await? {
+                Some(FeedFrame::Event {
+                    subscription_id,
+                    event,
+                }) if subscription_id == DISCOVER_CHANNELS_SUBSCRIPTION_ID => {
+                    if let Some(channel_id) = extract_d_tag_uuid(&event) {
+                        channel_ids.push(channel_id);
+                    }
+                }
+                Some(FeedFrame::Eose { subscription_id })
+                    if subscription_id == DISCOVER_CHANNELS_SUBSCRIPTION_ID =>
+                {
+                    break;
+                }
+                // A frame for anything else cannot arrive here — no other
+                // subscription is open yet at this point in the connect
+                // sequence — but ignoring rather than erroring costs nothing
+                // and keeps this loop from being the one place a stray relay
+                // message tears down the connection.
+                Some(_) => {}
+                None => return Err(WsClientError::Timeout),
+            }
+        }
+        Ok(channel_ids)
+    }
+
+    async fn subscribe_membership(&mut self, since: u64) -> Result<(), Self::Error> {
+        let req = wake_membership_req(&self.agent_pubkey, since);
         self.connection_mut()?.send_raw(&req).await
     }
 
-    async fn subscribe_backfill(&mut self, since: u64, until: u64) -> Result<(), Self::Error> {
+    async fn subscribe_channel_live(
+        &mut self,
+        channel_id: Uuid,
+        since: u64,
+    ) -> Result<(), Self::Error> {
+        // `self.agent_pubkey`, never an argument: the filter's `#p` and the
+        // socket's authenticated identity are the same value by construction.
+        let req = wake_live_req(&self.agent_pubkey, channel_id, since);
+        self.connection_mut()?.send_raw(&req).await
+    }
+
+    async fn unsubscribe_channel_live(&mut self, channel_id: Uuid) -> Result<(), Self::Error> {
+        self.connection_mut()?
+            .send_raw(&wake_live_close(channel_id))
+            .await
+    }
+
+    async fn subscribe_backfill(
+        &mut self,
+        since: u64,
+        until: Option<u64>,
+    ) -> Result<(), Self::Error> {
         let req = wake_backfill_req(&self.agent_pubkey, since, until);
         self.connection_mut()?.send_raw(&req).await
     }
@@ -136,6 +217,23 @@ impl FeedTransport for RelayFeed {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Extract a channel UUID from an event's `d` tag.
+///
+/// kind:39002 (NIP-29 group members) is a parameterized-replaceable event
+/// whose `d` tag is the channel id — not `h`, which is what channel-scoped
+/// *content* events (and membership-change notifications) carry instead. Only
+/// [`RelayFeed::discover_channels`]'s one-shot query reads this; nothing else
+/// in the crate needs it.
+fn extract_d_tag_uuid(event: &Value) -> Option<Uuid> {
+    event.get("tags")?.as_array()?.iter().find_map(|tag| {
+        let parts = tag.as_array()?;
+        if parts.first()?.as_str()? != "d" {
+            return None;
+        }
+        parts.get(1)?.as_str()?.parse::<Uuid>().ok()
+    })
 }
 
 /// Translate a relay message into the frame the feed understands.

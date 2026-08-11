@@ -207,6 +207,19 @@ hold_age() {
     printf '%s' "$((now - at))"
 }
 
+# True when the slot has a claim, it is still live, and it is not ours --
+# i.e. taking this slot would steal it out from under another session.
+# Checked during selection, not after: a slot excluded here is simply not a
+# candidate, so a session never gets refused while an unclaimed slot sits
+# free elsewhere.
+foreign_claim() {
+    local slots="$1" i="$2" now="$3" mine="$4" existing
+    existing=$(cat "$(claim_file "$slots" "$i")" 2>/dev/null || true)
+    [ -n "$existing" ] || return 1
+    [ "$(hold_age "$slots" "$i" "$now")" -lt "$HOLD_SECONDS" ] || return 1
+    [ "$existing" != "$mine" ]
+}
+
 cmd_path() {
     local ref="$1" name="$2" force="$3" claim_arg="$4"
     local canon slots shared sha
@@ -225,14 +238,21 @@ cmd_path() {
     local i slot chosen="" reused="" oldest="" oldest_at="" now
     now=$(date +%s)
 
+    # A slot with a live foreign claim is excluded from selection, not picked
+    # and then rejected -- otherwise a session asking for a ref already
+    # checked out in a claimed slot would be refused even while another slot
+    # sits empty. --force disables the exclusion (it doesn't disable the
+    # dirty check, which stays a separate protection for uncommitted work).
     for i in $(seq 1 "$SLOT_COUNT"); do
         slot="$slots/$i"
         [ -e "$slot/.git" ] || continue
-        if [ "$(git -C "$slot" rev-parse HEAD 2>/dev/null)" = "$sha" ]; then
-            chosen="$slot"
-            reused="already at this commit"
-            break
+        [ "$(git -C "$slot" rev-parse HEAD 2>/dev/null)" = "$sha" ] || continue
+        if [ "$force" != "1" ] && foreign_claim "$slots" "$i" "$now" "$claim_arg"; then
+            continue
         fi
+        chosen="$slot"
+        reused="already at this commit"
+        break
     done
 
     if [ -z "$chosen" ]; then
@@ -246,6 +266,9 @@ cmd_path() {
             if [ "$force" != "1" ] && slot_is_dirty "$slot"; then
                 continue
             fi
+            if [ "$force" != "1" ] && foreign_claim "$slots" "$i" "$now" "$claim_arg"; then
+                continue
+            fi
             local at
             at=$(stat -c %Y "$(stamp "$slots" "$i")" 2>/dev/null || echo 0)
             if [ -z "$oldest_at" ] || [ "$at" -lt "$oldest_at" ]; then
@@ -256,28 +279,20 @@ cmd_path() {
     fi
 
     if [ -z "$chosen" ]; then
-        [ -n "$oldest" ] || die "every slot under $slots has uncommitted work. Commit or stash it, or re-run with --force."
+        [ -n "$oldest" ] || die "every slot under $slots is dirty or claimed by another session. Commit/stash, wait, or re-run with --force."
         chosen="$oldest"
         reused="recycled"
     fi
 
-    # Exclusivity: whichever path picked $chosen -- an exact-sha match or a
-    # recycle -- lands here before anything destructive happens, so neither
-    # path can skip the check the other honors. A live claim (handed out less
-    # than HOLD_SECONDS ago) is exclusive to whoever holds its token; a
-    # timestamp warning is not exclusion, so reuse without the matching token
-    # is refused outright unless the caller passes --force.
+    # Selection above already excludes a live foreign claim unless --force
+    # was passed, so a claim can only still be live here in the --force case
+    # -- worth a warning since it means taking the slot from whoever holds it.
     local chosen_i existing_claim age
     chosen_i="$(basename "$chosen")"
     existing_claim=$(cat "$(claim_file "$slots" "$chosen_i")" 2>/dev/null || true)
     age=$(hold_age "$slots" "$chosen_i" "$now")
     if [ -n "$existing_claim" ] && [ "$age" -lt "$HOLD_SECONDS" ] && [ "$existing_claim" != "$claim_arg" ]; then
-        if [ "$force" = "1" ]; then
-            note "warning: taking $chosen from a live claim ($((age / 60))m old) -- --force was passed"
-        else
-            die "$chosen is claimed by another session (handed out $((age / 60))m ago)." \
-                "Pass --claim <token> if that session is you, --force to take it anyway, or wait $(( (HOLD_SECONDS - age) / 60 ))m."
-        fi
+        note "warning: taking $chosen from a live claim ($((age / 60))m old) -- --force was passed"
     fi
 
     # An exact-sha slot is handed back untouched. Checking it out again would be
@@ -293,13 +308,12 @@ cmd_path() {
     link_cache "$chosen" "$shared"
     printf '%s' "$ref" >"$(stamp "$slots" "$chosen_i")"
 
-    # Renew under the caller's own token when they proved they already hold
-    # it; otherwise this hand-out starts a fresh claim (new slot, an expired
-    # or absent claim, or a --force takeover all fall here).
+    # Honor a caller-supplied token unconditionally -- selection above already
+    # established the reuse is allowed (unclaimed, expired, matching, or
+    # --force), so there is nothing left to compare it against. Mint one only
+    # when the caller didn't bring their own, e.g. a bare first call.
     local my_claim="$claim_arg"
-    if [ -z "$my_claim" ] || [ "$my_claim" != "$existing_claim" ]; then
-        my_claim=$(new_claim_token)
-    fi
+    [ -n "$my_claim" ] || my_claim=$(new_claim_token)
     printf '%s' "$my_claim" >"$(claim_file "$slots" "$chosen_i")"
 
     note "$(basename "$chosen") -> ${sha:0:9} ($reused); cargo cache $shared"

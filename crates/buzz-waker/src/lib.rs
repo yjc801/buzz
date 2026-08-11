@@ -26,9 +26,12 @@
 //!   [`attempt::WakeEffects::heartbeat`], since presence carries no history
 //!   to query separately.
 //! - [`effects`] — [`effects::RealWakeEffects`], the production
-//!   [`attempt::WakeEffects`] implementation wiring the presence tap in.
-//!   `start_managed_agent` is an explicit, unimplemented seam: the provider
-//!   deploy wire protocol is out of scope here (see the module doc).
+//!   [`attempt::WakeEffects`] implementation wiring the presence tap in and
+//!   `start_managed_agent` to the provider deploy wire protocol
+//!   (`buzz-provider-deploy`, shared with the desktop app). It still cannot
+//!   complete a *real* wake: obtaining a signed launch bundle at runtime
+//!   needs bundle transport, an explicit, separately deferred seam (see the
+//!   module doc).
 //! - [`wake_loop`] — the connection loop: drives [`feed::FeedTransport`] plus
 //!   the reconnect ladder plus [`feed::step`], and spawns each admitted
 //!   trigger's [`attempt::run_wake_attempt`] onto its own task so the loop

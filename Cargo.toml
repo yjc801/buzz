@@ -29,6 +29,7 @@ members = [
     "crates/buzz-voice",
     "crates/buzz-backend-kubernetes",
     "crates/buzz-backend-sprites",
+    "crates/buzz-provider-deploy",
     "crates/buzz-waker",
     "examples/countdown-bot",
 ]
@@ -146,6 +147,7 @@ buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
 buzz-waker = { path = "crates/buzz-waker" }
+buzz-provider-deploy = { path = "crates/buzz-provider-deploy" }
 
 # CI profile — builds the relay for desktop e2e. Dependencies keep full
 # release optimization (warm from main's cache; they carry the runtime hot

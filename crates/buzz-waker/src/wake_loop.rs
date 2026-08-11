@@ -72,6 +72,11 @@ pub struct WakeLoopConfig {
     /// doc for why this is the accepted `confirm_author_not_known_agent`
     /// baseline.
     pub watch_list: Arc<[String]>,
+    /// This agent's signed launch bundle, if this daemon has one. `None`
+    /// until bundle transport is wired in — see `effects`'s module doc.
+    /// Shared across every attempt in this loop rather than fetched fresh:
+    /// there is no live source to fetch it from yet.
+    pub bundle: Option<Arc<crate::bundle::LaunchBundleBody>>,
 }
 
 fn now_secs() -> u64 {
@@ -231,6 +236,7 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                         Arc::clone(&attempt_state),
                                         Arc::clone(&config.presence_state),
                                         Arc::clone(&config.watch_list),
+                                        config.bundle.clone(),
                                         cancel.clone(),
                                     );
                                 }
@@ -445,6 +451,7 @@ fn spawn_attempt(
     attempt_state: Arc<WakeAttemptState>,
     presence_state: Arc<PresenceState>,
     watch_list: Arc<[String]>,
+    bundle: Option<Arc<crate::bundle::LaunchBundleBody>>,
     cancel: CancellationToken,
 ) {
     attempts.spawn(async move {
@@ -454,7 +461,10 @@ fn spawn_attempt(
         let effects = RealWakeEffects::new(
             presence_state,
             watch_list,
+            &agent_pubkey,
             &event.author,
+            event.created_at,
+            bundle,
             cancel,
             move || {
                 tracing::info!(
@@ -478,6 +488,32 @@ fn spawn_attempt(
                 event_id = %event_id,
                 "buzz-waker: wake succeeded but the triggering mention was already too old \
                  for the woken harness's replay floor to reach it"
+            );
+        }
+
+        if result.outcome == WakeOutcome::Woken && result.floor_adopted != Some(true) {
+            // Only `Some(true)` proves this deploy's `BUZZ_ACP_REPLAY_FLOOR`
+            // env is in effect anywhere. `Some(false)` is the provider
+            // proving a strict no-op against an already-running generation;
+            // `None` is a provider that gave no classification at all
+            // (reachable for any provider predating this optional wire
+            // field) — both are unproven, not just the former. Either way
+            // the heartbeat that satisfied `Woken` may be the old
+            // generation's, so a recovered mention may fall outside that
+            // generation's subscription window — the same operational gap
+            // as the undeliverable case above, from a different cause.
+            let reason = if result.floor_adopted == Some(false) {
+                "the provider proved this deploy was a strict no-op against an \
+                 already-running generation"
+            } else {
+                "the provider gave no fresh-generation classification for this deploy"
+            };
+            tracing::error!(
+                agent = %agent_pubkey,
+                event_id = %event_id,
+                reason,
+                "buzz-waker: wake attempt reported Woken with an unproven replay floor — the \
+                 triggering mention is not guaranteed to reach the already-running harness"
             );
         }
 

@@ -203,6 +203,10 @@ async fn main() -> anyhow::Result<()> {
                 cursor_path,
                 presence_state,
                 watch_list: Arc::clone(&watch_list),
+                // No bundle transport into this daemon build yet — see
+                // `effects`'s module doc. Every real wake attempt reaches
+                // the deploy step and fails with `EffectsError::NoBundle`.
+                bundle: None,
             };
             let cancel = cancel.clone();
             let pubkey = pubkey.clone();

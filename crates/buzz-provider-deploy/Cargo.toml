@@ -1,0 +1,22 @@
+[package]
+name = "buzz-provider-deploy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider deploy wire protocol: stage, negotiate, and invoke a buzz-backend-* binary. Shared by the desktop app and buzz-waker so both talk to providers the same way."
+
+[lib]
+name = "buzz_provider_deploy"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json  = { workspace = true }
+sha2        = { workspace = true }
+hex         = { workspace = true }
+uuid        = { workspace = true }
+tempfile    = "3"
+dirs        = "6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

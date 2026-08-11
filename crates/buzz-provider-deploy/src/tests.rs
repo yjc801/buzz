@@ -19,9 +19,8 @@ fn redact_secrets_replaces_token() {
 #[test]
 fn redact_secrets_with_extras_scrubs_user_env_values() {
     // If a provider echoes back a user-supplied API key in its error
-    // output, the desktop must not surface that secret unredacted via
-    // `last_error`. We scrub the literal values that came from the
-    // request's `agent.env_vars`.
+    // output, a caller must not surface that secret unredacted. We scrub
+    // the literal values that came from the request's `agent.env_vars`.
     let secret = "sk-ant-api03-abc123def456";
     let stderr = format!("auth failed with key {secret} on host api.anthropic.com");
     let r = redact_secrets_with(&stderr, &[secret]);
@@ -158,8 +157,13 @@ esac"#,
     );
     write_test_provider(&provider, &body);
 
-    let outcome = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
-        .expect("staged deploy");
+    let outcome = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+    )
+    .expect("staged deploy");
     assert_eq!(outcome.agent_id, "remote-1");
     // This fake omits `fresh_generation`, like any provider predating the
     // field: the classification must read as "unproven", not as an answer.
@@ -199,8 +203,13 @@ case "$request" in
 esac"#
         );
         write_test_provider(&provider, &body);
-        let outcome = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
-            .expect("staged deploy");
+        let outcome = provider_deploy(
+            &provider,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("staged deploy");
         assert_eq!(outcome.fresh_generation, parsed, "wire value {wire_value}");
     }
 }
@@ -243,9 +252,14 @@ esac"#,
     write_test_provider(&provider, &body);
     let inode_before = std::fs::metadata(&provider).unwrap().ino();
 
-    let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
-        .expect("deploy from immutable staged copy")
-        .agent_id;
+    let id = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+    )
+    .expect("deploy from immutable staged copy")
+    .agent_id;
 
     assert_eq!(id, "original-staged-bytes");
     assert_eq!(
@@ -285,9 +299,14 @@ esac"#,
     write_test_provider(&provider, &body);
     let inode_before = std::fs::metadata(&provider).unwrap().ino();
 
-    let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
-        .expect("deploy from immutable staged copy")
-        .agent_id;
+    let id = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+    )
+    .expect("deploy from immutable staged copy")
+    .agent_id;
 
     assert_eq!(id, "original-staged-bytes");
     assert_ne!(
@@ -322,6 +341,7 @@ esac"#,
         &provider,
         &serde_json::json!({"private_key_nsec": "nsec1must-not-cross"}),
         &serde_json::json!({}),
+        None,
     )
     .unwrap_err();
     assert!(error.contains("protocol version 2"), "{error}");
@@ -340,12 +360,74 @@ fn provider_deploy_requires_an_explicit_integer_protocol_version() {
 printf '%s\n' '{"ok":true,"version":"1.0.0"}'"#,
     );
 
-    let error =
-        provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({})).unwrap_err();
+    let error = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+    )
+    .unwrap_err();
     assert!(
         error.contains("missing integer protocol_version"),
         "{error}"
     );
+}
+
+/// G1: a bundle's pinned digest must be checked against the staged binary
+/// before anything — including the negotiation round-trip — talks to it.
+#[cfg(unix)]
+#[test]
+fn provider_deploy_pinned_refuses_a_digest_mismatch_before_any_negotiation() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    let marker = directory.path().join("provider-ran");
+    write_test_provider(
+        &provider,
+        &format!("touch '{}'\nread request", marker.display()),
+    );
+
+    let error = provider_deploy_pinned(
+        &provider,
+        &serde_json::json!({"private_key_nsec": "nsec1must-not-cross"}),
+        &serde_json::json!({}),
+        None,
+        &"f".repeat(64),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("digest"), "{error}");
+    assert!(
+        !marker.exists(),
+        "the binary must never run when its digest doesn't match"
+    );
+    assert!(!error.contains("nsec1must-not-cross"));
+}
+
+/// The matching-digest path is otherwise identical to the unpinned one.
+#[cfg(unix)]
+#[test]
+fn provider_deploy_pinned_deploys_when_the_digest_matches() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    write_test_provider(
+        &provider,
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,"description":"test provider","config_schema":{}}' ;;
+  *\"op\":\"deploy\"*) printf '%s\n' '{"ok":true,"agent_id":"pinned-1"}' ;;
+esac"#,
+    );
+    let expected = hex::encode(Sha256::digest(std::fs::read(&provider).unwrap()));
+
+    let outcome = provider_deploy_pinned(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+        &expected,
+    )
+    .expect("digest matched, deploy proceeds");
+    assert_eq!(outcome.agent_id, "pinned-1");
 }
 
 #[test]

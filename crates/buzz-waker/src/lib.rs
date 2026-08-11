@@ -21,6 +21,18 @@
 //! - [`feed`] — the **event feed**: the subscription that supplies the
 //!   mentions, and the fold from a relay frame into a claimed trigger. Its
 //!   socket lives behind a trait, implemented once in [`relay_feed`].
+//! - [`presence_feed`] — the **presence tap**: one live subscription per
+//!   watched agent that feeds both [`attempt::WakeEffects::presence`] and
+//!   [`attempt::WakeEffects::heartbeat`], since presence carries no history
+//!   to query separately.
+//! - [`effects`] — [`effects::RealWakeEffects`], the production
+//!   [`attempt::WakeEffects`] implementation wiring the presence tap in.
+//!   `start_managed_agent` is an explicit, unimplemented seam: the provider
+//!   deploy wire protocol is out of scope here (see the module doc).
+//! - [`wake_loop`] — the connection loop: drives [`feed::FeedTransport`] plus
+//!   the reconnect ladder plus [`feed::step`], and spawns each admitted
+//!   trigger's [`attempt::run_wake_attempt`] onto its own task so the loop
+//!   keeps answering the relay's pings during a liveness proof.
 //!
 //! Each exists because of a specific review finding and carries the gate id
 //! (`G1`–`G4`) it discharges, so the reason is not lost.
@@ -29,10 +41,13 @@ pub mod attempt;
 pub mod bundle;
 pub mod cursor;
 pub mod decide;
+pub mod effects;
 pub mod feed;
 mod fence;
 pub mod floors;
+pub mod presence_feed;
 pub mod relay_feed;
+pub mod wake_loop;
 
 pub use attempt::{
     is_managed_agent_live, is_presumed_delivered_by_floor, is_wake_attempt_debounced,

@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+#
+# buzz-waker — headless wake daemon, deployed as a normal always-on Fly app
+# (see fly.waker.toml), not a Sprite. Sprites hibernate on idle by design
+# (crates/buzz-backend-sprites/README.md); this daemon's entire job is
+# staying connected and listening continuously across every watched agent,
+# which is exactly the workload Sprites are built to suspend.
+#
+# Ships two binaries: buzz-waker itself, and buzz-backend-sprites, the one
+# provider this image supports today. buzz-provider-deploy (shared with
+# desktop) discovers provider binaries by name on PATH — add more
+# `-p buzz-backend-<id> --bin buzz-backend-<id>` lines below and to the
+# runtime COPY as other providers are needed.
+#
+# Multi-arch is produced by building this file on native amd64 and arm64
+# runners, matching Dockerfile.sprig's convention. Keep both bases pinned to
+# manifest-list digests so either architecture resolves to immutable source
+# bytes.
+FROM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS builder
+
+RUN apk add --no-cache \
+      build-base \
+      cmake \
+      git \
+      musl-dev \
+      openssl-dev \
+      openssl-libs-static \
+      perl \
+      pkgconf \
+      protoc
+WORKDIR /build
+COPY . .
+RUN cargo build --release --locked \
+      -p buzz-waker --bin buzz-waker \
+      -p buzz-backend-sprites --bin buzz-backend-sprites \
+    && strip target/release/buzz-waker target/release/buzz-backend-sprites
+
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+
+RUN apk add --no-cache bash ca-certificates \
+    && adduser -D -h /home/waker waker \
+    && install -d -o waker -g waker /data/waker /run/waker
+
+COPY --from=builder --chmod=0755 /build/target/release/buzz-waker /usr/local/bin/buzz-waker
+COPY --from=builder --chmod=0755 /build/target/release/buzz-backend-sprites /usr/local/bin/buzz-backend-sprites
+COPY --chmod=0755 scripts/waker-entrypoint.sh /usr/local/bin/waker-entrypoint
+
+ENV HOME=/home/waker \
+    PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    WAKER_STATE_DIR=/data/waker \
+    RUST_LOG=buzz_waker=info
+
+# fly.waker.toml mounts the durable volume here — WAKER_STATE_DIR holds each
+# watched agent's cursor.json and FloorStore, and the anti-rollback guarantee
+# those pin depends on this surviving restarts.
+VOLUME ["/data/waker"]
+
+WORKDIR /home/waker
+USER waker
+ENTRYPOINT ["/usr/local/bin/waker-entrypoint"]

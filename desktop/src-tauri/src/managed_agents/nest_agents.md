@@ -18,6 +18,25 @@ Filenames: `ALL_CAPS_WITH_UNDERSCORES.md` (e.g., `OAUTH_FLOW_NOTES.md`).
 
 The bundled CLI is your primary tool interface — run its `--help` command for usage. The CLI skill file has the full reference.
 
+## Checking Out a Branch or PR
+
+**Reuse a checkout path; don't mint one per PR.** A fresh clone or `git worktree add` at a *new* path is a cold Rust environment, not just a cold `target/`. Two reasons, and sharing a `target/` only fixes the second:
+
+- Hermit pins `CARGO_HOME` inside whichever directory it is activated in, so a new path re-downloads the whole registry (~800 crates, ~800 MB).
+- Cargo keys a local crate's artifacts on its **absolute path**, so a new path recompiles every workspace crate even against a shared `target/`.
+
+Measured on a sprite: ~4 GB and a full cold build per throwaway checkout, thrown away when the PR was done.
+
+So `git fetch` and `git checkout` an existing checkout instead of creating another one. Where `buzz-workspace` is on your PATH (remote agents), let it pick the checkout for you:
+
+```bash
+cd "$(buzz-workspace pr/19)"      # a PR, by number
+cd "$(buzz-workspace main)"       # a branch, tag, or sha
+buzz-workspace list               # which slots hold what
+```
+
+It recycles a small pool of fixed-path slots against a shared cargo cache, never touches `target/`, and will not recycle a slot that has uncommitted work. Each hand-out claims its slot for an hour; if you're going to call `buzz-workspace` repeatedly for the same ref, `export BUZZ_WORKSPACE_CLAIM=<anything-unique>` once so your own later calls are recognized as yours instead of refused. `buzz-workspace release <ref>` gives up a claim early.
+
 ## Knowledge File Conventions
 
 Files in `GUIDES/`, `PLANS/`, `RESEARCH/`, `WORK_LOGS/` should include YAML frontmatter:

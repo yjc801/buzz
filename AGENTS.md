@@ -90,8 +90,17 @@ See CONTRIBUTING.md for full setup details and dependency requirements.
 
 ## Quality Gates
 
-Run `just ci` before every PR — it runs `fmt` + `clippy` + desktop lint +
-unit tests + builds. Clippy passing does not mean fmt passes; run both.
+**Run `just gate` while iterating** — it runs only the gates your diff vs
+`origin/main` can affect. `just ci` sweeps five independent stacks (Rust
+workspace, desktop JS, Tauri Rust, web, Flutter); a change confined to one
+crate pays for the other four, and on a remote agent that is the single
+most expensive thing in the loop. `just gate` fails open: an unresolvable
+base, or a changed path it has no mapping for, runs the full `just ci`
+rather than silently skipping a check.
+
+Run `just ci` before opening the PR, and whenever the diff is broad — it
+runs `fmt` + `clippy` + desktop lint + unit tests + builds. Clippy passing
+does not mean fmt passes; run both.
 
 Run `just test` for integration tests if you touched `buzz-relay`,
 `buzz-db`, or `buzz-auth` — these require a running Postgres and Redis.

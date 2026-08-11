@@ -229,6 +229,20 @@ fn decrypt_verify_and_admit(
         .verify(&pinned_owner, now)
         .map_err(|error| format!("launch bundle verification failed: {error}"))?;
 
+    // `verify` only checks the owner's signature over the body — it does not,
+    // and by design cannot, know which agent this daemon is running as. An
+    // owner-signed bundle whose `agent_pubkey` names a *different* agent must
+    // never reach `admit`: that would durably raise this agent's version
+    // floor (and replace its live cache) for a bundle that was never meant
+    // for it, poisoning both until manual state repair.
+    let receiving_agent = normalize_pubkey(&keys.public_key().to_hex());
+    if normalize_pubkey(&body.agent_pubkey) != receiving_agent {
+        return Err(format!(
+            "launch bundle targets agent {}, not the receiving agent {receiving_agent}",
+            body.agent_pubkey
+        ));
+    }
+
     floor_store
         .admit(body.bundle_version)
         .map_err(|error| format!("launch bundle floor refused it: {error}"))?;
@@ -516,5 +530,51 @@ mod tests {
             decrypt_verify_and_admit(&agent, &owner_pubkey, &ciphertext, &mut floor_store)
                 .expect("round trip");
         assert_eq!(admitted.bundle_version, 1);
+    }
+
+    #[test]
+    fn a_bundle_targeting_another_agent_is_refused_and_does_not_advance_the_floor() {
+        use crate::bundle::{LaunchBundleBody, ProviderEnvelope};
+
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        // The receiving agent and the bundle's declared target are different
+        // keys — an owner-signed bundle correctly addressed (NIP-44, `#p`) to
+        // `agent` but whose signed body names `other_agent`.
+        let agent = Keys::generate();
+        let other_agent = Keys::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut floor_store =
+            FloorStore::enroll(dir.path().join("floor.json"), &owner_pubkey).unwrap();
+
+        let body = LaunchBundleBody {
+            agent_pubkey: other_agent.public_key().to_hex(),
+            agent_json: serde_json::json!({"launch": {"policy_env": {}}}),
+            provider: ProviderEnvelope {
+                provider_id: "sprites".to_string(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: "b".repeat(64),
+            },
+            bundle_version: 1,
+            issued_at: 0,
+            expires_at: u64::MAX,
+            owner_only_access: true,
+        };
+        let owner_keypair =
+            nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
+        let signed = SignedLaunchBundle::sign(&body, &owner_keypair).unwrap();
+        let plaintext = serde_json::to_string(&signed).unwrap();
+        let ciphertext = nostr::nips::nip44::encrypt(
+            owner.secret_key(),
+            &agent.public_key(),
+            &plaintext,
+            nostr::nips::nip44::Version::V2,
+        )
+        .unwrap();
+
+        let error = decrypt_verify_and_admit(&agent, &owner_pubkey, &ciphertext, &mut floor_store)
+            .expect_err("must be refused");
+        assert!(error.contains("targets agent"), "{error}");
+        assert_eq!(floor_store.snapshot().highest_accepted_version, 0);
     }
 }

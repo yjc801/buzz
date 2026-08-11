@@ -69,6 +69,33 @@ struct AgentConfig {
     owner_pubkey: String,
 }
 
+/// Refuse to start `pubkey`'s watch tasks if the floor's pinned owner
+/// disagrees with what `WAKER_AGENTS_CONFIG_PATH` configures now.
+///
+/// The floor's owner is pinned once, at enrolment, and never rewritten (G2)
+/// — but config is free to change on any later run. If it drifts from the
+/// pin, the daemon would still start "successfully" while
+/// subscribing/decrypting as the newly configured owner and verifying every
+/// delivery against the old pinned one, so no bundle could ever be admitted.
+/// Both arguments are expected already-normalized ([`normalize_pubkey`]).
+///
+/// # Errors
+/// The two owners disagree.
+fn ensure_owner_pin_matches(
+    pubkey: &str,
+    pinned_owner: &str,
+    configured_owner: &str,
+) -> anyhow::Result<()> {
+    if pinned_owner != configured_owner {
+        anyhow::bail!(
+            "floor store for {pubkey} is pinned to owner {pinned_owner}, but \
+             WAKER_AGENTS_CONFIG_PATH now configures owner {configured_owner}; refusing \
+             to run with disagreeing owners"
+        );
+    }
+    Ok(())
+}
+
 fn env_var(name: &str) -> anyhow::Result<String> {
     std::env::var(name).map_err(|_| anyhow::anyhow!("{name} is required but not set"))
 }
@@ -199,6 +226,9 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("could not open floor store for {pubkey}: {e}")
             }
         };
+
+        let pinned_owner = normalize_pubkey(&floor_store.snapshot().owner_pubkey);
+        ensure_owner_pin_matches(&pubkey, &pinned_owner, &owner_pubkey)?;
 
         tracing::info!(agent = %pubkey, owner = %owner_pubkey, "buzz-waker: watching agent");
 
@@ -340,6 +370,20 @@ mod tests {
     fn loading_a_missing_file_reports_a_clear_error() {
         let result = load_agents("/nonexistent/path/agents.json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_pin_matching_the_configured_owner_is_accepted() {
+        let owner = normalize_pubkey(&"a".repeat(64));
+        assert!(ensure_owner_pin_matches("agent", &owner, &owner).is_ok());
+    }
+
+    #[test]
+    fn a_pin_disagreeing_with_the_configured_owner_is_refused() {
+        let pinned = normalize_pubkey(&"a".repeat(64));
+        let configured = normalize_pubkey(&"b".repeat(64));
+        let error = ensure_owner_pin_matches("agent", &pinned, &configured).unwrap_err();
+        assert!(error.to_string().contains("disagreeing owners"), "{error}");
     }
 
     #[test]

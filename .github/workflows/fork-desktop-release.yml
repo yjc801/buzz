@@ -1,7 +1,7 @@
 name: Fork Desktop Release
 
-# Builds an unsigned Apple Silicon DMG from this fork and publishes it as a
-# GitHub Release on the fork itself.
+# Builds a signed, notarized Apple Silicon DMG of Waggle -- this fork's desktop
+# app -- and publishes it as a GitHub Release on the fork itself.
 #
 # This file deliberately does not exist upstream. Keeping the fork's release
 # path in its own file (rather than patching release.yml) means `git merge
@@ -9,10 +9,11 @@ name: Fork Desktop Release
 #
 # Differences from upstream release.yml, and why:
 #
-#   * Unsigned. Signing runs through block/apple-codesign-action, which
-#     authenticates via OIDC to Block infrastructure a fork cannot reach.
-#     Gatekeeper will quarantine the result — the release notes below carry the
-#     one-line fix for that.
+#   * Signed with this fork's own Developer ID, not Block's. Upstream signs via
+#     block/apple-codesign-action, which authenticates by OIDC to Block
+#     infrastructure a fork cannot reach. Hence the rename: the artifact is
+#     Waggle under its own bundle identifier, so it neither claims Block's
+#     product name nor collides with the official app's data directory.
 #   * No updater artifacts. Upstream injects an updater endpoint + pubkey via
 #     desktop/scripts/build-release-config.mjs. A fork enabling that would need
 #     its own signing keypair, and pointing it at the upstream feed would
@@ -43,7 +44,7 @@ permissions:
 
 jobs:
   build:
-    name: Build unsigned macOS release
+    name: Build signed macOS release
     # Forks only. Guards against this ever running upstream if the file is
     # merged there by accident.
     if: github.repository != 'block/buzz'
@@ -88,6 +89,38 @@ jobs:
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Fail in seconds rather than ~20 minutes, and fail LOUDLY. The dangerous
+      # outcome is not a missing secret causing a crash — it is Tauri quietly
+      # skipping the signing step and producing an unsigned bundle that looks
+      # like a successful release, then dying with "Waggle is damaged" on the
+      # user's machine. Checked after the freshness gate so a skipped run stays
+      # a no-op instead of failing on credentials it never needed.
+      - name: Require signing credentials
+        if: steps.freshness.outputs.build == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD \
+                      APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            # Presence only — never echo a value.
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Cannot build a signed release. Missing repository secrets: ${missing[*]}"
+            echo "Set them with: gh secret set <NAME> --repo $GITHUB_REPOSITORY"
+            echo "APPLE_CERTIFICATE is a base64-encoded Developer ID .p12."
+            echo "APPLE_PASSWORD is an app-specific password, not the Apple ID password."
+            exit 1
+          fi
+          echo "All six signing credentials present."
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
         if: steps.freshness.outputs.build == 'true'
@@ -174,10 +207,29 @@ jobs:
             -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
 
-      - name: Build unsigned Tauri app
+      # Signed and notarized with THIS fork's Developer ID, under the Waggle
+      # name and its own bundle identifier. Signing as Buzz under
+      # `xyz.block.buzz.app` would collide with the official app's data
+      # directory and present Block's product under a third-party identity.
+      #
+      # Tauri drives codesign and notarytool itself from these variables, so
+      # there is no separate signing step: with APPLE_CERTIFICATE set it signs,
+      # and with the notarization credentials set it staples before the DMG is
+      # written.
+      - name: Build signed Tauri app
         if: steps.freshness.outputs.build == 'true'
-        run: cd desktop && pnpm tauri build --verbose --no-sign --config src-tauri/tauri.fork.conf.json
+        run: cd desktop && pnpm tauri build --verbose --config src-tauri/tauri.fork.conf.json
         env:
+          # Developer ID Application cert, exported as .p12 and base64'd.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # Full identity string, e.g. "Developer ID Application: Name (TEAMID)".
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Notarization. APPLE_PASSWORD is an app-specific password, not the
+          # Apple ID password itself.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           # audiopus_sys (via the desktop crate's `opus` dep) bundles Opus with
           # `cmake_minimum_required(VERSION 3.1)`, which CMake 4 on the current
           # macOS ARM runner image rejects. Every other native build workflow
@@ -199,7 +251,7 @@ jobs:
             echo "::error::No DMG produced"
             exit 1
           fi
-          NAME="Buzz_${VERSION}_aarch64-unsigned.dmg"
+          NAME="Waggle_${VERSION}_aarch64.dmg"
           cp "$SRC" "$RUNNER_TEMP/$NAME"
           echo "path=$RUNNER_TEMP/$NAME" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
@@ -210,7 +262,7 @@ jobs:
         if: steps.freshness.outputs.build == 'true'
         run: |
           set -euo pipefail
-          APP=desktop/src-tauri/target/release/bundle/macos/Buzz.app/Contents/MacOS
+          APP=desktop/src-tauri/target/release/bundle/macos/Waggle.app/Contents/MacOS
           for bin in buzz-acp buzz-agent buzz buzz-dev-mcp; do
             if [[ ! -s "$APP/$bin" ]]; then
               echo "::error::sidecar $bin missing or empty in the bundle"
@@ -218,6 +270,34 @@ jobs:
             fi
             echo "ok: $bin ($(stat -f%z "$APP/$bin") bytes)"
           done
+
+      # The preflight proves the secrets EXIST. This proves they worked. A wrong
+      # or expired certificate, or a Tauri version that skips signing instead of
+      # erroring, both land here as a bundle carrying only the linker's ad-hoc
+      # signature — which is exactly what Gatekeeper reports as "damaged". That
+      # must fail the build, not reach a release page.
+      - name: Verify the bundle is really signed
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          APP=desktop/src-tauri/target/release/bundle/macos/Waggle.app
+
+          # `Signature=adhoc` is the tell-tale of an unsigned build. The two
+          # checks below would also reject it, but they report it as "code has
+          # no resources but signature indicates they must be present" — which
+          # sends you looking at the bundle rather than at the credentials.
+          # This names the real problem first.
+          if codesign -dv "$APP" 2>&1 | grep -q "Signature=adhoc"; then
+            echo "::error::Bundle is ad-hoc signed, not Developer ID signed. Check APPLE_SIGNING_IDENTITY."
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          # Gatekeeper's own verdict, which is what the user's machine applies.
+          spctl --assess --type execute --verbose=4 "$APP"
+
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Authority|TeamIdentifier" || true
+          echo "Signed and accepted by Gatekeeper."
 
       - name: Publish release
         if: steps.freshness.outputs.build == 'true'
@@ -228,21 +308,18 @@ jobs:
         run: |
           set -euo pipefail
           NOTES=$(cat <<EOF
-          Unsigned Apple Silicon build from \`$GITHUB_SHA\`.
+          Signed and notarized Apple Silicon build from \`$GITHUB_SHA\`.
 
-          **macOS will refuse to open this on first launch** — it is not signed
-          or notarized, because signing runs through Block infrastructure a fork
-          cannot reach. After dragging Buzz to /Applications:
-
-          \`\`\`
-          xattr -dr com.apple.quarantine /Applications/Buzz.app
-          \`\`\`
+          Drag Waggle to /Applications and open it — no quarantine command
+          needed. Waggle installs alongside Buzz rather than replacing it, and
+          adopts a copy of your existing Buzz agents, personas, and communities
+          on first launch. Buzz keeps its own data untouched.
 
           No auto-updater: install a newer DMG from this page to update.
           EOF
           )
           gh release create "fork-desktop-v${VERSION}" \
-            --title "Buzz Desktop ${VERSION} (fork, unsigned)" \
+            --title "Waggle ${VERSION}" \
             --notes "$NOTES" \
             --target "$GITHUB_SHA" \
             --prerelease \

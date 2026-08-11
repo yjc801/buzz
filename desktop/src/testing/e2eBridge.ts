@@ -9091,6 +9091,7 @@ async function handleSendChannelMessage(
     emojiTags?: string[][] | null;
     mentionTags?: string[][] | null;
     linkPreviewTags?: string[][] | null;
+    sentFromThreadTag?: string[] | null;
     suppressLinkPreviews?: boolean;
   },
   config: E2eConfig | undefined,
@@ -9150,6 +9151,7 @@ async function handleSendChannelMessage(
     ...emojiTags,
     ...mentionTags,
     ...linkPreviewTags,
+    ...(args.sentFromThreadTag ? [args.sentFromThreadTag] : []),
     ...(args.suppressLinkPreviews ? [["link-preview", "none"]] : []),
   ];
   const identity = getIdentity(config);
@@ -9386,12 +9388,24 @@ async function handleEditMessage(
     content: string;
     mediaTags?: string[][] | null;
     emojiTags?: string[][] | null;
+    mentionPubkeys?: string[] | null;
+    mentionTags?: string[][] | null;
+    suppressLinkPreviews?: boolean;
   },
   config: E2eConfig | undefined,
 ): Promise<void> {
   const mediaTags = args.mediaTags ?? [];
   const emojiTags = args.emojiTags ?? [];
-  const extraTags = [...mediaTags, ...emojiTags];
+  const mentionPubkeys = args.mentionPubkeys ?? [];
+  const mentionTags = args.mentionTags;
+  const extraTags = [
+    ...mediaTags,
+    ...emojiTags,
+    ...mentionPubkeys.map((pubkey) => ["p", pubkey]),
+    ...(mentionTags ?? []),
+    ...(mentionTags ? [["buzz:mention-snapshot"]] : []),
+    ...(args.suppressLinkPreviews ? [["link-preview", "none"]] : []),
+  ];
   const tags = [["h", args.channelId], ["e", args.eventId], ...extraTags];
   const content = args.content.trim();
   const identity = getIdentity(config);
@@ -13111,6 +13125,8 @@ export function maybeInstallE2eTauriMocks() {
       case "agent_metric_archive_default_enabled":
         return activeConfig?.mock?.agentMetricArchiveDefaultEnabled ?? true;
       case "set_prevent_sleep_active":
+        return null;
+      case "set_window_vibrancy":
         return null;
       case "plugin:window|is_fullscreen":
         return false;

@@ -231,6 +231,76 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// What one delivered relay message means for this tap.
+///
+/// Everything the tap does not read collapses to [`PresenceFrame::Ignored`]
+/// rather than being enumerated here, matching [`crate::relay_feed`]'s
+/// `feed_frame` convention. `Rejected` is split out from `Ignored` for the
+/// same reason it is there: a relay serving a forged or misrouted event is an
+/// incident worth a log line, not silence.
+#[derive(Debug, PartialEq, Eq)]
+enum PresenceFrame {
+    /// A verified `kind:20001` delivery, authored by the watched agent, with
+    /// a recognised status string.
+    Observed {
+        event_id: String,
+        status: PresenceStatus,
+    },
+    /// An event on this subscription that failed signature verification.
+    Rejected { event_id: String, reason: String },
+    /// This subscription was closed by the relay; the socket may still be
+    /// open, but nothing is subscribed on it any more.
+    Closed { message: String },
+    /// A frame for a subscription this tap did not open, an event that
+    /// verified but did not match this subscription's kind/author filter, an
+    /// unparseable status string, or a message type this tap has no use for.
+    Ignored,
+}
+
+/// Classify one relay message for `agent_pubkey`'s presence tap.
+///
+/// Verification proves only that the stated author signed the event — it
+/// does not prove the relay applied this subscription's `kind:20001` /
+/// `authors` filter. A buggy or compromised relay can hand this tap any
+/// validly signed event under this subscription id; checking kind and pubkey
+/// here (not just the signature) is what stops a misrouted or replayed event
+/// for a different agent or a different kind from being folded into this
+/// agent's cached presence. See `crate::relay_feed` for the same reasoning
+/// applied to the mention feed.
+fn presence_frame(agent_pubkey: &str, message: RelayMessage) -> PresenceFrame {
+    match message {
+        RelayMessage::Event {
+            subscription_id,
+            event,
+        } if subscription_id == PRESENCE_TAP_SUBSCRIPTION_ID => {
+            if let Err(error) = buzz_core::verify_event(&event) {
+                return PresenceFrame::Rejected {
+                    event_id: event.id.to_hex(),
+                    reason: error.to_string(),
+                };
+            }
+            if buzz_core::kind::event_kind_u32(&event) != KIND_PRESENCE_UPDATE {
+                return PresenceFrame::Ignored;
+            }
+            if normalize_pubkey(&event.pubkey.to_hex()) != agent_pubkey {
+                return PresenceFrame::Ignored;
+            }
+            match parse_presence_content(&event.content) {
+                Some(status) => PresenceFrame::Observed {
+                    event_id: event.id.to_hex(),
+                    status,
+                },
+                None => PresenceFrame::Ignored,
+            }
+        }
+        RelayMessage::Closed {
+            subscription_id,
+            message,
+        } if subscription_id == PRESENCE_TAP_SUBSCRIPTION_ID => PresenceFrame::Closed { message },
+        _ => PresenceFrame::Ignored,
+    }
+}
+
 /// Run one agent's presence tap until `cancel` fires.
 ///
 /// Connects, authenticates as `keys`, subscribes under
@@ -293,32 +363,39 @@ pub async fn run_presence_tap(
             };
 
             match next {
-                Ok(RelayMessage::Event {
-                    subscription_id,
-                    event,
-                }) if subscription_id == PRESENCE_TAP_SUBSCRIPTION_ID => {
-                    // The same authentication concern as the mention feed:
-                    // without a check here a relay could hand this tap a
-                    // forged "online" for an agent that is actually dead, and
-                    // every wake attempt would treat it as live. See
-                    // `crate::relay_feed` for the fuller reasoning.
-                    if let Err(error) = buzz_core::verify_event(&event) {
+                Ok(message) => match presence_frame(&agent_pubkey, message) {
+                    PresenceFrame::Observed { event_id, status } => {
+                        state.observe(&event_id, status, now_ms());
+                    }
+                    PresenceFrame::Rejected { event_id, reason } => {
                         tracing::warn!(
                             agent = %agent_pubkey,
-                            %error,
+                            event_id = %event_id,
+                            %reason,
                             "presence tap received an event that failed verification; ignoring"
                         );
-                        continue;
                     }
-                    let Some(status) = parse_presence_content(&event.content) else {
-                        continue;
-                    };
-                    state.observe(&event.id.to_hex(), status, now_ms());
-                }
-                // A frame for a subscription we did not open, or a message
-                // type this tap has no use for (NOTICE, OK, a late AUTH
-                // challenge). Ignored, not an error.
-                Ok(_) => {}
+                    PresenceFrame::Closed { message } => {
+                        // The relay can close this subscription (auth
+                        // change, rejected filter, eviction) while leaving
+                        // the socket open. Left unhandled, the tap would sit
+                        // on a live connection with no active subscription
+                        // and never re-subscribe. Treat it the same as a
+                        // transport error: reconnect from scratch.
+                        tracing::warn!(
+                            agent = %agent_pubkey,
+                            %message,
+                            "presence tap subscription closed by relay; reconnecting"
+                        );
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        break;
+                    }
+                    // A frame for a subscription we did not open, an
+                    // unparseable status, or a message type this tap has no
+                    // use for (NOTICE, OK, a late AUTH challenge). Ignored,
+                    // not an error.
+                    PresenceFrame::Ignored => {}
+                },
                 Err(WsClientError::Timeout) => {
                     // A quiet tap is the normal case — presence republishes
                     // on a multi-minute interval, not on every mention.
@@ -336,6 +413,169 @@ pub async fn run_presence_tap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_ws_client::OkResponse;
+    use nostr::EventBuilder;
+
+    fn presence_event(keys: &Keys, content: &str) -> nostr::Event {
+        EventBuilder::new(nostr::Kind::Custom(KIND_PRESENCE_UPDATE as u16), content)
+            .sign_with_keys(keys)
+            .expect("signs")
+    }
+
+    #[test]
+    fn a_verified_own_kind_delivery_is_observed() {
+        let keys = Keys::generate();
+        let agent_pubkey = normalize_pubkey(&keys.public_key().to_hex());
+        let event = presence_event(&keys, "online");
+        let id = event.id.to_hex();
+
+        let frame = presence_frame(
+            &agent_pubkey,
+            RelayMessage::Event {
+                subscription_id: PRESENCE_TAP_SUBSCRIPTION_ID.to_string(),
+                event: Box::new(event),
+            },
+        );
+
+        assert_eq!(
+            frame,
+            PresenceFrame::Observed {
+                event_id: id,
+                status: PresenceStatus::Online,
+            }
+        );
+    }
+
+    #[test]
+    fn a_forged_delivery_is_rejected_not_observed() {
+        // Same reasoning as `relay_feed`'s equivalent test: a relay that
+        // deserializes an EVENT frame by shape alone would otherwise let a
+        // forged author or signature through unnoticed.
+        use nostr::JsonUtil;
+        let keys = Keys::generate();
+        let agent_pubkey = normalize_pubkey(&keys.public_key().to_hex());
+        let impersonator = Keys::generate();
+        let event = presence_event(&keys, "online");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&event.as_json()).expect("round-trips");
+        json["pubkey"] = serde_json::Value::String(impersonator.public_key().to_hex());
+        let forged = nostr::Event::from_json(json.to_string()).expect("still parses");
+
+        let frame = presence_frame(
+            &agent_pubkey,
+            RelayMessage::Event {
+                subscription_id: PRESENCE_TAP_SUBSCRIPTION_ID.to_string(),
+                event: Box::new(forged),
+            },
+        );
+
+        match frame {
+            PresenceFrame::Rejected { reason, .. } => assert!(!reason.is_empty()),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_verified_event_for_a_different_agent_is_ignored() {
+        // A relay that ignores this subscription's `authors` filter must not
+        // let another agent's presence answer for the watched one.
+        let watched = Keys::generate();
+        let other = Keys::generate();
+        let agent_pubkey = normalize_pubkey(&watched.public_key().to_hex());
+        let event = presence_event(&other, "online");
+
+        let frame = presence_frame(
+            &agent_pubkey,
+            RelayMessage::Event {
+                subscription_id: PRESENCE_TAP_SUBSCRIPTION_ID.to_string(),
+                event: Box::new(event),
+            },
+        );
+
+        assert_eq!(frame, PresenceFrame::Ignored);
+    }
+
+    #[test]
+    fn a_verified_event_of_the_wrong_kind_is_ignored() {
+        // A relay that ignores this subscription's `kinds` filter must not
+        // let some other kind from the same agent answer as presence.
+        let keys = Keys::generate();
+        let agent_pubkey = normalize_pubkey(&keys.public_key().to_hex());
+        let event = EventBuilder::text_note("online")
+            .sign_with_keys(&keys)
+            .expect("signs");
+
+        let frame = presence_frame(
+            &agent_pubkey,
+            RelayMessage::Event {
+                subscription_id: PRESENCE_TAP_SUBSCRIPTION_ID.to_string(),
+                event: Box::new(event),
+            },
+        );
+
+        assert_eq!(frame, PresenceFrame::Ignored);
+    }
+
+    #[test]
+    fn a_close_on_this_subscription_is_reported() {
+        let keys = Keys::generate();
+        let agent_pubkey = normalize_pubkey(&keys.public_key().to_hex());
+
+        let frame = presence_frame(
+            &agent_pubkey,
+            RelayMessage::Closed {
+                subscription_id: PRESENCE_TAP_SUBSCRIPTION_ID.to_string(),
+                message: "restricted: auth required".to_string(),
+            },
+        );
+
+        assert_eq!(
+            frame,
+            PresenceFrame::Closed {
+                message: "restricted: auth required".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn frames_for_another_subscription_or_this_tap_ignores_collapse_to_ignored() {
+        let keys = Keys::generate();
+        let agent_pubkey = normalize_pubkey(&keys.public_key().to_hex());
+        let event = presence_event(&keys, "online");
+
+        let messages = [
+            RelayMessage::Event {
+                subscription_id: "some-other-subscription".to_string(),
+                event: Box::new(event),
+            },
+            RelayMessage::Closed {
+                subscription_id: "some-other-subscription".to_string(),
+                message: "irrelevant".to_string(),
+            },
+            RelayMessage::Ok(OkResponse {
+                event_id: "ff".repeat(32),
+                accepted: true,
+                message: String::new(),
+            }),
+            RelayMessage::Notice {
+                message: "slow down".to_string(),
+            },
+            RelayMessage::Auth {
+                challenge: "c".to_string(),
+            },
+            RelayMessage::Count {
+                subscription_id: PRESENCE_TAP_SUBSCRIPTION_ID.to_string(),
+                count: 1,
+            },
+        ];
+
+        for message in messages {
+            assert_eq!(
+                presence_frame(&agent_pubkey, message),
+                PresenceFrame::Ignored
+            );
+        }
+    }
 
     #[test]
     fn only_the_three_known_statuses_parse() {

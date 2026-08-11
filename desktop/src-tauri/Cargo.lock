@@ -1239,6 +1239,7 @@ dependencies = [
 name = "buzz-waker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "buzz-core",
  "buzz-ws-client",
  "hex",
@@ -1246,6 +1247,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

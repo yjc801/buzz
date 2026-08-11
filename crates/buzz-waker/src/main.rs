@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use nostr::{Keys, Tag};
 use serde::Deserialize;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -160,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     let cancel = CancellationToken::new();
-    let mut tasks = Vec::with_capacity(keys_by_agent.len() * 2);
+    let mut tasks: JoinSet<(String, &'static str)> = JoinSet::new();
 
     for (keys, auth_tag) in keys_by_agent {
         let pubkey = normalize_pubkey(&keys.public_key().to_hex());
@@ -180,7 +181,8 @@ async fn main() -> anyhow::Result<()> {
             let auth_tag = auth_tag.clone();
             let presence_state = Arc::clone(&presence_state);
             let cancel = cancel.clone();
-            tasks.push(tokio::spawn(async move {
+            let pubkey = pubkey.clone();
+            tasks.spawn(async move {
                 run_presence_tap(
                     &relay_url,
                     &keys,
@@ -189,7 +191,8 @@ async fn main() -> anyhow::Result<()> {
                     &cancel,
                 )
                 .await;
-            }));
+                (pubkey, "presence_tap")
+            });
         }
 
         {
@@ -202,24 +205,53 @@ async fn main() -> anyhow::Result<()> {
                 watch_list: Arc::clone(&watch_list),
             };
             let cancel = cancel.clone();
-            tasks.push(tokio::spawn(async move {
+            let pubkey = pubkey.clone();
+            tasks.spawn(async move {
                 run_wake_loop(config, cancel).await;
-            }));
+                (pubkey, "wake_loop")
+            });
         }
     }
 
-    shutdown_signal().await;
-    tracing::info!("buzz-waker: shutdown signal received; stopping");
+    // A watch task can also finish on its own, outside the shutdown path: a
+    // corrupt cursor makes `run_wake_loop` return immediately, and either
+    // task can panic. If that happens before `cancel` fires, the daemon must
+    // not keep running with that agent silently unwatched and reporting
+    // healthy — race the first such completion against the shutdown signal
+    // and treat an early one as fatal for the whole process.
+    let early_exit = tokio::select! {
+        () = shutdown_signal() => {
+            tracing::info!("buzz-waker: shutdown signal received; stopping");
+            None
+        }
+        result = tasks.join_next() => Some(result),
+    };
+
     cancel.cancel();
 
-    for task in tasks {
-        if let Err(error) = task.await {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
             tracing::error!(%error, "buzz-waker: a watch task panicked during shutdown");
         }
     }
 
     tracing::info!("buzz-waker: shutdown complete");
-    Ok(())
+
+    match early_exit {
+        Some(Some(Ok((pubkey, task)))) => {
+            anyhow::bail!(
+                "buzz-waker: {task} for agent {pubkey} exited before shutdown was requested; \
+                 that agent stopped being watched — treating as fatal rather than running \
+                 silently degraded"
+            )
+        }
+        Some(Some(Err(error))) => {
+            anyhow::bail!(
+                "buzz-waker: a watch task panicked before shutdown was requested: {error}"
+            )
+        }
+        Some(None) | None => Ok(()),
+    }
 }
 
 #[cfg(test)]

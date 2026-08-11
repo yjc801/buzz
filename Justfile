@@ -284,6 +284,72 @@ desktop-e2e-pre-push: _ensure-migrations
 # Run all checks suitable for CI / pre-push (no infra needed)
 ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
 
+# Run only the gates the diff vs BASE can affect. `just ci` sweeps five stacks
+# (Rust workspace, desktop JS, Tauri Rust, web, Flutter); a change confined to
+# one of them pays for the other four. Same recipes, chosen by changed path.
+#
+# Fails OPEN: an unresolvable base or an unrecognised path runs the full `ci`,
+# so a mapping this recipe has not learned yet can never silently skip a gate.
+# Before a release, or when you want the sweep regardless, run `just ci`.
+gate base="origin/main":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! merge_base=$(git merge-base HEAD "{{base}}" 2>/dev/null); then
+        echo "gate: cannot resolve {{base}} — running the full sweep" >&2
+        exec just ci
+    fi
+    # Committed diff plus whatever is still in the working tree: the gate must
+    # cover what you are about to push, not only what is already a commit.
+    changed=$( (git diff --name-only "$merge_base" HEAD; git diff --name-only HEAD; git ls-files --others --exclude-standard) | sort -u)
+    if [ -z "$changed" ]; then
+        echo "gate: no changes vs {{base}}"
+        exit 0
+    fi
+
+    rust=0 desktop_js=0 tauri=0 web=0 mobile=0 unknown=0
+    while IFS= read -r f; do
+        case "$f" in
+            crates/* | Cargo.toml | Cargo.lock | rust-toolchain.toml | deny.toml | migrations/*) rust=1 ;;
+            desktop/src-tauri/*) tauri=1 ;;
+            desktop/*) desktop_js=1 ;;
+            web/*) web=1 ;;
+            mobile/*) mobile=1 ;;
+            pnpm-lock.yaml | pnpm-workspace.yaml | package.json | biome.json)
+                desktop_js=1
+                web=1
+                ;;
+            # Gate nothing on their own. The Justfile and hook config are
+            # covered by whichever recipes the rest of the diff selects — and
+            # by `just --evaluate` below when they change alone.
+            *.md | .github/* | scripts/* | docs/* | benchmarks/* | examples/* | Justfile | lefthook.yml) ;;
+            *) unknown=1 ;;
+        esac
+    done <<<"$changed"
+
+    if [ "$unknown" = 1 ]; then
+        echo "gate: diff touches paths with no mapping — running the full sweep" >&2
+        exec just ci
+    fi
+
+    recipes=()
+    [ "$rust" = 1 ] && recipes+=(fmt-check clippy test-unit)
+    [ "$tauri" = 1 ] && recipes+=(desktop-tauri-fmt-check desktop-tauri-clippy desktop-tauri-check desktop-tauri-test)
+    [ "$desktop_js" = 1 ] && recipes+=(desktop-check desktop-test desktop-build)
+    [ "$web" = 1 ] && recipes+=(web-check web-build)
+    [ "$mobile" = 1 ] && recipes+=(mobile-check mobile-test)
+
+    # A Justfile edit still has to parse, even when it is the whole diff.
+    if grep -qx 'Justfile' <<<"$changed"; then
+        just --evaluate >/dev/null
+    fi
+
+    if [ "${#recipes[@]}" = 0 ]; then
+        echo "gate: nothing to run — the diff is docs, CI config, or scripts only"
+        exit 0
+    fi
+    echo "gate: ${recipes[*]}"
+    just "${recipes[@]}"
+
 # ─── Test ─────────────────────────────────────────────────────────────────────
 
 # Run all tests (unit + integration)

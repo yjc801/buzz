@@ -1,16 +1,22 @@
-//! The embedded in-sprite assets (launcher + probe), their content digests,
-//! the argv builders that invoke them, and the probe's typed report.
+//! The embedded in-sprite assets (launcher, probe, workspace helper), their
+//! content digests, the argv builders that invoke them, and the probe's typed
+//! report.
 
 use sha2::{Digest, Sha256};
 
 pub const LAUNCHER_SH: &str = include_str!("assets/launcher.sh");
 pub const PROBE_SH: &str = include_str!("assets/probe.sh");
+pub const WORKSPACE_SH: &str = include_str!("assets/workspace.sh");
 
 /// Where the assets live inside the sprite. Versioned by content (the shas
 /// participate in the provision fingerprint), so the paths themselves stay
 /// stable.
 pub const LAUNCHER_PATH: &str = "/home/sprite/.buzz/launcher.sh";
 pub const PROBE_PATH: &str = "/home/sprite/.buzz/probe.sh";
+/// The workspace helper sits in `bin/` — unlike the launcher and probe, which
+/// only the provider invokes, this one is for the agent, and the launcher puts
+/// `bin/` on its PATH.
+pub const WORKSPACE_PATH: &str = "/home/sprite/.buzz/bin/buzz-workspace";
 
 fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -24,6 +30,10 @@ pub fn launcher_sha256() -> String {
 
 pub fn probe_sha256() -> String {
     sha256_hex(PROBE_SH)
+}
+
+pub fn workspace_sha256() -> String {
+    sha256_hex(WORKSPACE_SH)
 }
 
 /// The detachable session's argv. Only public identity travels here — the
@@ -86,13 +96,45 @@ mod tests {
 
     #[test]
     fn asset_digests_are_stable_hex() {
-        for sha in [launcher_sha256(), probe_sha256()] {
+        for sha in [launcher_sha256(), probe_sha256(), workspace_sha256()] {
             assert_eq!(sha.len(), 64);
             assert!(sha
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         }
         assert_ne!(launcher_sha256(), probe_sha256());
+        assert_ne!(launcher_sha256(), workspace_sha256());
+        assert_ne!(probe_sha256(), workspace_sha256());
+    }
+
+    /// The helper only pays for itself if the agent can reach it, and the only
+    /// directory the launcher puts on the agent's PATH is `$BUZZ/bin`. A path
+    /// change that moves it out of there would leave a script nothing invokes.
+    #[test]
+    fn the_workspace_helper_is_installed_on_the_agents_path() {
+        assert_eq!(WORKSPACE_PATH, "/home/sprite/.buzz/bin/buzz-workspace");
+        assert!(
+            LAUNCHER_SH.contains(r#"export PATH="$BUZZ/bin:"#),
+            "the launcher no longer puts $BUZZ/bin on the agent's PATH"
+        );
+    }
+
+    /// The whole point is that a slot's build caches survive being handed to a
+    /// new ref. `git clean -x` and a plain `rm -rf target` are the two ways to
+    /// throw that away by accident, so neither may appear in the helper.
+    #[test]
+    fn the_workspace_helper_never_destroys_a_build_cache() {
+        for forbidden in [
+            "clean -ffdx",
+            "clean -fdx",
+            "clean -x",
+            "rm -rf \"$slot/target",
+        ] {
+            assert!(
+                !WORKSPACE_SH.contains(forbidden),
+                "workspace.sh contains {forbidden:?}, which discards the warm build it exists to preserve"
+            );
+        }
     }
 
     /// The launcher must exec the harness personality (comm "buzz-acp") and

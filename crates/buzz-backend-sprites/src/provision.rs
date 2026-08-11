@@ -326,6 +326,7 @@ pub async fn resolve(
             codex_adapter_version: config::CODEX_ADAPTER_VERSION,
             launcher_sha256: launcher::launcher_sha256(),
             probe_sha256: launcher::probe_sha256(),
+            workspace_sha256: launcher::workspace_sha256(),
             preapprove_agent_tools: cfg.preapprove_agent_tools,
         },
         arch,
@@ -555,6 +556,14 @@ pub async fn ensure(
             launcher::LAUNCHER_SH,
         ),
         ("install probe", launcher::PROBE_PATH, launcher::PROBE_SH),
+        // Written after sprig, never before: sprig extracts into the same
+        // `bin/` directory, and an install that lost a race with the tarball
+        // would leave the agent without the helper on its PATH.
+        (
+            "install workspace helper",
+            launcher::WORKSPACE_PATH,
+            launcher::WORKSPACE_SH,
+        ),
     ] {
         // Write-chmod-rename rather than `install -m 755 /dev/stdin`:
         // install(1) fails with "No such file or directory" when its

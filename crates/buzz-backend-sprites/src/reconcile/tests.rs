@@ -355,6 +355,7 @@ fn desired_intent() -> String {
         codex_adapter_version: crate::config::CODEX_ADAPTER_VERSION,
         launcher_sha256: launcher::launcher_sha256(),
         probe_sha256: launcher::probe_sha256(),
+        workspace_sha256: launcher::workspace_sha256(),
         preapprove_agent_tools: true,
     };
     template.fingerprint().as_str().to_string()

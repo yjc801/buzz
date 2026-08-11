@@ -8,9 +8,11 @@
 //!
 //! # `start_managed_agent` needs a launch bundle it is not yet given
 //!
-//! The deploy call itself — stage the provider binary, verify it against the
-//! bundle's pinned digest (**G1**), negotiate, invoke — is implemented and
-//! shared with the desktop app via `buzz-provider-deploy`. What this crate
+//! The deploy call itself — bind the bundle to the agent this attempt
+//! watches, recheck the bundle has not expired since activation, stage the
+//! provider binary, verify it against the bundle's pinned digest (**G1**),
+//! negotiate, invoke — is implemented and shared with the desktop app via
+//! `buzz-provider-deploy`. What this crate
 //! still cannot do is *obtain* a [`crate::bundle::LaunchBundleBody`] at
 //! runtime: bundle transport (how a signed bundle reaches this daemon process)
 //! is a separate, explicitly deferred task (see
@@ -79,6 +81,37 @@ pub enum EffectsError {
     )]
     NoBundle,
 
+    /// The bundle authorizes a different agent than the one this attempt is
+    /// watching.
+    ///
+    /// Checked before any provider resolution or process spawn: a bundle
+    /// transport bug that routes, caches, or restores agent B's valid,
+    /// owner-signed bundle into agent A's wake loop must not deploy B's
+    /// secret-bearing payload while this attempt believes it is waking A.
+    #[error("launch bundle authorizes agent {found}, not the watched agent {expected}")]
+    AgentMismatch {
+        /// The pubkey this attempt is scoped to.
+        expected: String,
+        /// The pubkey the bundle actually authorizes.
+        found: String,
+    },
+
+    /// The bundle's validity window has lapsed since it was verified and
+    /// activated into this daemon's `WakeLoopConfig`.
+    ///
+    /// `SignedLaunchBundle::verify` only checks expiry once, at activation
+    /// time — the body then rests in memory indefinitely. Rechecked here,
+    /// immediately before any external effect, so a bundle that expires
+    /// while resident cannot still launch days later with a revoked
+    /// credential or access policy.
+    #[error("launch bundle expired at {expires_at} (now {now})")]
+    BundleExpired {
+        /// The bundle's expiry, unix seconds.
+        expires_at: u64,
+        /// The current time, unix seconds.
+        now: u64,
+    },
+
     /// The bundle's `provider_id` did not resolve to a discovered binary.
     #[error("provider binary unresolved: {0}")]
     ProviderUnresolved(String),
@@ -106,6 +139,12 @@ pub struct RealWakeEffects {
     /// `confirm_author_not_known_agent`; see the module note on why this is
     /// the accepted baseline rather than a full managed-agent roster.
     watch_list: Arc<[String]>,
+    /// The pubkey of the agent this attempt is scoped to — this daemon's own
+    /// watched identity, never derived from the bundle. Compared against
+    /// `bundle.agent_pubkey` before any deploy, so a bundle transport bug
+    /// that hands this attempt another agent's validly-signed bundle is
+    /// refused rather than deployed.
+    expected_agent_pubkey: String,
     /// The pubkey that authored the triggering event, normalized once at
     /// construction so every re-check compares like with like.
     trigger_author: String,
@@ -137,6 +176,7 @@ impl RealWakeEffects {
     pub fn new(
         presence_state: Arc<PresenceState>,
         watch_list: Arc<[String]>,
+        watched_agent_pubkey: &str,
         trigger_author: &str,
         trigger_created_at: u64,
         bundle: Option<Arc<LaunchBundleBody>>,
@@ -146,6 +186,7 @@ impl RealWakeEffects {
         Self {
             presence_state,
             watch_list,
+            expected_agent_pubkey: normalize_pubkey(watched_agent_pubkey),
             trigger_author: normalize_pubkey(trigger_author),
             trigger_created_at,
             bundle,
@@ -196,7 +237,7 @@ impl WakeEffects for RealWakeEffects {
             .any(|watched| watched == &self.trigger_author))
     }
 
-    async fn start_managed_agent(&self) -> Result<(), Self::Error> {
+    async fn start_managed_agent(&self) -> Result<Option<bool>, Self::Error> {
         let Some(bundle) = self.bundle.clone() else {
             tracing::error!(
                 author = %self.trigger_author,
@@ -206,6 +247,36 @@ impl WakeEffects for RealWakeEffects {
             );
             return Err(EffectsError::NoBundle);
         };
+
+        let bundle_agent = normalize_pubkey(&bundle.agent_pubkey);
+        if bundle_agent != self.expected_agent_pubkey {
+            tracing::error!(
+                expected = %self.expected_agent_pubkey,
+                found = %bundle_agent,
+                "buzz-waker: launch bundle authorizes a different agent than this wake \
+                 attempt is watching — refusing to deploy"
+            );
+            return Err(EffectsError::AgentMismatch {
+                expected: self.expected_agent_pubkey.clone(),
+                found: bundle_agent,
+            });
+        }
+
+        // Rechecked here rather than trusted from `SignedLaunchBundle::verify`
+        // — see the module note and `EffectsError::BundleExpired`.
+        let now = self.now_ms() / 1000;
+        if now > bundle.expires_at {
+            tracing::error!(
+                expires_at = bundle.expires_at,
+                now,
+                "buzz-waker: resident launch bundle has expired since activation — \
+                 refusing to deploy"
+            );
+            return Err(EffectsError::BundleExpired {
+                expires_at: bundle.expires_at,
+                now,
+            });
+        }
 
         let binary = buzz_provider_deploy::resolve_provider_binary(&bundle.provider.provider_id)
             .map_err(EffectsError::ProviderUnresolved)?;
@@ -238,7 +309,7 @@ impl WakeEffects for RealWakeEffects {
             fresh_generation = ?outcome.fresh_generation,
             "buzz-waker: provider deploy accepted"
         );
-        Ok(())
+        Ok(outcome.fresh_generation)
     }
 }
 
@@ -255,6 +326,7 @@ mod tests {
     fn effects_with(
         presence_state: Arc<PresenceState>,
         watch_list: Arc<[String]>,
+        watched_agent_pubkey: &str,
         trigger_author: &str,
         bundle: Option<Arc<LaunchBundleBody>>,
         cancel: CancellationToken,
@@ -263,6 +335,7 @@ mod tests {
         RealWakeEffects::new(
             presence_state,
             watch_list,
+            watched_agent_pubkey,
             trigger_author,
             1_000,
             bundle,
@@ -271,11 +344,30 @@ mod tests {
         )
     }
 
+    /// A bundle authorizing `agent_pubkey`, valid until `expires_at` (unix
+    /// seconds).
+    fn bundle_for(agent_pubkey: &str, expires_at: u64) -> Arc<LaunchBundleBody> {
+        Arc::new(LaunchBundleBody {
+            agent_pubkey: agent_pubkey.to_string(),
+            agent_json: serde_json::json!({"launch": {"policy_env": {}}}),
+            provider: ProviderEnvelope {
+                provider_id: "zzz-nonexistent-test-provider".to_string(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: "b".repeat(64),
+            },
+            bundle_version: 1,
+            issued_at: 0,
+            expires_at,
+            owner_only_access: true,
+        })
+    }
+
     #[tokio::test]
     async fn an_unresolved_presence_tap_reports_unavailable() {
         let effects = effects_with(
             state(),
             Arc::from(vec![]),
+            "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
             CancellationToken::new(),
@@ -297,6 +389,7 @@ mod tests {
             presence_state,
             Arc::from(vec![]),
             "aa".repeat(32).as_str(),
+            "aa".repeat(32).as_str(),
             None,
             CancellationToken::new(),
             || {},
@@ -311,6 +404,7 @@ mod tests {
         let effects = effects_with(
             state(),
             Arc::from(vec![watched.clone()]),
+            "aa".repeat(32).as_str(),
             &watched,
             None,
             CancellationToken::new(),
@@ -325,6 +419,7 @@ mod tests {
         let effects = effects_with(
             state(),
             Arc::from(vec!["bb".repeat(32)]),
+            "aa".repeat(32).as_str(),
             "cc".repeat(32).as_str(),
             None,
             CancellationToken::new(),
@@ -340,6 +435,7 @@ mod tests {
         let effects = effects_with(
             state(),
             Arc::from(vec![normalize_pubkey(&watched)]),
+            "aa".repeat(32).as_str(),
             &watched,
             None,
             CancellationToken::new(),
@@ -355,6 +451,7 @@ mod tests {
             state(),
             Arc::from(vec![]),
             "aa".repeat(32).as_str(),
+            "aa".repeat(32).as_str(),
             None,
             CancellationToken::new(),
             || {},
@@ -365,25 +462,17 @@ mod tests {
     }
 
     /// A bundle whose `provider_id` resolves to nothing on `PATH` fails at
-    /// resolution, before any process is spawned.
+    /// resolution, before any process is spawned. Uses a bundle correctly
+    /// bound to the watched agent and not expired, so resolution is the
+    /// first thing that can fail.
     #[tokio::test]
     async fn start_managed_agent_with_an_unresolvable_provider_fails_to_resolve() {
-        let bundle = Arc::new(LaunchBundleBody {
-            agent_pubkey: "a".repeat(64),
-            agent_json: serde_json::json!({"launch": {"policy_env": {}}}),
-            provider: ProviderEnvelope {
-                provider_id: "zzz-nonexistent-test-provider".to_string(),
-                provider_config: serde_json::json!({}),
-                provider_binary_sha256: "b".repeat(64),
-            },
-            bundle_version: 1,
-            issued_at: 0,
-            expires_at: u64::MAX,
-            owner_only_access: true,
-        });
+        let watched = "a".repeat(64);
+        let bundle = bundle_for(&watched, u64::MAX);
         let effects = effects_with(
             state(),
             Arc::from(vec![]),
+            &watched,
             "aa".repeat(32).as_str(),
             Some(bundle),
             CancellationToken::new(),
@@ -392,6 +481,57 @@ mod tests {
 
         let result = effects.start_managed_agent().await;
         assert!(matches!(result, Err(EffectsError::ProviderUnresolved(_))));
+    }
+
+    /// G-bind: a bundle authorizing a different agent than this attempt
+    /// watches must be refused before any provider resolution — otherwise a
+    /// bundle-transport mix-up could deploy the wrong agent's secret-bearing
+    /// payload while this attempt believes it is waking its own.
+    #[tokio::test]
+    async fn start_managed_agent_with_a_bundle_for_a_different_agent_is_refused() {
+        let watched = "a".repeat(64);
+        let other_agent = "d".repeat(64);
+        let bundle = bundle_for(&other_agent, u64::MAX);
+        let effects = effects_with(
+            state(),
+            Arc::from(vec![]),
+            &watched,
+            "aa".repeat(32).as_str(),
+            Some(bundle),
+            CancellationToken::new(),
+            || {},
+        );
+
+        let result = effects.start_managed_agent().await;
+        assert_eq!(
+            result,
+            Err(EffectsError::AgentMismatch {
+                expected: watched,
+                found: other_agent,
+            })
+        );
+    }
+
+    /// A bundle that was valid when it was verified and activated into
+    /// `WakeLoopConfig` but has since sat resident past `expires_at` must be
+    /// refused at deploy time, not just at activation.
+    #[tokio::test]
+    async fn start_managed_agent_with_an_expired_resident_bundle_is_refused() {
+        let watched = "a".repeat(64);
+        // Expired in 1970 relative to any real wall clock this test runs on.
+        let bundle = bundle_for(&watched, 1);
+        let effects = effects_with(
+            state(),
+            Arc::from(vec![]),
+            &watched,
+            "aa".repeat(32).as_str(),
+            Some(bundle),
+            CancellationToken::new(),
+            || {},
+        );
+
+        let result = effects.start_managed_agent().await;
+        assert!(matches!(result, Err(EffectsError::BundleExpired { .. })));
     }
 
     /// The replay floor is written into the bundle's `agent_json` before the
@@ -412,6 +552,7 @@ mod tests {
             state(),
             Arc::from(vec![]),
             "aa".repeat(32).as_str(),
+            "aa".repeat(32).as_str(),
             None,
             CancellationToken::new(),
             move || called_clone.store(true, std::sync::atomic::Ordering::SeqCst),
@@ -428,6 +569,7 @@ mod tests {
             state(),
             Arc::from(vec![]),
             "aa".repeat(32).as_str(),
+            "aa".repeat(32).as_str(),
             None,
             cancel.clone(),
             || {},
@@ -443,6 +585,7 @@ mod tests {
         let effects = effects_with(
             state(),
             Arc::from(vec![]),
+            "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
             cancel.clone(),

@@ -220,6 +220,20 @@ pub struct WakeAttemptResult<E> {
     pub reconcile: bool,
     /// The underlying effect error, for the two outcomes that carry one.
     pub error: Option<E>,
+    /// The **provider's** proof that this attempt's deploy started a fresh
+    /// harness generation, when a deploy was actually spent.
+    ///
+    /// `Some(true)` — the env this deploy carried (the replay floor
+    /// included) is provably in effect. `Some(false)` — the deploy was a
+    /// strict no-op against an already-running generation, so a subsequent
+    /// heartbeat proving [`WakeOutcome::Woken`] can be that *old*
+    /// generation's beat, not evidence the replay floor took effect. `None`
+    /// — no deploy was spent, or the provider gave no classification, which
+    /// is likewise unproven. Never used to change `outcome` itself: deploy
+    /// is idempotent by contract, so a strict no-op is still a legitimate
+    /// settlement — this field only tells a caller whether it may *also*
+    /// presume the mention that caused it was delivered.
+    pub floor_adopted: Option<bool>,
 }
 
 impl<E> WakeAttemptResult<E> {
@@ -228,6 +242,7 @@ impl<E> WakeAttemptResult<E> {
             outcome,
             reconcile,
             error: None,
+            floor_adopted: None,
         }
     }
 
@@ -236,6 +251,16 @@ impl<E> WakeAttemptResult<E> {
             outcome,
             reconcile,
             error: Some(error),
+            floor_adopted: None,
+        }
+    }
+
+    fn woken(reconcile: bool, floor_adopted: Option<bool>) -> Self {
+        Self {
+            outcome: WakeOutcome::Woken,
+            reconcile,
+            error: None,
+            floor_adopted,
         }
     }
 }
@@ -651,7 +676,11 @@ pub trait WakeEffects {
 
     /// Deploy the agent. Idempotent by contract: the provider reconciles to
     /// at-most-one instance and treats a live agent as a strict no-op.
-    fn start_managed_agent(&self) -> impl Future<Output = Result<(), Self::Error>>;
+    ///
+    /// The `Ok` payload is the provider's own fresh-generation classification
+    /// (see [`WakeAttemptResult::floor_adopted`]) — `None` if the provider
+    /// gave none.
+    fn start_managed_agent(&self) -> impl Future<Output = Result<Option<bool>, Self::Error>>;
 }
 
 /// Decide and perform one wake.
@@ -792,21 +821,24 @@ pub async fn run_wake_attempt<E: WakeEffects>(
 
     let stamped_at = effects.now_ms();
     state.stamp(&key, stamped_at);
-    if let Err(error) = effects.start_managed_agent().await {
-        // The fence can fire while the provider call is pending — the
-        // unmounted generation's error must not surface in its successor.
-        if effects.is_cancelled() {
-            return WakeAttemptResult::plain(WakeOutcome::Cancelled, reconcile);
+    let floor_adopted = match effects.start_managed_agent().await {
+        Ok(floor_adopted) => floor_adopted,
+        Err(error) => {
+            // The fence can fire while the provider call is pending — the
+            // unmounted generation's error must not surface in its successor.
+            if effects.is_cancelled() {
+                return WakeAttemptResult::plain(WakeOutcome::Cancelled, reconcile);
+            }
+            // Holding the debounce after a refusal is deliberate: a provider
+            // that just refused will refuse the next mention too. Measured
+            // from *settlement*, because a provider call is allowed to
+            // outlast the window it is supposed to close (600s deploy
+            // deadline, 120s debounce) and a stamp that expired while the
+            // call was still pending is not a cooldown at all.
+            state.refresh_stamp(&key, stamped_at, effects.now_ms());
+            return WakeAttemptResult::failed(WakeOutcome::DeployFailed, reconcile, error);
         }
-        // Holding the debounce after a refusal is deliberate: a provider that
-        // just refused will refuse the next mention too. Measured from
-        // *settlement*, because a provider call is allowed to outlast the
-        // window it is supposed to close (600s deploy deadline, 120s debounce)
-        // and a stamp that expired while the call was still pending is not a
-        // cooldown at all.
-        state.refresh_stamp(&key, stamped_at, effects.now_ms());
-        return WakeAttemptResult::failed(WakeOutcome::DeployFailed, reconcile, error);
-    }
+    };
     if effects.is_cancelled() {
         // Same fence on the success path: the deploy happened under the right
         // generation, but its surface must not appear in the next one.
@@ -831,7 +863,7 @@ pub async fn run_wake_attempt<E: WakeEffects>(
         }
         if let Some(observation) = effects.heartbeat() {
             if observation.observed_at_ms >= deployed_at {
-                return WakeAttemptResult::plain(WakeOutcome::Woken, reconcile);
+                return WakeAttemptResult::woken(reconcile, floor_adopted);
             }
         }
     }
@@ -872,6 +904,9 @@ mod tests {
         cancel_during_deploy: bool,
         evidence_on_deploy: bool,
         deploy_fails: bool,
+        /// What `start_managed_agent` reports as the provider's
+        /// fresh-generation classification on a successful deploy.
+        deploy_fresh_generation: Option<bool>,
         /// How long the provider call occupies the clock. Non-zero exercises
         /// the case the constants do not cover on their own: a deploy allowed
         /// to run five times the debounce window.
@@ -908,6 +943,7 @@ mod tests {
                 cancel_during_deploy: false,
                 evidence_on_deploy: true,
                 deploy_fails: false,
+                deploy_fresh_generation: None,
                 deploy_duration_ms: 0,
                 author_is_agent: false,
                 author_check_fails: false,
@@ -1027,7 +1063,7 @@ mod tests {
             Ok(!self.author_is_agent)
         }
 
-        async fn start_managed_agent(&self) -> Result<(), Self::Error> {
+        async fn start_managed_agent(&self) -> Result<Option<bool>, Self::Error> {
             self.deploys.set(self.deploys.get() + 1);
             self.delays_before_deploy.set(Some(self.delay_count.get()));
             // Time the provider spends before answering. Not a `delay`: it
@@ -1043,7 +1079,7 @@ mod tests {
             if self.evidence_on_deploy {
                 self.record_beat();
             }
-            Ok(())
+            Ok(self.deploy_fresh_generation)
         }
     }
 
@@ -1066,6 +1102,52 @@ mod tests {
         assert!(
             harness.delays().contains(&REMOTE_POST_OFFLINE_GRACE_MS),
             "the deploy must respect the post-offline teardown fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_proven_fresh_deploy_reports_floor_adopted() {
+        let harness = Harness {
+            deploy_fresh_generation: Some(true),
+            ..Harness::default()
+        };
+        let state = WakeAttemptState::new();
+
+        let result = attempt(&harness, &state).await;
+
+        assert_eq!(result.outcome, WakeOutcome::Woken);
+        assert_eq!(result.floor_adopted, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_strict_no_op_deploy_reports_the_floor_was_not_adopted_even_though_woken() {
+        // A heartbeat still arrives — from the already-running generation —
+        // so the outcome is Woken, but the provider proved this deploy's env
+        // (the replay floor included) never took effect. A caller must not
+        // read `Woken` alone as proof the mention was delivered.
+        let harness = Harness {
+            deploy_fresh_generation: Some(false),
+            ..Harness::default()
+        };
+        let state = WakeAttemptState::new();
+
+        let result = attempt(&harness, &state).await;
+
+        assert_eq!(result.outcome, WakeOutcome::Woken);
+        assert_eq!(result.floor_adopted, Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_provider_giving_no_classification_reports_the_floor_as_unproven() {
+        let harness = Harness::default();
+        let state = WakeAttemptState::new();
+
+        let result = attempt(&harness, &state).await;
+
+        assert_eq!(result.outcome, WakeOutcome::Woken);
+        assert_eq!(
+            result.floor_adopted, None,
+            "a provider predating the classification must read as unproven, not adopted"
         );
     }
 

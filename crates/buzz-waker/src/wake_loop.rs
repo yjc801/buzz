@@ -461,6 +461,7 @@ fn spawn_attempt(
         let effects = RealWakeEffects::new(
             presence_state,
             watch_list,
+            &agent_pubkey,
             &event.author,
             event.created_at,
             bundle,
@@ -487,6 +488,23 @@ fn spawn_attempt(
                 event_id = %event_id,
                 "buzz-waker: wake succeeded but the triggering mention was already too old \
                  for the woken harness's replay floor to reach it"
+            );
+        }
+
+        if result.outcome == WakeOutcome::Woken && result.floor_adopted == Some(false) {
+            // The provider proved this deploy was a strict no-op against an
+            // already-running generation: the heartbeat that satisfied
+            // `Woken` is that old generation's, not proof this deploy's
+            // `BUZZ_ACP_REPLAY_FLOOR` env is in effect anywhere. A recovered
+            // mention may fall outside that generation's subscription
+            // window — the same operational gap as the undeliverable case
+            // above, from a different cause.
+            tracing::error!(
+                agent = %agent_pubkey,
+                event_id = %event_id,
+                "buzz-waker: wake attempt reported Woken from a strict no-op deploy — this \
+                 attempt's replay floor was never adopted by any generation, so the \
+                 triggering mention is not guaranteed to reach the already-running harness"
             );
         }
 

@@ -6,9 +6,10 @@
 # staying connected and listening continuously across every watched agent,
 # which is exactly the workload Sprites are built to suspend.
 #
-# Ships two binaries: buzz-waker itself, and buzz-backend-sprites, the one
-# provider this image supports today. buzz-provider-deploy (shared with
-# desktop) discovers provider binaries by name on PATH — add more
+# Ships two binaries: buzz-waker itself, and buzz-backend-sprites. Provider
+# *deployment* through buzz-backend-sprites is NOT functional yet — see the
+# KNOWN GAP note below. buzz-provider-deploy (shared with desktop) discovers
+# provider binaries by name on PATH — add more
 # `-p buzz-backend-<id> --bin buzz-backend-<id>` lines below and to the
 # runtime COPY as other providers are needed.
 #
@@ -17,20 +18,23 @@
 # manifest-list digests so either architecture resolves to immutable source
 # bytes.
 #
-# KNOWN GAP, not yet closed: buzz-provider-deploy rejects a provider whose
-# staged bytes don't exactly match the SHA-256 a launch bundle pins
-# (crates/buzz-waker/src/effects.rs, provider_deploy_pinned). That digest is
-# computed by desktop from whatever provider binary is on the issuing
-# machine's local disk (desktop/src-tauri/src/managed_agents/waker_bundle.rs,
+# KNOWN GAP, not yet closed: this image can run the waker's listener/state
+# machinery end-to-end (relay connection, presence tap, bundle admission),
+# but provider *deployment* through it will always fail today.
+# buzz-provider-deploy rejects a provider whose staged bytes don't exactly
+# match the SHA-256 a launch bundle pins (crates/buzz-waker/src/effects.rs,
+# provider_deploy_pinned). That digest is computed by desktop from whatever
+# provider binary is on the issuing machine's local disk
+# (desktop/src-tauri/src/managed_agents/waker_bundle.rs,
 # provider_binary_sha256) — a macOS Tauri sidecar, not the Linux/musl
-# buzz-backend-sprites this image builds and strips below. No amount of
-# tweaking this Dockerfile's build flags fixes that; the two binaries come
-# from different toolchains for different platforms and were never going to
-# byte-match. A real wake through this image will fail the digest check
-# until bundle issuance (`sign_launch_bundle`, currently zero production
-# callers — see PLANS/BUZZ_WAKER_DESIGN.md §11) learns to pin against the
-# digest of the artifact actually deployed to the target daemon, not the
-# issuing machine's own binary.
+# buzz-backend-sprites this image builds and strips below. No build-flag
+# change here closes that gap; the two binaries come from different
+# toolchains for different platforms and were never going to byte-match.
+# This is expected and non-regressive: bundle issuance (`sign_launch_bundle`)
+# has zero production callers today, so no real wake reaches this image's
+# deploy step yet regardless of where the daemon runs. Closing it requires
+# target-aware digest selection in desktop's issuance path — see this PR's
+# description for the concrete follow-up.
 FROM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS builder
 
 RUN apk add --no-cache \

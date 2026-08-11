@@ -69,6 +69,28 @@ struct AgentConfig {
     owner_pubkey: String,
 }
 
+/// Normalize and validate a configured `owner_pubkey` as a real Nostr public
+/// key, before any per-agent state directory or [`FloorStore`] is created.
+///
+/// `owner_pubkey` is otherwise only normalized (trimmed/lowercased) and
+/// never parsed until a bundle actually arrives and `bundle_feed` calls
+/// [`nostr::PublicKey::from_hex`] on it — by which point a typo has already
+/// been durably enrolled as the floor's pinned owner (G2, which never
+/// rewrites once set). That leaves the daemon reporting healthy startup
+/// while silently unable to admit anything, and correcting the config on a
+/// later run is then refused by [`ensure_owner_pin_matches`]. Validating
+/// here, before enrollment, catches the typo at startup instead.
+///
+/// # Errors
+/// `owner_pubkey` does not parse as a hex Nostr public key.
+fn parse_owner_pubkey(pubkey: &str, owner_pubkey: &str) -> anyhow::Result<String> {
+    let owner_pubkey = normalize_pubkey(owner_pubkey);
+    nostr::PublicKey::from_hex(&owner_pubkey).map_err(|e| {
+        anyhow::anyhow!("invalid owner_pubkey for agent {pubkey} in WAKER_AGENTS_CONFIG_PATH: {e}")
+    })?;
+    Ok(owner_pubkey)
+}
+
 /// Refuse to start `pubkey`'s watch tasks if the floor's pinned owner
 /// disagrees with what `WAKER_AGENTS_CONFIG_PATH` configures now.
 ///
@@ -176,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
             .map(Tag::parse)
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid auth_tag for agent {pubkey}: {e}"))?;
-        let owner_pubkey = normalize_pubkey(&agent.owner_pubkey);
+        let owner_pubkey = parse_owner_pubkey(&pubkey, &agent.owner_pubkey)?;
         keys_by_agent.push((keys, auth_tag, owner_pubkey));
     }
 
@@ -370,6 +392,22 @@ mod tests {
     fn loading_a_missing_file_reports_a_clear_error() {
         let result = load_agents("/nonexistent/path/agents.json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_valid_owner_pubkey_is_normalized_and_accepted() {
+        let owner = "A".repeat(64);
+        let parsed = parse_owner_pubkey("agent", &owner).expect("valid hex pubkey parses");
+        assert_eq!(parsed, "a".repeat(64));
+    }
+
+    #[test]
+    fn a_malformed_owner_pubkey_is_refused_before_enrollment() {
+        let error = parse_owner_pubkey("agent", "not-a-key").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid owner_pubkey"),
+            "{error}"
+        );
     }
 
     #[test]

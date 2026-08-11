@@ -113,90 +113,59 @@ pub(crate) fn retain_waker_bundle_pending(
         provider_config,
         provider_binary_sha256,
         issued_at,
+        false,
     )
 }
 
-/// Build a NIP-09 deletion (kind:5) targeting an agent's kind:30180 launch
-/// bundle.
+/// Publish an owner-signed revocation at the agent's kind:30180 coordinate —
+/// the disable half of enrolment. Replaces whatever event (a real bundle or a
+/// prior revocation) currently sits at `30180:<owner>:<agent_pubkey>`, the
+/// same NIP-33 replacement `retain_waker_bundle_pending` already relies on
+/// for a config-change reissue.
 ///
-/// Carries a single `a`-tag with the NIP-33 coordinate
-/// `30180:<owner>:<agent_pubkey>` and no `e`-tag, mirroring
-/// `agent_events::build_agent_delete` — an `e`-tag would route the relay to
-/// the event-id deletion path and leave the parameterized-replaceable
-/// coordinate live.
-fn build_waker_bundle_delete(
-    agent_pubkey: &str,
-    owner_pubkey_hex: &str,
-) -> Result<nostr::EventBuilder, String> {
-    use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
-
-    let coord = format!("{KIND_WAKER_LAUNCH_BUNDLE}:{owner_pubkey_hex}:{agent_pubkey}");
-    let tag =
-        nostr::Tag::parse(["a", coord.as_str()]).map_err(|e| format!("invalid a-tag: {e}"))?;
-    Ok(nostr::EventBuilder::new(nostr::Kind::Custom(5), "").tags(vec![tag]))
-}
-
-/// Purge any pending (unpublished) launch bundle and enqueue a NIP-09
-/// tombstone for the retained kind:30180 coordinate — the disable half of
-/// enrolment, mirroring `commands::agents::tombstone_managed_agent_pending`.
-/// Called whenever `waker_enabled` flips off, or the backend migrates off
-/// `Provider` out from under an enabled agent
-/// (`agent_settings::set_managed_agent_backend`). Best-effort, like every
-/// other tombstone site: a failure is logged and swallowed, and the
-/// tombstone stays queued as `pending_sync` for the existing 30s flush loop
-/// to retry.
+/// That reuse is exactly what closes the gap a NIP-09 tombstone alone left
+/// open: because the daemon's bundle tap holds this coordinate's filter open
+/// live ("hold the same filter open live for real-time reissues",
+/// `PLANS/BUZZ_WAKER_DESIGN.md` §11), a revocation published here reaches an
+/// already-connected daemon the same way a config-change reissue already
+/// does — no new relay change, no new event kind, no dependency on the
+/// daemon ever reconnecting. `bundle_feed::decrypt_verify_and_admit` raises
+/// the daemon's `FloorStore` revocation floor to this version and clears its
+/// cached bundle on receipt.
 ///
-/// # Known gap
-/// This stops a daemon that queries the relay *after* the tombstone lands
-/// (a restart, or a fresh connect) from recovering the previous
-/// authorization. It does NOT reach a daemon that already holds the bundle
-/// in its live, in-memory `BundleState` — the bundle tap has no kind:5
-/// handling today, and `FloorStore::raise_revocation_floor`
-/// (`crates/buzz-waker/src/floors.rs`) has zero production callers yet.
-/// Closing that needs daemon-side revocation delivery, which
-/// `PLANS/BUZZ_WAKER_DESIGN.md` §3 names as an "implementation gate" still
-/// unbuilt — a separate piece of work, not something this desktop-only
-/// change can close on its own.
-pub(crate) fn tombstone_waker_bundle_pending(
-    app: &AppHandle,
-    state: &AppState,
-    agent_pubkey: &str,
-) {
-    use crate::managed_agents::retention::{
-        delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-        RetainedEvent,
-    };
-    use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
-    use nostr::JsonUtil;
-
-    const KIND_DELETE: u32 = 5;
-
+/// Called from every place that turns `waker_enabled` off while the agent
+/// still has a retained bundle: `set_managed_agent_waker_enabled(false)` and
+/// `set_managed_agent_backend` migrating a waker-enabled agent off
+/// `Provider`. Best-effort like every other retention write here: a failure
+/// is logged and swallowed, and the event stays queued as `pending_sync` for
+/// the existing 30s flush loop to retry.
+pub(crate) fn revoke_waker_bundle_pending(app: &AppHandle, state: &AppState, agent_pubkey: &str) {
     let result = (|| -> Result<(), String> {
+        use crate::managed_agents::waker_bundle::issuance_ledger;
+
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let owner_pubkey = scope.owner_keys.public_key().to_hex();
-        let event = build_waker_bundle_delete(agent_pubkey, &owner_pubkey)?
-            .sign_with_keys(&scope.owner_keys)
-            .map_err(|e| format!("failed to sign waker-bundle tombstone: {e}"))?;
-        let conn = open_retention_db(&scope.db_path)?;
-        delete_retained_event(&conn, KIND_WAKER_LAUNCH_BUNDLE, &owner_pubkey, agent_pubkey)?;
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
-                pubkey: owner_pubkey,
-                // Key by the target coordinate so cross-kind d-tag tombstones
-                // occupy distinct rows (same reasoning as
-                // `tombstone_managed_agent_pending`).
-                d_tag: tombstone_retention_d_tag(KIND_WAKER_LAUNCH_BUNDLE, agent_pubkey),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+        let ledger = issuance_ledger(app)?;
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system clock before unix epoch: {e}"))?
+            .as_secs();
+
+        sign_and_retain_waker_bundle_at(
+            &scope.db_path,
+            &scope.owner_keys,
+            &ledger,
+            agent_pubkey,
+            // Unread by a revoked delivery — see `LaunchBundleBody::revoked`.
+            serde_json::Value::Null,
+            String::new(),
+            serde_json::json!({}),
+            String::new(),
+            issued_at,
+            true,
         )
     })();
     if let Err(e) = result {
-        eprintln!("buzz-desktop: waker-bundle-tombstone: {e}");
+        eprintln!("buzz-desktop: waker-bundle-revoke: {e}");
     }
 }
 
@@ -216,6 +185,7 @@ pub(super) fn sign_and_retain_waker_bundle_at(
     provider_config: serde_json::Value,
     provider_binary_sha256: String,
     issued_at: u64,
+    revoked: bool,
 ) -> Result<(), String> {
     use crate::managed_agents::{
         retention::{open_retention_db, retain_event, RetainedEvent},
@@ -237,6 +207,7 @@ pub(super) fn sign_and_retain_waker_bundle_at(
             issued_at,
             lifetime_secs: DEFAULT_BUNDLE_LIFETIME_SECS,
             owner_only_access: crate::managed_agents::owner_only_access_build(),
+            revoked,
         },
         owner_keys,
     )?;
@@ -311,6 +282,7 @@ mod tests {
             serde_json::json!({"org": "buzz-team"}),
             "b".repeat(64),
             1_000,
+            false,
         )
         .expect("retain");
 
@@ -363,6 +335,7 @@ mod tests {
                 serde_json::json!({}),
                 "b".repeat(64),
                 issued_at,
+                false,
             )
             .expect("retain");
         }
@@ -387,6 +360,77 @@ mod tests {
         assert_eq!(
             body.bundle_version, 2,
             "the second issuance for this agent must carry version 2, not repeat version 1"
+        );
+    }
+
+    /// The headline case: a revocation replaces the prior real bundle at the
+    /// same coordinate, and what's left decrypts to a body the waker's own
+    /// verifier accepts as `revoked`. This is what makes a revocation reach
+    /// an already-connected daemon over the same live subscription a
+    /// config-change reissue already uses.
+    #[test]
+    fn a_revocation_replaces_the_retained_bundle_at_the_same_coordinate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_pubkey = agent.public_key().to_hex();
+        let ledger = ledger(dir.path());
+        let db_path = dir.path().join("retention.sqlite");
+
+        sign_and_retain_waker_bundle_at(
+            &db_path,
+            &owner,
+            &ledger,
+            &agent_pubkey,
+            serde_json::json!({"launch": {"command": "buzz-acp"}}),
+            "sprites".to_string(),
+            serde_json::json!({"org": "buzz-team"}),
+            "b".repeat(64),
+            1_000,
+            false,
+        )
+        .expect("issue the real bundle");
+
+        sign_and_retain_waker_bundle_at(
+            &db_path,
+            &owner,
+            &ledger,
+            &agent_pubkey,
+            serde_json::Value::Null,
+            String::new(),
+            serde_json::json!({}),
+            String::new(),
+            2_000,
+            true,
+        )
+        .expect("revoke it");
+
+        let conn = open_retention_db(&db_path).expect("open db");
+        let retained = get_retained_event(
+            &conn,
+            KIND_WAKER_LAUNCH_BUNDLE,
+            &owner.public_key().to_hex(),
+            &agent_pubkey,
+        )
+        .expect("query")
+        .expect("exactly one row remains at the coordinate");
+        assert!(retained.pending_sync, "must be queued for the flush loop");
+
+        let plaintext =
+            nostr::nips::nip44::decrypt(agent.secret_key(), &owner.public_key(), &retained.content)
+                .expect("decrypt");
+        let signed: buzz_waker_pkg::SignedLaunchBundle =
+            serde_json::from_str(&plaintext).expect("parse signed bundle");
+        let body = signed
+            .verify(&owner.public_key().to_hex(), 3_000)
+            .expect("a revocation must still verify");
+        assert!(
+            body.revoked,
+            "the retained row must be the revocation, not the earlier real bundle"
+        );
+        assert_eq!(
+            body.bundle_version, 2,
+            "revoking still consumes a version from the same monotonic ledger"
         );
     }
 }

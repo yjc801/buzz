@@ -291,6 +291,11 @@ pub(crate) struct BundleInputs {
     pub lifetime_secs: u64,
     /// The clamp **as resolved by this build**.
     pub owner_only_access: bool,
+    /// See `buzz_waker_pkg::LaunchBundleBody::revoked`. `false` for every
+    /// real issuance — only `commands::agents_waker::revoke_waker_bundle_pending`
+    /// sets this, with `agent_json`/`provider_id`/`provider_config`/
+    /// `provider_binary_sha256` left as unread placeholders.
+    pub revoked: bool,
 }
 
 /// Stream a provider binary and return its lowercase hex SHA-256.
@@ -339,6 +344,7 @@ pub(crate) fn sign_launch_bundle(
         issued_at: inputs.issued_at,
         expires_at: inputs.issued_at.saturating_add(inputs.lifetime_secs),
         owner_only_access: inputs.owner_only_access,
+        revoked: inputs.revoked,
     };
     let keypair = Keypair::from_secret_key(SECP256K1, owner.secret_key());
     SignedLaunchBundle::sign(&body, &keypair)
@@ -369,6 +375,7 @@ mod tests {
             issued_at: 1_000,
             lifetime_secs: DEFAULT_BUNDLE_LIFETIME_SECS,
             owner_only_access: true,
+            revoked: false,
         }
     }
 
@@ -388,6 +395,23 @@ mod tests {
         assert_eq!(verified.bundle_version, 7);
         assert!(verified.owner_only_access);
         assert_eq!(verified.agent_json["private_key_nsec"], NSEC);
+    }
+
+    /// A revocation is a real signed body like any other, just flagged and
+    /// carrying placeholders where a launch payload would be — the waker's
+    /// own `bundle.rs` proves the flag survives tampering; this proves the
+    /// desktop's issuing path actually sets it.
+    #[test]
+    fn a_revocation_carries_the_flag_and_still_verifies() {
+        let keys = owner();
+        let mut revoke = inputs();
+        revoke.revoked = true;
+        revoke.agent_json = serde_json::Value::Null;
+        let signed = sign_launch_bundle(revoke, &keys).expect("sign");
+        let verified = signed
+            .verify(&keys.public_key().to_hex(), 2_000)
+            .expect("a revocation must still verify");
+        assert!(verified.revoked);
     }
 
     /// The clamp is a property of the issuing build, so it must travel as

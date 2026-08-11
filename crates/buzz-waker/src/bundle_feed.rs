@@ -114,6 +114,13 @@ impl BundleState {
         *self.lock() = Some(Arc::new(body));
     }
 
+    /// Drop whatever bundle is currently held, in response to an owner-signed
+    /// revocation. Leaves this daemon with nothing to deploy until a fresh,
+    /// non-revoked bundle is delivered.
+    pub fn clear(&self) {
+        *self.lock() = None;
+    }
+
     /// The current admitted bundle, if any has been delivered and admitted
     /// on this daemon run yet.
     #[must_use]
@@ -181,7 +188,18 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
     }
 }
 
-/// Decrypt, verify, and admit one delivered bundle.
+/// What a decrypted, verified delivery means for the tap's caller.
+#[derive(Debug, PartialEq)]
+enum BundleOutcome {
+    /// A launch bundle to hold as the current one.
+    Delivered(LaunchBundleBody),
+    /// An owner-signed revocation. The revocation floor has already been
+    /// raised (durably, best-effort) by the time this is returned; the
+    /// caller's only remaining job is to drop whatever it was holding.
+    Revoked,
+}
+
+/// Decrypt, verify, and admit (or revoke) one delivered bundle.
 ///
 /// `keys` is the **agent's own** keypair (the NIP-44 recipient); the
 /// ciphertext was encrypted to it. The sender side of the ECDH is
@@ -194,6 +212,13 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
 /// `FloorStore`-pinned owner) is. A decrypted-but-forged or tampered body
 /// fails `verify`, never silently activates.
 ///
+/// A revocation (`LaunchBundleBody::revoked`) is delivered on the exact same
+/// wire path as a real bundle — same coordinate, same subscription, same
+/// decrypt/verify — so it reaches an already-connected daemon exactly as
+/// promptly as a config-change reissue does. It raises the floor rather than
+/// admitting a bundle, and never touches `agent_json`/`provider`, which the
+/// issuer leaves as unused placeholders for a revocation.
+///
 /// # Errors
 /// A human-readable message on any failure — malformed/oversized ciphertext,
 /// a decrypt failure, a parse failure, a failed inner signature check, or a
@@ -204,7 +229,7 @@ fn decrypt_verify_and_admit(
     owner_pubkey: &str,
     ciphertext: &str,
     floor_store: &mut FloorStore,
-) -> Result<LaunchBundleBody, String> {
+) -> Result<BundleOutcome, String> {
     if !NIP44_CONTENT_LEN_RANGE.contains(&ciphertext.len()) {
         return Err(format!(
             "launch bundle ciphertext outside the expected NIP-44 size range \
@@ -243,11 +268,28 @@ fn decrypt_verify_and_admit(
         ));
     }
 
+    if body.revoked {
+        if let Err(error) = floor_store.raise_revocation_floor(body.bundle_version) {
+            // Fail closed on the in-memory side even if the durable floor
+            // didn't move: a revocation the daemon cannot persist must not
+            // leave it still willing to deploy from its live cache. Worst
+            // case if this daemon then restarts before ever hearing another
+            // delivery, `FloorStore` reopens at the old floor — the
+            // pre-existing G2 rollback surface, not a new one.
+            tracing::warn!(
+                agent = %normalize_pubkey(&keys.public_key().to_hex()),
+                %error,
+                "bundle tap could not durably raise the revocation floor; revoking this run's cache anyway"
+            );
+        }
+        return Ok(BundleOutcome::Revoked);
+    }
+
     floor_store
         .admit(body.bundle_version)
         .map_err(|error| format!("launch bundle floor refused it: {error}"))?;
 
-    Ok(body)
+    Ok(BundleOutcome::Delivered(body))
 }
 
 /// Run one agent's bundle-delivery tap until `cancel` fires.
@@ -329,13 +371,20 @@ pub async fn run_bundle_tap(
                             &ciphertext,
                             floor_store,
                         ) {
-                            Ok(body) => {
+                            Ok(BundleOutcome::Delivered(body)) => {
                                 tracing::info!(
                                     agent = %agent_pubkey,
                                     bundle_version = body.bundle_version,
                                     "bundle tap admitted a launch bundle"
                                 );
                                 state.set(body);
+                            }
+                            Ok(BundleOutcome::Revoked) => {
+                                tracing::info!(
+                                    agent = %agent_pubkey,
+                                    "bundle tap received a revocation; clearing the cached bundle"
+                                );
+                                state.clear();
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -513,6 +562,7 @@ mod tests {
             issued_at: 0,
             expires_at: u64::MAX,
             owner_only_access: true,
+            revoked: false,
         };
         let owner_keypair =
             nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
@@ -529,7 +579,82 @@ mod tests {
         let admitted =
             decrypt_verify_and_admit(&agent, &owner_pubkey, &ciphertext, &mut floor_store)
                 .expect("round trip");
-        assert_eq!(admitted.bundle_version, 1);
+        assert_eq!(
+            admitted,
+            BundleOutcome::Delivered(
+                signed
+                    .verify(&owner_pubkey, u64::MAX)
+                    .expect("the same body the tap just admitted")
+            )
+        );
+        assert_eq!(floor_store.snapshot().highest_accepted_version, 1);
+    }
+
+    /// The headline case this whole outcome type exists for: a revocation
+    /// raises the floor instead of admitting a bundle, and reports
+    /// `Revoked` so the caller clears its cache.
+    #[test]
+    fn a_revocation_raises_the_floor_and_reports_revoked() {
+        use crate::bundle::{LaunchBundleBody, ProviderEnvelope};
+
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let agent = Keys::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut floor_store =
+            FloorStore::enroll(dir.path().join("floor.json"), &owner_pubkey).unwrap();
+
+        let body = LaunchBundleBody {
+            agent_pubkey: agent.public_key().to_hex(),
+            // Placeholders — a revoked delivery must never be read this far.
+            agent_json: serde_json::Value::Null,
+            provider: ProviderEnvelope {
+                provider_id: String::new(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: String::new(),
+            },
+            bundle_version: 5,
+            issued_at: 0,
+            expires_at: u64::MAX,
+            owner_only_access: true,
+            revoked: true,
+        };
+        let owner_keypair =
+            nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
+        let signed = SignedLaunchBundle::sign(&body, &owner_keypair).unwrap();
+        let plaintext = serde_json::to_string(&signed).unwrap();
+        let ciphertext = nostr::nips::nip44::encrypt(
+            owner.secret_key(),
+            &agent.public_key(),
+            &plaintext,
+            nostr::nips::nip44::Version::V2,
+        )
+        .unwrap();
+
+        let outcome =
+            decrypt_verify_and_admit(&agent, &owner_pubkey, &ciphertext, &mut floor_store)
+                .expect("a revocation is not an error");
+        assert_eq!(outcome, BundleOutcome::Revoked);
+        assert_eq!(floor_store.snapshot().revocation_floor, 5);
+
+        // A later delivery below the raised floor is refused, same as any
+        // other revoked version.
+        let mut stale = body.clone();
+        stale.bundle_version = 3;
+        stale.revoked = false;
+        let stale_signed = SignedLaunchBundle::sign(&stale, &owner_keypair).unwrap();
+        let stale_plaintext = serde_json::to_string(&stale_signed).unwrap();
+        let stale_ciphertext = nostr::nips::nip44::encrypt(
+            owner.secret_key(),
+            &agent.public_key(),
+            &stale_plaintext,
+            nostr::nips::nip44::Version::V2,
+        )
+        .unwrap();
+        let error =
+            decrypt_verify_and_admit(&agent, &owner_pubkey, &stale_ciphertext, &mut floor_store)
+                .expect_err("must be refused as revoked");
+        assert!(error.contains("floor refused"), "{error}");
     }
 
     #[test]
@@ -559,6 +684,7 @@ mod tests {
             issued_at: 0,
             expires_at: u64::MAX,
             owner_only_access: true,
+            revoked: false,
         };
         let owner_keypair =
             nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());

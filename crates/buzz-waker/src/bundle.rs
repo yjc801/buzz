@@ -155,6 +155,21 @@ pub struct LaunchBundleBody {
     /// Travels with the data precisely because it cannot be recomputed
     /// correctly anywhere else.
     pub owner_only_access: bool,
+    /// When `true`, this delivery is a revocation, not a launch authorization.
+    ///
+    /// A revocation is published at the **same** NIP-33 coordinate
+    /// (`30180:<owner>:<agent_pubkey>`) a real bundle would use, so it
+    /// replaces whatever the relay was serving and — because the daemon
+    /// holds that coordinate's filter open live for real-time reissues
+    /// (`crates/buzz-waker/src/bundle_feed.rs`) — reaches an
+    /// already-connected daemon the same way a config-change reissue
+    /// already does. The receiving side must raise its
+    /// [`crate::floors::FloorStore`] revocation floor to
+    /// [`Self::bundle_version`] and drop any cached bundle; it must never
+    /// read [`Self::agent_json`] or [`Self::provider`], which the issuer
+    /// leaves as unused placeholders for a revocation.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 impl std::fmt::Debug for LaunchBundleBody {
@@ -167,6 +182,7 @@ impl std::fmt::Debug for LaunchBundleBody {
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("owner_only_access", &self.owner_only_access)
+            .field("revoked", &self.revoked)
             .finish()
     }
 }
@@ -331,6 +347,7 @@ mod tests {
             issued_at: 1_000,
             expires_at: 100_000,
             owner_only_access: true,
+            revoked: false,
         }
     }
 
@@ -382,6 +399,23 @@ mod tests {
         signed.body_json = signed
             .body_json
             .replace("\"owner_only_access\":true", "\"owner_only_access\":false");
+        assert_eq!(
+            signed.verify(&owner_hex(&kp), 2_000),
+            Err(BundleError::BadSignature)
+        );
+    }
+
+    /// The revocation flag rides inside the signature exactly like the
+    /// owner-only clamp: flipping it after signing must not survive.
+    #[test]
+    fn a_tampered_revoked_flag_fails_verification() {
+        let kp = keypair();
+        let mut b = body();
+        b.revoked = true;
+        let mut signed = SignedLaunchBundle::sign(&b, &kp).expect("sign");
+        signed.body_json = signed
+            .body_json
+            .replace("\"revoked\":true", "\"revoked\":false");
         assert_eq!(
             signed.verify(&owner_hex(&kp), 2_000),
             Err(BundleError::BadSignature)

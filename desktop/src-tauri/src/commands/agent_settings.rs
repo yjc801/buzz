@@ -245,7 +245,7 @@ pub async fn set_managed_agent_backend(
         save_managed_agents(&app, &records)?;
 
         if leaving_provider_waker {
-            super::agents::tombstone_waker_bundle_pending(&app, &state, &pubkey);
+            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey);
         }
 
         let record = records
@@ -393,9 +393,10 @@ pub async fn set_managed_agent_waker_enabled(
         save_managed_agents(&app, &records)?;
 
         if was_enabled && !waker_enabled {
-            // Durable revoke: see `tombstone_waker_bundle_pending`'s own doc
-            // for what this does and does not close.
-            super::agents::tombstone_waker_bundle_pending(&app, &state, &pubkey);
+            // Durable revoke: see `revoke_waker_bundle_pending`'s own doc for
+            // why this reaches an already-connected daemon, not just a
+            // future relay recovery.
+            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey);
         }
 
         if waker_enabled && !was_enabled {

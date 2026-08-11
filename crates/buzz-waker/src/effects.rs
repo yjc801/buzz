@@ -6,24 +6,24 @@
 //! the provider deploy wire protocol (`buzz-provider-deploy`, shared with the
 //! desktop app) for `start_managed_agent()`.
 //!
-//! # `start_managed_agent` needs a launch bundle it is not yet given
+//! # `start_managed_agent`
 //!
 //! The deploy call itself — bind the bundle to the agent this attempt
 //! watches, recheck the bundle has not expired since activation, stage the
 //! provider binary, verify it against the bundle's pinned digest (**G1**),
 //! negotiate, invoke — is implemented and shared with the desktop app via
-//! `buzz-provider-deploy`. What this crate
-//! still cannot do is *obtain* a [`crate::bundle::LaunchBundleBody`] at
-//! runtime: bundle transport (how a signed bundle reaches this daemon process)
-//! is a separate, explicitly deferred task (see
-//! `PLANS/BUZZ_WAKER_DESIGN.md` §7). Until that lands, every
-//! [`RealWakeEffects`] is constructed with `bundle: None`, and a real wake
-//! attempt runs the full decision sequence — presence, liveness proof, author
-//! re-check — and then fails at the deploy step, reported as
-//! [`crate::attempt::WakeOutcome::DeployFailed`] with a clearly logged reason.
-//! This is intentional and must not be papered over with a fake success: a
-//! stubbed "deploy" that returns `Ok(())` would make every wake look healthy
-//! while waking nothing.
+//! `buzz-provider-deploy`. The bundle it deploys comes from
+//! [`crate::bundle_feed::BundleState`], written by
+//! [`crate::bundle_feed::run_bundle_tap`] (§11, `PLANS/BUZZ_WAKER_DESIGN.md`)
+//! — read fresh at the moment each attempt reaches this step, per
+//! `wake_loop`'s own doc on why it isn't captured once at loop-construction
+//! time. A wake attempt whose agent has never had a bundle delivered and
+//! admitted yet — a fresh daemon before the tap's first delivery, or an
+//! agent never enrolled for remote wake at all — fails at the deploy step,
+//! reported as [`crate::attempt::WakeOutcome::DeployFailed`] with a clearly
+//! logged reason. This is intentional and must not be papered over with a
+//! fake success: a stubbed "deploy" that returns `Ok(())` would make every
+//! wake look healthy while waking nothing.
 //!
 //! # The generation nonce is not implemented
 //!
@@ -72,12 +72,12 @@ pub enum EffectsError {
     #[error("presence unavailable: {0}")]
     Presence(#[from] PresenceError),
 
-    /// This attempt has no signed launch bundle to deploy from. Expected
-    /// until bundle transport is wired in — see the module note.
+    /// This attempt's agent has no admitted launch bundle yet — the tap
+    /// hasn't delivered a first one since this daemon started, or the owner
+    /// has never issued one for this agent.
     #[error(
         "no launch bundle available for this agent; refusing to claim a wake \
-         that cannot actually start anything (bundle transport is not yet \
-         wired into this daemon build)"
+         that cannot actually start anything"
     )]
     NoBundle,
 
@@ -241,9 +241,9 @@ impl WakeEffects for RealWakeEffects {
         let Some(bundle) = self.bundle.clone() else {
             tracing::error!(
                 author = %self.trigger_author,
-                "buzz-waker: wake attempt reached the deploy step with no launch \
-                 bundle available — reporting DeployFailed rather than a fake \
-                 success. Bundle transport is not yet wired into this daemon build."
+                "buzz-waker: wake attempt reached the deploy step with no admitted \
+                 launch bundle for this agent — reporting DeployFailed rather than \
+                 a fake success."
             );
             return Err(EffectsError::NoBundle);
         };

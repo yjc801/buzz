@@ -35,7 +35,7 @@ cd "$(buzz-workspace main)"       # a branch, tag, or sha
 buzz-workspace list               # which slots hold what
 ```
 
-It recycles a small pool of fixed-path slots against a shared cargo cache, never touches `target/`, and will not recycle a slot that has uncommitted work.
+It recycles a small pool of fixed-path slots against a shared cargo cache, never touches `target/`, and will not recycle a slot that has uncommitted work. Each hand-out claims its slot for an hour; if you're going to call `buzz-workspace` repeatedly for the same ref, `export BUZZ_WORKSPACE_CLAIM=<anything-unique>` once so your own later calls are recognized as yours instead of refused. `buzz-workspace release <ref>` gives up a claim early.
 
 ## Knowledge File Conventions
 

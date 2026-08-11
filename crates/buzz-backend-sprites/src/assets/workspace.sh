@@ -29,8 +29,11 @@ set -euo pipefail
 BUZZ="$HOME/.buzz"
 CACHE_ROOT="${BUZZ_WORKSPACE_CACHE:-$HOME/.cache/buzz-build}"
 SLOT_COUNT="${BUZZ_WORKSPACE_SLOTS:-3}"
-# How long a slot is considered "someone else's" after it is handed out. Only
-# affects which slot is recycled when none matches the ref — never correctness.
+# How long a slot stays claimed by whoever it was last handed to. A live claim
+# is exclusive: nobody else gets that slot, not through recycling and not
+# through the exact-sha fast path, unless they present the matching token or
+# pass --force. This is enforced, not advisory — see the claim check in
+# cmd_path.
 HOLD_SECONDS="${BUZZ_WORKSPACE_HOLD:-3600}"
 
 die() {
@@ -44,9 +47,10 @@ note() {
 
 usage() {
     cat >&2 <<'EOF'
-usage: buzz-workspace <ref> [repo]   print the path to a warm checkout of <ref>
-       buzz-workspace list [repo]    show every slot, its ref, and its build cache
-       buzz-workspace gc [repo]      prune worktrees whose directory is gone
+usage: buzz-workspace <ref> [repo] [--claim TOKEN]   print the path to a warm checkout of <ref>
+       buzz-workspace list [repo]                    show every slot, its ref, and its build cache
+       buzz-workspace gc [repo]                       prune worktrees whose directory is gone
+       buzz-workspace release <ref> [repo] [--claim TOKEN]   give up a held slot early
 
 <ref> may be a branch, tag, sha, or a pull request as `pr/19`, `#19`, or `19`.
 [repo] defaults to `buzz` and names a checkout under the Nest's REPOS/.
@@ -55,6 +59,15 @@ Slots live beside the canonical clone as <repo>-slots/N and are RECYCLED, not
 created per ref: their build caches only stay warm because their paths do not
 change. A slot with uncommitted work is never recycled out from under you --
 pass --force to reset one anyway.
+
+Every hand-out claims its slot for BUZZ_WORKSPACE_HOLD seconds (default 3600).
+While a claim is live, nobody else can be handed that slot -- not by
+recycling, and not by matching the same ref's commit -- unless they present
+the same claim token or pass --force. A fresh random token is minted and
+printed on first hand-out; a session doing repeated work against one ref
+should set BUZZ_WORKSPACE_CLAIM (or pass --claim) once so its own later calls
+are recognized as itself instead of being refused. `buzz-workspace release`
+gives up a claim early so the slot is immediately reusable by anyone.
 EOF
     exit 2
 }
@@ -168,8 +181,34 @@ stamp() {
     printf '%s/.state/%s' "$1" "$2"
 }
 
+# The claim token lives next to the stamp, same reasoning: outside the
+# worktree so it never taints `git status`.
+claim_file() {
+    printf '%s/.state/%s.claim' "$1" "$2"
+}
+
+# Not a security token -- just needs to be unguessable enough that two
+# concurrent hand-outs don't mint the same one. /proc/sys/kernel/random/uuid
+# exists on every sprite; the fallback covers a plain dev machine running
+# this script directly.
+new_claim_token() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s%N 2>/dev/null || date +%s)"
+    fi
+}
+
+# Seconds since this slot was last handed out. A slot that was never handed
+# out (no stamp yet) reads as infinitely old, i.e. not held.
+hold_age() {
+    local slots="$1" i="$2" now="$3" at
+    at=$(stat -c %Y "$(stamp "$slots" "$i")" 2>/dev/null || echo 0)
+    printf '%s' "$((now - at))"
+}
+
 cmd_path() {
-    local ref="$1" name="$2" force="$3"
+    local ref="$1" name="$2" force="$3" claim_arg="$4"
     local canon slots shared sha
     canon=$(resolve_repo "$name")
     slots="$(dirname "$canon")/$(basename "$canon")-slots"
@@ -218,11 +257,27 @@ cmd_path() {
 
     if [ -z "$chosen" ]; then
         [ -n "$oldest" ] || die "every slot under $slots has uncommitted work. Commit or stash it, or re-run with --force."
-        if [ "$((now - oldest_at))" -lt "$HOLD_SECONDS" ]; then
-            note "warning: recycling $oldest, handed out $(((now - oldest_at) / 60))m ago — another session may be using it"
-        fi
         chosen="$oldest"
         reused="recycled"
+    fi
+
+    # Exclusivity: whichever path picked $chosen -- an exact-sha match or a
+    # recycle -- lands here before anything destructive happens, so neither
+    # path can skip the check the other honors. A live claim (handed out less
+    # than HOLD_SECONDS ago) is exclusive to whoever holds its token; a
+    # timestamp warning is not exclusion, so reuse without the matching token
+    # is refused outright unless the caller passes --force.
+    local chosen_i existing_claim age
+    chosen_i="$(basename "$chosen")"
+    existing_claim=$(cat "$(claim_file "$slots" "$chosen_i")" 2>/dev/null || true)
+    age=$(hold_age "$slots" "$chosen_i" "$now")
+    if [ -n "$existing_claim" ] && [ "$age" -lt "$HOLD_SECONDS" ] && [ "$existing_claim" != "$claim_arg" ]; then
+        if [ "$force" = "1" ]; then
+            note "warning: taking $chosen from a live claim ($((age / 60))m old) -- --force was passed"
+        else
+            die "$chosen is claimed by another session (handed out $((age / 60))m ago)." \
+                "Pass --claim <token> if that session is you, --force to take it anyway, or wait $(( (HOLD_SECONDS - age) / 60 ))m."
+        fi
     fi
 
     # An exact-sha slot is handed back untouched. Checking it out again would be
@@ -236,9 +291,19 @@ cmd_path() {
     fi
 
     link_cache "$chosen" "$shared"
-    printf '%s' "$ref" >"$(stamp "$slots" "$(basename "$chosen")")"
+    printf '%s' "$ref" >"$(stamp "$slots" "$chosen_i")"
+
+    # Renew under the caller's own token when they proved they already hold
+    # it; otherwise this hand-out starts a fresh claim (new slot, an expired
+    # or absent claim, or a --force takeover all fall here).
+    local my_claim="$claim_arg"
+    if [ -z "$my_claim" ] || [ "$my_claim" != "$existing_claim" ]; then
+        my_claim=$(new_claim_token)
+    fi
+    printf '%s' "$my_claim" >"$(claim_file "$slots" "$chosen_i")"
 
     note "$(basename "$chosen") -> ${sha:0:9} ($reused); cargo cache $shared"
+    note "claim $my_claim -- set BUZZ_WORKSPACE_CLAIM=$my_claim (or pass --claim $my_claim) so your own later calls reuse this slot"
     if [ -d "$chosen/target" ] || [ -d "$chosen/desktop/src-tauri/target" ]; then
         note "build cache preserved — expect an incremental build, not a cold one"
     fi
@@ -246,25 +311,32 @@ cmd_path() {
 }
 
 cmd_list() {
-    local name="$1" canon slots shared
+    local name="$1" canon slots shared now
     canon=$(resolve_repo "$name")
     slots="$(dirname "$canon")/$(basename "$canon")-slots"
     shared="$CACHE_ROOT/$name/cargo"
+    now=$(date +%s)
 
     printf 'canonical  %s\n' "$canon"
     printf 'cargo home %s (%s)\n' "$shared" "$(du -sh "$shared" 2>/dev/null | cut -f1 || echo absent)"
-    local i slot
+    local i slot held age
     for i in $(seq 1 "$SLOT_COUNT"); do
         slot="$slots/$i"
         if [ ! -e "$slot/.git" ]; then
             printf 'slot %s     (empty)\n' "$i"
             continue
         fi
-        printf 'slot %s     %s  %s%s\n' \
+        held=""
+        if [ -s "$(claim_file "$slots" "$i")" ]; then
+            age=$(hold_age "$slots" "$i" "$now")
+            [ "$age" -lt "$HOLD_SECONDS" ] && held="  [held $((age / 60))m]"
+        fi
+        printf 'slot %s     %s  %s%s%s\n' \
             "$i" \
             "$(git -C "$slot" rev-parse --short HEAD 2>/dev/null || echo '?')" \
             "$(cat "$(stamp "$slots" "$i")" 2>/dev/null || echo '-')" \
-            "$(slot_is_dirty "$slot" && echo '  [dirty]' || true)"
+            "$(slot_is_dirty "$slot" && echo '  [dirty]' || true)" \
+            "$held"
     done
 }
 
@@ -275,21 +347,59 @@ cmd_gc() {
     note "pruned worktree registrations with no directory"
 }
 
+# Give up a live claim early so the slot is immediately eligible for reuse by
+# anyone. Only rewinds the hold clock -- the checkout itself is left exactly
+# as it is, same as the exact-sha fast path in cmd_path.
+cmd_release() {
+    local ref="$1" name="$2" claim_arg="$3" force="$4"
+    [ -n "$ref" ] || die "usage: buzz-workspace release <ref> [repo] [--claim TOKEN]"
+    local canon slots sha
+    canon=$(resolve_repo "$name")
+    slots="$(dirname "$canon")/$(basename "$canon")-slots"
+    sha=$(resolve_sha "$canon" "$ref")
+
+    exec 9>"$slots/.lock"
+    flock -w 30 9 || die "another buzz-workspace is picking a slot; try again"
+
+    local i slot existing_claim
+    for i in $(seq 1 "$SLOT_COUNT"); do
+        slot="$slots/$i"
+        [ -e "$slot/.git" ] || continue
+        [ "$(git -C "$slot" rev-parse HEAD 2>/dev/null)" = "$sha" ] || continue
+        existing_claim=$(cat "$(claim_file "$slots" "$i")" 2>/dev/null || true)
+        if [ -n "$existing_claim" ] && [ "$existing_claim" != "$claim_arg" ] && [ "$force" != "1" ]; then
+            die "$slot is claimed by another session. Pass --claim <token> or --force to release it anyway."
+        fi
+        rm -f "$(claim_file "$slots" "$i")"
+        touch -d @0 "$(stamp "$slots" "$i")" 2>/dev/null || true
+        note "released $slot ($ref)"
+        return
+    done
+    note "no slot under $slots is at ${sha:0:9}; nothing to release"
+}
+
 main() {
-    local force=0 args=()
-    for arg in "$@"; do
-        case "$arg" in
+    local force=0 claim="${BUZZ_WORKSPACE_CLAIM:-}" args=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
             --force) force=1 ;;
+            --claim)
+                shift
+                [ "$#" -gt 0 ] || die "--claim requires a value"
+                claim="$1"
+                ;;
             -h | --help) usage ;;
-            *) args+=("$arg") ;;
+            *) args+=("$1") ;;
         esac
+        shift
     done
     [ "${#args[@]}" -ge 1 ] || usage
 
     case "${args[0]}" in
         list) cmd_list "${args[1]:-buzz}" ;;
         gc) cmd_gc "${args[1]:-buzz}" ;;
-        *) cmd_path "${args[0]}" "${args[1]:-buzz}" "$force" ;;
+        release) cmd_release "${args[1]:-}" "${args[2]:-buzz}" "$claim" "$force" ;;
+        *) cmd_path "${args[0]}" "${args[1]:-buzz}" "$force" "$claim" ;;
     esac
 }
 

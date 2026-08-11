@@ -6,10 +6,10 @@ use super::agent_env::build_buzz_agent_provider_defaults;
 
 use crate::{
     managed_agents::{
-        append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
-        missing_command_message, normalize_agent_args, open_log_file, resolve_command,
-        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
-        ManagedAgentRuntimeKey, ManagedAgentSummary,
+        append_log_marker, community_scope::home_community_allows, known_acp_runtime,
+        login_shell_path, managed_agent_log_path, missing_command_message, normalize_agent_args,
+        open_log_file, resolve_command, spawn_key_refusal, KnownAcpRuntime,
+        ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -417,6 +417,11 @@ pub fn spawn_agent_child(
         return Err(error);
     }
     let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
+    // Refused here rather than only in `start_pair` so the other two spawn
+    // paths that call this function directly — launch restore and the
+    // reconcile-on-launch fallback — cannot bypass it and start a second,
+    // UI-invisible harness for an identity on a relay that is not its home.
+    home_community_allows(record, &runtime_key)?;
     // Resolve the effective harness (agent command) from the linked persona, so
     // persona harness edits propagate on the next spawn; an explicit per-agent
     // override wins. `agent_args` and `mcp_command` are pure derivations of the

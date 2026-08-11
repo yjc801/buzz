@@ -9,7 +9,7 @@ import { MigrateAgentDialog } from "./MigrateAgentDialog";
 import { migrationGate } from "./migrationGate";
 
 /**
- * "Move…" affordance for an agent's run location, with the safety gate applied.
+ * "Migrate" affordance for an agent's run location, with the safety gate applied.
  *
  * Returned as two nodes rather than one component because the dialog must not
  * live inside `DropdownMenuContent`: opening it moves focus out of the menu,
@@ -67,7 +67,7 @@ export function useAgentRunLocationMove(agent: ManagedAgent | undefined): {
         title={gate.allowed ? undefined : gate.reason}
       >
         <MoveRight className="h-4 w-4" />
-        Move…
+        Migrate
       </DropdownMenuItem>
     ),
     dialog: gate.allowed ? (

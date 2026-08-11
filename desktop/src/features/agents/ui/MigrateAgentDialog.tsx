@@ -22,7 +22,7 @@ import {
 } from "./whereToRunIntent";
 
 /**
- * Move an existing agent between local and provider execution.
+ * Migrate an existing agent between local and provider execution.
  *
  * Reuses the create flow's `WhereToRunSection` rather than a parallel picker,
  * so provider discovery, schema probing and config validation stay in one
@@ -103,7 +103,7 @@ export function MigrateAgentDialog({
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent data-testid="migrate-agent-dialog">
         <DialogHeader>
-          <DialogTitle>Move {agent.name}</DialogTitle>
+          <DialogTitle>Migrate {agent.name}</DialogTitle>
           <DialogDescription>
             {agent.name} keeps the same identity — its key, channel membership,
             git access and memory all follow it. Only where it runs changes.
@@ -150,7 +150,7 @@ export function MigrateAgentDialog({
             }
             onClick={submit}
           >
-            {migrate.isPending ? "Moving…" : "Move agent"}
+            {migrate.isPending ? "Migrating…" : "Migrate agent"}
           </Button>
         </div>
       </DialogContent>

@@ -3,13 +3,13 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::{
-    agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
-    load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
-    process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
-    spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
-    write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
-    ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
-    ManagedAgentRuntimeStatus,
+    agent_readiness, append_log_marker, community_scope::home_community_allows,
+    current_instance_id, find_managed_agent_mut, load_global_agent_config, load_managed_agents,
+    load_personas, managed_agent_runtime_log_path, process_is_running, record_agent_command,
+    resolve_effective_agent_env, save_managed_agents, spawn_agent_child, terminate_process,
+    terminate_untracked_pair_runtime, write_agent_runtime_receipt, AgentReadiness, BackendKind,
+    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle,
+    ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus,
 };
 use crate::app_state::AppState;
 
@@ -469,6 +469,19 @@ pub async fn reconcile_managed_agent_runtimes(
         for record in records
             .iter()
             .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+            .filter(|record| {
+                // Drop off-home (agent, community) pairs before the relay
+                // probe rather than after: `start_pair` would refuse them
+                // anyway (via `spawn_agent_child`), but only once each had
+                // already paid for a probe round-trip and produced a Failed
+                // row that reads exactly like a real relay-access failure.
+                // A URL that can't even form a key is left in — that failure
+                // mode is unrelated and already handled after the probe.
+                match ManagedAgentRuntimeKey::new(record.pubkey.clone(), &community.relay_url) {
+                    Ok(key) => home_community_allows(record, &key).is_ok(),
+                    Err(_) => true,
+                }
+            })
         // The legacy per-record relay pin is deliberately ignored here — see
         // `effective_agent_relay_url`. Every local auto-start agent fans out
         // to every configured community.

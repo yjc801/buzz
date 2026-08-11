@@ -191,6 +191,7 @@ fn local_agent() -> ManagedAgentRecord {
         backend_agent_id: Some("local-remote-id".to_string()),
         residual_deployments: Vec::new(),
         provider_binary_path: Some("/local/bin".to_string()),
+        waker_enabled: false,
         team_id: None,
         persona_team_dir: None,
         persona_name_in_team: None,

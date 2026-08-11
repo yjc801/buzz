@@ -41,20 +41,11 @@
 //!
 //! # Not here: transport
 //!
-//! How a bundle *reaches* the waker is deliberately unimplemented. The bundle
-//! contains the agent's `nsec`, so its transport and at-rest storage are the
-//! whole of the waker's secrets posture, and picking a mechanism is a design
-//! decision rather than an implementation detail. This module produces the
-//! artifact and stops there.
-
-// Staged, by decision: these are the issuance half of the launch-bundle
-// contract and their only caller would be the bundle *transport*, which is a
-// separate and still-undecided design step (the bundle carries the agent's
-// nsec, so the mechanism is a security choice). Landing issuance now keeps the
-// desktop and waker halves reviewable together, and the round-trip test at the
-// bottom of this file is what proves they actually agree rather than merely
-// compiling. Remove this allow when the transport wires them up.
-#![allow(dead_code)]
+//! How a bundle *reaches* the waker was unimplemented on the desktop side
+//! until `commands::agents::retain_waker_bundle_pending` wired this module's
+//! issuance into the existing owner-authored retention/flush-loop transport
+//! (`persona_events::flush_active_pending_events`) that already delivers
+//! persona, team, and managed-agent writes to the relay.
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -321,6 +321,74 @@ pub async fn set_managed_agent_community(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
+/// Opt an agent into (or out of) `buzz-waker` deployment.
+///
+/// Turning this on for a `Provider`-backend agent is the enrolment moment
+/// (`PLANS/BUZZ_WAKER_DESIGN.md` §11): `retain_managed_agent_pending` below
+/// issues and retains that agent's first signed launch bundle in the same
+/// call. Every later edit that already calls `retain_managed_agent_pending`
+/// (model/provider changes, persona-propagated updates, rollback restores)
+/// reissues it — never a bare liveness ping (G3).
+///
+/// Refused for a `Local` backend: there is nothing for a remote daemon to
+/// invoke, so an enabled flag would sit there silently doing nothing.
+#[tauri::command]
+pub async fn set_managed_agent_waker_enabled(
+    pubkey: String,
+    waker_enabled: bool,
+    app: AppHandle,
+) -> Result<ManagedAgentSummary, String> {
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let mut records = load_managed_agents(&app)?;
+        let mut runtimes = state
+            .managed_agent_processes
+            .lock()
+            .map_err(|error| error.to_string())?;
+
+        let (sync_changed, exited_pubkeys) =
+            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
+        if sync_changed {
+            save_managed_agents(&app, &records)?;
+        }
+        for pubkey in &exited_pubkeys {
+            state.clear_agent_session_caches(pubkey);
+        }
+
+        {
+            let record = find_managed_agent_mut(&mut records, &pubkey)?;
+            if waker_enabled && !matches!(record.backend, BackendKind::Provider { .. }) {
+                return Err(
+                    "buzz-waker can only deploy agents running on a provider backend".to_string(),
+                );
+            }
+            record.waker_enabled = waker_enabled;
+            record.updated_at = now_iso();
+        }
+
+        save_managed_agents(&app, &records)?;
+        let record = records
+            .iter()
+            .find(|record| record.pubkey == pubkey)
+            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        super::agents::retain_managed_agent_pending(&app, &state, record);
+        let personas = load_personas(&app).unwrap_or_default();
+        build_managed_agent_summary(
+            &app,
+            record,
+            &runtimes,
+            &personas,
+            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn set_managed_agent_auto_restart(
     pubkey: String,

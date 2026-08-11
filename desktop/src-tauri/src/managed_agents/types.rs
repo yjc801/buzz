@@ -252,6 +252,16 @@ pub struct ManagedAgentRecord {
     pub residual_deployments: Vec<ResidualDeployment>,
     #[serde(default)]
     pub provider_binary_path: Option<String>,
+    /// Opt-in: publish a signed launch bundle (kind:30180) so `buzz-waker`
+    /// can deploy this agent to its `Provider` backend while desktop is
+    /// offline. Meaningless for `BackendKind::Local`, which a remote daemon
+    /// has nothing to invoke. Default `false` — a bundle carries this
+    /// agent's `private_key_nsec` (NIP-44-encrypted to the agent, but
+    /// published under the owner's real key to a public relay), so turning
+    /// it on is a deliberate per-agent choice, not an automatic consequence
+    /// of picking a Provider backend.
+    #[serde(default)]
+    pub waker_enabled: bool,
     /// Installed team directory path (absolute). Set when agent was created from a team persona.
     #[serde(
         default,

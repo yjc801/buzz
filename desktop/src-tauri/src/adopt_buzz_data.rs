@@ -10,9 +10,12 @@
 //! installs Waggle, dislikes it, and goes back should find their agents intact.
 //! The cost is disk, which is cheap next to losing an agent's identity.
 //!
-//! The marker is written only after a fully successful copy, so a run that dies
-//! partway retries from scratch on the next launch rather than leaving a
-//! half-populated directory that looks adopted.
+//! The copy lands in a staging directory next to `data_dir` and is promoted
+//! into place with a single rename only once it completes in full, and the
+//! marker is written only after that. A run that dies partway therefore never
+//! leaves `data_dir` half-populated — it stays empty, so the next launch
+//! retries from scratch instead of mistaking the partial copy for the
+//! destination's own data.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +26,11 @@ const LEGACY_IDENTIFIER_PREFIX: &str = "xyz.block.buzz.app";
 const WAGGLE_IDENTIFIER_PREFIX: &str = "xyz.waggle.app";
 /// Written into the destination once a copy completes in full.
 const ADOPTION_MARKER: &str = ".adopted-from-buzz";
+/// Sibling directory the copy lands in before being promoted into
+/// `data_dir`, so a copy that dies partway never leaves files directly in
+/// `data_dir` where `has_content` would mistake them for the destination's
+/// own data and skip adoption forever.
+const ADOPTION_STAGING_SUFFIX: &str = ".adopting-from-buzz";
 
 /// Boot entry point: adopt if needed, and report the outcome.
 ///
@@ -61,6 +69,13 @@ fn legacy_dir_for(data_dir: &Path) -> Option<PathBuf> {
     let name = data_dir.file_name()?.to_str()?;
     let suffix = name.strip_prefix(WAGGLE_IDENTIFIER_PREFIX)?;
     Some(data_dir.with_file_name(format!("{LEGACY_IDENTIFIER_PREFIX}{suffix}")))
+}
+
+/// Staging directory for a copy in progress, a sibling of `data_dir` so it
+/// never counts toward `has_content(data_dir)`.
+fn staging_dir_for(data_dir: &Path) -> PathBuf {
+    let name = data_dir.file_name().unwrap_or_default().to_string_lossy();
+    data_dir.with_file_name(format!("{name}{ADOPTION_STAGING_SUFFIX}"))
 }
 
 /// Whether a directory holds anything worth preserving.
@@ -118,7 +133,25 @@ pub(crate) fn adopt_buzz_data_dir(data_dir: &Path) -> Adoption {
         return Adoption::Skipped("no Buzz data to adopt");
     }
 
-    match copy_tree(&legacy, data_dir) {
+    let staging = staging_dir_for(data_dir);
+    // Clear any partial copy left by a previous interrupted attempt: retries
+    // start from scratch rather than resuming into stale staged files.
+    let _ = fs::remove_dir_all(&staging);
+
+    let copied = copy_tree(&legacy, &staging).and_then(|files| {
+        // `data_dir` is confirmed empty (or absent) by `has_content` above, so
+        // this promotes the whole tree in one rename instead of copying files
+        // into `data_dir` directly, where a failure partway through would
+        // leave real data there with no marker — indistinguishable from an
+        // install with its own history, and adoption would never retry.
+        if data_dir.exists() {
+            fs::remove_dir_all(data_dir)?;
+        }
+        fs::rename(&staging, data_dir)?;
+        Ok(files)
+    });
+
+    match copied {
         Ok(files) => {
             // Marker last, and only on success: a failed copy must look
             // un-adopted so the next launch retries instead of starting from a
@@ -133,7 +166,10 @@ pub(crate) fn adopt_buzz_data_dir(data_dir: &Path) -> Adoption {
             }
             Adoption::Copied { files }
         }
-        Err(error) => Adoption::Failed(error.to_string()),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Adoption::Failed(error.to_string())
+        }
     }
 }
 
@@ -205,6 +241,38 @@ mod tests {
             fs::read_to_string(waggle.join("agents/managed-agents.json")).unwrap(),
             "edited in waggle"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_interrupted_copy_retries_from_scratch_on_the_next_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let (waggle, buzz) = dirs(&tmp);
+        seed(&buzz, "agents/managed-agents.json", "from buzz");
+        seed(&buzz, "blocked/file.txt", "unreachable");
+
+        // Strip read/execute from a subdirectory so `copy_tree` fails partway
+        // through, simulating a permissions error or a process kill mid-copy.
+        let blocked = buzz.join("blocked");
+        let mut perms = fs::metadata(&blocked).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&blocked, perms.clone()).unwrap();
+
+        let result = adopt_buzz_data_dir(&waggle);
+
+        perms.set_mode(0o755);
+        fs::set_permissions(&blocked, perms).unwrap();
+
+        assert!(matches!(result, Adoption::Failed(_)));
+        // The destination must stay empty — a partial copy must never land
+        // directly in `data_dir`, where it would be mistaken for the
+        // destination's own data and adoption would never retry.
+        assert!(!has_content(&waggle));
+        assert!(!waggle.join(ADOPTION_MARKER).exists());
+
+        assert_eq!(adopt_buzz_data_dir(&waggle), Adoption::Copied { files: 2 });
     }
 
     #[test]

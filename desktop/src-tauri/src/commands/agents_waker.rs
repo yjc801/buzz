@@ -72,7 +72,7 @@ pub(crate) fn retain_managed_agent_pending(
 /// generic flush loop (`persona_events::flush_active_pending_events`) already
 /// drains every 30s for persona, team, and managed-agent writers — this reuses
 /// that retry path rather than adding a second one.
-pub(super) fn retain_waker_bundle_pending(
+pub(crate) fn retain_waker_bundle_pending(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
@@ -114,6 +114,90 @@ pub(super) fn retain_waker_bundle_pending(
         provider_binary_sha256,
         issued_at,
     )
+}
+
+/// Build a NIP-09 deletion (kind:5) targeting an agent's kind:30180 launch
+/// bundle.
+///
+/// Carries a single `a`-tag with the NIP-33 coordinate
+/// `30180:<owner>:<agent_pubkey>` and no `e`-tag, mirroring
+/// `agent_events::build_agent_delete` — an `e`-tag would route the relay to
+/// the event-id deletion path and leave the parameterized-replaceable
+/// coordinate live.
+fn build_waker_bundle_delete(
+    agent_pubkey: &str,
+    owner_pubkey_hex: &str,
+) -> Result<nostr::EventBuilder, String> {
+    use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
+
+    let coord = format!("{KIND_WAKER_LAUNCH_BUNDLE}:{owner_pubkey_hex}:{agent_pubkey}");
+    let tag =
+        nostr::Tag::parse(["a", coord.as_str()]).map_err(|e| format!("invalid a-tag: {e}"))?;
+    Ok(nostr::EventBuilder::new(nostr::Kind::Custom(5), "").tags(vec![tag]))
+}
+
+/// Purge any pending (unpublished) launch bundle and enqueue a NIP-09
+/// tombstone for the retained kind:30180 coordinate — the disable half of
+/// enrolment, mirroring `commands::agents::tombstone_managed_agent_pending`.
+/// Called whenever `waker_enabled` flips off, or the backend migrates off
+/// `Provider` out from under an enabled agent
+/// (`agent_settings::set_managed_agent_backend`). Best-effort, like every
+/// other tombstone site: a failure is logged and swallowed, and the
+/// tombstone stays queued as `pending_sync` for the existing 30s flush loop
+/// to retry.
+///
+/// # Known gap
+/// This stops a daemon that queries the relay *after* the tombstone lands
+/// (a restart, or a fresh connect) from recovering the previous
+/// authorization. It does NOT reach a daemon that already holds the bundle
+/// in its live, in-memory `BundleState` — the bundle tap has no kind:5
+/// handling today, and `FloorStore::raise_revocation_floor`
+/// (`crates/buzz-waker/src/floors.rs`) has zero production callers yet.
+/// Closing that needs daemon-side revocation delivery, which
+/// `PLANS/BUZZ_WAKER_DESIGN.md` §3 names as an "implementation gate" still
+/// unbuilt — a separate piece of work, not something this desktop-only
+/// change can close on its own.
+pub(crate) fn tombstone_waker_bundle_pending(
+    app: &AppHandle,
+    state: &AppState,
+    agent_pubkey: &str,
+) {
+    use crate::managed_agents::retention::{
+        delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
+        RetainedEvent,
+    };
+    use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
+    use nostr::JsonUtil;
+
+    const KIND_DELETE: u32 = 5;
+
+    let result = (|| -> Result<(), String> {
+        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let owner_pubkey = scope.owner_keys.public_key().to_hex();
+        let event = build_waker_bundle_delete(agent_pubkey, &owner_pubkey)?
+            .sign_with_keys(&scope.owner_keys)
+            .map_err(|e| format!("failed to sign waker-bundle tombstone: {e}"))?;
+        let conn = open_retention_db(&scope.db_path)?;
+        delete_retained_event(&conn, KIND_WAKER_LAUNCH_BUNDLE, &owner_pubkey, agent_pubkey)?;
+        retain_event(
+            &conn,
+            &RetainedEvent {
+                kind: KIND_DELETE,
+                pubkey: owner_pubkey,
+                // Key by the target coordinate so cross-kind d-tag tombstones
+                // occupy distinct rows (same reasoning as
+                // `tombstone_managed_agent_pending`).
+                d_tag: tombstone_retention_d_tag(KIND_WAKER_LAUNCH_BUNDLE, agent_pubkey),
+                content: event.content.to_string(),
+                created_at: event.created_at.as_secs() as i64,
+                raw_event: event.as_json(),
+                pending_sync: true,
+            },
+        )
+    })();
+    if let Err(e) = result {
+        eprintln!("buzz-desktop: waker-bundle-tombstone: {e}");
+    }
 }
 
 /// The pure half of [`retain_waker_bundle_pending`]: reserve a version, sign,

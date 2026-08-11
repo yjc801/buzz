@@ -30,10 +30,12 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     Ok(keys.public_key().to_hex())
 }
 
-// Moved to `waker::retain_managed_agent_pending` (`agents_waker.rs`) to keep
-// this file under the size ratchet (`desktop/scripts/check-file-sizes.mjs`);
-// re-exported so every existing call site is unchanged.
-pub(super) use waker::retain_managed_agent_pending;
+// Implemented in `waker::*` (`agents_waker.rs`) to keep this file under the
+// size ratchet (`desktop/scripts/check-file-sizes.mjs`); re-exported so
+// `commands::agent_settings` can reach them without a `mod`-path change.
+pub(super) use waker::{
+    retain_managed_agent_pending, retain_waker_bundle_pending, tombstone_waker_bundle_pending,
+};
 
 /// Purge a deleted agent's pending row and enqueue a NIP-09 tombstone, both
 /// inside the `managed_agents_store_lock`-held delete body and NEVER across an

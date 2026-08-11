@@ -173,6 +173,7 @@ pub async fn set_managed_agent_backend(
         let personas = load_personas(&app).unwrap_or_default();
         let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
 
+        let leaving_provider_waker;
         {
             let record = find_managed_agent_mut(&mut records, &pubkey)?;
 
@@ -197,6 +198,15 @@ pub async fn set_managed_agent_backend(
                     .is_some(),
             };
             validate_backend_migration(&record.backend, &backend, &observed)?;
+
+            // `set_managed_agent_waker_enabled` refuses to enable buzz-waker
+            // for anything but a `Provider` backend, so a still-enabled agent
+            // migrating off one is leaving the only backend its retained
+            // launch bundle authorizes. Force it off and revoke below —
+            // otherwise the stale bundle would keep authorizing a remote
+            // deploy for a backend this agent no longer runs on.
+            leaving_provider_waker =
+                record.waker_enabled && !matches!(backend, BackendKind::Provider { .. });
 
             record.provider_binary_path = match backend {
                 // Cache the discovered path for `deploy_to_provider`, the same
@@ -227,9 +237,17 @@ pub async fn set_managed_agent_backend(
             record.start_on_app_launch = false;
             record.backend = backend;
             record.updated_at = now_iso();
+            if leaving_provider_waker {
+                record.waker_enabled = false;
+            }
         }
 
         save_managed_agents(&app, &records)?;
+
+        if leaving_provider_waker {
+            super::agents::tombstone_waker_bundle_pending(&app, &state, &pubkey);
+        }
+
         let record = records
             .iter()
             .find(|record| record.pubkey == pubkey)
@@ -359,23 +377,59 @@ pub async fn set_managed_agent_waker_enabled(
             state.clear_agent_session_caches(pubkey);
         }
 
-        {
+        let was_enabled = {
             let record = find_managed_agent_mut(&mut records, &pubkey)?;
             if waker_enabled && !matches!(record.backend, BackendKind::Provider { .. }) {
                 return Err(
                     "buzz-waker can only deploy agents running on a provider backend".to_string(),
                 );
             }
+            let was_enabled = record.waker_enabled;
             record.waker_enabled = waker_enabled;
             record.updated_at = now_iso();
-        }
+            was_enabled
+        };
 
         save_managed_agents(&app, &records)?;
+
+        if was_enabled && !waker_enabled {
+            // Durable revoke: see `tombstone_waker_bundle_pending`'s own doc
+            // for what this does and does not close.
+            super::agents::tombstone_waker_bundle_pending(&app, &state, &pubkey);
+        }
+
+        if waker_enabled && !was_enabled {
+            // Enrolment: a swallowed issuance failure here would report
+            // success while buzz-waker has nothing to deploy, and — per G3
+            // (never a bare liveness ping) — nothing else would retry it.
+            // Fail the command and roll the flag back so a retry re-enters
+            // this same transition rather than looking like a completed
+            // no-op.
+            let record = records
+                .iter()
+                .find(|record| record.pubkey == pubkey)
+                .ok_or_else(|| format!("agent {pubkey} not found"))?;
+            if let Err(e) = super::agents::retain_waker_bundle_pending(&app, &state, record) {
+                let record = find_managed_agent_mut(&mut records, &pubkey)?;
+                record.waker_enabled = false;
+                record.updated_at = now_iso();
+                save_managed_agents(&app, &records)?;
+                return Err(format!(
+                    "buzz-waker enrolment failed to issue a launch bundle: {e}"
+                ));
+            }
+        } else {
+            let record = records
+                .iter()
+                .find(|record| record.pubkey == pubkey)
+                .ok_or_else(|| format!("agent {pubkey} not found"))?;
+            super::agents::retain_managed_agent_pending(&app, &state, record);
+        }
+
         let record = records
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
-        super::agents::retain_managed_agent_pending(&app, &state, record);
         let personas = load_personas(&app).unwrap_or_default();
         build_managed_agent_summary(
             &app,

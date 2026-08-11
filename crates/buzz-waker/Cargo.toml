@@ -31,6 +31,10 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 hex         = { workspace = true }
 uuid        = { workspace = true }
+# Zeroes decrypted launch-bundle plaintext after use — it carries the
+# agent's nsec, same hygiene `buzz-core::pairing::session` already applies
+# to NIP-44 plaintext.
+zeroize     = { workspace = true }
 # The feed's transport, and the only reason this crate touches a socket. The
 # decision core, the cursor and the attempt state machine stay effect-free —
 # `feed::FeedTransport` is the seam, and `relay_feed` is its one implementation.

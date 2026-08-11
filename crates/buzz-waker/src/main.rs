@@ -3,31 +3,30 @@
 //! Env-var configured — this repo's other daemons don't use clap; see
 //! `crates/buzz-relay/src/main.rs` and `crates/buzz-pair-relay/src/main.rs`
 //! for the pattern this follows. JSON-structured logs, graceful shutdown on
-//! SIGTERM/Ctrl+C via a shared [`CancellationToken`], and one mention-feed
-//! loop ([`buzz_waker::wake_loop::run_wake_loop`]) plus one presence tap
-//! ([`buzz_waker::presence_feed::run_presence_tap`]) spawned per configured
-//! agent.
+//! SIGTERM/Ctrl+C via a shared [`CancellationToken`], and three tasks spawned
+//! per configured agent: the mention-feed loop
+//! ([`buzz_waker::wake_loop::run_wake_loop`]), the presence tap
+//! ([`buzz_waker::presence_feed::run_presence_tap`]), and the bundle-delivery
+//! tap ([`buzz_waker::bundle_feed::run_bundle_tap`]).
 //!
 //! # Configuration
 //!
 //! | Env var | Required | Meaning |
 //! |---|---|---|
-//! | `WAKER_RELAY_URL` | yes | The relay every watched agent's mention feed and presence tap connects to. |
-//! | `WAKER_STATE_DIR` | yes | Base directory for durable per-agent state (`<dir>/<pubkey>/cursor.json`). Created if missing. |
+//! | `WAKER_RELAY_URL` | yes | The relay every watched agent's mention feed, presence tap, and bundle tap connects to. |
+//! | `WAKER_STATE_DIR` | yes | Base directory for durable per-agent state (`<dir>/<pubkey>/{cursor,floor}.json`). Created if missing. |
 //! | `WAKER_AGENTS_CONFIG_PATH` | yes | Path to a JSON file listing the agents to watch — see [`AgentConfig`]. |
 //! | `RUST_LOG` | no | `tracing-subscriber` env filter. Defaults to `buzz_waker=info`. |
 //!
-//! # What is deliberately not here
+//! # What is still deliberately not here
 //!
-//! Bundle transport (how a signed launch bundle reaches this daemon) and the
-//! provider deploy wire protocol are both out of scope for this build — see
-//! `buzz_waker::effects`'s module doc. Agent identities and the watch list
-//! are therefore read from local config rather than from a delivered bundle,
-//! and every real wake attempt ends in `WakeOutcome::DeployFailed`, loudly
-//! logged, rather than a faked success. Wiring a real signed-bundle source in
-//! later only has to replace [`load_agents`] and the construction of
-//! [`AgentConfig`] below; nothing in `wake_loop` or `effects` assumes local
-//! config.
+//! The "generation nonce" the bundle doc mentions as a second wake-specific
+//! substitution has no concrete contract anywhere in this codebase yet — see
+//! `buzz_waker::effects`'s module doc. Agent identities, the watch list, and
+//! each agent's owner pubkey (pinned into its [`buzz_waker::floors::FloorStore`]
+//! on first run, **G2**) are read from local config, matching the ecosystem's
+//! existing agent-identity provisioning story — nothing about *that* pin can
+//! come from a delivered bundle without defeating the pin's own purpose.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -39,7 +38,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use buzz_waker::bundle_feed::{run_bundle_tap, BundleState};
 use buzz_waker::decide::normalize_pubkey;
+use buzz_waker::floors::FloorStore;
 use buzz_waker::presence_feed::{run_presence_tap, PresenceState};
 use buzz_waker::wake_loop::{run_wake_loop, WakeLoopConfig};
 
@@ -59,6 +60,13 @@ struct AgentConfig {
     /// the restricted connection class this tag would otherwise request.
     #[serde(default)]
     auth_tag: Option<Vec<String>>,
+    /// The owner's pubkey, hex — pinned into this agent's [`FloorStore`] on
+    /// first run (**G2**) and used to scope the bundle-delivery query's
+    /// `authors` filter. Read from local config, not from any delivered
+    /// bundle: the pin has to exist independently of anything a bundle could
+    /// claim about itself, or a compromised bundle could pin its own
+    /// attacker-controlled owner.
+    owner_pubkey: String,
 }
 
 fn env_var(name: &str) -> anyhow::Result<String> {
@@ -126,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
 
     let agent_configs = load_agents(&agents_config_path)?;
 
-    let mut keys_by_agent: Vec<(Keys, Option<Tag>)> = Vec::with_capacity(agent_configs.len());
+    let mut keys_by_agent: Vec<(Keys, Option<Tag>, String)> =
+        Vec::with_capacity(agent_configs.len());
     let mut seen_pubkeys = HashSet::new();
     for agent in agent_configs {
         let keys = Keys::parse(&agent.nsec)
@@ -140,7 +149,8 @@ async fn main() -> anyhow::Result<()> {
             .map(Tag::parse)
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid auth_tag for agent {pubkey}: {e}"))?;
-        keys_by_agent.push((keys, auth_tag));
+        let owner_pubkey = normalize_pubkey(&agent.owner_pubkey);
+        keys_by_agent.push((keys, auth_tag, owner_pubkey));
     }
 
     // This daemon's whole known-agent baseline — see `effects`'s module doc
@@ -149,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     // roster.
     let watch_list: Arc<[String]> = keys_by_agent
         .iter()
-        .map(|(keys, _)| normalize_pubkey(&keys.public_key().to_hex()))
+        .map(|(keys, _, _)| normalize_pubkey(&keys.public_key().to_hex()))
         .collect::<Vec<_>>()
         .into();
 
@@ -163,17 +173,34 @@ async fn main() -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let mut tasks: JoinSet<(String, &'static str)> = JoinSet::new();
 
-    for (keys, auth_tag) in keys_by_agent {
+    for (keys, auth_tag, owner_pubkey) in keys_by_agent {
         let pubkey = normalize_pubkey(&keys.public_key().to_hex());
         let agent_dir = state_dir.join(&pubkey);
         std::fs::create_dir_all(&agent_dir).map_err(|e| {
             anyhow::anyhow!("could not create state dir {}: {e}", agent_dir.display())
         })?;
         let cursor_path = agent_dir.join("cursor.json");
+        let floor_path = agent_dir.join("floor.json");
 
         let presence_state = Arc::new(PresenceState::new());
+        let bundle_state = Arc::new(BundleState::new());
 
-        tracing::info!(agent = %pubkey, "buzz-waker: watching agent");
+        // Open-or-enroll, matching `CursorStore::open_or_start`'s idempotent
+        // shape: a fresh state dir enrolls fresh, an existing one re-opens
+        // its durable floors (G2) rather than resetting them.
+        let mut floor_store = match FloorStore::open(&floor_path) {
+            Ok(store) => store,
+            Err(buzz_waker::floors::FloorError::NotEnrolled { .. }) => {
+                FloorStore::enroll(&floor_path, &owner_pubkey).map_err(|e| {
+                    anyhow::anyhow!("could not enroll floor store for {pubkey}: {e}")
+                })?
+            }
+            Err(e) => {
+                anyhow::bail!("could not open floor store for {pubkey}: {e}")
+            }
+        };
+
+        tracing::info!(agent = %pubkey, owner = %owner_pubkey, "buzz-waker: watching agent");
 
         {
             let relay_url = relay_url.clone();
@@ -196,6 +223,29 @@ async fn main() -> anyhow::Result<()> {
         }
 
         {
+            let relay_url = relay_url.clone();
+            let keys = keys.clone();
+            let auth_tag = auth_tag.clone();
+            let owner_pubkey = owner_pubkey.clone();
+            let bundle_state = Arc::clone(&bundle_state);
+            let cancel = cancel.clone();
+            let pubkey = pubkey.clone();
+            tasks.spawn(async move {
+                run_bundle_tap(
+                    &relay_url,
+                    &keys,
+                    auth_tag.as_ref(),
+                    &owner_pubkey,
+                    &mut floor_store,
+                    &bundle_state,
+                    &cancel,
+                )
+                .await;
+                (pubkey, "bundle_tap")
+            });
+        }
+
+        {
             let config = WakeLoopConfig {
                 relay_url: relay_url.clone(),
                 keys,
@@ -203,10 +253,7 @@ async fn main() -> anyhow::Result<()> {
                 cursor_path,
                 presence_state,
                 watch_list: Arc::clone(&watch_list),
-                // No bundle transport into this daemon build yet — see
-                // `effects`'s module doc. Every real wake attempt reaches
-                // the deploy step and fails with `EffectsError::NoBundle`.
-                bundle: None,
+                bundle_state,
             };
             let cancel = cancel.clone();
             let pubkey = pubkey.clone();
@@ -264,10 +311,15 @@ mod tests {
 
     #[test]
     fn agent_config_parses_the_documented_shape() {
-        let json = r#"[{"nsec": "nsec1abc"}, {"nsec": "deadbeef", "auth_tag": ["auth", "token"]}]"#;
+        let owner = "a".repeat(64);
+        let json = format!(
+            r#"[{{"nsec": "nsec1abc", "owner_pubkey": "{owner}"}}, {{"nsec": "deadbeef", "auth_tag": ["auth", "token"], "owner_pubkey": "{owner}"}}]"#
+        );
+        let json = json.as_str();
         let agents: Vec<AgentConfig> = serde_json::from_str(json).expect("parses");
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].auth_tag, None);
+        assert_eq!(agents[0].owner_pubkey, owner);
         assert_eq!(
             agents[1].auth_tag,
             Some(vec!["auth".to_string(), "token".to_string()])
@@ -294,7 +346,14 @@ mod tests {
     fn a_valid_agent_list_round_trips_through_load_agents() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agents.json");
-        std::fs::write(&path, r#"[{"nsec": "deadbeef"}]"#).expect("write");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[{{"nsec": "deadbeef", "owner_pubkey": "{}"}}]"#,
+                "a".repeat(64)
+            ),
+        )
+        .expect("write");
 
         let agents = load_agents(path.to_str().expect("utf8 path")).expect("loads");
         assert_eq!(agents.len(), 1);

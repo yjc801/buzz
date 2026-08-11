@@ -25,13 +25,16 @@
 //!   watched agent that feeds both [`attempt::WakeEffects::presence`] and
 //!   [`attempt::WakeEffects::heartbeat`], since presence carries no history
 //!   to query separately.
+//! - [`bundle_feed`] — the **bundle-delivery tap**: one live subscription per
+//!   watched agent, over the relay this daemon already connects to (§11),
+//!   that decrypts, verifies (against [`floors::FloorStore`]'s pinned
+//!   owner), and admits a signed launch bundle without ever needing a new
+//!   network path to the desktop.
 //! - [`effects`] — [`effects::RealWakeEffects`], the production
-//!   [`attempt::WakeEffects`] implementation wiring the presence tap in and
-//!   `start_managed_agent` to the provider deploy wire protocol
-//!   (`buzz-provider-deploy`, shared with the desktop app). It still cannot
-//!   complete a *real* wake: obtaining a signed launch bundle at runtime
-//!   needs bundle transport, an explicit, separately deferred seam (see the
-//!   module doc).
+//!   [`attempt::WakeEffects`] implementation wiring the presence tap and the
+//!   bundle tap's admitted state in, and `start_managed_agent` to the
+//!   provider deploy wire protocol (`buzz-provider-deploy`, shared with the
+//!   desktop app).
 //! - [`wake_loop`] — the connection loop: drives [`feed::FeedTransport`] plus
 //!   the reconnect ladder plus [`feed::step`], and spawns each admitted
 //!   trigger's [`attempt::run_wake_attempt`] onto its own task so the loop
@@ -42,6 +45,7 @@
 
 pub mod attempt;
 pub mod bundle;
+pub mod bundle_feed;
 pub mod cursor;
 pub mod decide;
 pub mod effects;

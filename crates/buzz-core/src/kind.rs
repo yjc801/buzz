@@ -117,6 +117,32 @@ pub const KIND_PUSH_LEASE: u32 = 30350;
 /// plus exact public projection bindings. See `docs/nips/NIP-PMA.md`.
 pub const KIND_PRIVATE_MANAGED_AGENT: u32 = 30179;
 
+/// buzz-waker signed launch bundle delivery (parameterized replaceable,
+/// owner-authored).
+///
+/// Addressed by `(owner pubkey, kind, agent pubkey)` — `d_tag` is the target
+/// agent's pubkey, same convention as [`KIND_MANAGED_AGENT`]. Carries the
+/// desktop-issued `SignedLaunchBundle` (`buzz-waker::bundle`) that lets a
+/// headless `buzz-waker` daemon deploy this agent without the desktop
+/// running. Content is NIP-44 v2 encrypted from the owner's key to the
+/// target agent's pubkey — unlike [`KIND_PRIVATE_MANAGED_AGENT`], which
+/// self-encrypts (owner reads its own data), this one is owner→agent so the
+/// daemon, holding the agent's key, can decrypt it.
+///
+/// The signed outer event's own signature is *not* the trust boundary — the
+/// bundle inside carries its own BIP-340 signature, checked against a
+/// separately enrolment-pinned owner key. The outer signature only needs to
+/// be the owner's real key so ordinary ingest (`event.pubkey == the
+/// authenticated publisher`) refuses a forged sender outright, and so NIP-33
+/// replacement — keyed by `(pubkey, kind, d_tag)` — means an attacker can
+/// never displace or bury the owner's current bundle: any event under this
+/// kind from any other signer occupies a different coordinate entirely.
+///
+/// Member of [`P_GATED_KINDS`]: readable only by the connection authenticated
+/// as the `d_tag` agent. See `PLANS/BUZZ_WAKER_DESIGN.md` §11 (design review
+/// closed, Alex, 2026-08-11).
+pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 30180;
+
 /// Kinds whose stored events are readable only by their author.
 ///
 /// The relay must never reveal the existence, count, tags, content, schedule,
@@ -139,7 +165,11 @@ pub const AUTHOR_ONLY_KINDS: &[u32] = &[
 ///
 /// Used by `filter_can_match_result_gated_kinds` to force the per-event
 /// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_AGENT_TURN_METRIC,
+    KIND_WAKER_LAUNCH_BUNDLE,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.
@@ -166,6 +196,10 @@ pub const P_GATED_KINDS: &[u32] = &[
     // readable by any unauthenticated or non-owner party, including via `ids`
     // filters — see NIP-AM §Relay Behavior.
     KIND_AGENT_TURN_METRIC,
+    // The launch bundle carries an agent's private key (NIP-44 encrypted, but
+    // still) — must not be readable by any connection but the target agent's
+    // own, including via `ids` filters.
+    KIND_WAKER_LAUNCH_BUNDLE,
 ];
 
 /// NIP-AP: Agent Persona (parameterized replaceable, owner-authored).

@@ -8,7 +8,8 @@ use tracing::{debug, warn};
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
     is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC,
-    KIND_DM_VISIBILITY, P_GATED_KINDS, RESULT_GATED_KINDS, SHARED_GATED_KINDS,
+    KIND_DM_VISIBILITY, KIND_WAKER_LAUNCH_BUNDLE, P_GATED_KINDS, RESULT_GATED_KINDS,
+    SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -1091,12 +1092,19 @@ pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: 
         // when `ids` is present. KIND_AGENT_TURN_METRIC events are long-lived
         // and their cleartext envelope (pubkey, agent tag, created_at) leaks
         // turn-activity metadata — knowing an event id is NOT authorization
-        // (NIP-AM §Relay Behavior). Only filters that explicitly name the kind
-        // lose the exemption — a kindless `ids` lookup is unaffected.
+        // (NIP-AM §Relay Behavior). KIND_WAKER_LAUNCH_BUNDLE is the same shape:
+        // NIP-44-encrypted content, but its cleartext envelope (owner pubkey,
+        // agent d-tag, created_at) leaks exactly when an owner is (re)issuing
+        // wake credentials to which agent, and hands out the raw ciphertext for
+        // offline attack — same reasoning, same exemption loss. Only filters
+        // that explicitly name the kind lose the exemption — a kindless `ids`
+        // lookup is unaffected.
         let explicitly_no_ids_exemption = filter.kinds.as_ref().is_some_and(|ks| {
             ks.iter().any(|kind| {
                 let k = kind.as_u16() as u32;
-                k == KIND_DM_VISIBILITY || k == KIND_AGENT_TURN_METRIC
+                k == KIND_DM_VISIBILITY
+                    || k == KIND_AGENT_TURN_METRIC
+                    || k == KIND_WAKER_LAUNCH_BUNDLE
             })
         });
         if !explicitly_no_ids_exemption && filter.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
@@ -1844,6 +1852,66 @@ mod tests {
         assert!(
             p_gated_filters_authorized(&[owner_p_and_ids], authed),
             "kind:44200 with matching #p and ids must be allowed"
+        );
+    }
+
+    /// Bundle transport (`PLANS/BUZZ_WAKER_DESIGN.md` §11) implementation
+    /// gate 4: only the tagged agent's own authenticated connection can query
+    /// a launch bundle. Same shape as `agent_turn_metric_requires_p_tag_even_with_ids`
+    /// — NIP-44-encrypted content, but the cleartext envelope (owner pubkey,
+    /// agent d-tag, timestamps) is itself sensitive, so the `ids` exemption is
+    /// lost for this kind too (loss confirmed in cases 1–2; the general
+    /// kindless-`ids` pass-through in case 3 is unaffected, same as
+    /// `KIND_AGENT_TURN_METRIC`'s and matches its own comment above).
+    #[test]
+    fn waker_launch_bundle_requires_p_tag_even_with_ids() {
+        let p_tag = SingleLetterTag::lowercase(Alphabet::P);
+        let authed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let event_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let bundle_kind = nostr::Kind::Custom(buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE as u16);
+
+        // Case 1: {kinds:[30180], ids:[...]} — explicit kind, requires #p agent.
+        let explicit_kind_ids_only = Filter::new()
+            .kind(bundle_kind)
+            .id(nostr::EventId::from_hex(event_id).unwrap());
+        assert!(
+            !p_gated_filters_authorized(&[explicit_kind_ids_only], authed),
+            "kind:30180 + ids without matching #p must be denied"
+        );
+
+        let explicit_kind_wrong_p = Filter::new()
+            .kind(bundle_kind)
+            .id(nostr::EventId::from_hex(event_id).unwrap())
+            .custom_tags(p_tag, [other]);
+        assert!(
+            !p_gated_filters_authorized(&[explicit_kind_wrong_p], authed),
+            "kind:30180 + ids + wrong #p must be denied"
+        );
+
+        // Case 2: kindless {ids:[...]} — passes this filter-level gate, same as
+        // every other p-gated kind; the result-level gate is the enforcement
+        // point for that path (`reader_authorized_for_event`).
+        let kindless_ids = Filter::new().id(nostr::EventId::from_hex(event_id).unwrap());
+        assert!(
+            p_gated_filters_authorized(&[kindless_ids], authed),
+            "kindless ids filter passes this filter gate — result-level gate closes the path"
+        );
+
+        // Case 3: the agent querying by #p is allowed, ids or not.
+        let agent_by_p = Filter::new().kind(bundle_kind).custom_tags(p_tag, [authed]);
+        assert!(
+            p_gated_filters_authorized(&[agent_by_p], authed),
+            "kind:30180 with matching #p must be allowed"
+        );
+
+        let agent_p_and_ids = Filter::new()
+            .kind(bundle_kind)
+            .id(nostr::EventId::from_hex(event_id).unwrap())
+            .custom_tags(p_tag, [authed]);
+        assert!(
+            p_gated_filters_authorized(&[agent_p_and_ids], authed),
+            "kind:30180 with matching #p and ids must be allowed"
         );
     }
 

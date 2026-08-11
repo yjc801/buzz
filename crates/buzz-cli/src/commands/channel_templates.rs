@@ -15,7 +15,12 @@ use crate::error::CliError;
 /// Tauri bundle identifier for the production desktop app. `dirs::data_dir()`
 /// joined with this segment matches `app.path().app_data_dir()` exactly
 /// (Tauri resolves app-data as the platform data dir plus the identifier).
-const PROD_BUNDLE_IDENTIFIER: &str = "xyz.block.buzz.app";
+///
+/// This fork's desktop app is Waggle, so it must track
+/// `desktop/src-tauri/tauri.conf.json`'s `identifier` rather than upstream's.
+/// Left pointing at `xyz.block.buzz.app` it would silently read a different
+/// app's templates — or an empty directory on a machine that never ran Buzz.
+const PROD_BUNDLE_IDENTIFIER: &str = "xyz.waggle.app";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelTemplateRecord {
@@ -143,7 +148,7 @@ mod tests {
     #[test]
     fn resolve_templates_path_defaults_to_prod_bundle() {
         let path = resolve_templates_path(None).unwrap();
-        assert!(path.ends_with("xyz.block.buzz.app/templates/channel-templates.json"));
+        assert!(path.ends_with("xyz.waggle.app/templates/channel-templates.json"));
     }
 
     #[test]

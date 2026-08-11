@@ -1,4 +1,5 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
+mod adopt_buzz_data;
 mod app_menu;
 mod app_state;
 mod archive;
@@ -322,6 +323,10 @@ pub fn run() {
             // init_nest_dir is called early here (normally it runs inside
             // run_boot_migrations) so reset::run_boot_reset can call nest_dir().
             let reset_outcome = if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                // Must precede every read of the data directory — see the
+                // module docs for why the rename makes this necessary.
+                adopt_buzz_data::run_at_boot(&data_dir);
+
                 let is_dev_for_reset = data_dir
                     .file_name()
                     .and_then(|n| n.to_str())

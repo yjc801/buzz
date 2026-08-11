@@ -348,10 +348,7 @@ fn seed_up_migrates_sibling_file_to_canonical_then_symlinks() {
     let rel = "agents/personas.json";
     // Canonical is missing the file; a sibling (.main) holds real content.
     std::fs::remove_file(canonical.join(rel)).unwrap();
-    let sibling = canonical
-        .parent()
-        .unwrap()
-        .join("xyz.waggle.app.dev.main");
+    let sibling = canonical.parent().unwrap().join("xyz.waggle.app.dev.main");
     std::fs::create_dir_all(sibling.join("agents")).unwrap();
     std::fs::write(sibling.join(rel), r#"[{"id":"brain"}]"#).unwrap();
 
@@ -394,10 +391,7 @@ fn seed_up_skipped_when_canonical_has_file() {
     let (_parent, canonical, worktree) = setup_sync_layout();
     let rel = "agents/personas.json";
     // A sibling also holds different content, but canonical already has the file.
-    let sibling = canonical
-        .parent()
-        .unwrap()
-        .join("xyz.waggle.app.dev.main");
+    let sibling = canonical.parent().unwrap().join("xyz.waggle.app.dev.main");
     std::fs::create_dir_all(sibling.join("agents")).unwrap();
     std::fs::write(sibling.join(rel), r#"[{"id":"should-not-win"}]"#).unwrap();
 
@@ -421,10 +415,7 @@ fn seed_up_ignores_sibling_symlink_as_source() {
     let rel = "agents/personas.json";
     std::fs::remove_file(canonical.join(rel)).unwrap();
     // Sibling holds only a symlink (not real content) — not a valid seed source.
-    let sibling = canonical
-        .parent()
-        .unwrap()
-        .join("xyz.waggle.app.dev.main");
+    let sibling = canonical.parent().unwrap().join("xyz.waggle.app.dev.main");
     std::fs::create_dir_all(sibling.join("agents")).unwrap();
     std::os::unix::fs::symlink(
         PathBuf::from("/nonexistent/elsewhere.json"),
@@ -480,10 +471,7 @@ fn sync_creates_teams_directory_symlink() {
 #[test]
 fn sync_migrates_teams_from_sibling_to_canonical() {
     let (_parent, canonical, worktree) = setup_sync_layout();
-    let main_instance = canonical
-        .parent()
-        .unwrap()
-        .join("xyz.waggle.app.dev.main");
+    let main_instance = canonical.parent().unwrap().join("xyz.waggle.app.dev.main");
 
     // Before sync: canonical has no teams, .main has the real team dir.
     assert!(!canonical.join("agents/teams").exists());

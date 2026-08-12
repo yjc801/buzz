@@ -27,7 +27,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE;
+use buzz_core::kind::KIND_WAKER_BUNDLE_ENVELOPE;
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Keys, Tag};
 use serde_json::{json, Value};
@@ -57,6 +57,17 @@ pub const BUNDLE_TAP_IDLE_TIMEOUT_SECS: u64 = 300;
 /// than handing an oversized or malformed string to the decryptor.
 const NIP44_CONTENT_LEN_RANGE: std::ops::RangeInclusive<usize> = 132..=87472;
 
+/// How many envelopes to ask for on subscribe.
+///
+/// The envelope kind is not parameterized-replaceable, so every reissue and
+/// revocation lands beside its predecessors instead of replacing them, and an
+/// unbounded query would grow with an agent's whole enrolment history. The
+/// newest is the one that matters — anything older is at or below the
+/// [`FloorStore`]'s revocation floor and would be refused anyway — so a small
+/// window is enough while still leaving room to observe a revocation that
+/// arrived immediately after the bundle it revokes.
+const BUNDLE_QUERY_LIMIT: u32 = 16;
+
 /// The REQ filter for one agent's bundle tap: global, `authors` pinned to
 /// the enrolment-pinned owner, `#p` pinned to the target agent.
 ///
@@ -64,13 +75,21 @@ const NIP44_CONTENT_LEN_RANGE: std::ops::RangeInclusive<usize> = 132..=87472;
 /// in this query's results — ordinary ingest already refuses a forged
 /// `event.pubkey`, so `authors` here is redundant with what the relay
 /// enforces at write time, kept as defense in depth and to make the query's
-/// own intent explicit (§11).
+/// own intent explicit (§11). It matters more under the envelope kind than it
+/// did under a dedicated one: the envelope is a kind any member may write, so
+/// `authors` is what keeps this query from surfacing anyone else's traffic to
+/// this agent.
+///
+/// `#p` is not optional. The relay refuses an envelope query that does not
+/// carry one (`push_filter_authorized_for_event`'s read-path counterpart), so
+/// a filter without it is closed rather than answered.
 #[must_use]
 pub fn bundle_filter(owner_pubkey: &str, agent_pubkey: &str) -> Value {
     json!({
-        "kinds": [KIND_WAKER_LAUNCH_BUNDLE],
+        "kinds": [KIND_WAKER_BUNDLE_ENVELOPE],
         "authors": [normalize_pubkey(owner_pubkey)],
         "#p": [normalize_pubkey(agent_pubkey)],
+        "limit": BUNDLE_QUERY_LIMIT,
     })
 }
 
@@ -135,7 +154,7 @@ impl BundleState {
 /// this tap does not read collapses to [`BundleFrame::Ignored`].
 #[derive(Debug, PartialEq, Eq)]
 enum BundleFrame {
-    /// A verified `kind:30180` delivery, authored by the pinned owner,
+    /// A verified envelope delivery, authored by the pinned owner,
     /// carrying its raw (still-encrypted) content.
     Delivered { ciphertext: String },
     /// An event on this subscription that failed signature verification.
@@ -170,7 +189,7 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
                     reason: error.to_string(),
                 };
             }
-            if buzz_core::kind::event_kind_u32(&event) != KIND_WAKER_LAUNCH_BUNDLE {
+            if buzz_core::kind::event_kind_u32(&event) != KIND_WAKER_BUNDLE_ENVELOPE {
                 return BundleFrame::Ignored;
             }
             if normalize_pubkey(&event.pubkey.to_hex()) != normalize_pubkey(owner_pubkey) {
@@ -433,13 +452,71 @@ mod tests {
     use nostr::{EventBuilder, Kind};
 
     fn bundle_event(owner: &Keys, ciphertext: &str, agent_pubkey: &str) -> nostr::Event {
-        EventBuilder::new(Kind::Custom(KIND_WAKER_LAUNCH_BUNDLE as u16), ciphertext)
+        EventBuilder::new(Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16), ciphertext)
             .tags([
                 Tag::parse(["d", agent_pubkey]).unwrap(),
                 Tag::parse(["p", agent_pubkey]).unwrap(),
             ])
             .sign_with_keys(owner)
             .expect("sign")
+    }
+
+    /// The transport regression. A bundle published under the payload kind is
+    /// refused at ingest by any relay that has not adopted it — which is what
+    /// made remote wake silently impossible, since the desktop discards the
+    /// rejection and this tap simply never receives anything. The query must
+    /// name the envelope kind, and must carry `#p`, which the relay requires
+    /// for this kind rather than answering an unscoped query.
+    #[test]
+    fn the_query_asks_for_the_envelope_kind_not_the_payload_kind() {
+        let owner_pubkey = "b".repeat(64);
+        let agent_pubkey = "a".repeat(64);
+        let filter = bundle_filter(&owner_pubkey, &agent_pubkey);
+
+        assert_eq!(
+            filter["kinds"],
+            json!([KIND_WAKER_BUNDLE_ENVELOPE]),
+            "publishing under the payload kind is what the relay rejects"
+        );
+        assert_ne!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE]),
+            "the payload kind must never reach the wire"
+        );
+        assert_eq!(filter["#p"], json!([agent_pubkey]), "#p is not optional");
+        assert_eq!(filter["authors"], json!([owner_pubkey]));
+        assert!(
+            filter["limit"].is_number(),
+            "the envelope is not replaceable, so the query must be bounded"
+        );
+    }
+
+    /// An envelope carrying the payload kind's number must not be mistaken for
+    /// a delivery: the tap keys off the envelope kind alone.
+    #[test]
+    fn an_event_under_the_payload_kind_is_ignored() {
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let agent_pubkey = "a".repeat(64);
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE as u16),
+            "ciphertext-bytes",
+        )
+        .tags([
+            Tag::parse(["d", &agent_pubkey]).unwrap(),
+            Tag::parse(["p", &agent_pubkey]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign");
+
+        let frame = bundle_frame(
+            &owner_pubkey,
+            RelayMessage::Event {
+                subscription_id: BUNDLE_TAP_SUBSCRIPTION_ID.to_string(),
+                event: Box::new(event),
+            },
+        );
+        assert_eq!(frame, BundleFrame::Ignored);
     }
 
     #[test]

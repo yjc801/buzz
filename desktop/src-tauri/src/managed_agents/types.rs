@@ -252,7 +252,7 @@ pub struct ManagedAgentRecord {
     pub residual_deployments: Vec<ResidualDeployment>,
     #[serde(default)]
     pub provider_binary_path: Option<String>,
-    /// Opt-in: publish a signed launch bundle (kind:30180) so `buzz-waker`
+    /// Opt-in: publish a signed launch bundle so `buzz-waker`
     /// can deploy this agent to its `Provider` backend while desktop is
     /// offline. Meaningless for `BackendKind::Local`, which a remote daemon
     /// has nothing to invoke. Default `false` — a bundle carries this

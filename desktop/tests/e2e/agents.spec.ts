@@ -2634,7 +2634,7 @@ test("the run-location move is reachable from an agent's settings menu", async (
   await expect(
     page
       .getByTestId("migrate-agent-dialog")
-      .getByText("Move Relocatable instance", { exact: true }),
+      .getByText("Migrate Relocatable instance", { exact: true }),
   ).toBeVisible();
 });
 

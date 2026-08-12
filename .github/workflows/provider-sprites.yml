@@ -33,11 +33,6 @@ on:
   push:
     branches: [main]
     tags: ["buzz-backend-sprites-v*"]
-    paths:
-      - "crates/buzz-backend-sprites/**"
-      - "crates/buzz-provider-deploy/**"
-      - "Cargo.lock"
-      - ".github/workflows/provider-sprites.yml"
   workflow_dispatch:
     inputs:
       publish:

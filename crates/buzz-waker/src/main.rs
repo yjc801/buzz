@@ -20,13 +20,11 @@
 //!
 //! # What is still deliberately not here
 //!
-//! The "generation nonce" the bundle doc mentions as a second wake-specific
-//! substitution has no concrete contract anywhere in this codebase yet — see
-//! `buzz_waker::effects`'s module doc. Agent identities, the watch list, and
-//! each agent's owner pubkey (pinned into its [`buzz_waker::floors::FloorStore`]
-//! on first run, **G2**) are read from local config, matching the ecosystem's
-//! existing agent-identity provisioning story — nothing about *that* pin can
-//! come from a delivered bundle without defeating the pin's own purpose.
+//! Agent identities, the watch list, and each agent's owner pubkey (pinned
+//! into its [`buzz_waker::floors::FloorStore`] on first run, **G2**) are read
+//! from local config, matching the ecosystem's existing agent-identity
+//! provisioning story — nothing about *that* pin can come from a delivered
+//! bundle without defeating the pin's own purpose.
 
 use std::collections::HashSet;
 use std::path::PathBuf;

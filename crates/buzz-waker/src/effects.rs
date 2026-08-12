@@ -25,15 +25,18 @@
 //! fake success: a stubbed "deploy" that returns `Ok(())` would make every
 //! wake look healthy while waking nothing.
 //!
-//! # The generation nonce is not implemented
+//! # The generation nonce doesn't apply here
 //!
-//! The bundle doc (`crate::bundle`, `PLANS/BUZZ_WAKER_DESIGN.md` §3) says the
-//! waker substitutes two wake-specific values into the bundle's `agent_json`
-//! before executing: `BUZZ_ACP_REPLAY_FLOOR` (implemented below, mirroring the
-//! desktop's own `apply_wake_replay_floor`) and "the generation nonce". No
-//! concrete contract for that second value — an env var name, its shape, what
-//! consumes it — exists anywhere in this codebase yet, so it is not invented
-//! here. Left as an open follow-up rather than guessed at.
+//! An earlier draft of the bundle doc (`crate::bundle`) named a second
+//! wake-specific substitution alongside `BUZZ_ACP_REPLAY_FLOOR` (implemented
+//! below, mirroring the desktop's own `apply_wake_replay_floor`): a
+//! "generation nonce". That term traces back to an abandoned design (a
+//! bearer-secret HTTP `/wake` endpoint) that needed nonce-based replay
+//! binding; it was never re-derived for what actually got built here.
+//! Replay protection for the signed launch bundle this crate deploys comes
+//! from `bundle_version` (`FloorStore::admit`), `issued_at`/`expires_at`, and
+//! the owner's signature instead — none of which need a nonce. There is
+//! exactly one wake-specific substitution.
 //!
 //! # The known-agent baseline is this daemon's own watch list
 //!
@@ -282,7 +285,7 @@ impl WakeEffects for RealWakeEffects {
             .map_err(EffectsError::ProviderUnresolved)?;
 
         // Substitute the one wake-specific value this crate implements — see
-        // the module note on the generation nonce, which it does not.
+        // the module note on why there is only one.
         let mut agent_json = bundle.agent_json.clone();
         agent_json["launch"]["policy_env"][REPLAY_FLOOR_ENV_KEY] =
             serde_json::Value::String(self.trigger_created_at.to_string());

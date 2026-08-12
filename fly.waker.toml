@@ -18,7 +18,7 @@
 # `app` below is a placeholder — rename before creating the real app; Fly
 # app names are globally unique.
 app = "buzz-waker"
-primary_region = "sea"
+primary_region = "sjc"
 
 # No [http_service] block: this is a background worker with no inbound
 # traffic (its connections to the relay are outbound), so there is nothing

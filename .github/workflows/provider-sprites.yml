@@ -1,0 +1,219 @@
+name: Provider (sprites)
+
+# Builds and publishes `buzz-backend-sprites` as a versioned Linux artifact.
+#
+# Why this exists: a launch bundle pins the SHA-256 of the provider binary the
+# daemon is authorized to run (`buzz-provider-deploy`, G1), and the daemon
+# refuses anything else. Nothing published that binary, so there was no digest
+# to pin — desktop hashed whatever sat on the issuing Mac (a Mach-O arm64
+# build) while the waker image compiled its own Linux/musl copy from source.
+# Two platforms, two artifacts, a mismatch that could never resolve. See
+# docs/waker-provider-digest-gap.md.
+#
+# Compiling inside the image was the second half of that problem: the bytes
+# were a function of the source revision and toolchain at image build time, so
+# the digest moved on every rebuild. Publishing here fixes the artifact once,
+# so `Dockerfile.waker` can install a known binary and a bundle can pin a
+# digest that stays true until the artifact is deliberately republished.
+#
+# Targets: x86_64-unknown-linux-musl and aarch64-unknown-linux-musl (static
+# musl, matching Sprig's rationale — runs on any modern Linux without libc
+# surprises, and the waker image is Alpine).
+#
+# Assets are the bare binary plus its `.sha256`, not a tarball: the only
+# consumer is a Dockerfile that wants to download, verify, and install it, and
+# a tar step would buy nothing.
+#
+# Triggers:
+#   - push to main                       → updates rolling `buzz-backend-sprites-latest`
+#   - tag `buzz-backend-sprites-v*`      → versioned release
+#   - workflow_dispatch                  → canary build (publishes only if asked)
+
+on:
+  push:
+    branches: [main]
+    tags: ["buzz-backend-sprites-v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to the rolling release (otherwise artifacts only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-sprites-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Install cross
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
+        with:
+          tool: cross@0.2.5
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          WORKSPACE_VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name=="buzz-backend-sprites") | .version')
+
+          REF="${GITHUB_REF#refs/tags/}"
+          if [[ "$GITHUB_REF" == refs/tags/buzz-backend-sprites-v* ]]; then
+            VERSION="${REF#buzz-backend-sprites-v}"
+            CHANNEL="tag"
+          else
+            SHORT_SHA="${GITHUB_SHA::7}"
+            VERSION="${WORKSPACE_VERSION}+git.${SHORT_SHA}"
+            CHANNEL="rolling"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION channel=$CHANNEL"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          # Stripped through Cargo rather than a `strip` invocation: the host
+          # binutils cannot strip a cross-compiled aarch64 binary, and the
+          # digest must not depend on which runner happened to build it.
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          set -euo pipefail
+          cross build --release --locked --target "$TARGET" \
+            -p buzz-backend-sprites --bin buzz-backend-sprites
+
+      - name: Package with digest
+        id: pkg
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ASSET="buzz-backend-sprites-${TARGET}"
+          cp "target/${TARGET}/release/buzz-backend-sprites" "dist/${ASSET}"
+          chmod +x "dist/${ASSET}"
+          # Written with a bare filename so `sha256sum -c` verifies against a
+          # file of the same name wherever it is downloaded to.
+          ( cd dist && sha256sum "$ASSET" > "${ASSET}.sha256" )
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "--- $ASSET ---"
+          cat "dist/${ASSET}.sha256"
+          file "dist/${ASSET}" || true
+
+      - name: Verify the digest file round-trips
+        working-directory: dist
+        run: sha256sum -c "${{ steps.pkg.outputs.asset }}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-backend-sprites-${{ matrix.target }}
+          path: |
+            dist/${{ steps.pkg.outputs.asset }}
+            dist/${{ steps.pkg.outputs.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish rolling release
+    needs: build
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Download all provider artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: buzz-backend-sprites-*
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh dist/ && cat dist/*.sha256
+
+      - name: Update rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="buzz-backend-sprites-latest"
+          TITLE="buzz-backend-sprites (rolling)"
+          NOTES="Rolling static-musl build of the sprites provider backend, tracking \`main\` (\`${SHA}\`).
+
+          Consumed by \`Dockerfile.waker\`, which verifies the \`.sha256\` before installing. A launch bundle pins this digest; see docs/waker-provider-digest-gap.md.
+
+          A rolling asset is deliberately **not** a stable pin — republishing moves the digest. Pin a \`buzz-backend-sprites-v*\` tag for anything that must stay verifiable."
+
+          # Create-then-edit, matching sprig.yml: `gh release edit` fails when
+          # the rolling release does not exist yet, which under `set -e` fails
+          # the job permanently in a fresh clone or fork.
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" \
+              --prerelease \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          gh release edit "$TAG" \
+            --prerelease \
+            --title "$TITLE" \
+            --notes "$NOTES"
+          gh release upload "$TAG" dist/* --clobber
+
+  publish-tag:
+    name: Publish tagged release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/buzz-backend-sprites-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Download all provider artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: buzz-backend-sprites-*
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "buzz-backend-sprites ${TAG#buzz-backend-sprites-v}" \
+            --notes "Static-musl build of the sprites provider backend.
+
+          Each asset ships a \`.sha256\`. \`Dockerfile.waker\` verifies it before installing, and a launch bundle pins the same digest (\`buzz-provider-deploy\`, G1)." \
+            dist/*

@@ -179,7 +179,12 @@ impl IssuanceLedger {
     ///
     /// The directory fsync is what makes the rename durable; without it a crash
     /// can leave the old counter visible even though the new file was synced,
-    /// which is precisely the repeated version this guards against.
+    /// which is precisely the repeated version this guards against. Unix only:
+    /// `std::fs::File::open` cannot obtain a handle to a directory on Windows
+    /// (`CreateFile` without `FILE_FLAG_BACKUP_SEMANTICS` refuses it with
+    /// `ERROR_ACCESS_DENIED`), and `fs::rename` there is already a metadata-
+    /// journaled operation without a portable-std equivalent of an fsync to
+    /// wait on.
     ///
     /// `_fence` is an unused witness parameter, and that is the point: it makes
     /// "never write outside the fence" something the compiler checks rather
@@ -204,10 +209,13 @@ impl IssuanceLedger {
 
         fs::rename(&tmp, &self.path).map_err(|e| fail(e.to_string()))?;
 
-        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::File::open(dir)
-            .and_then(|handle| handle.sync_all())
-            .map_err(|e| fail(e.to_string()))?;
+        #[cfg(unix)]
+        {
+            let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+            fs::File::open(dir)
+                .and_then(|handle| handle.sync_all())
+                .map_err(|e| fail(e.to_string()))?;
+        }
 
         Ok(())
     }

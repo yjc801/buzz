@@ -338,6 +338,49 @@ fn has_membership_snapshot_distinguishes_empty_from_missing() {
 }
 
 #[test]
+fn availability_reports_malformed_status_reason() {
+    // A status event missing its owner binding fields never contributes a
+    // valid status, so the aggregate falls back to the malformed-status
+    // reason rather than silently reporting an empty roster.
+    let secret = "3".repeat(64);
+    let member = nostr::Keys::parse(&secret).unwrap().public_key().to_hex();
+    let payload = json!({
+        "ownerId": "not-a-real-owner-id",
+        "serveTargets": []
+    });
+    let malformed = super::coordinator::build_status_report_event(payload)
+        .unwrap()
+        .sign_with_keys(&nostr::Keys::parse(&secret).unwrap())
+        .unwrap();
+    let membership = signed_membership_event(std::slice::from_ref(&member));
+
+    let availability = super::availability_from_events(vec![malformed, membership]);
+    assert!(availability.serve_targets.is_empty());
+    assert_eq!(
+        availability.reason.as_deref(),
+        Some("Waggle shared compute status is malformed")
+    );
+}
+
+#[test]
+fn availability_reports_no_serving_members_reason() {
+    // A validly-signed status with no serve targets is a real, current member
+    // in good standing — distinct from the malformed case above — but still
+    // has nothing to route to.
+    let secret = "4".repeat(64);
+    let member = nostr::Keys::parse(&secret).unwrap().public_key().to_hex();
+    let status = signed_reporter_status(&secret, "owner-empty");
+    let membership = signed_membership_event(std::slice::from_ref(&member));
+
+    let availability = super::availability_from_events(vec![status, membership]);
+    assert!(availability.serve_targets.is_empty());
+    assert_eq!(
+        availability.reason.as_deref(),
+        Some("no Waggle shared compute serving members are available")
+    );
+}
+
+#[test]
 fn owner_ids_from_events_collects_sorted_deduped_roster() {
     let secret_a = "1".repeat(64);
     let secret_b = "2".repeat(64);

@@ -65,7 +65,7 @@ pub fn validate_backend_migration(
     // deployment cannot reach. Creation enforces the same rule in
     // `normalize_relay_mesh`; this is the migration-time half of it.
     if observed.uses_relay_mesh && *target != BackendKind::Local {
-        return Err("Buzz shared compute agents must use the local backend".to_string());
+        return Err("Waggle shared compute agents must use the local backend".to_string());
     }
 
     if observed.local_harness_alive {
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(
             validate_backend_migration(&BackendKind::Local, &provider("sprites"), &observed)
                 .unwrap_err(),
-            "Buzz shared compute agents must use the local backend"
+            "Waggle shared compute agents must use the local backend"
         );
     }
 

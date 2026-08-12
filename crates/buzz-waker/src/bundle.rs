@@ -13,8 +13,8 @@
 //! build should have clamped it.
 //!
 //! So the desktop resolves everything and signs the result. The waker
-//! substitutes only the two wake-specific values (`BUZZ_ACP_REPLAY_FLOOR` and
-//! the generation nonce) and executes.
+//! substitutes only the one wake-specific value (`BUZZ_ACP_REPLAY_FLOOR`) and
+//! executes.
 //!
 //! # Signing over bytes, not structure
 //!

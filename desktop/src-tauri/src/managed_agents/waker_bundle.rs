@@ -3,8 +3,8 @@
 //! The desktop is the **only** resolver of an agent's deploy payload, and this
 //! is where that resolution becomes something a headless waker can act on. The
 //! waker resolves nothing: it verifies the signature, checks the version
-//! against its durable floors, substitutes the two wake-specific values
-//! (`BUZZ_ACP_REPLAY_FLOOR` and the generation nonce), and executes.
+//! against its durable floors, substitutes the one wake-specific value
+//! (`BUZZ_ACP_REPLAY_FLOOR`), and executes.
 //!
 //! # Why the desktop has to be the issuer
 //!

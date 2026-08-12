@@ -202,6 +202,22 @@ pub const RECONNECT_BASE_DELAY_MS: u64 = 500;
 /// further is a mention nobody answers.
 pub const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 
+/// Shortest `retry in {N}s` hint a relay is taken at its word for.
+///
+/// Below this the hint is treated as "no useful number" and replaced by
+/// [`RATE_LIMIT_FLOOR_SECS`]. `buzz-acp` draws the same line for the same
+/// relay behaviour.
+pub const RATE_LIMIT_MIN_HINT_SECS: u64 = 2;
+
+/// Park duration substituted for a missing or too-short rate-limit hint.
+///
+/// The relay this daemon runs against answers a rate-limited subscription
+/// with `retry in 0s`. Taking that literally is precisely what turns one
+/// close into an unbounded hot loop: the retry re-trips the quota, the relay
+/// closes again, and — because the send itself succeeded — nothing on the
+/// reconnect ladder ever counts it. This floor is what ends that loop.
+pub const RATE_LIMIT_FLOOR_SECS: u64 = 5;
+
 /// Whether a membership-change notification added or removed this agent from
 /// a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -841,6 +857,60 @@ pub fn reconnect_delay_ms(consecutive_failures: u32) -> u64 {
         .min(RECONNECT_MAX_DELAY_MS)
 }
 
+/// Whether a relay's close `reason` says the subscription was rate limited.
+///
+/// Keys off NIP-01's machine-readable `rate-limited:` prefix rather than the
+/// free-form prose after it, which is relay-specific. `buzz-acp` matches the
+/// same prefix for the same reason.
+#[must_use]
+pub fn is_rate_limited(reason: &str) -> bool {
+    reason.starts_with("rate-limited:")
+}
+
+/// Parse a relay's `retry in {N}s` hint out of a close reason.
+///
+/// Accepts any string containing `retry in ` followed by decimal digits.
+/// Returns `None` when there is no hint, and `Some(0)` for a literal zero —
+/// flooring is [`rate_limit_park_ms`]'s job, so that a caller cannot get a
+/// zero delay by reading this value directly. A split is enough; no regex.
+#[must_use]
+pub fn parse_rate_limit_retry_secs(reason: &str) -> Option<u64> {
+    let after = reason.split("retry in ").nth(1)?;
+    // Hint digits are ASCII, so the char count equals the byte count and the
+    // subslice below lands on a character boundary.
+    let len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+    after[..len].parse::<u64>().ok()
+}
+
+/// How long to park a channel whose live subscription the relay rate limited.
+///
+/// `hint_secs` is the relay's own value when it offered one
+/// ([`parse_rate_limit_retry_secs`]). `consecutive` counts this channel's
+/// rate-limited closes on the current connection *before* this one, so the
+/// first park is the unmultiplied floor.
+///
+/// An ordinary close is independent, and repairing it immediately is correct.
+/// A rate-limited close is neither independent nor transient: it trips every
+/// channel at once, and the retry is itself what re-trips it. So the hint is
+/// floored to [`RATE_LIMIT_FLOOR_SECS`] when it is missing or below
+/// [`RATE_LIMIT_MIN_HINT_SECS`], then doubled per consecutive close and
+/// capped at [`RECONNECT_MAX_DELAY_MS`] — the same shape and ceiling as
+/// [`reconnect_delay_ms`].
+///
+/// Deterministic and jitter-free, for the reason given on
+/// [`reconnect_delay_ms`]. The channels that all park together are spread by
+/// the caller's staggered drain, not by randomness here.
+#[must_use]
+pub fn rate_limit_park_ms(hint_secs: Option<u64>, consecutive: u32) -> u64 {
+    let secs = match hint_secs {
+        Some(secs) if secs >= RATE_LIMIT_MIN_HINT_SECS => secs,
+        _ => RATE_LIMIT_FLOOR_SECS,
+    };
+    secs.saturating_mul(1_000)
+        .saturating_mul(1_u64 << consecutive.min(16))
+        .min(RECONNECT_MAX_DELAY_MS)
+}
+
 /// The socket, behind a trait so the loop above it can be tested.
 ///
 /// One connection, owned for the transport's lifetime. `connect` is separate
@@ -1017,9 +1087,16 @@ pub enum FeedStep {
     Closed(String),
     /// The relay closed one channel's live subscription — access revoked,
     /// rate limited, or similar — without necessarily being preceded by a
-    /// membership-removed notification. Not a reconnect: drop this channel
-    /// from the tracked set. If the agent is still a member, a later
-    /// membership event or the next reconnect's discovery will re-open it.
+    /// membership-removed notification. Not a reconnect: the caller repairs
+    /// this one subscription and keeps the socket.
+    ///
+    /// *How* it repairs depends on `reason`, and the distinction matters. An
+    /// ordinary close is an independent failure, so resubscribing at once is
+    /// right — left alone, that channel's coverage degrades silently until an
+    /// unrelated reconnect or membership event happens to fire. A close that
+    /// [`is_rate_limited`] is the opposite: correlated across every channel
+    /// and self-perpetuating, because the immediate retry is what re-trips
+    /// the quota. Those park for [`rate_limit_park_ms`] instead.
     ChannelLiveClosed {
         /// The channel whose live subscription closed.
         channel_id: Uuid,
@@ -2081,6 +2158,84 @@ mod tests {
         assert_eq!(reconnect_delay_ms(30), RECONNECT_MAX_DELAY_MS);
         assert_eq!(
             reconnect_delay_ms(u32::MAX),
+            RECONNECT_MAX_DELAY_MS,
+            "the ladder must not overflow into a short delay"
+        );
+    }
+
+    // ── Rate-limited channel closes ──────────────────────────────────────────
+
+    /// The close this daemon actually received from the relay, verbatim.
+    const OBSERVED_CLOSE: &str = "rate-limited: quota exceeded; retry in 0s";
+
+    #[test]
+    fn rate_limited_closes_are_told_apart_by_the_nip01_prefix() {
+        assert!(is_rate_limited(OBSERVED_CLOSE));
+        assert!(is_rate_limited(
+            "rate-limited: too many concurrent requests"
+        ));
+        assert!(
+            !is_rate_limited("restricted: not a member"),
+            "an access denial is an independent failure and must still be \
+             repaired immediately"
+        );
+        assert!(
+            !is_rate_limited("error: the relay mentioned rate-limited: late"),
+            "the prefix is machine-readable precisely so prose cannot trip it"
+        );
+    }
+
+    #[test]
+    fn the_retry_hint_is_read_when_present() {
+        assert_eq!(
+            parse_rate_limit_retry_secs("rate-limited: quota exceeded; retry in 12s"),
+            Some(12)
+        );
+        assert_eq!(parse_rate_limit_retry_secs(OBSERVED_CLOSE), Some(0));
+        assert_eq!(
+            parse_rate_limit_retry_secs("rate-limited: too many concurrent requests"),
+            None
+        );
+    }
+
+    /// The regression: the relay says `retry in 0s`, and honouring that
+    /// literally is what produced 100 re-subscribes in 25 seconds.
+    #[test]
+    fn a_zero_second_hint_never_parks_for_zero() {
+        let hint = parse_rate_limit_retry_secs(OBSERVED_CLOSE);
+        assert_eq!(hint, Some(0), "the relay really does send a literal zero");
+
+        let parked = rate_limit_park_ms(hint, 0);
+        assert_ne!(parked, 0, "a zero park is the hot loop this fix exists for");
+        assert_eq!(parked, RATE_LIMIT_FLOOR_SECS * 1_000);
+    }
+
+    #[test]
+    fn short_and_absent_hints_fall_back_to_the_floor() {
+        let floor_ms = RATE_LIMIT_FLOOR_SECS * 1_000;
+        assert_eq!(rate_limit_park_ms(None, 0), floor_ms, "no hint at all");
+        assert_eq!(rate_limit_park_ms(Some(1), 0), floor_ms, "below the min");
+        assert_eq!(
+            rate_limit_park_ms(Some(RATE_LIMIT_MIN_HINT_SECS), 0),
+            RATE_LIMIT_MIN_HINT_SECS * 1_000,
+            "a hint at the minimum is trusted as written"
+        );
+        assert_eq!(rate_limit_park_ms(Some(12), 0), 12_000, "a real hint wins");
+    }
+
+    #[test]
+    fn the_park_ladder_climbs_then_holds() {
+        let floor_ms = RATE_LIMIT_FLOOR_SECS * 1_000;
+        assert_eq!(rate_limit_park_ms(Some(0), 0), floor_ms, "first park");
+        assert_eq!(rate_limit_park_ms(Some(0), 1), floor_ms * 2);
+        assert_eq!(rate_limit_park_ms(Some(0), 2), floor_ms * 4);
+        assert_eq!(
+            rate_limit_park_ms(Some(0), 30),
+            RECONNECT_MAX_DELAY_MS,
+            "a persistently rate-limiting relay must settle at the ceiling"
+        );
+        assert_eq!(
+            rate_limit_park_ms(Some(0), u32::MAX),
             RECONNECT_MAX_DELAY_MS,
             "the ladder must not overflow into a short delay"
         );

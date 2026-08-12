@@ -136,37 +136,39 @@ pub(crate) fn retain_waker_bundle_pending(
 /// Called from every place that turns `waker_enabled` off while the agent
 /// still has a retained bundle: `set_managed_agent_waker_enabled(false)` and
 /// `set_managed_agent_backend` migrating a waker-enabled agent off
-/// `Provider`. Best-effort like every other retention write here: a failure
-/// is logged and swallowed, and the event stays queued as `pending_sync` for
-/// the existing 30s flush loop to retry.
-pub(crate) fn revoke_waker_bundle_pending(app: &AppHandle, state: &AppState, agent_pubkey: &str) {
-    let result = (|| -> Result<(), String> {
-        use crate::managed_agents::waker_bundle::issuance_ledger;
+/// `Provider`. Unlike every other retention write in this module, this one
+/// is **not** best-effort: revocation is the security effect of the calling
+/// command, not a side channel, so a caller MUST propagate `Err` and refuse
+/// to persist the disable/migration rather than report success with the old
+/// bundle still live. Call this *before* mutating and saving the record —
+/// that way a failure here needs no rollback, since nothing was written yet.
+pub(crate) fn revoke_waker_bundle_pending(
+    app: &AppHandle,
+    state: &AppState,
+    agent_pubkey: &str,
+) -> Result<(), String> {
+    use crate::managed_agents::waker_bundle::issuance_ledger;
 
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let ledger = issuance_ledger(app)?;
-        let issued_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("system clock before unix epoch: {e}"))?
-            .as_secs();
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let ledger = issuance_ledger(app)?;
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock before unix epoch: {e}"))?
+        .as_secs();
 
-        sign_and_retain_waker_bundle_at(
-            &scope.db_path,
-            &scope.owner_keys,
-            &ledger,
-            agent_pubkey,
-            // Unread by a revoked delivery — see `LaunchBundleBody::revoked`.
-            serde_json::Value::Null,
-            String::new(),
-            serde_json::json!({}),
-            String::new(),
-            issued_at,
-            true,
-        )
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: waker-bundle-revoke: {e}");
-    }
+    sign_and_retain_waker_bundle_at(
+        &scope.db_path,
+        &scope.owner_keys,
+        &ledger,
+        agent_pubkey,
+        // Unread by a revoked delivery — see `LaunchBundleBody::revoked`.
+        serde_json::Value::Null,
+        String::new(),
+        serde_json::json!({}),
+        String::new(),
+        issued_at,
+        true,
+    )
 }
 
 /// The pure half of [`retain_waker_bundle_pending`]: reserve a version, sign,
@@ -188,7 +190,8 @@ pub(super) fn sign_and_retain_waker_bundle_at(
     revoked: bool,
 ) -> Result<(), String> {
     use crate::managed_agents::{
-        retention::{open_retention_db, retain_event, RetainedEvent},
+        persona_events::monotonic_created_at,
+        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
         waker_bundle::{sign_launch_bundle, BundleInputs, DEFAULT_BUNDLE_LIFETIME_SECS},
     };
     use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
@@ -224,6 +227,18 @@ pub(super) fn sign_and_retain_waker_bundle_at(
     )
     .map_err(|e| format!("failed to encrypt launch bundle: {e}"))?;
 
+    let conn = open_retention_db(db_path)?;
+    let owner_pubkey = owner_keys.public_key().to_hex();
+    // NIP-33 keeps the greatest `created_at` per coordinate and breaks ties
+    // by lowest event id — wall-clock seconds alone let a same-second
+    // issue-then-revoke (or two reissues) tie, and the relay's tiebreak is
+    // not guaranteed to pick the one this desktop retained. Bumping past the
+    // retained head's `created_at` (same rule `reconcile::retain_agent_record`
+    // already applies to the sibling 30177 record) guarantees this write
+    // always supersedes.
+    let existing =
+        get_retained_event(&conn, KIND_WAKER_LAUNCH_BUNDLE, &owner_pubkey, agent_pubkey)?;
+
     let event = nostr::EventBuilder::new(
         nostr::Kind::Custom(KIND_WAKER_LAUNCH_BUNDLE as u16),
         ciphertext,
@@ -232,15 +247,17 @@ pub(super) fn sign_and_retain_waker_bundle_at(
         Tag::parse(["d", agent_pubkey]).map_err(|e| e.to_string())?,
         Tag::parse(["p", agent_pubkey]).map_err(|e| e.to_string())?,
     ])
+    .custom_created_at(monotonic_created_at(
+        existing.as_ref().map(|row| row.created_at),
+    ))
     .sign_with_keys(owner_keys)
     .map_err(|e| format!("failed to sign launch bundle event: {e}"))?;
 
-    let conn = open_retention_db(db_path)?;
     retain_event(
         &conn,
         &RetainedEvent {
             kind: KIND_WAKER_LAUNCH_BUNDLE,
-            pubkey: owner_keys.public_key().to_hex(),
+            pubkey: owner_pubkey,
             d_tag: agent_pubkey.to_string(),
             content: event.content.to_string(),
             created_at: event.created_at.as_secs() as i64,

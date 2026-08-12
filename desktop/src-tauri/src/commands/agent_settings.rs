@@ -242,11 +242,21 @@ pub async fn set_managed_agent_backend(
             }
         }
 
-        save_managed_agents(&app, &records)?;
-
         if leaving_provider_waker {
-            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey);
+            // Durable revoke, BEFORE the migration is persisted: a failure
+            // here must abort the whole migration (the in-memory mutation
+            // above is simply discarded, since it was never saved) rather
+            // than let a `Local` record land with the old `Provider` bundle
+            // still live for up to 90 days. See `revoke_waker_bundle_pending`'s
+            // own doc.
+            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey).map_err(|e| {
+                format!(
+                    "buzz-waker could not revoke the launch bundle; backend migration aborted: {e}"
+                )
+            })?;
         }
+
+        save_managed_agents(&app, &records)?;
 
         let record = records
             .iter()
@@ -384,20 +394,27 @@ pub async fn set_managed_agent_waker_enabled(
                     "buzz-waker can only deploy agents running on a provider backend".to_string(),
                 );
             }
-            let was_enabled = record.waker_enabled;
-            record.waker_enabled = waker_enabled;
-            record.updated_at = now_iso();
-            was_enabled
+            record.waker_enabled
         };
 
-        save_managed_agents(&app, &records)?;
-
         if was_enabled && !waker_enabled {
-            // Durable revoke: see `revoke_waker_bundle_pending`'s own doc for
-            // why this reaches an already-connected daemon, not just a
-            // future relay recovery.
-            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey);
+            // Durable revoke, BEFORE the flag is persisted as disabled: see
+            // `revoke_waker_bundle_pending`'s own doc for why this reaches an
+            // already-connected daemon, not just a future relay recovery, and
+            // why a failure here must refuse the whole transition rather than
+            // report success with the old bundle still live. Failing before
+            // any mutation needs no rollback — nothing has been written yet.
+            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey).map_err(|e| {
+                format!("buzz-waker could not revoke the launch bundle; waker remains enabled: {e}")
+            })?;
         }
+
+        {
+            let record = find_managed_agent_mut(&mut records, &pubkey)?;
+            record.waker_enabled = waker_enabled;
+            record.updated_at = now_iso();
+        }
+        save_managed_agents(&app, &records)?;
 
         if waker_enabled && !was_enabled {
             // Enrolment: a swallowed issuance failure here would report

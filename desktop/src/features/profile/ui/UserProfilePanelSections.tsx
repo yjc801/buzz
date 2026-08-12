@@ -119,7 +119,12 @@ export type ProfileSummaryViewProps = {
   tab: ProfilePanelTab;
   unfollowMutation: ReturnType<typeof useUnfollowMutation>;
   userStatus: { text: string; emoji: string } | null | undefined;
-  wakerToggle?: { enabled: boolean; onToggle: () => void; pending: boolean };
+  wakerToggle?: {
+    enabled: boolean;
+    onToggle: () => void;
+    pending: boolean;
+    warning: string | null;
+  };
 };
 
 const PROFILE_HERO_SPACING = {

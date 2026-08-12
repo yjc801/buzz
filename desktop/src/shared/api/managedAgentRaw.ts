@@ -61,6 +61,7 @@ export type RawManagedAgent = {
   respond_to_allowlist?: string[];
   // Pre-feature fixtures may omit it; mapped to false in fromRawManagedAgent.
   waker_enabled?: boolean;
+  waker_bundle_expires_at?: number | null;
 };
 
 export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
@@ -114,5 +115,6 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
     wakerEnabled: agent.waker_enabled ?? false,
+    wakerBundleExpiresAt: agent.waker_bundle_expires_at ?? null,
   };
 }

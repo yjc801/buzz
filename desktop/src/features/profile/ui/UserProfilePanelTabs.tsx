@@ -227,7 +227,12 @@ export function ProfileInfoTabContent({
   runLocationMove?: { row: React.ReactNode; dialog: React.ReactNode };
   showActivityIngress: boolean;
   showInstructionBlock: boolean;
-  wakerToggle?: { enabled: boolean; onToggle: () => void; pending: boolean };
+  wakerToggle?: {
+    enabled: boolean;
+    onToggle: () => void;
+    pending: boolean;
+    warning: string | null;
+  };
 }) {
   const infoFields: ProfileField[] = isArchived
     ? [

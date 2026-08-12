@@ -746,6 +746,7 @@ fn summary_fixture(
         log_path: String::new(),
         respond_to: RespondTo::OwnerOnly,
         respond_to_allowlist: Vec::new(),
+        waker_bundle_expires_at: None,
         waker_enabled: false,
     }
 }

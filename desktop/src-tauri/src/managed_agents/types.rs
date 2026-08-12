@@ -550,6 +550,16 @@ pub struct ManagedAgentSummary {
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
+    /// When this agent's current launch bundle lapses, unix seconds.
+    ///
+    /// `None` means not known rather than no bundle: an agent that was never
+    /// enrolled has none, and so does one enrolled before expiries were
+    /// recorded. The UI must not render absence as either healthy or expired.
+    ///
+    /// Read from the issuance ledger only for waker-enabled agents — it is the
+    /// one field here that costs a file read, and every other agent would pay
+    /// it for an answer that is always `None`.
+    pub waker_bundle_expires_at: Option<u64>,
     /// Mirror of `ManagedAgentRecord.waker_enabled` — whether this agent's
     /// signed launch bundle is published for `buzz-waker` to remotely wake it.
     /// Only meaningful for `BackendKind::Provider`; `set_managed_agent_waker_enabled`

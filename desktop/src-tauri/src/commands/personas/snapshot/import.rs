@@ -640,6 +640,7 @@ pub async fn confirm_agent_snapshot_import(
             backend_agent_id: None,
             residual_deployments: Vec::new(),
             provider_binary_path: None,
+            waker_enabled: false,
             team_id: None,
             persona_team_dir: None,
             persona_name_in_team: None,

@@ -587,13 +587,11 @@ pub fn run() {
                 }
             });
 
-            // Drain events the retention store flagged `pending_sync` (UI
-            // create/edit, delete tombstones, launch reconcile) to the relay.
-            // One loop is the sole publisher for persona, team, and managed-
-            // agent writers; a relay-unreachable tick leaves rows pending for
-            // the next sweep.
-            // Skipped in recovery mode — flushing under an ephemeral key would
-            // publish events attributed to an identity the user doesn't own.
+            // Drain events the retention store flagged `pending_sync` (UI create/edit, delete
+            // tombstones, launch reconcile, waker bundle reissue) to the relay — the sole
+            // publisher for persona, team, and managed-agent writers; a relay-unreachable tick
+            // leaves rows pending for the next sweep. Skipped in recovery mode — an ephemeral key
+            // must never publish under an identity it doesn't own.
             if !recovery_mode {
                 let flush_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -783,6 +781,7 @@ pub fn run() {
             set_managed_agent_auto_restart,
             set_managed_agent_community,
             set_managed_agent_backend,
+            set_managed_agent_waker_enabled,
             delete_managed_agent,
             get_managed_agent_log,
             get_agent_models,

@@ -173,6 +173,7 @@ pub async fn set_managed_agent_backend(
         let personas = load_personas(&app).unwrap_or_default();
         let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
 
+        let leaving_provider_waker;
         {
             let record = find_managed_agent_mut(&mut records, &pubkey)?;
 
@@ -197,6 +198,15 @@ pub async fn set_managed_agent_backend(
                     .is_some(),
             };
             validate_backend_migration(&record.backend, &backend, &observed)?;
+
+            // `set_managed_agent_waker_enabled` refuses to enable buzz-waker
+            // for anything but a `Provider` backend, so a still-enabled agent
+            // migrating off one is leaving the only backend its retained
+            // launch bundle authorizes. Force it off and revoke below —
+            // otherwise the stale bundle would keep authorizing a remote
+            // deploy for a backend this agent no longer runs on.
+            leaving_provider_waker =
+                record.waker_enabled && !matches!(backend, BackendKind::Provider { .. });
 
             record.provider_binary_path = match backend {
                 // Cache the discovered path for `deploy_to_provider`, the same
@@ -227,9 +237,27 @@ pub async fn set_managed_agent_backend(
             record.start_on_app_launch = false;
             record.backend = backend;
             record.updated_at = now_iso();
+            if leaving_provider_waker {
+                record.waker_enabled = false;
+            }
+        }
+
+        if leaving_provider_waker {
+            // Durable revoke, BEFORE the migration is persisted: a failure
+            // here must abort the whole migration (the in-memory mutation
+            // above is simply discarded, since it was never saved) rather
+            // than let a `Local` record land with the old `Provider` bundle
+            // still live for up to 90 days. See `revoke_waker_bundle_pending`'s
+            // own doc.
+            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey).map_err(|e| {
+                format!(
+                    "buzz-waker could not revoke the launch bundle; backend migration aborted: {e}"
+                )
+            })?;
         }
 
         save_managed_agents(&app, &records)?;
+
         let record = records
             .iter()
             .find(|record| record.pubkey == pubkey)
@@ -304,6 +332,118 @@ pub async fn set_managed_agent_community(
         }
 
         save_managed_agents(&app, &records)?;
+        let record = records
+            .iter()
+            .find(|record| record.pubkey == pubkey)
+            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        let personas = load_personas(&app).unwrap_or_default();
+        build_managed_agent_summary(
+            &app,
+            record,
+            &runtimes,
+            &personas,
+            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+/// Opt an agent into (or out of) `buzz-waker` deployment.
+///
+/// Turning this on for a `Provider`-backend agent is the enrolment moment
+/// (`PLANS/BUZZ_WAKER_DESIGN.md` §11): `retain_managed_agent_pending` below
+/// issues and retains that agent's first signed launch bundle in the same
+/// call. Every later edit that already calls `retain_managed_agent_pending`
+/// (model/provider changes, persona-propagated updates, rollback restores)
+/// reissues it — never a bare liveness ping (G3).
+///
+/// Refused for a `Local` backend: there is nothing for a remote daemon to
+/// invoke, so an enabled flag would sit there silently doing nothing.
+#[tauri::command]
+pub async fn set_managed_agent_waker_enabled(
+    pubkey: String,
+    waker_enabled: bool,
+    app: AppHandle,
+) -> Result<ManagedAgentSummary, String> {
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let mut records = load_managed_agents(&app)?;
+        let mut runtimes = state
+            .managed_agent_processes
+            .lock()
+            .map_err(|error| error.to_string())?;
+
+        let (sync_changed, exited_pubkeys) =
+            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
+        if sync_changed {
+            save_managed_agents(&app, &records)?;
+        }
+        for pubkey in &exited_pubkeys {
+            state.clear_agent_session_caches(pubkey);
+        }
+
+        let was_enabled = {
+            let record = find_managed_agent_mut(&mut records, &pubkey)?;
+            if waker_enabled && !matches!(record.backend, BackendKind::Provider { .. }) {
+                return Err(
+                    "buzz-waker can only deploy agents running on a provider backend".to_string(),
+                );
+            }
+            record.waker_enabled
+        };
+
+        if was_enabled && !waker_enabled {
+            // Durable revoke, BEFORE the flag is persisted as disabled: see
+            // `revoke_waker_bundle_pending`'s own doc for why this reaches an
+            // already-connected daemon, not just a future relay recovery, and
+            // why a failure here must refuse the whole transition rather than
+            // report success with the old bundle still live. Failing before
+            // any mutation needs no rollback — nothing has been written yet.
+            super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey).map_err(|e| {
+                format!("buzz-waker could not revoke the launch bundle; waker remains enabled: {e}")
+            })?;
+        }
+
+        {
+            let record = find_managed_agent_mut(&mut records, &pubkey)?;
+            record.waker_enabled = waker_enabled;
+            record.updated_at = now_iso();
+        }
+        save_managed_agents(&app, &records)?;
+
+        if waker_enabled && !was_enabled {
+            // Enrolment: a swallowed issuance failure here would report
+            // success while buzz-waker has nothing to deploy, and — per G3
+            // (never a bare liveness ping) — nothing else would retry it.
+            // Fail the command and roll the flag back so a retry re-enters
+            // this same transition rather than looking like a completed
+            // no-op.
+            let record = records
+                .iter()
+                .find(|record| record.pubkey == pubkey)
+                .ok_or_else(|| format!("agent {pubkey} not found"))?;
+            if let Err(e) = super::agents::retain_waker_bundle_pending(&app, &state, record) {
+                let record = find_managed_agent_mut(&mut records, &pubkey)?;
+                record.waker_enabled = false;
+                record.updated_at = now_iso();
+                save_managed_agents(&app, &records)?;
+                return Err(format!(
+                    "buzz-waker enrolment failed to issue a launch bundle: {e}"
+                ));
+            }
+        } else {
+            let record = records
+                .iter()
+                .find(|record| record.pubkey == pubkey)
+                .ok_or_else(|| format!("agent {pubkey} not found"))?;
+            super::agents::retain_managed_agent_pending(&app, &state, record);
+        }
+
         let record = records
             .iter()
             .find(|record| record.pubkey == pubkey)

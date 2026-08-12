@@ -359,6 +359,7 @@ mod tests {
             issued_at: 0,
             expires_at,
             owner_only_access: true,
+            revoked: false,
         })
     }
 

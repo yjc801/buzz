@@ -193,6 +193,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         backend_agent_id: None,
         residual_deployments: Vec::new(),
         provider_binary_path: None,
+        waker_enabled: false,
         persona_team_dir: None,
         persona_name_in_team: None,
         created_at: "2026-01-01T00:00:00Z".to_string(),

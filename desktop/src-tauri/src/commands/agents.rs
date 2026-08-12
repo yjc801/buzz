@@ -9,8 +9,8 @@ use crate::{
         normalize_agent_args, resolve_provider_binary, save_managed_agents,
         start_managed_agent_process, stop_managed_agent_process, stop_managed_agent_workspace_pair,
         sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
-        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
-        ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentSummary,
+        RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
         DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
@@ -20,6 +20,8 @@ use crate::{
 use super::agent_create_support::{
     normalize_relay_mesh, resolve_created_avatar_url, trim_to_optional_string,
 };
+#[cfg(test)]
+use crate::managed_agents::ManagedAgentRecord;
 
 /// Read the workspace owner pubkey without holding the lock. Used to populate `BUZZ_ACP_AGENT_OWNER`
 /// as a fallback for legacy agent records that have no NIP-OA `auth_tag`.
@@ -28,39 +30,12 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     Ok(keys.public_key().to_hex())
 }
 
-/// Retain a freshly authored managed-agent event in the local store, flagged
-/// for relay sync. MUST be called inside the `managed_agents_store_lock`-held
-/// body after `save_managed_agents`, NEVER across an `.await`: it acquires
-/// `state.keys` and a retention-db connection, both `std::sync` guards, and
-/// drops them before returning.
-///
-/// Owner-authored, mirroring `commands::personas::retain_persona_pending`: the
-/// owner keys sign, the d_tag is the agent's pubkey, so the coordinate is
-/// `30177:<owner>:<agent_pubkey>`. The event content is the opt-IN
-/// [`agent_event_content`] projection — the retention upsert's content-equality
-/// guard compares this projection, so an operational start/stop that mutates
-/// only runtime fields produces an identical row and never re-enqueues a
-/// publish. Best-effort: a failure here is logged and swallowed so a retention
-/// hiccup never blocks the disk-authoritative write.
-pub(super) fn retain_managed_agent_pending(
-    app: &AppHandle,
-    state: &AppState,
-    record: &ManagedAgentRecord,
-) {
-    use crate::managed_agents::{reconcile::retain_agent_record, retention::open_retention_db};
-
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let conn = open_retention_db(&scope.db_path)?;
-        // Shared engine with the boot-time reconcile: projection content diff
-        // (no republish for runtime-only churn) + monotonic created_at bump
-        // past the retained head (NIP-AP step 3).
-        retain_agent_record(&conn, &scope.owner_keys, record).map(|_| ())
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: agent-retain: {e}");
-    }
-}
+// Implemented in `waker::*` (`agents_waker.rs`) to keep this file under the
+// size ratchet (`desktop/scripts/check-file-sizes.mjs`); re-exported so
+// `commands::agent_settings` can reach them without a `mod`-path change.
+pub(super) use waker::{
+    retain_managed_agent_pending, retain_waker_bundle_pending, revoke_waker_bundle_pending,
+};
 
 /// Purge a deleted agent's pending row and enqueue a NIP-09 tombstone, both
 /// inside the `managed_agents_store_lock`-held delete body and NEVER across an
@@ -780,6 +755,7 @@ pub async fn create_managed_agent(
             backend_agent_id: None,
             residual_deployments: Vec::new(),
             provider_binary_path,
+            waker_enabled: false,
             persona_team_dir: None,
             persona_name_in_team: None,
             env_vars: input.env_vars.clone(),
@@ -1279,6 +1255,9 @@ mod profile;
 #[cfg(test)]
 use profile::{profile_needs_sync, resolve_legacy_avatar};
 pub(crate) use profile::{reconcile_agent_profile, ProfileReconcileData};
+
+#[path = "agents_waker.rs"]
+mod waker;
 
 #[cfg(test)]
 #[path = "agents_tests.rs"]

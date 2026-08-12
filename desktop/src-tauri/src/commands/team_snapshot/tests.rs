@@ -209,6 +209,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         backend_agent_id: None,
         residual_deployments: Vec::new(),
         provider_binary_path: None,
+        waker_enabled: false,
         team_id: Some("t1".to_string()),
         persona_team_dir: None,
         persona_name_in_team: None,

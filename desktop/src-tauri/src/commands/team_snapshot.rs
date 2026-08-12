@@ -583,6 +583,7 @@ pub async fn confirm_team_snapshot_import(
             backend_agent_id: None,
             residual_deployments: Vec::new(),
             provider_binary_path: None,
+            waker_enabled: false,
             team_id: Some(imported_team.id.clone()),
             persona_team_dir: None,
             persona_name_in_team: None,

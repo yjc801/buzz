@@ -226,7 +226,20 @@ impl WakeEffects for RealWakeEffects {
     }
 
     async fn presence(&self) -> Result<Option<PresenceStatus>, Self::Error> {
-        Ok(self.presence_state.snapshot()?)
+        let snapshot = self.presence_state.snapshot();
+        if let Err(error) = &snapshot {
+            // The attempt no longer refuses on this, so nothing downstream
+            // would otherwise say it happened — and "deployed without knowing
+            // whether the agent was already up" is exactly the kind of thing
+            // that must not be inferred from silence later.
+            tracing::warn!(
+                agent = %self.expected_agent_pubkey,
+                %error,
+                "buzz-waker: presence unresolved; treating liveness as unproven and \
+                 reconciling through the idempotent deploy"
+            );
+        }
+        Ok(snapshot?)
     }
 
     async fn confirm_author_not_known_agent(&self) -> Result<bool, Self::Error> {

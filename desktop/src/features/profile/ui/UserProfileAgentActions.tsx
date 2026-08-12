@@ -5,6 +5,7 @@ import {
   CopyPlus,
   Download,
   Power,
+  Radio,
   Settings,
   Trash2,
 } from "lucide-react";
@@ -42,6 +43,7 @@ export function UserProfileAgentSettingsMenu({
   onDuplicatePersona,
   onExportPersona,
   onToggleAutoStart,
+  onToggleWaker,
   personaActionKey,
 }: {
   archiveActions?: IdentityArchiveActions;
@@ -52,6 +54,7 @@ export function UserProfileAgentSettingsMenu({
   onDuplicatePersona?: () => void;
   onExportPersona?: () => void;
   onToggleAutoStart?: () => void;
+  onToggleWaker?: () => void;
   personaActionKey?: string;
 }) {
   const [archiveConfirmOpen, setArchiveConfirmOpen] = React.useState(false);
@@ -64,6 +67,13 @@ export function UserProfileAgentSettingsMenu({
     managedAgent.backend.type === "local" &&
     onToggleAutoStart !== undefined;
   const autoStartSwitchId = `user-profile-agent-auto-start-${actionKey}`;
+  // Only a provider-backend agent has anything for a remote daemon to
+  // invoke — mirrors `set_managed_agent_waker_enabled`'s own backend guard.
+  const canToggleWaker =
+    managedAgent !== undefined &&
+    managedAgent.backend.type === "provider" &&
+    onToggleWaker !== undefined;
+  const wakerSwitchId = `user-profile-agent-waker-${actionKey}`;
   // Moving needs a real record to move: a persona draft has no backend, and
   // `UserProfileAgentSettingsMenuSlot` passes `managedAgent` only on the branch
   // where the viewer owns it.
@@ -77,7 +87,10 @@ export function UserProfileAgentSettingsMenu({
   const hasManageActions =
     hasArchiveAction || Boolean(onDelete) || canMoveRunLocation;
   const hasActions =
-    canToggleAutoStart || hasPrimaryActions || hasManageActions;
+    canToggleAutoStart ||
+    canToggleWaker ||
+    hasPrimaryActions ||
+    hasManageActions;
 
   if (!hasActions) {
     return null;
@@ -125,6 +138,30 @@ export function UserProfileAgentSettingsMenu({
                 disabled={isPending}
                 id={autoStartSwitchId}
                 onCheckedChange={onToggleAutoStart}
+                onClick={(event) => event.stopPropagation()}
+              />
+            </DropdownMenuItem>
+          ) : null}
+          {canToggleWaker ? (
+            <DropdownMenuItem
+              className="gap-3 pr-2"
+              disabled={isPending}
+              onSelect={(event) => {
+                event.preventDefault();
+                onToggleWaker();
+              }}
+            >
+              <Radio className="h-4 w-4 text-muted-foreground" />
+              <span className="min-w-0 flex-1 text-sm font-medium">
+                Remote wake
+              </span>
+              <Switch
+                aria-label="Remote wake"
+                checked={managedAgent.wakerEnabled}
+                data-testid={wakerSwitchId}
+                disabled={isPending}
+                id={wakerSwitchId}
+                onCheckedChange={onToggleWaker}
                 onClick={(event) => event.stopPropagation()}
               />
             </DropdownMenuItem>
@@ -238,6 +275,7 @@ export function UserProfileAgentSettingsMenuSlot({
   onDuplicatePersona,
   onExportPersona,
   onToggleAutoStart,
+  onToggleWaker,
   personaActionKey,
   viewerIsOwner,
 }: {
@@ -253,6 +291,7 @@ export function UserProfileAgentSettingsMenuSlot({
   onDuplicatePersona: () => void;
   onExportPersona: () => void;
   onToggleAutoStart: () => void;
+  onToggleWaker: () => void;
   personaActionKey?: string;
   viewerIsOwner: boolean;
 }) {
@@ -276,6 +315,7 @@ export function UserProfileAgentSettingsMenuSlot({
         managedAgent={managedAgent}
         onDelete={onDeleteAgent}
         onToggleAutoStart={onToggleAutoStart}
+        onToggleWaker={onToggleWaker}
       />
     );
   }

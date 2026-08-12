@@ -30,11 +30,19 @@
 # buzz-backend-sprites this image builds and strips below. No build-flag
 # change here closes that gap; the two binaries come from different
 # toolchains for different platforms and were never going to byte-match.
-# This is expected and non-regressive: bundle issuance (`sign_launch_bundle`)
-# has zero production callers today, so no real wake reaches this image's
-# deploy step yet regardless of where the daemon runs. Closing it requires
-# target-aware digest selection in desktop's issuance path — see this PR's
-# description for the concrete follow-up.
+# This is no longer theoretical. When this note was written, bundle issuance
+# had zero production callers, so nothing reached the deploy step. It has one
+# now (the desktop's Remote wake toggle), and a real mention has produced a
+# real attempt that reached this step with an admitted bundle and failed
+# exactly here — `refusing to run an unauthorized binary`, which is G1 working
+# rather than misbehaving.
+#
+# Closing it needs more than target-aware digest selection in desktop's
+# issuance path: buzz-backend-sprites is not built in CI for any platform, so
+# there is no Linux digest to select, and this image compiles it from source
+# below, so its digest drifts on every rebuild. Both have to be fixed, and in
+# order. See docs/waker-provider-digest-gap.md for the evidence and the
+# required sequencing.
 FROM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS builder
 
 RUN apk add --no-cache \

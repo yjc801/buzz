@@ -174,11 +174,11 @@ fn endpoint_binding_is_valid(event: &nostr::Event, content: &serde_json::Value) 
 
 pub fn availability_from_events(events: Vec<nostr::Event>) -> MeshAvailability {
     if events.is_empty() {
-        return MeshAvailability::unavailable("Buzz shared compute status is not published yet");
+        return MeshAvailability::unavailable("Waggle shared compute status is not published yet");
     }
     let Some(members) = latest_membership_list(&events) else {
         return MeshAvailability::unavailable(
-            "Buzz shared compute is waiting for the current member roster",
+            "Waggle shared compute is waiting for the current member roster",
         );
     };
 

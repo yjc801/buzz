@@ -31,6 +31,7 @@ members = [
     "crates/buzz-backend-sprites",
     "crates/buzz-provider-deploy",
     "crates/buzz-waker",
+    "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
 ]
 exclude = ["desktop/src-tauri"]
@@ -148,6 +149,7 @@ buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
 buzz-waker = { path = "crates/buzz-waker" }
 buzz-provider-deploy = { path = "crates/buzz-provider-deploy" }
+buzz-datastore-tracing = { path = "crates/buzz-datastore-tracing" }
 
 # CI profile — builds the relay for desktop e2e. Dependencies keep full
 # release optimization (warm from main's cache; they carry the runtime hot

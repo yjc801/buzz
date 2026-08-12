@@ -5,7 +5,6 @@ import {
   connectAcpRuntime,
   discoverAcpAuthMethods,
 } from "@/shared/api/tauriAgentAuth";
-import { resolveSnapshotAvatarPng } from "@/features/agents/ui/snapshotAvatarPng";
 import { channelsQueryKey } from "@/features/channels/hooks";
 import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
 import { evictUsersBatchEntries } from "@/features/profile/hooks";
@@ -43,16 +42,6 @@ import { bootstrapManagedAgentRuntimePairs } from "@/features/agents/managedAgen
 import {
   createPersona,
   deletePersona,
-  exportAgentSnapshot,
-  encodeAgentSnapshotForSend,
-  previewAgentSnapshotImport,
-  confirmAgentSnapshotImport,
-  type AgentSnapshotImportPreview,
-  type AgentSnapshotImportConfirm,
-  type AgentSnapshotImportResult,
-  type EncodedSnapshotPayload,
-  type SnapshotMemoryLevel,
-  type SnapshotFormat,
   listPersonas,
   setPersonaActive,
   updatePersona,
@@ -76,6 +65,7 @@ export {
   useTeamsQuery,
   useUpdateTeamMutation,
 } from "@/features/agents/teamHooks";
+export * from "@/features/agents/snapshotHooks";
 export type {
   AttachManagedAgentToChannelInput,
   AttachManagedAgentToChannelResult,
@@ -87,6 +77,27 @@ export type {
   EnsureChannelAgentPresetResult,
   ProvisionChannelManagedAgentResult,
 } from "@/features/agents/channelAgents";
+
+export const AGENTS_FOCUS_STALE_TIME_MS = 5 * 60_000;
+
+/**
+ * Matches the query's 30 s poll so a focus-return refetches anything older
+ * than one poll tick. This detail-view query mounts only on the agent-detail
+ * surface and is not part of the app-wide focus storm.
+ */
+export const MANAGED_AGENT_LOG_FOCUS_STALE_TIME_MS = 30_000;
+
+/** Focus-refetch policy for relay-agent and managed-agent queries; consumed by focusRefetchPolicy.test.mjs. */
+export const agentsFocusRefetchPolicy = {
+  staleTime: AGENTS_FOCUS_STALE_TIME_MS,
+  refetchOnWindowFocus: true,
+} as const;
+
+/** Focus-refetch policy for the managed-agent-log query; consumed by focusRefetchPolicy.test.mjs. */
+export const managedAgentLogFocusRefetchPolicy = {
+  staleTime: MANAGED_AGENT_LOG_FOCUS_STALE_TIME_MS,
+  refetchOnWindowFocus: true,
+} as const;
 
 export const relayAgentsQueryKey = ["relay-agents"] as const;
 export const managedAgentsQueryKey = ["managed-agents"] as const;
@@ -305,11 +316,10 @@ export function useManagedAgentPrereqsQuery(
 }
 
 export function useRelayAgentsQuery(options?: { enabled?: boolean }) {
-  const refetchInterval = useFocusedRefetchInterval(5 * 60_000);
+  const refetchInterval = useFocusedRefetchInterval(AGENTS_FOCUS_STALE_TIME_MS);
   return useQuery({
     queryKey: relayAgentsQueryKey,
     queryFn: listRelayAgents,
-    staleTime: 30_000,
     // Relay agent profiles (kind:10100) are near-static and the backing
     // `list_relay_agents` command is an unfiltered relay query for the whole
     // profile set — mounted on ~13 always-live surfaces (channel screen,
@@ -319,8 +329,8 @@ export function useRelayAgentsQuery(options?: { enabled?: boolean }) {
     // reconcile (kinds PERSONA/TEAM/MANAGED_AGENT), never for kind:10100. So we
     // keep polling but at a relaxed cadence and pause it while backgrounded.
     refetchInterval,
-    refetchOnWindowFocus: true,
     enabled: options?.enabled,
+    ...agentsFocusRefetchPolicy,
   });
 }
 
@@ -330,7 +340,6 @@ export function useManagedAgentsQuery(options?: { enabled?: boolean }) {
     enabled: options?.enabled ?? true,
     queryKey: managedAgentsQueryKey,
     queryFn: listManagedAgents,
-    staleTime: 5_000,
     refetchInterval: (query) => {
       if (!appFocused) return false;
       const agents = query.state.data as ManagedAgent[] | undefined;
@@ -343,7 +352,7 @@ export function useManagedAgentsQuery(options?: { enabled?: boolean }) {
         ? 5_000
         : false;
     },
-    refetchOnWindowFocus: true,
+    ...agentsFocusRefetchPolicy,
   });
 }
 
@@ -613,101 +622,20 @@ export function useDeleteManagedAgentMutation() {
   });
 }
 
-export function useExportAgentSnapshotMutation() {
-  return useMutation({
-    mutationFn: async ({
-      id,
-      memoryLevel,
-      format,
-      memorySourcePubkey,
-      avatarUrl,
-    }: {
-      id: string;
-      memoryLevel: SnapshotMemoryLevel;
-      format: SnapshotFormat;
-      memorySourcePubkey?: string | null;
-      avatarUrl?: string | null;
-    }) => {
-      const avatarPngDataUrl =
-        format === "png"
-          ? await resolveSnapshotAvatarPng(avatarUrl)
-          : undefined;
-      return exportAgentSnapshot(
-        id,
-        memoryLevel,
-        format,
-        memorySourcePubkey,
-        avatarPngDataUrl,
-      );
-    },
-  });
-}
-
-export function useEncodeAgentSnapshotForSendMutation() {
-  return useMutation({
-    mutationFn: ({
-      id,
-      memoryLevel,
-      format,
-      memorySourcePubkey,
-      avatarPngDataUrl,
-    }: {
-      id: string;
-      memoryLevel: SnapshotMemoryLevel;
-      format: SnapshotFormat;
-      memorySourcePubkey?: string | null;
-      avatarPngDataUrl?: string;
-    }) =>
-      encodeAgentSnapshotForSend(
-        id,
-        memoryLevel,
-        format,
-        memorySourcePubkey,
-        avatarPngDataUrl,
-      ),
-  });
-}
-
-export function usePreviewAgentSnapshotImportMutation() {
-  return useMutation({
-    mutationFn: ({
-      fileBytes,
-      fileName,
-    }: {
-      fileBytes: number[];
-      fileName: string;
-    }) => previewAgentSnapshotImport(fileBytes, fileName),
-  });
-}
-
-export function useConfirmAgentSnapshotImportMutation() {
-  return useMutation({
-    mutationFn: (input: AgentSnapshotImportConfirm) =>
-      confirmAgentSnapshotImport(input),
-  });
-}
-
-// Re-export import types for consumers that import from hooks.
-export type {
-  AgentSnapshotImportPreview,
-  AgentSnapshotImportConfirm,
-  AgentSnapshotImportResult,
-  EncodedSnapshotPayload,
-};
-
 export function useManagedAgentLogQuery(
   pubkey: string | null,
   lineCount = 120,
 ) {
-  const refetchInterval = useFocusedRefetchInterval(pubkey ? 30_000 : false);
+  const refetchInterval = useFocusedRefetchInterval(
+    pubkey ? MANAGED_AGENT_LOG_FOCUS_STALE_TIME_MS : false,
+  );
   return useQuery({
     queryKey: ["managed-agent-log", pubkey, lineCount],
     queryFn: () => getManagedAgentLog(pubkey as string, lineCount),
     enabled: pubkey !== null,
     retry: false,
-    staleTime: 3_000,
     refetchInterval,
-    refetchOnWindowFocus: true,
+    ...managedAgentLogFocusRefetchPolicy,
   });
 }
 
@@ -720,9 +648,8 @@ export function useAgentConfigSurface(pubkey: string | null) {
     queryKey: agentConfigSurfaceQueryKey(pubkey ?? ""),
     queryFn: () => getAgentConfigSurface(pubkey ?? ""),
     enabled: !!pubkey,
-    staleTime: 10_000,
     refetchInterval,
-    refetchOnWindowFocus: true,
+    ...agentsFocusRefetchPolicy,
   });
 }
 

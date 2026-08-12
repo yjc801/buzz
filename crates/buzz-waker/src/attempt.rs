@@ -724,10 +724,27 @@ pub async fn run_wake_attempt<E: WakeEffects>(
 
     let mut tracker = LiveEvidenceTracker::new(attempt_started_at);
 
+    // An unresolved lookup is *unknown*, and unknown is not a refusal.
+    //
+    // It is the same epistemic state as an `online` this attempt cannot
+    // prove, and step 3 already answers that one by reconciling through the
+    // idempotent deploy — which a live agent turns into a strict no-op.
+    // Refusing here instead bought nothing that costs, and guaranteed the one
+    // thing that does: presence is ephemeral, so an agent that is already
+    // down publishes nothing to resolve the lookup with, and
+    // `PresenceState::mark_disconnected` reopens the same hole on every
+    // reconnect. An agent this daemon has never observed could therefore
+    // never be woken — exactly the case remote wake exists for.
+    //
+    // The error itself is not dropped: `WakeEffects::presence`'s
+    // implementation reports it, because this decision core stays free of
+    // side effects.
+    let mut presence_unknown = false;
     let mut presence = match effects.presence().await {
         Ok(presence) => presence,
-        Err(error) => {
-            return WakeAttemptResult::failed(WakeOutcome::PresenceUnavailable, false, error)
+        Err(_) => {
+            presence_unknown = true;
+            None
         }
     };
     if effects.is_cancelled() {
@@ -776,17 +793,20 @@ pub async fn run_wake_attempt<E: WakeEffects>(
         reconcile = !announced_exit;
     }
 
-    if !reconcile {
+    // The teardown fence answers a death this attempt *observed* — the old
+    // process outliving its own `offline` publish. Unknown observed no death,
+    // so there is no window to wait out, and waiting would only delay a wake
+    // for an agent whose state never resolves anyway.
+    if !reconcile && !presence_unknown {
         effects.delay(REMOTE_POST_OFFLINE_GRACE_MS).await;
         if effects.is_cancelled() {
             return WakeAttemptResult::plain(WakeOutcome::Cancelled, false);
         }
-        presence = match effects.presence().await {
-            Ok(presence) => presence,
-            Err(error) => {
-                return WakeAttemptResult::failed(WakeOutcome::PresenceUnavailable, false, error)
-            }
-        };
+        // Unknown again, after the fence this time: same rule as the first
+        // lookup — unproven liveness reconciles through the deploy rather
+        // than refusing, so an unresolved read falls back to "no record". No
+        // flag to set; the fence it would have skipped is already waited out.
+        presence = effects.presence().await.unwrap_or_default();
         // A fresh generation appearing meanwhile — another client's deploy —
         // can still prove itself through the same tracker, and the fence is
         // one poll interval wide, which is not enough for two spaced beats
@@ -1350,9 +1370,19 @@ mod tests {
         assert_eq!(state.last_attempt_at(AGENT), Some(CLOCK + 1_000));
     }
 
+    /// An unresolved lookup is unknown, not offline — and not a refusal.
+    ///
+    /// This previously returned `PresenceUnavailable` and deployed nothing,
+    /// on the reasoning that an outage must not deploy on every hiccup. The
+    /// cost of that turned out to be the feature: presence is ephemeral, so a
+    /// down agent publishes nothing to resolve the lookup with, and
+    /// `mark_disconnected` reopens the gap on every reconnect — an agent the
+    /// daemon has never observed could never be woken, which is the case
+    /// remote wake exists for. Unknown is the same unproven liveness an
+    /// unverifiable `online` already reconciles through the idempotent
+    /// deploy, and a live agent turns that deploy into a strict no-op.
     #[tokio::test]
-    async fn a_failed_presence_lookup_never_deploys() {
-        // An outage is "unknown", not "offline".
+    async fn an_unresolved_presence_lookup_reconciles_through_the_deploy() {
         let harness = Harness {
             presence_fails: true,
             ..Harness::default()
@@ -1361,9 +1391,16 @@ mod tests {
 
         let result = attempt(&harness, &state).await;
 
-        assert_eq!(result.outcome, WakeOutcome::PresenceUnavailable);
-        assert_eq!(harness.deploys.get(), 0);
-        assert_eq!(state.last_attempt_at(AGENT), None);
+        assert_eq!(harness.deploys.get(), 1, "unknown must not block the wake");
+        assert_ne!(
+            result.outcome,
+            WakeOutcome::PresenceUnavailable,
+            "an unresolved lookup is no longer terminal"
+        );
+        assert!(
+            !result.reconcile,
+            "nothing claimed `online`, so the waking-up surface must still show"
+        );
     }
 
     #[tokio::test]

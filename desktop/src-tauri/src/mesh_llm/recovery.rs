@@ -349,7 +349,7 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
             }
             Err(error) => {
                 let message = format!(
-                    "{MESH_REARM_ERROR_SENTINEL}Buzz shared compute offline — failed to re-arm local ingress for this agent: {error}"
+                    "{MESH_REARM_ERROR_SENTINEL}Waggle shared compute offline — failed to re-arm local ingress for this agent: {error}"
                 );
                 if let Err(persist_error) = persist_mesh_last_error(app, &record.pubkey, &message) {
                     eprintln!("buzz-mesh: failed to persist recovery error: {persist_error}");

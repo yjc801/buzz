@@ -258,7 +258,7 @@ pub fn availability_from_events(events: Vec<nostr::Event>) -> MeshAvailability {
     }
 
     if !saw_valid_status {
-        return MeshAvailability::unavailable("Buzz shared compute status is malformed");
+        return MeshAvailability::unavailable("Waggle shared compute status is malformed");
     }
 
     let serve_targets = dedupe_targets(all_targets);
@@ -268,7 +268,7 @@ pub fn availability_from_events(events: Vec<nostr::Event>) -> MeshAvailability {
         reason: if available {
             None
         } else {
-            Some("no Buzz shared compute serving members are available".to_string())
+            Some("no Waggle shared compute serving members are available".to_string())
         },
         models,
         serve_targets,

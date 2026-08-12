@@ -58,6 +58,11 @@ pub async fn set_managed_agent_start_on_app_launch(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        // A config change like any other update path — see `set_managed_agent_waker_enabled`'s
+        // doc — so it must reissue a waker-enrolled agent's launch bundle too, or the
+        // "change any setting to reissue" recovery copy in `wakerBundleHealth.ts` would be
+        // false for this specific setting.
+        super::agents::retain_managed_agent_pending(&app, &state, record);
         let personas = load_personas(&app).unwrap_or_default();
         build_managed_agent_summary(
             &app,
@@ -499,6 +504,8 @@ pub async fn set_managed_agent_auto_restart(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        // See the matching reissue call in `set_managed_agent_start_on_app_launch` above.
+        super::agents::retain_managed_agent_pending(&app, &state, record);
         let personas = load_personas(&app).unwrap_or_default();
         build_managed_agent_summary(
             &app,

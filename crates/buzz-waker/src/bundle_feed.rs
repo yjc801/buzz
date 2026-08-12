@@ -27,7 +27,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE;
+use buzz_core::kind::KIND_WAKER_BUNDLE_ENVELOPE;
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Keys, Tag};
 use serde_json::{json, Value};
@@ -57,6 +57,17 @@ pub const BUNDLE_TAP_IDLE_TIMEOUT_SECS: u64 = 300;
 /// than handing an oversized or malformed string to the decryptor.
 const NIP44_CONTENT_LEN_RANGE: std::ops::RangeInclusive<usize> = 132..=87472;
 
+/// How many envelopes to ask for on subscribe.
+///
+/// The envelope kind is not parameterized-replaceable, so every reissue and
+/// revocation lands beside its predecessors instead of replacing them, and an
+/// unbounded query would grow with an agent's whole enrolment history. The
+/// newest is the one that matters — anything older is at or below the
+/// [`FloorStore`]'s revocation floor and would be refused anyway — so a small
+/// window is enough while still leaving room to observe a revocation that
+/// arrived immediately after the bundle it revokes.
+const BUNDLE_QUERY_LIMIT: u32 = 16;
+
 /// The REQ filter for one agent's bundle tap: global, `authors` pinned to
 /// the enrolment-pinned owner, `#p` pinned to the target agent.
 ///
@@ -64,13 +75,21 @@ const NIP44_CONTENT_LEN_RANGE: std::ops::RangeInclusive<usize> = 132..=87472;
 /// in this query's results — ordinary ingest already refuses a forged
 /// `event.pubkey`, so `authors` here is redundant with what the relay
 /// enforces at write time, kept as defense in depth and to make the query's
-/// own intent explicit (§11).
+/// own intent explicit (§11). It matters more under the envelope kind than it
+/// did under a dedicated one: the envelope is a kind any member may write, so
+/// `authors` is what keeps this query from surfacing anyone else's traffic to
+/// this agent.
+///
+/// `#p` is not optional. The relay refuses an envelope query that does not
+/// carry one (`push_filter_authorized_for_event`'s read-path counterpart), so
+/// a filter without it is closed rather than answered.
 #[must_use]
 pub fn bundle_filter(owner_pubkey: &str, agent_pubkey: &str) -> Value {
     json!({
-        "kinds": [KIND_WAKER_LAUNCH_BUNDLE],
+        "kinds": [KIND_WAKER_BUNDLE_ENVELOPE],
         "authors": [normalize_pubkey(owner_pubkey)],
         "#p": [normalize_pubkey(agent_pubkey)],
+        "limit": BUNDLE_QUERY_LIMIT,
     })
 }
 
@@ -135,7 +154,7 @@ impl BundleState {
 /// this tap does not read collapses to [`BundleFrame::Ignored`].
 #[derive(Debug, PartialEq, Eq)]
 enum BundleFrame {
-    /// A verified `kind:30180` delivery, authored by the pinned owner,
+    /// A verified envelope delivery, authored by the pinned owner,
     /// carrying its raw (still-encrypted) content.
     Delivered { ciphertext: String },
     /// An event on this subscription that failed signature verification.
@@ -170,7 +189,7 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
                     reason: error.to_string(),
                 };
             }
-            if buzz_core::kind::event_kind_u32(&event) != KIND_WAKER_LAUNCH_BUNDLE {
+            if buzz_core::kind::event_kind_u32(&event) != KIND_WAKER_BUNDLE_ENVELOPE {
                 return BundleFrame::Ignored;
             }
             if normalize_pubkey(&event.pubkey.to_hex()) != normalize_pubkey(owner_pubkey) {
@@ -197,6 +216,14 @@ enum BundleOutcome {
     /// raised (durably, best-effort) by the time this is returned; the
     /// caller's only remaining job is to drop whatever it was holding.
     Revoked,
+    /// An owner-signed revocation whose version is below the version already
+    /// admitted — a later, still-valid reissue has already superseded it.
+    /// The floor was still raised (defense in depth for any *future*
+    /// delivery below it), but the currently held bundle must not be
+    /// cleared: the relay has no delivery order guarantee, so this delivery
+    /// can reach the tap after the reissue that supersedes it, on a
+    /// reconnect that replays history in `created_at DESC` order.
+    StaleRevocation,
 }
 
 /// Decrypt, verify, and admit (or revoke) one delivered bundle.
@@ -281,6 +308,16 @@ fn decrypt_verify_and_admit(
                 %error,
                 "bundle tap could not durably raise the revocation floor; revoking this run's cache anyway"
             );
+        }
+
+        // The floor was just re-read (and possibly raised) under the fence,
+        // so this reflects the freshest known `highest_accepted_version` —
+        // including one admitted by a delivery this same connection already
+        // processed. A revocation below it is stale: a later reissue already
+        // superseded it, and clearing the cache here would throw away that
+        // still-valid, still-current bundle.
+        if body.bundle_version < floor_store.snapshot().highest_accepted_version {
+            return Ok(BundleOutcome::StaleRevocation);
         }
         return Ok(BundleOutcome::Revoked);
     }
@@ -386,6 +423,12 @@ pub async fn run_bundle_tap(
                                 );
                                 state.clear();
                             }
+                            Ok(BundleOutcome::StaleRevocation) => {
+                                tracing::info!(
+                                    agent = %agent_pubkey,
+                                    "bundle tap received a revocation already superseded by a newer admitted bundle; leaving the cache in place"
+                                );
+                            }
                             Err(error) => {
                                 tracing::warn!(
                                     agent = %agent_pubkey,
@@ -433,13 +476,71 @@ mod tests {
     use nostr::{EventBuilder, Kind};
 
     fn bundle_event(owner: &Keys, ciphertext: &str, agent_pubkey: &str) -> nostr::Event {
-        EventBuilder::new(Kind::Custom(KIND_WAKER_LAUNCH_BUNDLE as u16), ciphertext)
+        EventBuilder::new(Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16), ciphertext)
             .tags([
                 Tag::parse(["d", agent_pubkey]).unwrap(),
                 Tag::parse(["p", agent_pubkey]).unwrap(),
             ])
             .sign_with_keys(owner)
             .expect("sign")
+    }
+
+    /// The transport regression. A bundle published under the payload kind is
+    /// refused at ingest by any relay that has not adopted it — which is what
+    /// made remote wake silently impossible, since the desktop discards the
+    /// rejection and this tap simply never receives anything. The query must
+    /// name the envelope kind, and must carry `#p`, which the relay requires
+    /// for this kind rather than answering an unscoped query.
+    #[test]
+    fn the_query_asks_for_the_envelope_kind_not_the_payload_kind() {
+        let owner_pubkey = "b".repeat(64);
+        let agent_pubkey = "a".repeat(64);
+        let filter = bundle_filter(&owner_pubkey, &agent_pubkey);
+
+        assert_eq!(
+            filter["kinds"],
+            json!([KIND_WAKER_BUNDLE_ENVELOPE]),
+            "publishing under the payload kind is what the relay rejects"
+        );
+        assert_ne!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE]),
+            "the payload kind must never reach the wire"
+        );
+        assert_eq!(filter["#p"], json!([agent_pubkey]), "#p is not optional");
+        assert_eq!(filter["authors"], json!([owner_pubkey]));
+        assert!(
+            filter["limit"].is_number(),
+            "the envelope is not replaceable, so the query must be bounded"
+        );
+    }
+
+    /// An envelope carrying the payload kind's number must not be mistaken for
+    /// a delivery: the tap keys off the envelope kind alone.
+    #[test]
+    fn an_event_under_the_payload_kind_is_ignored() {
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let agent_pubkey = "a".repeat(64);
+        let event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE as u16),
+            "ciphertext-bytes",
+        )
+        .tags([
+            Tag::parse(["d", &agent_pubkey]).unwrap(),
+            Tag::parse(["p", &agent_pubkey]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign");
+
+        let frame = bundle_frame(
+            &owner_pubkey,
+            RelayMessage::Event {
+                subscription_id: BUNDLE_TAP_SUBSCRIPTION_ID.to_string(),
+                event: Box::new(event),
+            },
+        );
+        assert_eq!(frame, BundleFrame::Ignored);
     }
 
     #[test]
@@ -655,6 +756,101 @@ mod tests {
             decrypt_verify_and_admit(&agent, &owner_pubkey, &stale_ciphertext, &mut floor_store)
                 .expect_err("must be refused as revoked");
         assert!(error.contains("floor refused"), "{error}");
+    }
+
+    /// The reconnect regression: a disable at v2 followed by a re-enable at
+    /// v3 leaves both envelopes on the relay (the wire kind isn't
+    /// replaceable), and on reconnect the relay returns history in
+    /// `created_at DESC` order — v3 (the current, valid bundle) before v2
+    /// (the stale revocation that predates it). Processing v3 first and then
+    /// v2 must not clear the cache v3 just populated.
+    #[test]
+    fn a_stale_revocation_in_reverse_history_order_does_not_clear_a_newer_admitted_bundle() {
+        use crate::bundle::{LaunchBundleBody, ProviderEnvelope};
+
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let agent = Keys::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut floor_store =
+            FloorStore::enroll(dir.path().join("floor.json"), &owner_pubkey).unwrap();
+        let owner_keypair =
+            nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
+
+        let encrypt = |body: &LaunchBundleBody| -> String {
+            let signed = SignedLaunchBundle::sign(body, &owner_keypair).unwrap();
+            let plaintext = serde_json::to_string(&signed).unwrap();
+            nostr::nips::nip44::encrypt(
+                owner.secret_key(),
+                &agent.public_key(),
+                &plaintext,
+                nostr::nips::nip44::Version::V2,
+            )
+            .unwrap()
+        };
+
+        let v2_revocation = LaunchBundleBody {
+            agent_pubkey: agent.public_key().to_hex(),
+            agent_json: serde_json::Value::Null,
+            provider: ProviderEnvelope {
+                provider_id: String::new(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: String::new(),
+            },
+            bundle_version: 2,
+            issued_at: 0,
+            expires_at: u64::MAX,
+            owner_only_access: true,
+            revoked: true,
+        };
+        let v3_reissue = LaunchBundleBody {
+            agent_json: serde_json::json!({"launch": {"policy_env": {}}}),
+            provider: ProviderEnvelope {
+                provider_id: "sprites".to_string(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: "b".repeat(64),
+            },
+            bundle_version: 3,
+            revoked: false,
+            ..v2_revocation.clone()
+        };
+
+        let v2_ciphertext = encrypt(&v2_revocation);
+        let v3_ciphertext = encrypt(&v3_reissue);
+
+        // Reconnect order: newest first.
+        let admitted =
+            decrypt_verify_and_admit(&agent, &owner_pubkey, &v3_ciphertext, &mut floor_store)
+                .expect("v3 admits");
+        assert_eq!(
+            admitted,
+            BundleOutcome::Delivered(
+                SignedLaunchBundle::sign(&v3_reissue, &owner_keypair)
+                    .unwrap()
+                    .verify(&owner_pubkey, u64::MAX)
+                    .expect("the same body the tap just admitted")
+            )
+        );
+        assert_eq!(floor_store.snapshot().highest_accepted_version, 3);
+
+        let outcome =
+            decrypt_verify_and_admit(&agent, &owner_pubkey, &v2_ciphertext, &mut floor_store)
+                .expect("a stale revocation is not an error");
+        assert_eq!(
+            outcome,
+            BundleOutcome::StaleRevocation,
+            "a revocation superseded by an already-admitted bundle must not report Revoked"
+        );
+        assert_eq!(
+            floor_store.snapshot().highest_accepted_version,
+            3,
+            "the newer real bundle must remain the admitted version"
+        );
+        assert_eq!(
+            floor_store.snapshot().revocation_floor,
+            2,
+            "the floor still moves, as defense for any future delivery below it"
+        );
     }
 
     #[test]

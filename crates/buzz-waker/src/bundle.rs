@@ -157,13 +157,17 @@ pub struct LaunchBundleBody {
     pub owner_only_access: bool,
     /// When `true`, this delivery is a revocation, not a launch authorization.
     ///
-    /// A revocation is published at the **same** NIP-33 coordinate
-    /// (`30180:<owner>:<agent_pubkey>`) a real bundle would use, so it
-    /// replaces whatever the relay was serving and — because the daemon
-    /// holds that coordinate's filter open live for real-time reissues
-    /// (`crates/buzz-waker/src/bundle_feed.rs`) — reaches an
-    /// already-connected daemon the same way a config-change reissue
-    /// already does. The receiving side must raise its
+    /// A revocation is published exactly like a real bundle — same envelope,
+    /// same query — so, because the daemon holds that filter open live for
+    /// real-time reissues (`crates/buzz-waker/src/bundle_feed.rs`), it reaches
+    /// an already-connected daemon the same way a config-change reissue does.
+    ///
+    /// It does **not** displace the bundle it revokes: the envelope kind is
+    /// not parameterized-replaceable, so both remain readable on the relay.
+    /// Nothing depends on displacement — the floor below is the whole
+    /// mechanism, and it is durable and monotonic, so the revoked version stays
+    /// refused across restarts and whatever order the two are read in. The
+    /// receiving side must raise its
     /// [`crate::floors::FloorStore`] revocation floor to
     /// [`Self::bundle_version`] and drop any cached bundle; it must never
     /// read [`Self::agent_json`] or [`Self::provider`], which the issuer

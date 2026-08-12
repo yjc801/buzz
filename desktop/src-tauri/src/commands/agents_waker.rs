@@ -1,4 +1,13 @@
-//! Issuing and retaining signed launch bundles (kind:30180) for `buzz-waker`.
+//! Issuing and retaining signed launch bundles for `buzz-waker`.
+//!
+//! The payload is a `KIND_WAKER_LAUNCH_BUNDLE` bundle; the event that carries
+//! it to a relay is a `KIND_WAKER_BUNDLE_ENVELOPE` (see that constant for why
+//! the two differ). The envelope is *not* parameterized-replaceable, so a
+//! reissue or revocation does not displace what came before — it lands beside
+//! it. Correctness does not depend on displacement: `buzz-waker`'s `FloorStore`
+//! keeps a durable, monotonic revocation floor, so once a revocation is
+//! admitted every earlier version is refused permanently, whatever order the
+//! daemon happens to read them in.
 //!
 //! Sibling half of [`super::deploy`]: `build_deploy_payload` there resolves
 //! `agent_json`, this module turns that plus the record's provider envelope
@@ -117,21 +126,24 @@ pub(crate) fn retain_waker_bundle_pending(
     )
 }
 
-/// Publish an owner-signed revocation at the agent's kind:30180 coordinate —
-/// the disable half of enrolment. Replaces whatever event (a real bundle or a
-/// prior revocation) currently sits at `30180:<owner>:<agent_pubkey>`, the
-/// same NIP-33 replacement `retain_waker_bundle_pending` already relies on
-/// for a config-change reissue.
+/// Publish an owner-signed revocation for the agent — the disable half of
+/// enrolment. It is an ordinary bundle at the next reserved version, carrying
+/// `revoked`, published in the same envelope as any reissue.
 ///
-/// That reuse is exactly what closes the gap a NIP-09 tombstone alone left
-/// open: because the daemon's bundle tap holds this coordinate's filter open
-/// live ("hold the same filter open live for real-time reissues",
-/// `PLANS/BUZZ_WAKER_DESIGN.md` §11), a revocation published here reaches an
-/// already-connected daemon the same way a config-change reissue already
-/// does — no new relay change, no new event kind, no dependency on the
-/// daemon ever reconnecting. `bundle_feed::decrypt_verify_and_admit` raises
-/// the daemon's `FloorStore` revocation floor to this version and clears its
-/// cached bundle on receipt.
+/// It does **not** displace the bundle it revokes. The envelope is not
+/// parameterized-replaceable, so the revoked bundle stays readable on the
+/// relay; what makes that safe is that the daemon's authority is its own
+/// durable state, not the relay's. `bundle_feed::decrypt_verify_and_admit`
+/// raises the `FloorStore` revocation floor to this version and clears the
+/// cached bundle, and the floor never decreases — so the revoked bundle is
+/// refused from then on, including across restarts and regardless of the
+/// order the daemon reads the two events in.
+///
+/// Delivery is live: the daemon's bundle tap holds this filter open ("hold the
+/// same filter open live for real-time reissues",
+/// `PLANS/BUZZ_WAKER_DESIGN.md` §11), so a revocation reaches an
+/// already-connected daemon exactly as a config-change reissue does, with no
+/// dependency on it ever reconnecting.
 ///
 /// Called from every place that turns `waker_enabled` off while the agent
 /// still has a retained bundle: `set_managed_agent_waker_enabled(false)` and
@@ -172,7 +184,7 @@ pub(crate) fn revoke_waker_bundle_pending(
 }
 
 /// The pure half of [`retain_waker_bundle_pending`]: reserve a version, sign,
-/// NIP-44-encrypt to the agent, and retain the resulting kind:30180 event —
+/// NIP-44-encrypt to the agent, and retain the resulting envelope event —
 /// everything after `agent_json` is resolved. Split out so it is unit-testable
 /// against a tempdir ledger/retention db without a Tauri `AppHandle`, mirroring
 /// `commands::personas::pending::prepare_persona_publication_at`.
@@ -194,7 +206,7 @@ pub(super) fn sign_and_retain_waker_bundle_at(
         retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
         waker_bundle::{sign_launch_bundle, BundleInputs, DEFAULT_BUNDLE_LIFETIME_SECS},
     };
-    use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
+    use buzz_core_pkg::kind::KIND_WAKER_BUNDLE_ENVELOPE;
     use nostr::{nips::nip44, JsonUtil, PublicKey, Tag};
 
     let bundle_version = ledger.reserve(agent_pubkey)?;
@@ -229,18 +241,31 @@ pub(super) fn sign_and_retain_waker_bundle_at(
 
     let conn = open_retention_db(db_path)?;
     let owner_pubkey = owner_keys.public_key().to_hex();
-    // NIP-33 keeps the greatest `created_at` per coordinate and breaks ties
-    // by lowest event id — wall-clock seconds alone let a same-second
-    // issue-then-revoke (or two reissues) tie, and the relay's tiebreak is
-    // not guaranteed to pick the one this desktop retained. Bumping past the
-    // retained head's `created_at` (same rule `reconcile::retain_agent_record`
-    // already applies to the sibling 30177 record) guarantees this write
-    // always supersedes.
-    let existing =
-        get_retained_event(&conn, KIND_WAKER_LAUNCH_BUNDLE, &owner_pubkey, agent_pubkey)?;
+    // The bump is for *this* store, not the relay: `retain_event` only
+    // replaces a row when `excluded.created_at >= persona_events.created_at`,
+    // and wall-clock seconds alone let a same-second issue-then-revoke (or two
+    // reissues) tie — leaving the newer event silently dropped on the floor
+    // and never queued for publish. Bumping past the retained head (the same
+    // rule `reconcile::retain_agent_record` applies to the sibling 30177
+    // record) guarantees the local row always advances.
+    //
+    // Relay-side ordering is deliberately not relied on here: the envelope is
+    // not parameterized-replaceable, so nothing supersedes anything there —
+    // the daemon's monotonic `FloorStore` is what makes ordering irrelevant.
+    let existing = get_retained_event(
+        &conn,
+        KIND_WAKER_BUNDLE_ENVELOPE,
+        &owner_pubkey,
+        agent_pubkey,
+    )?;
 
+    // Published under the envelope kind, not the payload kind — see
+    // `KIND_WAKER_BUNDLE_ENVELOPE`. The `d` tag is kept even though the
+    // envelope is not parameterized-replaceable: it is what keys this row in
+    // the retention store, and what `revoke_waker_bundle_pending` looks the
+    // current bundle up by.
     let event = nostr::EventBuilder::new(
-        nostr::Kind::Custom(KIND_WAKER_LAUNCH_BUNDLE as u16),
+        nostr::Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16),
         ciphertext,
     )
     .tags([
@@ -256,7 +281,7 @@ pub(super) fn sign_and_retain_waker_bundle_at(
     retain_event(
         &conn,
         &RetainedEvent {
-            kind: KIND_WAKER_LAUNCH_BUNDLE,
+            kind: KIND_WAKER_BUNDLE_ENVELOPE,
             pubkey: owner_pubkey,
             d_tag: agent_pubkey.to_string(),
             content: event.content.to_string(),
@@ -272,7 +297,7 @@ mod tests {
     use super::*;
     use crate::managed_agents::retention::{get_retained_event, open_retention_db};
     use crate::managed_agents::waker_bundle::IssuanceLedger;
-    use buzz_core_pkg::kind::KIND_WAKER_LAUNCH_BUNDLE;
+    use buzz_core_pkg::kind::KIND_WAKER_BUNDLE_ENVELOPE;
 
     fn ledger(dir: &std::path::Path) -> IssuanceLedger {
         IssuanceLedger::open(dir.join("waker-bundle-versions.json"))
@@ -306,7 +331,7 @@ mod tests {
         let conn = open_retention_db(&dir.path().join("retention.sqlite")).expect("open db");
         let retained = get_retained_event(
             &conn,
-            KIND_WAKER_LAUNCH_BUNDLE,
+            KIND_WAKER_BUNDLE_ENVELOPE,
             &owner.public_key().to_hex(),
             &agent_pubkey,
         )
@@ -360,7 +385,7 @@ mod tests {
         let conn = open_retention_db(&db_path).expect("open db");
         let retained = get_retained_event(
             &conn,
-            KIND_WAKER_LAUNCH_BUNDLE,
+            KIND_WAKER_BUNDLE_ENVELOPE,
             &owner.public_key().to_hex(),
             &agent_pubkey,
         )
@@ -380,11 +405,19 @@ mod tests {
         );
     }
 
-    /// The headline case: a revocation replaces the prior real bundle at the
-    /// same coordinate, and what's left decrypts to a body the waker's own
-    /// verifier accepts as `revoked`. This is what makes a revocation reach
-    /// an already-connected daemon over the same live subscription a
+    /// The headline case: a revocation supersedes the prior real bundle in
+    /// *this* store, and what's left decrypts to a body the waker's own
+    /// verifier accepts as `revoked`. This is what makes a revocation reach an
+    /// already-connected daemon over the same live subscription a
     /// config-change reissue already uses.
+    ///
+    /// "Coordinate" here is the retention table's `(kind, pubkey, d_tag)`
+    /// primary key, not a NIP-33 address: the envelope kind is not
+    /// parameterized-replaceable, so on the relay the revocation lands beside
+    /// the bundle it revokes rather than replacing it. That is safe for the
+    /// reason [`revoke_waker_bundle_pending`] documents — the daemon's
+    /// `FloorStore` refuses anything at or below the revoked version, durably
+    /// and regardless of read order.
     #[test]
     fn a_revocation_replaces_the_retained_bundle_at_the_same_coordinate() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -425,7 +458,7 @@ mod tests {
         let conn = open_retention_db(&db_path).expect("open db");
         let retained = get_retained_event(
             &conn,
-            KIND_WAKER_LAUNCH_BUNDLE,
+            KIND_WAKER_BUNDLE_ENVELOPE,
             &owner.public_key().to_hex(),
             &agent_pubkey,
         )

@@ -143,6 +143,57 @@ pub const KIND_PRIVATE_MANAGED_AGENT: u32 = 30179;
 /// closed, Alex, 2026-08-11).
 pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 30180;
 
+/// The wire envelope a launch bundle is actually published in.
+///
+/// [`KIND_WAKER_LAUNCH_BUNDLE`] describes the payload; this is the kind that
+/// reaches a relay. They differ because the transport has to work against
+/// relays this project does not operate, and an unrecognised kind is refused
+/// at ingest (`required_scope_for_kind` answers `restricted: unknown event
+/// kind` for anything it does not enumerate). 30180 is not upstream, so a
+/// bundle published under it is rejected by every relay that has not adopted
+/// it — which is what made remote wake silently impossible: the desktop
+/// retried forever and the daemon's tap had nothing to receive.
+///
+/// [`KIND_GIFT_WRAP`] is upstream, accepted at ingest, and already a member of
+/// [`P_GATED_KINDS`], so the confidentiality this payload requires is enforced
+/// by rules that already exist rather than by rules a relay operator must
+/// first agree to deploy.
+///
+/// # This is not NIP-17 / NIP-59
+///
+/// A real gift wrap is signed by a throwaway key to hide the sender. These are
+/// signed by the owner, deliberately: `authors` pinned to the enrolment-pinned
+/// owner is what keeps an attacker's event out of the daemon's query results
+/// altogether, and only the author of an event may delete it (NIP-09), which
+/// is how a superseded bundle is cleaned up. Hiding the owner would cost both
+/// and buy nothing here — the owner→agent relationship is already public in
+/// the agent record. Clients unwrapping NIP-17 conversations will encounter
+/// payloads they cannot open and must ignore them, exactly as they must for
+/// any gift wrap not addressed to a conversation they know.
+///
+/// # What this costs, deliberately
+///
+/// [`KIND_WAKER_LAUNCH_BUNDLE`] is a member of [`RESULT_GATED_KINDS`], so a
+/// filter naming it loses the `ids` exemption — knowing an event id is not
+/// authorization there, and the `#p` check still has to hold.
+/// [`KIND_GIFT_WRAP`] is not in that list, so under this envelope an `ids`
+/// lookup regains the exemption: a reader who already knows a bundle's event
+/// id can fetch it.
+///
+/// That is a real reduction, taken with open eyes rather than overlooked. The
+/// content stays NIP-44-encrypted, so no plaintext is exposed; the cleartext
+/// envelope (owner, agent, timestamp) leaks issuance *timing*, but the
+/// owner→agent relationship it would otherwise reveal is already public in the
+/// sibling `KIND_MANAGED_AGENT` record. Event ids are not enumerable, so
+/// reaching the ciphertext at all means learning one by other means first.
+///
+/// The alternative was worse: under the stricter kind a bundle is refused at
+/// ingest by every relay that has not adopted it, so the feature does not work
+/// at all. Closing this properly means adding [`KIND_GIFT_WRAP`] to
+/// [`RESULT_GATED_KINDS`] — a relay change, and needing a relay change is the
+/// exact constraint that produced this envelope.
+pub const KIND_WAKER_BUNDLE_ENVELOPE: u32 = KIND_GIFT_WRAP;
+
 /// Kinds whose stored events are readable only by their author.
 ///
 /// The relay must never reveal the existence, count, tags, content, schedule,

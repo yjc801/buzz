@@ -26,6 +26,7 @@ import {
   useUpdatePersonaMutation,
 } from "@/features/agents/hooks";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
+import { useToggleManagedAgentWaker } from "@/features/agents/useToggleManagedAgentWaker";
 import { AddAgentToChannelDialog } from "@/features/agents/ui/AddAgentToChannelDialog";
 import {
   availableRuntimesForStart,
@@ -237,6 +238,7 @@ export function UserProfilePanel({
   const stopAgentMutation = useStopManagedAgentMutation();
   const deleteAgentMutation = useDeleteManagedAgentMutation();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
+  const wakerToggle = useToggleManagedAgentWaker(managedAgent);
   const createPersonaMutation = useCreatePersonaMutation();
   const updatePersonaMutation = useUpdatePersonaMutation();
   const deletePersonaMutation = useDeletePersonaMutation();
@@ -360,6 +362,7 @@ export function UserProfilePanel({
     stopAgentMutation.isPending ||
     deleteAgentMutation.isPending ||
     startOnLaunchMutation.isPending ||
+    wakerToggle.isPending ||
     createPersonaMutation.isPending ||
     updatePersonaMutation.isPending ||
     deletePersonaMutation.isPending ||
@@ -731,6 +734,7 @@ export function UserProfilePanel({
       onDuplicatePersona={handleDuplicatePersona}
       onExportPersona={handleExportPersona}
       onToggleAutoStart={handleToggleAgentAutoStart}
+      onToggleWaker={wakerToggle.toggle}
       personaActionKey={resolvedPersona?.id}
       viewerIsOwner={viewerIsOwner}
     />

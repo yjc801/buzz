@@ -550,6 +550,11 @@ pub struct ManagedAgentSummary {
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
+    /// Mirror of `ManagedAgentRecord.waker_enabled` — whether this agent's
+    /// signed launch bundle is published for `buzz-waker` to remotely wake it.
+    /// Only meaningful for `BackendKind::Provider`; `set_managed_agent_waker_enabled`
+    /// refuses to enable it for `Local`.
+    pub waker_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]

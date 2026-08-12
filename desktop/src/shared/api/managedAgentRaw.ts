@@ -59,6 +59,8 @@ export type RawManagedAgent = {
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
+  // Pre-feature fixtures may omit it; mapped to false in fromRawManagedAgent.
+  waker_enabled?: boolean;
 };
 
 export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
@@ -111,5 +113,6 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     ),
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
+    wakerEnabled: agent.waker_enabled ?? false,
   };
 }

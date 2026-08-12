@@ -253,6 +253,7 @@ type MockBridgeOptions = {
   /** Delay both managed and relay agent directory reads. */
   agentListDelayMs?: number;
   createManagedAgentDelayMs?: number;
+  setManagedAgentWakerEnabledDelayMs?: number;
   channelTemplates?: ChannelTemplate[];
   addChannelMembersDelayMs?: number;
   /** Sequenced add-member failures. A string fails that call; null succeeds. */

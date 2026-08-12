@@ -120,6 +120,25 @@ export async function setManagedAgentCommunity(
   return fromRawManagedAgent(response);
 }
 
+/**
+ * Enable or disable `buzz-waker` remote wake for an agent — publishes (or
+ * revokes) its signed launch bundle. Only meaningful for a `"provider"`
+ * backend; the Tauri command refuses to enable it for `"local"`.
+ */
+export async function setManagedAgentWakerEnabled(
+  pubkey: string,
+  wakerEnabled: boolean,
+): Promise<ManagedAgent> {
+  const response = await invokeTauri<RawManagedAgent>(
+    "set_managed_agent_waker_enabled",
+    {
+      pubkey,
+      wakerEnabled,
+    },
+  );
+  return fromRawManagedAgent(response);
+}
+
 export async function listManagedAgentRuntimes(): Promise<
   ManagedAgentRuntimeStatus[]
 > {

@@ -103,6 +103,8 @@ export type MockManagedAgentSeed = {
   respondToAllowlist?: string[];
   /** Per-agent env vars seeded into the mock store. */
   envVars?: Record<string, string>;
+  /** Whether buzz-waker's launch bundle is published for this agent. */
+  wakerEnabled?: boolean;
 };
 
 type MockManagedAgentRuntimeSeed = {
@@ -302,6 +304,7 @@ type E2eConfig = {
     addChannelMembersErrors?: (string | null)[];
     channelMembersReadDelayMs?: number;
     createManagedAgentDelayMs?: number;
+    setManagedAgentWakerEnabledDelayMs?: number;
     channelTemplates?: ChannelTemplate[];
     channelsReadError?: string;
     /** Reject successive mock `get_channels` calls, then resume. */
@@ -879,6 +882,7 @@ type RawManagedAgent = {
   }>;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
+  waker_enabled?: boolean;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -1716,6 +1720,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     respond_to_allowlist: agent.respond_to_allowlist
       ? [...agent.respond_to_allowlist]
       : [],
+    waker_enabled: agent.waker_enabled ?? false,
   };
 }
 
@@ -2269,6 +2274,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     residual_deployments: seed.residualDeployments ?? [],
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
+    waker_enabled: seed.wakerEnabled ?? false,
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
     log_lines: [
       `buzz-acp starting: relay=${DEFAULT_RELAY_WS_URL} agent_pubkey=${seed.pubkey} parallelism=1`,
@@ -8755,6 +8761,9 @@ async function handleSetManagedAgentBackend(args: {
   }
   agent.backend = args.backend;
   agent.start_on_app_launch = false;
+  if (args.backend.type !== "provider") {
+    agent.waker_enabled = false;
+  }
   agent.status = args.backend.type === "provider" ? "not_deployed" : "stopped";
   agent.updated_at = new Date().toISOString();
   syncMockRelayAgentsFromManagedAgents();
@@ -8767,6 +8776,28 @@ async function handleSetManagedAgentStartOnAppLaunch(args: {
 }): Promise<RawManagedAgent> {
   const agent = getMockManagedAgent(args.pubkey);
   agent.start_on_app_launch = args.startOnAppLaunch;
+  agent.updated_at = new Date().toISOString();
+  return cloneManagedAgent(agent);
+}
+
+async function handleSetManagedAgentWakerEnabled(
+  args: {
+    pubkey: string;
+    wakerEnabled: boolean;
+  },
+  config: E2eConfig | undefined,
+): Promise<RawManagedAgent> {
+  const delayMs = config?.mock?.setManagedAgentWakerEnabledDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const agent = getMockManagedAgent(args.pubkey);
+  if (args.wakerEnabled && agent.backend.type !== "provider") {
+    throw new Error(
+      "buzz-waker can only deploy agents running on a provider backend",
+    );
+  }
+  agent.waker_enabled = args.wakerEnabled;
   agent.updated_at = new Date().toISOString();
   return cloneManagedAgent(agent);
 }
@@ -12427,6 +12458,11 @@ export function maybeInstallE2eTauriMocks() {
       case "set_managed_agent_backend":
         return handleSetManagedAgentBackend(
           payload as Parameters<typeof handleSetManagedAgentBackend>[0],
+        );
+      case "set_managed_agent_waker_enabled":
+        return handleSetManagedAgentWakerEnabled(
+          payload as Parameters<typeof handleSetManagedAgentWakerEnabled>[0],
+          activeConfig,
         );
       case "delete_managed_agent":
         return handleDeleteManagedAgent(

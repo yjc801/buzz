@@ -110,4 +110,10 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
+  /**
+   * Whether this agent's signed launch bundle is published for `buzz-waker`
+   * to remotely wake it. Only meaningful for a `"provider"` backend — the
+   * Tauri command refuses to enable it for `"local"`.
+   */
+  wakerEnabled: boolean;
 };

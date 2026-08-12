@@ -171,6 +171,15 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the ring CryptoProvider before any wss:// feed opens. Both ring
+    // and aws-lc-rs are compiled in transitively, so rustls cannot auto-select
+    // one and every watch task panics on its first TLS connection without
+    // this — which reads as a daemon that starts, logs its watch list, then
+    // dies. Installed here rather than per-task because the provider is
+    // process-level; a second install is a no-op, so the result is ignored
+    // rather than unwrapped.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::registry()
         .with(fmt::layer().json().with_filter(log_env_filter()))
         .init();

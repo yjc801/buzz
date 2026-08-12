@@ -39,6 +39,12 @@ zeroize     = { workspace = true }
 # decision core, the cursor and the attempt state machine stay effect-free —
 # `feed::FeedTransport` is the seam, and `relay_feed` is its one implementation.
 buzz-ws-client = { workspace = true }
+# Every wss:// feed this daemon opens goes through rustls, which needs a
+# process-level CryptoProvider installed before the first connection — both
+# ring and aws-lc-rs arrive transitively, so rustls cannot auto-select one and
+# panics at first use without an explicit install in `main`. Same dependency
+# and reason as crates/buzz-backend-sprites and crates/buzz-relay.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # The connection loop (`wake_loop`), the presence tap (`presence_feed`) and
 # the daemon binary (`main`) all need a runtime — spawning one wake attempt
 # per trigger onto its own task, timing reconnects, and driving graceful

@@ -895,29 +895,29 @@ pub fn parse_rate_limit_retry_secs(reason: &str) -> Option<u64> {
 /// sub-[`RATE_LIMIT_MIN_HINT_SECS`] hint is synthesized from
 /// [`RATE_LIMIT_FLOOR_SECS`], doubled per consecutive close and capped at
 /// [`RECONNECT_MAX_DELAY_MS`] — the same shape and ceiling as
-/// [`reconnect_delay_ms`]. A *valid* hint is the relay's own read of its
-/// limiter and is honoured as a floor instead: the local ceiling only bounds
-/// the synthesized fallback, never a real hint, so a `retry in 60s` is never
-/// truncated into a retry that arrives before the relay's own reset and
-/// re-trips the same limiter.
+/// [`reconnect_delay_ms`]. A *valid* hint is the relay's own fresh read of
+/// its limiter on this close, taken as-is: it is never capped, since a
+/// `retry in 60s` must not be truncated into a retry that arrives before the
+/// relay's own reset, and never multiplied by `consecutive` either, since
+/// that exponent exists to grow a guess we made up in the absence of a real
+/// hint — applying it to a real hint compounds across repeated closes into
+/// unbounded delays (`retry in 60s` at 16 strikes is ~45 days) and can leave
+/// a channel parked long after the relay's limiter has actually reset.
 ///
 /// Deterministic and jitter-free, for the reason given on
 /// [`reconnect_delay_ms`]. The channels that all park together are spread by
 /// the caller's staggered drain, not by randomness here.
 #[must_use]
 pub fn rate_limit_park_ms(hint_secs: Option<u64>, consecutive: u32) -> u64 {
-    let multiplier = 1_u64 << consecutive.min(16);
     match hint_secs {
-        // A valid hint only ever grows from here (multiplier >= 1), so it
-        // can never need capping up to the ceiling — only down past it,
-        // which is exactly the bug: never floor a real hint below itself.
-        Some(secs) if secs >= RATE_LIMIT_MIN_HINT_SECS => {
-            secs.saturating_mul(1_000).saturating_mul(multiplier)
+        Some(secs) if secs >= RATE_LIMIT_MIN_HINT_SECS => secs.saturating_mul(1_000),
+        _ => {
+            let multiplier = 1_u64 << consecutive.min(16);
+            RATE_LIMIT_FLOOR_SECS
+                .saturating_mul(1_000)
+                .saturating_mul(multiplier)
+                .min(RECONNECT_MAX_DELAY_MS)
         }
-        _ => RATE_LIMIT_FLOOR_SECS
-            .saturating_mul(1_000)
-            .saturating_mul(multiplier)
-            .min(RECONNECT_MAX_DELAY_MS),
     }
 }
 
@@ -2264,6 +2264,25 @@ mod tests {
         assert!(
             rate_limit_park_ms(Some(60), 10) >= 60_000,
             "repeated strikes must never bring a valid hint back below itself"
+        );
+    }
+
+    /// The second P2 regression: only the synthesized fallback climbs with
+    /// `consecutive`. A real hint is the relay's own fresh read on every
+    /// close, so applying our own exponent on top of it compounds into
+    /// unbounded delays (`retry in 60s` at 16 strikes would be ~45 days)
+    /// instead of remaining exactly what the relay just told us.
+    #[test]
+    fn a_valid_hint_never_grows_with_consecutive_strikes() {
+        assert_eq!(
+            rate_limit_park_ms(Some(60), 16),
+            60_000,
+            "a real hint is not our guess to escalate"
+        );
+        assert_eq!(
+            rate_limit_park_ms(Some(RATE_LIMIT_MIN_HINT_SECS), 16),
+            RATE_LIMIT_MIN_HINT_SECS * 1_000,
+            "even a minimum-valid hint must not be multiplied by strikes"
         );
     }
 }

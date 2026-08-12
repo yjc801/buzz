@@ -103,6 +103,12 @@ reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"]
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 url = "2"
 buzz_core_pkg = { package = "buzz-core", path = "../../crates/buzz-core" }
+# Some kinds the relay stores are refused on the HTTP `POST /events` bridge
+# and accepted only over a WebSocket (`kind::requires_websocket_ingest`).
+# Publishing those needs a real relay connection, which this crate otherwise
+# has no reason to hold — `publish_event` is a one-shot connect/auth/send/close
+# rather than a second long-lived client alongside the frontend's.
+buzz_ws_client_pkg = { package = "buzz-ws-client", path = "../../crates/buzz-ws-client" }
 buzz_waker_pkg = { package = "buzz-waker", path = "../../crates/buzz-waker" }
 buzz_provider_deploy_pkg = { package = "buzz-provider-deploy", path = "../../crates/buzz-provider-deploy" }
 buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona" }

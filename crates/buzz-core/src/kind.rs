@@ -910,6 +910,24 @@ pub const fn is_command_kind(kind: u32) -> bool {
     )
 }
 
+/// Returns `true` if `kind` is only accepted over a WebSocket connection.
+///
+/// The relay refuses these on the HTTP `POST /events` bridge. A publisher that
+/// reaches for HTTP by default has to consult this first and take the
+/// WebSocket path instead, or the write is rejected with
+/// `invalid: kind {n} is only accepted via WebSocket`.
+///
+/// This exists as a shared predicate rather than an inline check on either
+/// side because the two must not drift: a client that believes HTTP is fine
+/// for a kind the relay restricts gets a rejection it may not surface, which
+/// is indistinguishable from an unreachable relay. That is exactly how
+/// [`KIND_WAKER_BUNDLE_ENVELOPE`] shipped publishing over HTTP and silently
+/// never delivered.
+#[must_use]
+pub const fn requires_websocket_ingest(kind: u32) -> bool {
+    matches!(kind, KIND_GIFT_WRAP | KIND_PRESENCE_UPDATE)
+}
+
 /// Returns `true` if `kind` may only be authored by the relay.
 /// Client submission of these kinds must be rejected.
 pub const fn is_relay_only_kind(kind: u32) -> bool {
@@ -996,6 +1014,28 @@ mod tests {
     fn nip43_membership_snapshot_is_relay_only() {
         assert!(is_relay_only_kind(KIND_NIP43_MEMBERSHIP_LIST));
         assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
+    }
+
+    /// The launch-bundle envelope shipped being published over HTTP, which
+    /// the relay refuses for this kind. The rejection is indistinguishable
+    /// from an unreachable relay to a caller that does not check, so the row
+    /// retried forever and nothing was ever delivered. Any publisher choosing
+    /// a transport has to be able to ask.
+    #[test]
+    fn the_bundle_envelope_cannot_be_published_over_http() {
+        assert!(
+            requires_websocket_ingest(KIND_WAKER_BUNDLE_ENVELOPE),
+            "publishing the envelope over the HTTP bridge is refused by the relay"
+        );
+        assert!(requires_websocket_ingest(KIND_GIFT_WRAP));
+        assert!(requires_websocket_ingest(KIND_PRESENCE_UPDATE));
+    }
+
+    #[test]
+    fn ordinary_stored_kinds_still_publish_over_http() {
+        assert!(!requires_websocket_ingest(KIND_PERSONA));
+        assert!(!requires_websocket_ingest(KIND_MANAGED_AGENT));
+        assert!(!requires_websocket_ingest(KIND_WAKER_LAUNCH_BUNDLE));
     }
 
     #[test]

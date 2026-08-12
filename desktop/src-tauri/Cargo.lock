@@ -1099,6 +1099,7 @@ dependencies = [
  "buzz-terminal",
  "buzz-voice",
  "buzz-waker",
+ "buzz-ws-client",
  "bytes",
  "bzip2 0.6.1",
  "chrono",

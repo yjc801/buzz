@@ -12,6 +12,14 @@ use serde::{Deserialize, Serialize};
 use super::{AgentDefinition, ManagedAgentRecord};
 use crate::app_state::AppState;
 
+/// Ceiling on one WebSocket publish: connect, NIP-42 auth, send, await OK.
+///
+/// Generous because it covers a full handshake plus a challenge round trip on
+/// a cold connection, and bounded because this runs inside the 30s sweep — a
+/// publish that hangs must not stall the rows behind it, which simply retry on
+/// the next pass.
+const WS_PUBLISH_TIMEOUT_SECS: u64 = 20;
+
 /// The JSON body stored in a persona event's content field.
 ///
 /// Field order MUST match the NIP-AP reference vectors (`docs/nips/NIP-AP.md`
@@ -306,14 +314,39 @@ async fn flush_pending_events_at(
             event
         };
 
-        if let Err(error) = crate::relay::submit_signed_event_at_with_keys(
-            &event,
-            state,
-            &relay_api_base,
-            owner_keys,
-        )
-        .await
-        {
+        // Route by what the relay will actually accept for this kind. The
+        // HTTP bridge refuses some stored kinds outright
+        // (`requires_websocket_ingest`), and reaching for HTTP anyway earns a
+        // rejection that looks exactly like an unreachable relay — which is
+        // how the waker's launch bundle shipped publishing over a path its
+        // own kind was never accepted on, and silently never delivered.
+        //
+        // One-shot rather than a second long-lived client: these publishes
+        // are rare (enrolment and config change), and a persistent socket
+        // here would duplicate the one the frontend already holds.
+        let published = if buzz_core_pkg::kind::requires_websocket_ingest(current.kind) {
+            buzz_ws_client_pkg::publish_event(
+                relay_url,
+                event.clone(),
+                owner_keys,
+                None,
+                WS_PUBLISH_TIMEOUT_SECS,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        } else {
+            crate::relay::submit_signed_event_at_with_keys(
+                &event,
+                state,
+                &relay_api_base,
+                owner_keys,
+            )
+            .await
+            .map(|_| ())
+        };
+
+        if let Err(error) = published {
             // Report it rather than assuming why. A relay that is briefly
             // unreachable and one that refuses this kind outright both land
             // here, and treating the second as the first — silently — is how a

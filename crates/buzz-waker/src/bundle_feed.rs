@@ -216,6 +216,14 @@ enum BundleOutcome {
     /// raised (durably, best-effort) by the time this is returned; the
     /// caller's only remaining job is to drop whatever it was holding.
     Revoked,
+    /// An owner-signed revocation whose version is below the version already
+    /// admitted — a later, still-valid reissue has already superseded it.
+    /// The floor was still raised (defense in depth for any *future*
+    /// delivery below it), but the currently held bundle must not be
+    /// cleared: the relay has no delivery order guarantee, so this delivery
+    /// can reach the tap after the reissue that supersedes it, on a
+    /// reconnect that replays history in `created_at DESC` order.
+    StaleRevocation,
 }
 
 /// Decrypt, verify, and admit (or revoke) one delivered bundle.
@@ -300,6 +308,16 @@ fn decrypt_verify_and_admit(
                 %error,
                 "bundle tap could not durably raise the revocation floor; revoking this run's cache anyway"
             );
+        }
+
+        // The floor was just re-read (and possibly raised) under the fence,
+        // so this reflects the freshest known `highest_accepted_version` —
+        // including one admitted by a delivery this same connection already
+        // processed. A revocation below it is stale: a later reissue already
+        // superseded it, and clearing the cache here would throw away that
+        // still-valid, still-current bundle.
+        if body.bundle_version < floor_store.snapshot().highest_accepted_version {
+            return Ok(BundleOutcome::StaleRevocation);
         }
         return Ok(BundleOutcome::Revoked);
     }
@@ -404,6 +422,12 @@ pub async fn run_bundle_tap(
                                     "bundle tap received a revocation; clearing the cached bundle"
                                 );
                                 state.clear();
+                            }
+                            Ok(BundleOutcome::StaleRevocation) => {
+                                tracing::info!(
+                                    agent = %agent_pubkey,
+                                    "bundle tap received a revocation already superseded by a newer admitted bundle; leaving the cache in place"
+                                );
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -732,6 +756,101 @@ mod tests {
             decrypt_verify_and_admit(&agent, &owner_pubkey, &stale_ciphertext, &mut floor_store)
                 .expect_err("must be refused as revoked");
         assert!(error.contains("floor refused"), "{error}");
+    }
+
+    /// The reconnect regression: a disable at v2 followed by a re-enable at
+    /// v3 leaves both envelopes on the relay (the wire kind isn't
+    /// replaceable), and on reconnect the relay returns history in
+    /// `created_at DESC` order — v3 (the current, valid bundle) before v2
+    /// (the stale revocation that predates it). Processing v3 first and then
+    /// v2 must not clear the cache v3 just populated.
+    #[test]
+    fn a_stale_revocation_in_reverse_history_order_does_not_clear_a_newer_admitted_bundle() {
+        use crate::bundle::{LaunchBundleBody, ProviderEnvelope};
+
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let agent = Keys::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut floor_store =
+            FloorStore::enroll(dir.path().join("floor.json"), &owner_pubkey).unwrap();
+        let owner_keypair =
+            nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
+
+        let encrypt = |body: &LaunchBundleBody| -> String {
+            let signed = SignedLaunchBundle::sign(body, &owner_keypair).unwrap();
+            let plaintext = serde_json::to_string(&signed).unwrap();
+            nostr::nips::nip44::encrypt(
+                owner.secret_key(),
+                &agent.public_key(),
+                &plaintext,
+                nostr::nips::nip44::Version::V2,
+            )
+            .unwrap()
+        };
+
+        let v2_revocation = LaunchBundleBody {
+            agent_pubkey: agent.public_key().to_hex(),
+            agent_json: serde_json::Value::Null,
+            provider: ProviderEnvelope {
+                provider_id: String::new(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: String::new(),
+            },
+            bundle_version: 2,
+            issued_at: 0,
+            expires_at: u64::MAX,
+            owner_only_access: true,
+            revoked: true,
+        };
+        let v3_reissue = LaunchBundleBody {
+            agent_json: serde_json::json!({"launch": {"policy_env": {}}}),
+            provider: ProviderEnvelope {
+                provider_id: "sprites".to_string(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256: "b".repeat(64),
+            },
+            bundle_version: 3,
+            revoked: false,
+            ..v2_revocation.clone()
+        };
+
+        let v2_ciphertext = encrypt(&v2_revocation);
+        let v3_ciphertext = encrypt(&v3_reissue);
+
+        // Reconnect order: newest first.
+        let admitted =
+            decrypt_verify_and_admit(&agent, &owner_pubkey, &v3_ciphertext, &mut floor_store)
+                .expect("v3 admits");
+        assert_eq!(
+            admitted,
+            BundleOutcome::Delivered(
+                SignedLaunchBundle::sign(&v3_reissue, &owner_keypair)
+                    .unwrap()
+                    .verify(&owner_pubkey, u64::MAX)
+                    .expect("the same body the tap just admitted")
+            )
+        );
+        assert_eq!(floor_store.snapshot().highest_accepted_version, 3);
+
+        let outcome =
+            decrypt_verify_and_admit(&agent, &owner_pubkey, &v2_ciphertext, &mut floor_store)
+                .expect("a stale revocation is not an error");
+        assert_eq!(
+            outcome,
+            BundleOutcome::StaleRevocation,
+            "a revocation superseded by an already-admitted bundle must not report Revoked"
+        );
+        assert_eq!(
+            floor_store.snapshot().highest_accepted_version,
+            3,
+            "the newer real bundle must remain the admitted version"
+        );
+        assert_eq!(
+            floor_store.snapshot().revocation_floor,
+            2,
+            "the floor still moves, as defense for any future delivery below it"
+        );
     }
 
     #[test]

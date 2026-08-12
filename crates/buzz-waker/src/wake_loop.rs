@@ -34,6 +34,7 @@
 //! resulting completion or abandonment serially, interleaved with incoming
 //! frames in one `select!`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,13 +42,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nostr::{Keys, Tag};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::attempt::{run_wake_attempt, WakeAttemptState, WakeOutcome};
 use crate::cursor::{CursorStore, Resume, DEFAULT_COMPLETED_RING};
 use crate::decide::TriggerEvent;
 use crate::effects::RealWakeEffects;
 use crate::feed::{
-    reconnect_delay_ms, step, FeedStep, FeedTransport, WakeReplay, FEED_IDLE_TIMEOUT_SECS,
+    is_rate_limited, parse_rate_limit_retry_secs, rate_limit_park_ms, reconnect_delay_ms, step,
+    FeedStep, FeedTransport, WakeReplay, FEED_IDLE_TIMEOUT_SECS,
 };
 use crate::presence_feed::PresenceState;
 use crate::relay_feed::RelayFeed;
@@ -91,6 +94,54 @@ fn now_secs() -> u64 {
 struct AttemptReport {
     event_id: String,
     outcome: WakeOutcome,
+}
+
+/// Gap left between re-subscribes when draining parked channels.
+///
+/// Every channel parked by one burst of rate limiting comes due at roughly
+/// the same moment, and firing all of their REQs at once is what tripped the
+/// quota in the first place. Spreading the drain is this loop's answer to
+/// that; it is why [`rate_limit_park_ms`] itself can stay jitter-free and
+/// testable.
+const PARK_DRAIN_SPACING: Duration = Duration::from_millis(250);
+
+/// A channel whose live subscription the relay closed as rate limited.
+///
+/// Lives only as long as one connection — a reconnect re-runs discovery and
+/// resubscribes everything, so carrying this across would be stale.
+struct ParkedChannel {
+    /// When to retry, or `None` once the retry has been sent and this entry
+    /// is being kept only for its strike count.
+    retry_at: Option<tokio::time::Instant>,
+    /// Rate-limited closes this channel has taken on this connection. Drives
+    /// the escalation in [`rate_limit_park_ms`], and deliberately survives a
+    /// successful re-subscribe: a relay that rate limits the same channel
+    /// repeatedly must back off further each time, not restart at the floor.
+    strikes: u32,
+}
+
+/// Wait until the next parked channel may be re-subscribed, or forever if
+/// none is parked.
+///
+/// `not_before` is the floor left by the previous drain. Holding the spacing
+/// here, rather than by pushing each still-parked channel's own deadline
+/// forward, is what makes it uniform: channels parked microseconds apart come
+/// due microseconds apart, and a rule that only defers the batch already due
+/// lets the stragglers through unspaced.
+///
+/// The `pending` arm is what makes this safe to leave in the `select!`
+/// permanently: with nothing parked the branch simply never fires.
+async fn next_park_due(
+    parked: &HashMap<Uuid, ParkedChannel>,
+    not_before: Option<tokio::time::Instant>,
+) {
+    match parked.values().filter_map(|p| p.retry_at).min() {
+        Some(deadline) => {
+            tokio::time::sleep_until(not_before.map_or(deadline, |floor| deadline.max(floor)))
+                .await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Run one agent's wake loop until `cancel` fires.
@@ -202,6 +253,13 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
         }
         consecutive_failures = 0;
         let mut replay = WakeReplay::new(since);
+        // Per-connection: this socket's subscriptions are the only ones these
+        // deadlines describe, and the reconnect above already resubscribed
+        // everything from discovery.
+        let mut parked: HashMap<Uuid, ParkedChannel> = HashMap::new();
+        // Floor for the next drain, so re-subscribes stay spaced even when a
+        // whole batch of channels came due at once.
+        let mut next_drain_at: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -220,6 +278,51 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                             "buzz-waker: a wake attempt task panicked; its cursor claim \
                              stays held until the next restart retries it"
                         ),
+                    }
+                }
+
+                () = next_park_due(&parked, next_drain_at) => {
+                    let now = tokio::time::Instant::now();
+                    // Exactly one re-subscribe per firing. Sleeping through a
+                    // whole batch here would stop this loop calling
+                    // `next_frame` for the length of the drain, and a healthy
+                    // connection would start to look idle-then-dead with the
+                    // relay's pings unanswered — the same reason attempts are
+                    // spawned rather than run inline (see the module docs).
+                    // One per firing keeps `next_frame` polled between each,
+                    // and the spacing floor keeps a burst of parked channels
+                    // from resubscribing together and re-tripping the quota
+                    // that parked them.
+                    let due = parked
+                        .iter()
+                        .filter(|(_, p)| p.retry_at.is_some_and(|at| at <= now))
+                        // Oldest deadline first, then by id so a drain is
+                        // reproducible in the logs.
+                        .min_by_key(|(channel_id, p)| (p.retry_at, **channel_id))
+                        .map(|(channel_id, _)| *channel_id);
+
+                    if let Some(channel_id) = due {
+                        next_drain_at = Some(now + PARK_DRAIN_SPACING);
+                        if let Err(error) =
+                            transport.subscribe_channel_live(channel_id, since).await
+                        {
+                            tracing::warn!(
+                                agent = %agent_pubkey, %channel_id, %error,
+                                "buzz-waker: parked channel re-subscribe failed"
+                            );
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            continue 'reconnect;
+                        }
+                        // Clear the deadline but keep the strike count: if the
+                        // relay rate limits this channel again, the next park
+                        // must be longer, not another turn at the floor.
+                        if let Some(entry) = parked.get_mut(&channel_id) {
+                            entry.retry_at = None;
+                        }
+                        tracing::info!(
+                            agent = %agent_pubkey, %channel_id,
+                            "buzz-waker: re-subscribed a channel parked by rate limiting"
+                        );
                     }
                 }
 
@@ -287,14 +390,46 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                     continue 'reconnect;
                                 }
                                 Ok(FeedStep::ChannelLiveClosed { channel_id, reason }) => {
-                                    // Not a full reconnect — see the module
-                                    // docs — but left unresubscribed until an
-                                    // unrelated reconnect or membership event
-                                    // fired would silently degrade coverage
-                                    // for this channel indefinitely. Retry
-                                    // the one subscription immediately; if
-                                    // that itself fails, fall back to the
-                                    // ordinary reconnect ladder.
+                                    // Rate limiting is neither independent nor
+                                    // transient: it closes every channel at
+                                    // once, and the retry is itself what
+                                    // re-trips the quota. Worse, the retry's
+                                    // send *succeeds*, so the reconnect ladder
+                                    // never counts it and never backs off —
+                                    // park instead, and let the drain above
+                                    // resubscribe once the relay's own hint
+                                    // (floored) has elapsed.
+                                    if is_rate_limited(&reason) {
+                                        let entry = parked
+                                            .entry(channel_id)
+                                            .or_insert(ParkedChannel { retry_at: None, strikes: 0 });
+                                        let delay_ms = rate_limit_park_ms(
+                                            parse_rate_limit_retry_secs(&reason),
+                                            entry.strikes,
+                                        );
+                                        entry.strikes = entry.strikes.saturating_add(1);
+                                        entry.retry_at = Some(
+                                            tokio::time::Instant::now()
+                                                + Duration::from_millis(delay_ms),
+                                        );
+                                        tracing::warn!(
+                                            agent = %agent_pubkey, %channel_id, %reason,
+                                            delay_ms, strikes = entry.strikes,
+                                            "buzz-waker: channel live subscription rate limited; \
+                                             parking before re-subscribing"
+                                        );
+                                        continue;
+                                    }
+
+                                    // Any other close is an independent
+                                    // failure. Not a full reconnect — see the
+                                    // module docs — but left unresubscribed
+                                    // until an unrelated reconnect or
+                                    // membership event fired would silently
+                                    // degrade coverage for this channel
+                                    // indefinitely. Retry the one subscription
+                                    // immediately; if that itself fails, fall
+                                    // back to the ordinary reconnect ladder.
                                     tracing::warn!(
                                         agent = %agent_pubkey, %channel_id, %reason,
                                         "buzz-waker: channel live subscription closed; \
@@ -312,6 +447,12 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                     }
                                 }
                                 Ok(FeedStep::ChannelMembershipChanged { channel_id, added }) => {
+                                    // A membership signal is fresher intent
+                                    // than any pending park: without this, a
+                                    // stale deadline could resubscribe a
+                                    // channel the agent just left, or race a
+                                    // subscribe it just gained.
+                                    parked.remove(&channel_id);
                                     if added {
                                         if let Err(error) =
                                             transport.subscribe_channel_live(channel_id, since).await

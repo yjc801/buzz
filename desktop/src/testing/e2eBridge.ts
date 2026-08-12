@@ -8581,7 +8581,7 @@ async function handleStartManagedAgent(
         mockMeshState.models.some((model) => model.id === modelId));
     if (!hasLiveTarget) {
       throw new Error(
-        "Buzz shared compute cannot start because no live member is serving this model.",
+        "Waggle shared compute cannot start because no live member is serving this model.",
       );
     }
   }
@@ -12489,7 +12489,7 @@ export function maybeInstallE2eTauriMocks() {
           }
           if (mockMeshState.models.length === 0) {
             throw new Error(
-              "no Buzz shared compute serving members are available",
+              "no Waggle shared compute serving members are available",
             );
           }
         }

@@ -26,9 +26,9 @@ test("model discovery status names missing OpenAI-compatible credentials", () =>
   assert.match(status?.message ?? "", /OpenAI models/);
 });
 
-test("Buzz shared compute names the empty state and next action", () => {
+test("Waggle shared compute names the empty state and next action", () => {
   const status = formatModelDiscoveryErrorStatus(
-    new Error("no Buzz shared compute serving members are available"),
+    new Error("no Waggle shared compute serving members are available"),
     "relay-mesh",
   );
 
@@ -37,27 +37,60 @@ test("Buzz shared compute names the empty state and next action", () => {
   assert.match(status?.message ?? "", /Settings > Compute/);
 });
 
-test("Buzz shared compute distinguishes relay lookup failures", () => {
+test("Waggle shared compute distinguishes relay lookup failures", () => {
   const status = formatModelDiscoveryErrorStatus(
-    new Error("Buzz shared compute model discovery failed: relay offline"),
+    new Error("Waggle shared compute model discovery failed: relay offline"),
     "relay-mesh",
   );
 
   assert.equal(status?.tone, "warning");
-  assert.match(status?.message ?? "", /couldn't check shared compute/);
+  assert.match(status?.message ?? "", /Waggle couldn't check shared compute/);
   assert.match(status?.message ?? "", /relay connection/);
 });
 
-test("Buzz shared compute names a missing relay member roster", () => {
+test("Waggle shared compute names a missing relay member roster", () => {
   const status = formatModelDiscoveryErrorStatus(
-    new Error("Buzz shared compute is waiting for the current member roster"),
+    new Error("Waggle shared compute is waiting for the current member roster"),
     "relay-mesh",
   );
 
   assert.equal(status?.tone, "warning");
-  assert.match(status?.message ?? "", /waiting for the relay's member roster/);
+  assert.match(
+    status?.message ?? "",
+    /Waggle is waiting for the relay's member roster/,
+  );
   assert.match(status?.message ?? "", /membership configuration/);
   assert.doesNotMatch(status?.message ?? "", /relay connection/);
+});
+
+test("Waggle shared compute names an unsupported build", () => {
+  const status = formatModelDiscoveryErrorStatus(
+    new Error("Waggle shared compute is not available in this build"),
+    "relay-mesh",
+  );
+
+  assert.equal(status?.tone, "warning");
+  assert.match(
+    status?.message ?? "",
+    /This version of Waggle cannot use shared compute/,
+  );
+  assert.match(
+    status?.message ?? "",
+    /Update Waggle or choose another provider/,
+  );
+});
+
+test("Waggle shared compute names a malformed status", () => {
+  const status = formatModelDiscoveryErrorStatus(
+    new Error("Waggle shared compute status is malformed"),
+    "relay-mesh",
+  );
+
+  assert.equal(status?.tone, "warning");
+  assert.match(
+    status?.message ?? "",
+    /Waggle received an invalid shared compute status/,
+  );
 });
 
 test("model discovery status stays quiet for missing Databricks defaults", () => {

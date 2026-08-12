@@ -2,8 +2,8 @@ import * as React from "react";
 import { MoveRight } from "lucide-react";
 
 import { usePresenceQuery } from "@/features/presence/hooks";
+import { ProfileAgentActionRow } from "@/features/profile/ui/UserProfileAgentManagementRows";
 import type { ManagedAgent } from "@/shared/api/types";
-import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
 
 import { MigrateAgentDialog } from "./MigrateAgentDialog";
 import { migrationGate } from "./migrationGate";
@@ -12,13 +12,13 @@ import { migrationGate } from "./migrationGate";
  * "Migrate" affordance for an agent's run location, with the safety gate applied.
  *
  * Returned as two nodes rather than one component because the dialog must not
- * live inside `DropdownMenuContent`: opening it moves focus out of the menu,
- * the menu closes, and the dialog unmounts with it. The archive and delete
- * confirmations in `UserProfileAgentActions` are hoisted for the same reason —
- * `menuItem` goes in the menu, `dialog` beside it.
+ * live inside the management-rows section: opening it moves focus out of that
+ * subtree in a way that can unmount it. The archive and delete confirmations
+ * in `UserProfileAgentManagementRows` are hoisted for the same reason —
+ * `row` goes in the section, `dialog` beside it.
  *
- * It belongs in that menu because moving is a whole-agent operation like
- * auto-start, archive and delete, and the profile panel is the surface a user
+ * It belongs in that section because moving is a whole-agent operation like
+ * duplicate, archive and delete, and the profile panel is the surface a user
  * actually reaches by opening an agent. An earlier revision mounted a button on
  * `ManagedAgentRow`, which is only reachable through `AgentGroupRows` — a
  * component with no caller — so the feature had no entry point at all.
@@ -31,19 +31,19 @@ import { migrationGate } from "./migrationGate";
  * is offline.
  *
  * Blocked state stays visible rather than hidden: an agent you cannot move is a
- * question ("why not?"), and the disabled item's `title` answers it in place.
+ * question ("why not?"), and the disabled row's `title` answers it in place.
  *
  * Presence is read here rather than threaded in from the panel. The query key
  * is the normalized pubkey list, so this shares the panel's cache entry instead
  * of adding a request, and it keeps the gate's inputs next to the gate.
  */
 export function useAgentRunLocationMove(agent: ManagedAgent | undefined): {
-  menuItem: React.ReactNode;
+  row: React.ReactNode;
   dialog: React.ReactNode;
 } {
   const [open, setOpen] = React.useState(false);
   // Unconditional, including the persona-draft case with no agent to move:
-  // this is a hook, and the menu it serves renders for personas too.
+  // this is a hook, and the row it serves would render for personas too.
   const presenceQuery = usePresenceQuery(agent ? [agent.pubkey] : []);
   const gate = agent
     ? migrationGate({
@@ -53,22 +53,18 @@ export function useAgentRunLocationMove(agent: ManagedAgent | undefined): {
       })
     : null;
 
-  if (!agent || !gate) return { menuItem: null, dialog: null };
+  if (!agent || !gate) return { row: null, dialog: null };
 
   return {
-    menuItem: (
-      <DropdownMenuItem
-        data-testid="agent-move-run-location"
+    row: (
+      <ProfileAgentActionRow
         disabled={!gate.allowed}
-        onSelect={(event) => {
-          event.preventDefault();
-          setOpen(true);
-        }}
+        icon={MoveRight}
+        label="Migrate"
+        onClick={() => setOpen(true)}
+        testId="agent-move-run-location"
         title={gate.allowed ? undefined : gate.reason}
-      >
-        <MoveRight className="h-4 w-4" />
-        Migrate
-      </DropdownMenuItem>
+      />
     ),
     dialog: gate.allowed ? (
       <MigrateAgentDialog

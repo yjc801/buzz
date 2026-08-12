@@ -2580,25 +2580,34 @@ test("duplicate instances move from the agents gallery into the agent profile", 
   ).toHaveCount(0);
 
   await page.getByTestId(`persona-agent-row-${personaId}`).click();
+  await page.getByTestId("user-profile-tab-runtime").click();
   await page.getByTestId("user-profile-instances").click();
   await page.getByTestId(`user-profile-instance-${additionalPubkey}`).click();
 
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
-  await page.getByTestId("user-profile-settings-menu-trigger").click();
+  await expect(page.getByTestId("user-profile-delete-agent-row")).toBeVisible();
+  await expect(
+    page.getByTestId("user-profile-settings-menu-trigger"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByTestId("user-profile-duplicate-agent-row"),
+  ).toBeVisible();
+  await expect(page.getByTestId("user-profile-export-agent-row")).toBeVisible();
   await expect(
     page.getByTestId(`user-profile-agent-delete-${additionalPubkey}`),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 
-test("the run-location move is reachable from an agent's settings menu", async ({
+test("the run-location move is reachable from an agent's management rows", async ({
   page,
 }) => {
   // Reachability is the point. The migration UI first shipped mounted only on
   // ManagedAgentRow, which nothing renders — AgentsView renders
   // UnifiedAgentsSection — so no user could open the dialog at all. This also
-  // pins the dialog surviving the menu: it is rendered outside
-  // DropdownMenuContent because opening it moves focus out of the menu, and a
-  // dialog mounted inside would unmount with the menu that closes.
+  // pins the dialog surviving the row: it is rendered outside
+  // `UserProfileAgentManagementRows`'s row list because opening it moves
+  // focus out of that subtree, and a dialog mounted inside would unmount
+  // with whatever collapses the rows around it.
   const personaId = "custom:relocatable";
   await installMockBridge(page, {
     personas: [
@@ -2623,7 +2632,6 @@ test("the run-location move is reachable from an agent's settings menu", async (
 
   await page.getByTestId(`persona-agent-row-${personaId}`).click();
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
-  await page.getByTestId("user-profile-settings-menu-trigger").click();
 
   const move = page.getByTestId("agent-move-run-location");
   await expect(move).toBeVisible();
@@ -2679,8 +2687,7 @@ test("deleting a migrated agent discloses the deployment it left behind", async 
 
   await page.getByTestId(`persona-agent-row-${personaId}`).click();
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
-  await page.getByTestId("user-profile-settings-menu-trigger").click();
-  await page.getByTestId(`user-profile-agent-delete-${pubkey}`).click();
+  await page.getByTestId("user-profile-delete-agent-row").click();
 
   const dialog = page.getByTestId("agent-delete-confirm-dialog");
   await expect(dialog).toBeVisible();

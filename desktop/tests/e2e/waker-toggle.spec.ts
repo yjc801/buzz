@@ -1,6 +1,7 @@
 /**
- * E2E spec for the buzz-waker enrolment toggle in an agent's profile
- * settings menu (`UserProfileAgentSettingsMenu`).
+ * E2E spec for the buzz-waker enrolment toggle in an agent's profile —
+ * a row in the management section of the Info tab
+ * (`UserProfileAgentManagementRows`).
  *
  * Covers:
  *  - the toggle only renders for a provider-backend agent, never for local
@@ -16,7 +17,7 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 const PROVIDER_AGENT = TEST_IDENTITIES.charlie;
 const LOCAL_AGENT = TEST_IDENTITIES.bob;
 
-async function openAgentProfileSettingsMenu(
+async function openAgentProfile(
   page: import("@playwright/test").Page,
   agentName: string,
 ) {
@@ -26,7 +27,6 @@ async function openAgentProfileSettingsMenu(
     .getByRole("button", { name: `${agentName} agent profile` })
     .click();
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
-  await page.getByTestId("user-profile-settings-menu-trigger").click();
 }
 
 test("waker toggle only renders for a provider-backend agent", async ({
@@ -49,13 +49,12 @@ test("waker toggle only renders for a provider-backend agent", async ({
     ],
   });
 
-  await openAgentProfileSettingsMenu(page, "Remote Helper");
+  await openAgentProfile(page, "Remote Helper");
   await expect(
     page.getByTestId(`user-profile-agent-waker-${PROVIDER_AGENT.pubkey}`),
   ).toBeVisible();
-  await page.keyboard.press("Escape");
 
-  await openAgentProfileSettingsMenu(page, "Local Helper");
+  await openAgentProfile(page, "Local Helper");
   await expect(
     page.getByTestId(`user-profile-agent-waker-${LOCAL_AGENT.pubkey}`),
   ).toHaveCount(0);
@@ -75,7 +74,7 @@ test("enabling and disabling the waker toggle calls the Tauri command", async ({
     ],
   });
 
-  await openAgentProfileSettingsMenu(page, "Remote Helper");
+  await openAgentProfile(page, "Remote Helper");
   const toggle = page.getByTestId(
     `user-profile-agent-waker-${PROVIDER_AGENT.pubkey}`,
   );
@@ -149,7 +148,7 @@ test("waker toggle disables itself while its mutation is pending", async ({
     setManagedAgentWakerEnabledDelayMs: 500,
   });
 
-  await openAgentProfileSettingsMenu(page, "Remote Helper");
+  await openAgentProfile(page, "Remote Helper");
   const toggle = page.getByTestId(
     `user-profile-agent-waker-${PROVIDER_AGENT.pubkey}`,
   );

@@ -2,10 +2,7 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import {
-  useAgentMemoryQuery,
-  useIsManagedAgent,
-} from "@/features/agent-memory/hooks";
+import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import {
   type AttachManagedAgentToChannelResult,
   useAcpRuntimesQuery,
@@ -28,19 +25,14 @@ import {
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useToggleManagedAgentWaker } from "@/features/agents/useToggleManagedAgentWaker";
 import { AddAgentToChannelDialog } from "@/features/agents/ui/AddAgentToChannelDialog";
+import { useAgentRunLocationMove } from "@/features/agents/ui/useAgentRunLocationMove";
 import {
   availableRuntimesForStart,
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "@/features/agents/lib/instanceInputForDefinition";
 import { describeLogFile } from "@/features/agents/ui/agentUi";
-import { AgentDialog } from "@/features/agents/ui/AgentDialog";
 import { useAgentLifecycleActions } from "@/features/profile/ui/useAgentLifecycleActions";
-import {
-  consumePendingOpenEditAgent,
-  type EditAgentFocusTarget,
-  subscribeOpenEditAgent,
-} from "@/features/agents/openEditAgentEvent";
 import {
   duplicatePersonaDialogState,
   editPersonaDialogState,
@@ -60,13 +52,15 @@ import {
 import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import { resolveProfileActivityAgent } from "@/features/profile/lib/profileActivityAgent";
 import {
-  AgentInfoFocusedView,
   AgentInstructionsFocusedView,
+  ProfileSummaryView,
+} from "@/features/profile/ui/UserProfilePanelSections";
+import {
+  AgentInfoFocusedView,
   ChannelsFocusedView,
   DiagnosticsFocusedView,
   MemoryFocusedView,
-  ProfileSummaryView,
-} from "@/features/profile/ui/UserProfilePanelSections";
+} from "@/features/profile/ui/UserProfilePanelFocusedViews";
 import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
@@ -88,7 +82,7 @@ import {
   useControllablePanelState,
   useRetainedPersona,
 } from "@/features/profile/ui/UserProfilePanelUtils";
-import { useProfileDmAction } from "@/features/profile/ui/useProfileDmAction";
+import { useProfileInteractionActions } from "@/features/profile/ui/useProfileInteractionActions";
 import { useUserStatusQuery } from "@/features/user-status/hooks";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
@@ -103,6 +97,8 @@ import type {
 } from "@/shared/api/types";
 import { UserProfilePanelFrame } from "@/features/profile/ui/UserProfilePanelFrame";
 import { getUserProfilePanelHeaderContent } from "@/features/profile/ui/UserProfilePanelHeaderContent";
+import { UserProfileEditAgentDialog } from "@/features/profile/ui/UserProfileEditAgentDialog";
+import { useProfileEditAgentRequest } from "@/features/profile/ui/useProfileEditAgentRequest";
 export type { ProfilePanelTab, ProfilePanelView };
 
 export function UserProfilePanel({
@@ -141,28 +137,27 @@ export function UserProfilePanel({
     onTabChange,
     "info",
   );
-  const [editAgentOpen, setEditAgentOpen] = React.useState(false);
-  const [editAgentFocus, setEditAgentFocus] = React.useState<
-    EditAgentFocusTarget | undefined
-  >(undefined);
-
-  // Open the Edit Agent dialog when `requestOpenEditAgent(pubkey)` fires from
-  // a card or other non-panel surface (e.g. `ConfigNudgeCard`). Mirrors the
-  // `subscribeOpenCreateAgent` pattern in AgentsView.
-  React.useEffect(() => {
-    if (!pubkey) return;
-    // Consume any pending request that arrived before this panel mounted.
-    const pending = consumePendingOpenEditAgent(pubkey);
-    if (pending !== false) {
-      setEditAgentFocus(pending === true ? undefined : pending);
-      setEditAgentOpen(true);
-    }
-    // Subscribe for events that arrive while the panel is mounted.
-    return subscribeOpenEditAgent(pubkey, (focus) => {
-      setEditAgentFocus(focus);
-      setEditAgentOpen(true);
-    });
-  }, [pubkey]);
+  const [stickyChrome, setStickyChrome] = React.useState({
+    active: false,
+    height: 0,
+  });
+  const handleStickyChromeChange = React.useCallback(
+    (nextState: { active: boolean; height: number }) => {
+      setStickyChrome((currentState) =>
+        currentState.active === nextState.active &&
+        currentState.height === nextState.height
+          ? currentState
+          : nextState,
+      );
+    },
+    [],
+  );
+  const {
+    focus: editAgentFocus,
+    open: editAgentOpen,
+    setFocus: setEditAgentFocus,
+    setOpen: setEditAgentOpen,
+  } = useProfileEditAgentRequest(pubkey);
   const [addToChannelOpen, setAddToChannelOpen] = React.useState(false);
   const [personaDialogState, setPersonaDialogState] =
     React.useState<PersonaDialogState | null>(null);
@@ -239,6 +234,7 @@ export function UserProfilePanel({
   const deleteAgentMutation = useDeleteManagedAgentMutation();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
   const wakerToggle = useToggleManagedAgentWaker(managedAgent);
+  const runLocationMove = useAgentRunLocationMove(managedAgent);
   const createPersonaMutation = useCreatePersonaMutation();
   const updatePersonaMutation = useUpdatePersonaMutation();
   const deletePersonaMutation = useDeletePersonaMutation();
@@ -313,15 +309,8 @@ export function UserProfilePanel({
       }),
     [effectivePubkey, isBot, managedAgent, profile, relayAgent, viewerIsOwner],
   );
-  // Observer ingestion (frame decryption + derived active-turn liveness) is
-  // owner-global — mounted once in AppShell via useAgentObserverIngestion —
-  // covering both locally managed agents and declared-owned relay agents.
-  const canEditAgent =
-    isOwner === true &&
-    (managedAgent !== undefined || resolvedPersona !== undefined);
-  const memoryQuery = useAgentMemoryQuery(effectivePubkey, {
-    enabled: viewerIsOwner && Boolean(effectivePubkey),
-  });
+  // Observer ingestion is owner-global across local and declared-owned agents.
+  const canEditAgent = Boolean(isOwner && (managedAgent ?? resolvedPersona));
   const isSelf =
     currentPubkey !== undefined &&
     pubkeyLower.length > 0 &&
@@ -403,10 +392,22 @@ export function UserProfilePanel({
     setView("summary", { replace: true });
     setTab("info", { replace: true });
   }, [setTab, setView, targetKey]);
-  const { handleMessage, isOpeningDm } = useProfileDmAction({
+  const {
+    canHuddle,
+    canMessage,
+    canWave,
+    handleHuddle,
+    handleMessage,
+    handleWave,
+    isStartingHuddle,
+    pendingAction,
+  } = useProfileInteractionActions({
     effectivePubkey,
+    enabled: onOpenDm !== undefined,
+    isBot,
+    isSelf,
     onClose,
-    onOpenDm,
+    viewerIsOwner,
   });
 
   const handleEditAgent = React.useCallback(() => {
@@ -415,7 +416,7 @@ export function UserProfilePanel({
       return;
     }
     setEditAgentOpen(true);
-  }, [resolvedPersona]);
+  }, [resolvedPersona, setEditAgentOpen]);
 
   const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
     useProfileAgentDeletion({
@@ -706,35 +707,30 @@ export function UserProfilePanel({
     : null;
   const ownerProfilePubkey =
     ownerPubkey ?? (isOwner === true ? (currentPubkey ?? null) : null);
-  const ownerAvatarProfile = ownerPubkey
-    ? ownerProfileQuery.data
-    : currentProfileQuery.data;
-  const memoryCount =
-    memoryQuery.data &&
-    (memoryQuery.data.core ? 1 : 0) + memoryQuery.data.memories.length;
   const agentInstruction = resolveAgentInstruction(
     managedAgent,
     resolvedPersona,
   );
   const canManagePersona = isOwner === true && resolvedPersona !== undefined;
-  const canEditPersona = canManagePersona;
   const canDeletePersona = canManagePersona && !resolvedPersona?.sourceTeam;
+  const canDeleteProfileAgent =
+    isBot &&
+    ((viewerIsOwner && managedAgent !== undefined) ||
+      (canInstantiateAgent && canDeletePersona));
+  const handleDeleteProfileAgent =
+    viewerIsOwner && managedAgent ? handleDeleteAgent : handleDeletePersona;
   const archiveActions = useIdentityArchive(effectivePubkey);
-  const agentSettingsMenu = (
+  const agentSettingsMenu = isBot ? null : (
     <UserProfileAgentSettingsMenuSlot
       archiveActions={archiveActions}
-      canDeletePersona={canDeletePersona}
       canInstantiateAgent={canInstantiateAgent}
       canManagePersona={canManagePersona}
       isAgentActionPending={isAgentActionPending}
       isBot={isBot}
       managedAgent={managedAgent}
-      onDeleteAgent={handleDeleteAgent}
-      onDeletePersona={handleDeletePersona}
       onDuplicatePersona={handleDuplicatePersona}
       onExportPersona={handleExportPersona}
       onToggleAutoStart={handleToggleAgentAutoStart}
-      onToggleWaker={wakerToggle.toggle}
       personaActionKey={resolvedPersona?.id}
       viewerIsOwner={viewerIsOwner}
     />
@@ -745,7 +741,6 @@ export function UserProfilePanel({
       isOwner: viewerIsOwner,
       managedAgent,
       onOpenProfile,
-      ownerAvatarUrl: ownerAvatarProfile?.avatarUrl ?? null,
       ownerDisplayName,
       ownerHandle,
       ownerProfilePubkey,
@@ -770,6 +765,7 @@ export function UserProfilePanel({
       logCopyValue: isDiagnosticsLikeView ? managedAgentLogContent : null,
       logSubtitle: logHeaderSubtitle,
       onBack: () => setView("summary"),
+      onEditAgent: canEditAgent ? handleEditAgent : undefined,
       view,
       viewerIsOwner,
     },
@@ -783,10 +779,12 @@ export function UserProfilePanel({
           ? "flex flex-col overflow-hidden"
           : "overflow-y-auto",
       )}
+      data-testid="user-profile-scroll-body"
     >
       {view === "summary" ? (
         <ProfileSummaryView
           canAddToChannel={managedAgent !== undefined && isOwner === true}
+          canDeleteAgent={canDeleteProfileAgent}
           canEditAgent={canEditAgent}
           canInstantiateAgent={canInstantiateAgent}
           canOpenAgentLogs={canOpenAgentLogs}
@@ -802,11 +800,16 @@ export function UserProfilePanel({
           handleAgentPrimaryAction={handleAgentPrimaryAction}
           handleAgentRestart={handleAgentRestart}
           handleEditAgent={handleEditAgent}
-          handleEditPersona={canEditPersona ? handleEditPersona : undefined}
+          handleToggleAgentAutoStart={handleToggleAgentAutoStart}
+          handleEditPersona={canManagePersona ? handleEditPersona : undefined}
+          handleHuddle={canHuddle ? handleHuddle : undefined}
           handleInstantiateAgent={handleInstantiateAgent}
-          handleMessage={handleMessage}
+          handleMessage={canMessage ? handleMessage : undefined}
+          handleWave={canWave ? handleWave : undefined}
           isArchived={archiveActions.isArchived === true}
-          isMessagePending={isOpeningDm}
+          isHuddlePending={pendingAction === "huddle" || isStartingHuddle}
+          isMessagePending={pendingAction === "message"}
+          isWavePending={pendingAction === "wave"}
           isBot={isBot}
           isAgentActionPending={isAgentActionPending}
           isFollowing={isFollowing}
@@ -815,39 +818,41 @@ export function UserProfilePanel({
           instances={personaInstances}
           activityAgent={activityAgent}
           managedAgent={managedAgent}
-          memoriesLoading={memoryQuery.isLoading}
-          memoryCount={memoryCount}
           agentInfoFields={agentInfoFields}
+          archiveActions={archiveActions}
           agentSettingsFields={agentSettingsFields}
           diagnosticsFields={diagnosticsFields}
           onAddToChannel={() => setAddToChannelOpen(true)}
+          onDeleteAgent={handleDeleteProfileAgent}
+          onDuplicateAgent={
+            isBot && canManagePersona ? handleDuplicatePersona : undefined
+          }
+          onExportAgent={
+            isBot && canManagePersona ? handleExportPersona : undefined
+          }
           onOpenInstance={(instancePubkey) => onOpenProfile?.(instancePubkey)}
           onOpenActivity={handleOpenActivity}
           onOpenChannel={handleOpenChannel}
           onOpenDiagnostics={() => setView("diagnostics")}
-          onOpenInstructions={() => setView("instructions")}
+          onStickyChromeChange={handleStickyChromeChange}
           onTabChange={setTab}
-          onOpenDm={onOpenDm}
-          onCreateCard={
-            canManagePersona && resolvedPersona
-              ? () =>
-                  setCardMintTarget({
-                    // Prefer the live instance pubkey; fall back to the
-                    // persona/definition id (same resolution as export).
-                    id: managedAgent?.pubkey ?? resolvedPersona.id,
-                    name: resolvedPersona.displayName,
-                    // Locking needs an instance keypair to encrypt to.
-                    canLock: Boolean(managedAgent?.pubkey),
-                  })
-              : undefined
-          }
           presenceStatus={presenceStatus}
           profile={profile}
           pubkey={effectivePubkey}
           relayAgent={relayAgent}
+          runLocationMove={runLocationMove}
           tab={tab}
           unfollowMutation={unfollowMutation}
           userStatus={userStatus}
+          wakerToggle={
+            managedAgent?.backend.type === "provider"
+              ? {
+                  enabled: managedAgent.wakerEnabled,
+                  onToggle: wakerToggle.toggle,
+                  pending: wakerToggle.isPending,
+                }
+              : undefined
+          }
         />
       ) : null}
       {view === "memories" && effectivePubkey ? (
@@ -905,28 +910,27 @@ export function UserProfilePanel({
       ) : null}
     </AuxiliaryPanelBody>
   );
-  const editAgentDialog =
-    canEditAgent && managedAgent ? (
-      <AgentDialog
-        agent={managedAgent}
-        mode="instance-edit"
-        initialFocus={editAgentFocus}
-        onEditLinkedPersona={
-          resolvedPersona && !resolvedPersona.isBuiltIn
-            ? () => {
-                setEditAgentOpen(false);
-                setEditAgentFocus(undefined);
-                setPersonaDialogState(editPersonaDialogState(resolvedPersona));
-              }
-            : undefined
-        }
-        onOpenChange={(next) => {
-          setEditAgentOpen(next);
-          if (!next) setEditAgentFocus(undefined);
-        }}
-        open={editAgentOpen}
-      />
-    ) : null;
+  const editAgentDialog = (
+    <UserProfileEditAgentDialog
+      agent={managedAgent}
+      canEdit={canEditAgent}
+      initialFocus={editAgentFocus}
+      onEditLinkedPersona={
+        resolvedPersona && !resolvedPersona.isBuiltIn
+          ? () => {
+              setEditAgentOpen(false);
+              setEditAgentFocus(undefined);
+              setPersonaDialogState(editPersonaDialogState(resolvedPersona));
+            }
+          : undefined
+      }
+      onOpenChange={(next) => {
+        setEditAgentOpen(next);
+        if (!next) setEditAgentFocus(undefined);
+      }}
+      open={editAgentOpen}
+    />
+  );
   const addAgentToChannelDialog = managedAgent ? (
     <AddAgentToChannelDialog
       agent={managedAgent ?? null}
@@ -992,6 +996,9 @@ export function UserProfilePanel({
       personaDialogs={personaDialogs}
       profileBody={profileBody}
       splitPaneClamp={splitPaneClamp}
+      stickyChromeActive={view === "summary" && stickyChrome.active}
+      stickyChromeEnabled={view === "summary" && isBot}
+      stickyChromeHeight={stickyChrome.height}
       widthPx={widthPx}
       transparentChrome={transparentChrome}
     />

@@ -306,19 +306,34 @@ async fn flush_pending_events_at(
             event
         };
 
-        if crate::relay::submit_signed_event_at_with_keys(
+        if let Err(error) = crate::relay::submit_signed_event_at_with_keys(
             &event,
             state,
             &relay_api_base,
             owner_keys,
         )
         .await
-        .is_err()
         {
+            // Report it rather than assuming why. A relay that is briefly
+            // unreachable and one that refuses this kind outright both land
+            // here, and treating the second as the first — silently — is how a
+            // permanently rejected kind retried every 30s for as long as the
+            // app ran while reporting nothing at all. The publish looked
+            // merely pending, the subscriber on the other side looked healthy,
+            // and the only symptom anywhere was an absence. The row still
+            // stays pending either way; what changes is that the reason is
+            // observable instead of discarded.
+            //
+            // The coordinate is logged, never the content: retained rows
+            // include payloads encrypted to someone else.
+            eprintln!(
+                "buzz-desktop: event-flush: kind:{} d_tag:{} not published, staying pending: {error}",
+                current.kind, current.d_tag
+            );
             if current.kind == 5 {
                 failed_tombstones.insert((current.pubkey.clone(), current.d_tag.clone()));
             }
-            continue; // relay unreachable — stays pending for the next sweep
+            continue;
         }
 
         let conn = open_retention_db(db_path)?;

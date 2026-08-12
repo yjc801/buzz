@@ -1,0 +1,29 @@
+{
+  "$comment": [
+    "SHA-256 of each published provider binary, keyed by provider id and then",
+    "by Rust target triple. Compiled into the desktop and pinned into every",
+    "launch bundle it issues; buzz-waker selects the entry for the platform it",
+    "runs on and refuses anything else (G1).",
+    "",
+    "Kept here rather than fetched at issuance so that issuing a bundle needs",
+    "no network, and so a change to what the owner authorizes is a reviewable",
+    "diff rather than whatever a release happened to serve that day.",
+    "",
+    "MUST be bumped together with Dockerfile.waker's PROVIDER_SPRITES_TAG. The",
+    "daemon can only run a binary this file authorizes, so a version bump on",
+    "one side alone means every wake fails with a digest mismatch. Values come",
+    "from the release's published .sha256 assets:",
+    "",
+    "  gh release download buzz-backend-sprites-v0.1.0 --pattern '*.sha256'",
+    "",
+    "Bumping invalidates bundles issued under the old version: reissue by",
+    "toggling Remote wake off and on, or by any config change."
+  ],
+  "sprites": {
+    "release": "buzz-backend-sprites-v0.1.0",
+    "targets": {
+      "aarch64-unknown-linux-musl": "9c831d1146b1a48d910f741f345d4b3982a19973b862352b2402ebc06e3a86cc",
+      "x86_64-unknown-linux-musl": "370d4e1921debaf447c630d020a7db0cc7224b2682920407486acadee0143d47"
+    }
+  }
+}

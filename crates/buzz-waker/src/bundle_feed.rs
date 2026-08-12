@@ -657,7 +657,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: "sprites".to_string(),
                 provider_config: serde_json::json!({}),
-                provider_binary_sha256: "b".repeat(64),
+                provider_binary_sha256_by_target: crate::bundle::test_digests(&"b".repeat(64)),
             },
             bundle_version: 1,
             issued_at: 0,
@@ -712,7 +712,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: String::new(),
                 provider_config: serde_json::json!({}),
-                provider_binary_sha256: String::new(),
+                provider_binary_sha256_by_target: std::collections::BTreeMap::new(),
             },
             bundle_version: 5,
             issued_at: 0,
@@ -795,7 +795,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: String::new(),
                 provider_config: serde_json::json!({}),
-                provider_binary_sha256: String::new(),
+                provider_binary_sha256_by_target: std::collections::BTreeMap::new(),
             },
             bundle_version: 2,
             issued_at: 0,
@@ -808,7 +808,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: "sprites".to_string(),
                 provider_config: serde_json::json!({}),
-                provider_binary_sha256: "b".repeat(64),
+                provider_binary_sha256_by_target: crate::bundle::test_digests(&"b".repeat(64)),
             },
             bundle_version: 3,
             revoked: false,
@@ -874,7 +874,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: "sprites".to_string(),
                 provider_config: serde_json::json!({}),
-                provider_binary_sha256: "b".repeat(64),
+                provider_binary_sha256_by_target: crate::bundle::test_digests(&"b".repeat(64)),
             },
             bundle_version: 1,
             issued_at: 0,

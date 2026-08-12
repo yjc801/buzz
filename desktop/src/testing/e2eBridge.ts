@@ -304,6 +304,7 @@ type E2eConfig = {
     addChannelMembersErrors?: (string | null)[];
     channelMembersReadDelayMs?: number;
     createManagedAgentDelayMs?: number;
+    setManagedAgentWakerEnabledDelayMs?: number;
     channelTemplates?: ChannelTemplate[];
     channelsReadError?: string;
     /** Reject successive mock `get_channels` calls, then resume. */
@@ -8779,10 +8780,17 @@ async function handleSetManagedAgentStartOnAppLaunch(args: {
   return cloneManagedAgent(agent);
 }
 
-async function handleSetManagedAgentWakerEnabled(args: {
-  pubkey: string;
-  wakerEnabled: boolean;
-}): Promise<RawManagedAgent> {
+async function handleSetManagedAgentWakerEnabled(
+  args: {
+    pubkey: string;
+    wakerEnabled: boolean;
+  },
+  config: E2eConfig | undefined,
+): Promise<RawManagedAgent> {
+  const delayMs = config?.mock?.setManagedAgentWakerEnabledDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
   const agent = getMockManagedAgent(args.pubkey);
   if (args.wakerEnabled && agent.backend.type !== "provider") {
     throw new Error(
@@ -12454,6 +12462,7 @@ export function maybeInstallE2eTauriMocks() {
       case "set_managed_agent_waker_enabled":
         return handleSetManagedAgentWakerEnabled(
           payload as Parameters<typeof handleSetManagedAgentWakerEnabled>[0],
+          activeConfig,
         );
       case "delete_managed_agent":
         return handleDeleteManagedAgent(

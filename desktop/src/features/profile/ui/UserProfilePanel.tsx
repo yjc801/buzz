@@ -238,7 +238,7 @@ export function UserProfilePanel({
   const stopAgentMutation = useStopManagedAgentMutation();
   const deleteAgentMutation = useDeleteManagedAgentMutation();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
-  const handleToggleAgentWaker = useToggleManagedAgentWaker(managedAgent);
+  const wakerToggle = useToggleManagedAgentWaker(managedAgent);
   const createPersonaMutation = useCreatePersonaMutation();
   const updatePersonaMutation = useUpdatePersonaMutation();
   const deletePersonaMutation = useDeletePersonaMutation();
@@ -362,6 +362,7 @@ export function UserProfilePanel({
     stopAgentMutation.isPending ||
     deleteAgentMutation.isPending ||
     startOnLaunchMutation.isPending ||
+    wakerToggle.isPending ||
     createPersonaMutation.isPending ||
     updatePersonaMutation.isPending ||
     deletePersonaMutation.isPending ||
@@ -733,7 +734,7 @@ export function UserProfilePanel({
       onDuplicatePersona={handleDuplicatePersona}
       onExportPersona={handleExportPersona}
       onToggleAutoStart={handleToggleAgentAutoStart}
-      onToggleWaker={handleToggleAgentWaker}
+      onToggleWaker={wakerToggle.toggle}
       personaActionKey={resolvedPersona?.id}
       viewerIsOwner={viewerIsOwner}
     />

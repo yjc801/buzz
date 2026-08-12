@@ -7,10 +7,10 @@ import type { ManagedAgent } from "@/shared/api/types";
 /** Toggle `buzz-waker` remote-wake enrolment for a managed agent, with toasts. */
 export function useToggleManagedAgentWaker(
   managedAgent: ManagedAgent | undefined,
-): () => Promise<void> {
+): { toggle: () => Promise<void>; isPending: boolean } {
   const mutation = useSetManagedAgentWakerEnabledMutation();
 
-  return React.useCallback(async () => {
+  const toggle = React.useCallback(async () => {
     if (!managedAgent) return;
 
     try {
@@ -31,4 +31,6 @@ export function useToggleManagedAgentWaker(
       );
     }
   }, [managedAgent, mutation]);
+
+  return { toggle, isPending: mutation.isPending };
 }

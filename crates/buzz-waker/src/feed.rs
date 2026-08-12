@@ -891,24 +891,34 @@ pub fn parse_rate_limit_retry_secs(reason: &str) -> Option<u64> {
 ///
 /// An ordinary close is independent, and repairing it immediately is correct.
 /// A rate-limited close is neither independent nor transient: it trips every
-/// channel at once, and the retry is itself what re-trips it. So the hint is
-/// floored to [`RATE_LIMIT_FLOOR_SECS`] when it is missing or below
-/// [`RATE_LIMIT_MIN_HINT_SECS`], then doubled per consecutive close and
-/// capped at [`RECONNECT_MAX_DELAY_MS`] — the same shape and ceiling as
-/// [`reconnect_delay_ms`].
+/// channel at once, and the retry is itself what re-trips it. So a missing or
+/// sub-[`RATE_LIMIT_MIN_HINT_SECS`] hint is synthesized from
+/// [`RATE_LIMIT_FLOOR_SECS`], doubled per consecutive close and capped at
+/// [`RECONNECT_MAX_DELAY_MS`] — the same shape and ceiling as
+/// [`reconnect_delay_ms`]. A *valid* hint is the relay's own read of its
+/// limiter and is honoured as a floor instead: the local ceiling only bounds
+/// the synthesized fallback, never a real hint, so a `retry in 60s` is never
+/// truncated into a retry that arrives before the relay's own reset and
+/// re-trips the same limiter.
 ///
 /// Deterministic and jitter-free, for the reason given on
 /// [`reconnect_delay_ms`]. The channels that all park together are spread by
 /// the caller's staggered drain, not by randomness here.
 #[must_use]
 pub fn rate_limit_park_ms(hint_secs: Option<u64>, consecutive: u32) -> u64 {
-    let secs = match hint_secs {
-        Some(secs) if secs >= RATE_LIMIT_MIN_HINT_SECS => secs,
-        _ => RATE_LIMIT_FLOOR_SECS,
-    };
-    secs.saturating_mul(1_000)
-        .saturating_mul(1_u64 << consecutive.min(16))
-        .min(RECONNECT_MAX_DELAY_MS)
+    let multiplier = 1_u64 << consecutive.min(16);
+    match hint_secs {
+        // A valid hint only ever grows from here (multiplier >= 1), so it
+        // can never need capping up to the ceiling — only down past it,
+        // which is exactly the bug: never floor a real hint below itself.
+        Some(secs) if secs >= RATE_LIMIT_MIN_HINT_SECS => {
+            secs.saturating_mul(1_000).saturating_mul(multiplier)
+        }
+        _ => RATE_LIMIT_FLOOR_SECS
+            .saturating_mul(1_000)
+            .saturating_mul(multiplier)
+            .min(RECONNECT_MAX_DELAY_MS),
+    }
 }
 
 /// The socket, behind a trait so the loop above it can be tested.
@@ -2238,6 +2248,22 @@ mod tests {
             rate_limit_park_ms(Some(0), u32::MAX),
             RECONNECT_MAX_DELAY_MS,
             "the ladder must not overflow into a short delay"
+        );
+    }
+
+    /// The P2 regression: a valid hint above the local reconnect ceiling
+    /// must not be truncated below it, or the retry lands before the
+    /// relay's own reset and can re-trip the same limiter forever.
+    #[test]
+    fn a_long_hint_is_never_capped_below_itself() {
+        assert_eq!(
+            rate_limit_park_ms(Some(60), 0),
+            60_000,
+            "a hint above the reconnect ceiling must win, not get capped to it"
+        );
+        assert!(
+            rate_limit_park_ms(Some(60), 10) >= 60_000,
+            "repeated strikes must never bring a valid hint back below itself"
         );
     }
 }

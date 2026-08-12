@@ -55,11 +55,11 @@ workflow in `.github/workflows/`. The release pipelines build `buzz-acp`,
 `git-credential-nostr`, and `buzz-cli` — sprites is not among them, for any
 platform. It is not a published artifact anywhere.
 
-And even if a digest were published, `Dockerfile.waker:54` compiles the binary
-**from source at image build time**, so its bytes are a function of the source
-revision, toolchain, and dependency versions at that moment. The digest drifts
-on every image rebuild. Pinning against it would break on routine rebuilds
-rather than only on genuine mismatch.
+And even if a digest were published, `Dockerfile.waker`'s `cargo build` stanza
+compiles the binary **from source at image build time**, so its bytes are a
+function of the source revision, toolchain, and dependency versions at that
+moment. The digest drifts on every image rebuild. Pinning against it would
+break on routine rebuilds rather than only on genuine mismatch.
 
 Note the macOS side has the same defect: the local binary is a hand-built
 `cargo build` output, not a released artifact either.

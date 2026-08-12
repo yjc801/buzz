@@ -116,11 +116,101 @@ pub struct ProviderEnvelope {
     pub provider_id: String,
     /// The provider's configuration object, exactly as the desktop resolved it.
     pub provider_config: serde_json::Value,
-    /// Lowercase hex SHA-256 of the provider binary this bundle authorizes.
+    /// Lowercase hex SHA-256 of the provider binary this bundle authorizes,
+    /// keyed by the Rust target triple it was built for.
     ///
     /// Pinned rather than resolved ambiently: the waker must not run whatever
     /// binary happens to sit on its PATH under a signed bundle's authority.
-    pub provider_binary_sha256: String,
+    ///
+    /// Keyed by target because the issuer and the daemon are not on the same
+    /// platform. A single digest could only ever name one build, and desktop
+    /// issues from macOS while the daemon runs Linux/musl — so one digest
+    /// meant every real wake compared a Mach-O hash against an ELF one and
+    /// refused, correctly and permanently. The owner authorizes each build it
+    /// is willing to have run; the daemon selects the entry for the platform
+    /// it is actually on.
+    ///
+    /// `BTreeMap` for a stable, reviewable order. The signature covers
+    /// `body_json` verbatim so ordering cannot invalidate it, but a bundle is
+    /// read by people too.
+    pub provider_binary_sha256_by_target: std::collections::BTreeMap<String, String>,
+}
+
+/// The Rust target triple this binary was built for, when it is one the
+/// provider publishes for.
+///
+/// `None` means no authorization can apply: a bundle names digests per target,
+/// and a target nothing was built for cannot be among them. Refusing there is
+/// the same rule as a mismatched digest — absence of authorization is not
+/// permission — and it fails loudly rather than reaching for whatever entry
+/// happens to be present.
+#[must_use]
+pub const fn current_target_triple() -> Option<&'static str> {
+    // Written as a `cfg!` ladder rather than assembled from
+    // `std::env::consts` because a triple is not `arch-os`: it carries a
+    // vendor and an environment, and musl vs gnu is exactly the distinction
+    // that matters for whether a binary runs at all.
+    if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "musl"
+    )) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "musl"
+    )) {
+        Some("aarch64-unknown-linux-musl")
+    } else if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        Some("aarch64-apple-darwin")
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        Some("x86_64-apple-darwin")
+    } else {
+        None
+    }
+}
+
+impl ProviderEnvelope {
+    /// The digest this bundle authorizes for `target`, if it names one.
+    #[must_use]
+    pub fn digest_for_target(&self, target: &str) -> Option<&str> {
+        self.provider_binary_sha256_by_target
+            .get(target)
+            .map(String::as_str)
+    }
+
+    /// Every target this bundle authorizes a build for, for diagnostics.
+    ///
+    /// A refusal that cannot say what *was* authorized sends the reader back
+    /// to guessing, which is what made the single-digest version expensive to
+    /// diagnose.
+    #[must_use]
+    pub fn authorized_targets(&self) -> Vec<&str> {
+        self.provider_binary_sha256_by_target
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// A digest map authorizing `digest` for the target the tests are running on.
+///
+/// Keyed by the host target rather than a fixed string so a fixture bundle
+/// authorizes the platform actually executing it — otherwise every
+/// deploy-path test would exercise the "unauthorized target" refusal instead
+/// of the behaviour it means to cover.
+#[cfg(test)]
+pub(crate) fn test_digests(digest: &str) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(target) = current_target_triple() {
+        map.insert(target.to_string(), digest.to_string());
+    }
+    map
 }
 
 /// The signed content of a launch bundle.
@@ -345,7 +435,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: "sprites".to_string(),
                 provider_config: serde_json::json!({"org": "buzz-team"}),
-                provider_binary_sha256: "b".repeat(64),
+                provider_binary_sha256_by_target: test_digests(&"b".repeat(64)),
             },
             bundle_version: 7,
             issued_at: 1_000,
@@ -536,5 +626,79 @@ mod tests {
             signed.verify(&owner_hex(&kp), 1_000),
             Err(BundleError::BadSignature)
         );
+    }
+
+    // ── Per-target provider authorization ───────────────────────────────────
+
+    fn envelope(entries: &[(&str, &str)]) -> ProviderEnvelope {
+        ProviderEnvelope {
+            provider_id: "sprites".to_string(),
+            provider_config: serde_json::json!({}),
+            provider_binary_sha256_by_target: entries
+                .iter()
+                .map(|(target, digest)| ((*target).to_string(), (*digest).to_string()))
+                .collect(),
+        }
+    }
+
+    /// The regression this whole shape exists for. The issuer runs macOS and
+    /// the daemon runs Linux/musl, so a single digest could only ever name one
+    /// of them — and every real wake compared a Mach-O hash against an ELF one
+    /// and refused, correctly and forever. Selection by target is what lets one
+    /// bundle authorize both.
+    #[test]
+    fn a_bundle_authorizes_a_different_build_per_target() {
+        let env = envelope(&[
+            ("x86_64-unknown-linux-musl", &"a".repeat(64)),
+            ("aarch64-apple-darwin", &"b".repeat(64)),
+        ]);
+
+        assert_eq!(
+            env.digest_for_target("x86_64-unknown-linux-musl"),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            env.digest_for_target("aarch64-apple-darwin"),
+            Some("b".repeat(64).as_str())
+        );
+    }
+
+    /// Absence of authorization is not permission: a target the bundle does
+    /// not name gets no digest to fall back on, however many others it lists.
+    #[test]
+    fn a_target_the_bundle_does_not_name_is_unauthorized() {
+        let env = envelope(&[("x86_64-unknown-linux-musl", &"a".repeat(64))]);
+
+        assert_eq!(env.digest_for_target("aarch64-unknown-linux-musl"), None);
+        assert_eq!(
+            env.authorized_targets(),
+            vec!["x86_64-unknown-linux-musl"],
+            "a refusal has to be able to say what was authorized"
+        );
+    }
+
+    /// A revocation authorizes nothing anywhere — the empty map is the
+    /// statement, not a placeholder that happens to be unset.
+    #[test]
+    fn a_revocation_authorizes_no_build_on_any_platform() {
+        let env = envelope(&[]);
+
+        assert_eq!(env.digest_for_target("x86_64-unknown-linux-musl"), None);
+        assert!(env.authorized_targets().is_empty());
+    }
+
+    /// The daemon has to be able to name its own platform to look one up.
+    /// A build for a target the provider does not publish resolves to `None`,
+    /// which the deploy path turns into a refusal rather than a guess.
+    #[test]
+    fn the_running_target_is_identifiable() {
+        let target = current_target_triple().expect("tests run on a supported target");
+        assert!(
+            target.contains('-'),
+            "expected a target triple, got {target:?}"
+        );
+        // Whatever host runs the suite, a bundle naming it must select it.
+        let env = envelope(&[(target, &"c".repeat(64))]);
+        assert_eq!(env.digest_for_target(target), Some("c".repeat(64).as_str()));
     }
 }

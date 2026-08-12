@@ -294,6 +294,30 @@ impl WakeEffects for RealWakeEffects {
             });
         }
 
+        // Select the digest for the platform this daemon actually runs on,
+        // before anything touches the filesystem. The owner authorizes a build
+        // per target; a bundle naming none for this one has authorized nothing
+        // here, and absence of authorization is not permission (**G1**). What
+        // happens to sit on PATH is irrelevant when nothing may run.
+        let target = crate::bundle::current_target_triple().ok_or_else(|| {
+            EffectsError::Deploy(format!(
+                "no provider build is published for this daemon's platform; \
+                 the bundle authorizes {:?}",
+                bundle.provider.authorized_targets()
+            ))
+        })?;
+        let expected_digest = bundle
+            .provider
+            .digest_for_target(target)
+            .ok_or_else(|| {
+                EffectsError::Deploy(format!(
+                    "launch bundle authorizes no provider build for {target}; \
+                     it names {:?}",
+                    bundle.provider.authorized_targets()
+                ))
+            })?
+            .to_string();
+
         let binary = buzz_provider_deploy::resolve_provider_binary(&bundle.provider.provider_id)
             .map_err(EffectsError::ProviderUnresolved)?;
 
@@ -304,7 +328,6 @@ impl WakeEffects for RealWakeEffects {
             serde_json::Value::String(self.trigger_created_at.to_string());
 
         let provider_config = bundle.provider.provider_config.clone();
-        let expected_digest = bundle.provider.provider_binary_sha256.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
             buzz_provider_deploy::provider_deploy_pinned(
@@ -369,7 +392,7 @@ mod tests {
             provider: ProviderEnvelope {
                 provider_id: "zzz-nonexistent-test-provider".to_string(),
                 provider_config: serde_json::json!({}),
-                provider_binary_sha256: "b".repeat(64),
+                provider_binary_sha256_by_target: crate::bundle::test_digests(&"b".repeat(64)),
             },
             bundle_version: 1,
             issued_at: 0,

@@ -286,8 +286,9 @@ pub(crate) struct BundleInputs {
     pub provider_id: String,
     /// Provider configuration, from `BackendKind::Provider`.
     pub provider_config: serde_json::Value,
-    /// Lowercase hex SHA-256 of the provider binary this bundle authorizes.
-    pub provider_binary_sha256: String,
+    /// Lowercase hex SHA-256 of each provider build this bundle authorizes,
+    /// keyed by Rust target triple. See [`provider_digests_for`].
+    pub provider_binary_sha256_by_target: std::collections::BTreeMap<String, String>,
     /// The version reserved for *this* body by [`IssuanceLedger::reserve`].
     /// The waker refuses a version below its durably persisted floor, and
     /// accepts a repeat of the highest one as a redelivery — so this may never
@@ -306,10 +307,71 @@ pub(crate) struct BundleInputs {
     pub revoked: bool,
 }
 
+/// Published provider digests, compiled in from `provider-digests.json`.
+///
+/// Baked in rather than fetched so issuing a bundle needs no network, and so
+/// what the owner authorizes is a reviewable diff rather than whatever a
+/// release happened to serve at that moment.
+const PROVIDER_DIGESTS_JSON: &str = include_str!("../../provider-digests.json");
+
+/// Every published build of `provider_id`, keyed by Rust target triple.
+///
+/// This is what a bundle authorizes, and it deliberately does **not** hash the
+/// binary on this machine. The daemon that runs the provider is on another
+/// platform — desktop issues from macOS, the waker runs Linux/musl — so a
+/// locally-hashed digest could only ever name a build the daemon does not
+/// have. That was the whole failure: a Mach-O hash compared against an ELF
+/// one, refused correctly and permanently.
+///
+/// Hashing locally would also mix versions: the local binary is whatever
+/// someone built, while the manifest is a coherent set from one release.
+///
+/// # Errors
+/// The manifest is unreadable, or names no builds for `provider_id` — either
+/// way there is nothing this owner can authorize, and issuing a bundle that
+/// authorizes nothing would only move the failure to the daemon.
+pub(crate) fn provider_digests_for(
+    provider_id: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let manifest: serde_json::Value = serde_json::from_str(PROVIDER_DIGESTS_JSON)
+        .map_err(|error| format!("provider digest manifest is malformed: {error}"))?;
+
+    let targets = manifest
+        .get(provider_id)
+        .and_then(|entry| entry.get("targets"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "provider digest manifest names no published builds for '{provider_id}'; \
+                 add them to desktop/src-tauri/provider-digests.json"
+            )
+        })?;
+
+    let digests: std::collections::BTreeMap<String, String> = targets
+        .iter()
+        .filter_map(|(target, digest)| {
+            digest
+                .as_str()
+                .map(|digest| (target.clone(), digest.to_ascii_lowercase()))
+        })
+        .collect();
+
+    if digests.is_empty() {
+        return Err(format!(
+            "provider digest manifest lists no usable target digests for '{provider_id}'"
+        ));
+    }
+    Ok(digests)
+}
+
 /// Stream a provider binary and return its lowercase hex SHA-256.
 ///
 /// Streamed rather than read whole: provider binaries are tens of megabytes
 /// and this runs on the UI process.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "kept for local verification tooling")
+)]
 pub(crate) fn provider_binary_sha256(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| format!("failed to open provider binary for hashing: {error}"))?;
@@ -346,7 +408,7 @@ pub(crate) fn sign_launch_bundle(
         provider: ProviderEnvelope {
             provider_id: inputs.provider_id,
             provider_config: inputs.provider_config,
-            provider_binary_sha256: inputs.provider_binary_sha256,
+            provider_binary_sha256_by_target: inputs.provider_binary_sha256_by_target,
         },
         bundle_version: inputs.bundle_version.0,
         issued_at: inputs.issued_at,
@@ -378,7 +440,10 @@ mod tests {
             }),
             provider_id: "sprites".to_string(),
             provider_config: serde_json::json!({"org": "buzz-team"}),
-            provider_binary_sha256: "b".repeat(64),
+            provider_binary_sha256_by_target: BTreeMap::from([(
+                "x86_64-unknown-linux-musl".to_string(),
+                "b".repeat(64),
+            )]),
             bundle_version: ReservedVersion(7),
             issued_at: 1_000,
             lifetime_secs: DEFAULT_BUNDLE_LIFETIME_SECS,
@@ -403,6 +468,66 @@ mod tests {
         assert_eq!(verified.bundle_version, 7);
         assert!(verified.owner_only_access);
         assert_eq!(verified.agent_json["private_key_nsec"], NSEC);
+    }
+
+    /// The manifest is only useful if it names the provider the app actually
+    /// issues bundles for, with plausible digests.
+    #[test]
+    fn the_manifest_authorizes_the_sprites_provider() {
+        let digests = provider_digests_for("sprites").expect("sprites is published");
+
+        assert!(
+            digests.contains_key("x86_64-unknown-linux-musl"),
+            "the deployed daemon is linux/musl; without this entry no wake can \
+             ever be authorized"
+        );
+        for (target, digest) in &digests {
+            assert_eq!(digest.len(), 64, "{target} digest is not a sha256");
+            assert!(
+                digest.chars().all(|c| c.is_ascii_hexdigit()),
+                "{target} digest is not hex"
+            );
+            assert_eq!(
+                digest.to_ascii_lowercase(),
+                *digest,
+                "{target} not lowercase"
+            );
+        }
+    }
+
+    /// A provider with no published builds must fail at issuance rather than
+    /// producing a bundle that authorizes nothing — the daemon would refuse it
+    /// anyway, and the owner should learn that here, not from a failed wake.
+    #[test]
+    fn an_unpublished_provider_refuses_to_issue() {
+        assert!(provider_digests_for("kubernetes").is_err());
+        assert!(provider_digests_for("nonexistent").is_err());
+    }
+
+    /// The manifest and `Dockerfile.waker` name the same provider release, and
+    /// nothing enforces that but this. They are two files a person has to
+    /// remember to bump together; if they drift, every wake fails on a digest
+    /// mismatch that looks exactly like the bug this replaced.
+    #[test]
+    fn the_manifest_release_matches_the_image_the_daemon_runs() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(PROVIDER_DIGESTS_JSON).expect("manifest parses");
+        let release = manifest["sprites"]["release"]
+            .as_str()
+            .expect("sprites names a release");
+
+        let dockerfile = include_str!("../../../../Dockerfile.waker");
+        let pinned = dockerfile
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ARG PROVIDER_SPRITES_TAG="))
+            .expect("Dockerfile.waker pins a provider tag");
+
+        assert_eq!(
+            release, pinned,
+            "provider-digests.json authorizes {release} but Dockerfile.waker \
+             installs {pinned}; the daemon can only run what the manifest \
+             authorizes, so these must be bumped together"
+        );
     }
 
     /// A revocation is a real signed body like any other, just flagged and

@@ -86,7 +86,7 @@ pub(crate) fn retain_waker_bundle_pending(
     state: &AppState,
     record: &ManagedAgentRecord,
 ) -> Result<(), String> {
-    use crate::managed_agents::waker_bundle::{issuance_ledger, provider_binary_sha256};
+    use crate::managed_agents::waker_bundle::{issuance_ledger, provider_digests_for};
 
     let BackendKind::Provider {
         id: provider_id,
@@ -96,12 +96,12 @@ pub(crate) fn retain_waker_bundle_pending(
         return Ok(());
     };
 
-    let provider_binary_path = record
-        .provider_binary_path
-        .as_ref()
-        .ok_or_else(|| "no provider binary resolved for this agent yet".to_string())?;
-    let provider_binary_sha256 =
-        provider_binary_sha256(std::path::Path::new(provider_binary_path))?;
+    // Authorized from the published manifest, not from the binary on this
+    // machine. `record.provider_binary_path` points at whatever this host has
+    // — on a Mac, a Mach-O build the Linux daemon will never be running — so
+    // hashing it could only ever authorize a binary the daemon does not have.
+    // That path stays as it is: it is what a *local* deploy executes.
+    let provider_binary_sha256_by_target = provider_digests_for(&provider_id)?;
 
     let agent_json = super::deploy::build_deploy_payload(app, state, record, None)?;
 
@@ -120,7 +120,7 @@ pub(crate) fn retain_waker_bundle_pending(
         agent_json,
         provider_id,
         provider_config,
-        provider_binary_sha256,
+        provider_binary_sha256_by_target,
         issued_at,
         false,
     )
@@ -173,11 +173,13 @@ pub(crate) fn revoke_waker_bundle_pending(
         &scope.owner_keys,
         &ledger,
         agent_pubkey,
-        // Unread by a revoked delivery — see `LaunchBundleBody::revoked`.
+        // Unread by a revoked delivery — see `LaunchBundleBody::revoked`. The
+        // digest map is empty rather than a placeholder: a revocation
+        // authorizes no build on any platform, which is exactly what it means.
         serde_json::Value::Null,
         String::new(),
         serde_json::json!({}),
-        String::new(),
+        std::collections::BTreeMap::new(),
         issued_at,
         true,
     )
@@ -197,7 +199,7 @@ pub(super) fn sign_and_retain_waker_bundle_at(
     agent_json: serde_json::Value,
     provider_id: String,
     provider_config: serde_json::Value,
-    provider_binary_sha256: String,
+    provider_binary_sha256_by_target: std::collections::BTreeMap<String, String>,
     issued_at: u64,
     revoked: bool,
 ) -> Result<(), String> {
@@ -217,7 +219,7 @@ pub(super) fn sign_and_retain_waker_bundle_at(
             agent_json,
             provider_id,
             provider_config,
-            provider_binary_sha256,
+            provider_binary_sha256_by_target,
             bundle_version,
             issued_at,
             lifetime_secs: DEFAULT_BUNDLE_LIFETIME_SECS,
@@ -322,7 +324,10 @@ mod tests {
             serde_json::json!({"launch": {"command": "buzz-acp"}}),
             "sprites".to_string(),
             serde_json::json!({"org": "buzz-team"}),
-            "b".repeat(64),
+            std::collections::BTreeMap::from([(
+                "x86_64-unknown-linux-musl".to_string(),
+                "b".repeat(64),
+            )]),
             1_000,
             false,
         )
@@ -375,7 +380,10 @@ mod tests {
                 serde_json::json!({}),
                 "sprites".to_string(),
                 serde_json::json!({}),
-                "b".repeat(64),
+                std::collections::BTreeMap::from([(
+                    "x86_64-unknown-linux-musl".to_string(),
+                    "b".repeat(64),
+                )]),
                 issued_at,
                 false,
             )
@@ -435,7 +443,10 @@ mod tests {
             serde_json::json!({"launch": {"command": "buzz-acp"}}),
             "sprites".to_string(),
             serde_json::json!({"org": "buzz-team"}),
-            "b".repeat(64),
+            std::collections::BTreeMap::from([(
+                "x86_64-unknown-linux-musl".to_string(),
+                "b".repeat(64),
+            )]),
             1_000,
             false,
         )
@@ -449,7 +460,7 @@ mod tests {
             serde_json::Value::Null,
             String::new(),
             serde_json::json!({}),
-            String::new(),
+            std::collections::BTreeMap::new(),
             2_000,
             true,
         )

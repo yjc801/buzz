@@ -88,7 +88,9 @@ test("editing a kubernetes agent shows its saved run-on settings", async ({
   ).toHaveCount(0);
 
   // The section explains immutability instead of pretending to be a form.
-  await expect(runOn).toContainText("can't be changed afterwards");
+  await expect(runOn).toContainText(
+    "These are the settings saved when the agent was created",
+  );
 
   await runOn.scrollIntoViewIfNeeded();
   await waitForAnimations(page);

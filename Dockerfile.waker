@@ -37,12 +37,68 @@
 # exactly here — `refusing to run an unauthorized binary`, which is G1 working
 # rather than misbehaving.
 #
-# Closing it needs more than target-aware digest selection in desktop's
-# issuance path: buzz-backend-sprites is not built in CI for any platform, so
-# there is no Linux digest to select, and this image compiles it from source
-# below, so its digest drifts on every rebuild. Both have to be fixed, and in
-# order. See docs/waker-provider-digest-gap.md for the evidence and the
-# required sequencing.
+# Half of it is now closed. buzz-backend-sprites is built and published by
+# .github/workflows/provider-sprites.yml, and this image installs that
+# artifact after verifying its checksum rather than compiling its own — so the
+# Linux digest exists, and it no longer drifts on every rebuild.
+#
+# What remains is desktop's issuance path: it still hashes whatever provider
+# binary sits on the issuing machine, which on a Mac is a Mach-O arm64 build
+# that can never equal the musl one running here. Until a bundle carries a
+# digest per target and the daemon matches its own, a real wake still ends at
+# `deploy-failed`. See docs/waker-provider-digest-gap.md for the sequencing.
+# The published provider release this image installs. Pinned to a version tag
+# on purpose: the rolling `buzz-backend-sprites-latest` asset is republished on
+# every push to main, so its digest moves for reasons that have nothing to do
+# with the provider. Pinning a tag is what makes the installed bytes — and
+# therefore the digest a launch bundle pins — a fact rather than a moving
+# target. Bump this deliberately, and expect issued bundles to need reissuing
+# when you do.
+ARG PROVIDER_SPRITES_REPO=yjc801/buzz
+ARG PROVIDER_SPRITES_TAG=buzz-backend-sprites-v0.1.0
+
+# Fetched, not compiled. Building it here made its bytes a function of the
+# source revision and toolchain at image build time, so the digest drifted on
+# every rebuild and nothing could pin it. See docs/waker-provider-digest-gap.md.
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS provider
+ARG PROVIDER_SPRITES_REPO
+ARG PROVIDER_SPRITES_TAG
+# BuildKit sets TARGETARCH from the platform being built for, which is what
+# makes this correct on both native runners rather than baking in one arch.
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates curl
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) TRIPLE=x86_64-unknown-linux-musl ;; \
+      arm64) TRIPLE=aarch64-unknown-linux-musl ;; \
+      *) echo "no published provider build for TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    ASSET="buzz-backend-sprites-${TRIPLE}"; \
+    BASE="https://github.com/${PROVIDER_SPRITES_REPO}/releases/download/${PROVIDER_SPRITES_TAG}"; \
+    cd /tmp; \
+    # Retried hard, because this is the one step that leaves the builder's
+    # network and the release CDN throttles it. Measured from Fly's remote
+    # builder: one build took 503 on all seven attempts across ~18s while the
+    # next succeeded on its first, and the same fetch is instant from a laptop
+    # — GitHub rate-limiting unauthenticated release downloads from a shared
+    # cloud egress IP. So the budget has to cover minutes, not seconds; curl's
+    # default backoff grows between attempts and --retry-max-time caps the
+    # whole thing rather than each try.
+    #
+    # A partial body cannot reach the checksum: curl only writes -o on
+    # success, so a truncated download fails here as a network error rather
+    # than surfacing later as a confusing digest mismatch.
+    fetch() { curl -fsSL --retry 10 --retry-all-errors --retry-max-time 300 \
+                   --connect-timeout 20 --max-time 300 -o "$1" "$2"; }; \
+    fetch "$ASSET" "${BASE}/${ASSET}"; \
+    fetch "${ASSET}.sha256" "${BASE}/${ASSET}.sha256"; \
+    # Verified under the asset's own name, because the published .sha256 names
+    # it — renaming first would silently verify nothing.
+    sha256sum -c "${ASSET}.sha256"; \
+    install -D -m 0755 "$ASSET" /out/buzz-backend-sprites; \
+    echo "installed ${ASSET} from ${PROVIDER_SPRITES_TAG}:"; \
+    sha256sum /out/buzz-backend-sprites
+
 FROM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS builder
 
 RUN apk add --no-cache \
@@ -59,8 +115,7 @@ WORKDIR /build
 COPY . .
 RUN cargo build --release --locked \
       -p buzz-waker --bin buzz-waker \
-      -p buzz-backend-sprites --bin buzz-backend-sprites \
-    && strip target/release/buzz-waker target/release/buzz-backend-sprites
+    && strip target/release/buzz-waker
 
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
@@ -69,7 +124,7 @@ RUN apk add --no-cache bash ca-certificates \
     && install -d -o waker -g waker /data/waker /run/waker
 
 COPY --from=builder --chmod=0755 /build/target/release/buzz-waker /usr/local/bin/buzz-waker
-COPY --from=builder --chmod=0755 /build/target/release/buzz-backend-sprites /usr/local/bin/buzz-backend-sprites
+COPY --from=provider --chmod=0755 /out/buzz-backend-sprites /usr/local/bin/buzz-backend-sprites
 COPY --chmod=0755 scripts/waker-entrypoint.sh /usr/local/bin/waker-entrypoint
 
 ENV HOME=/home/waker \

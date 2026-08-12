@@ -1,0 +1,126 @@
+name: Waker image
+
+# Builds the buzz-waker image and pushes it to Fly's registry, so deploying is
+# `fly deploy --image <ref>` rather than `fly deploy` building from source.
+#
+# Why not let Fly build it: the image installs a published provider binary
+# from a GitHub release (Dockerfile.waker), and GitHub rate-limits
+# unauthenticated release downloads from shared cloud egress IPs. Measured
+# from Fly's remote builder: one build took HTTP 503 on all seven retry
+# attempts across ~18s while the next succeeded immediately, and the same
+# fetch is instant from a laptop. Roughly half of deploys failed on a step
+# that has nothing to do with the code being deployed. In Actions the fetch is
+# GitHub-to-GitHub and does not hit that throttle.
+#
+# Single-arch (linux/amd64) on purpose: the Fly app runs shared-cpu-1x, which
+# is x86_64. Dockerfile.waker supports arm64 and the provider release ships an
+# aarch64 asset, so adding a native arm64 runner here is a matrix entry and a
+# manifest merge (see docker.yml) whenever a machine needs it — not something
+# to carry unused.
+#
+# Requires an FLY_API_TOKEN repo secret with push access to the app's registry:
+#
+#   fly tokens create deploy -a buzz-waker
+#   gh secret set FLY_API_TOKEN --repo <owner>/<repo>
+#
+# Deploy a built image with:
+#   fly deploy --config fly.waker.toml --app buzz-waker \
+#     --image registry.fly.io/buzz-waker:sha-<short>
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.waker"
+      - "scripts/waker-entrypoint.sh"
+      - "fly.waker.toml"
+      - ".github/workflows/waker-image.yml"
+      - "crates/buzz-waker/**"
+      - "crates/buzz-provider-deploy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - "Dockerfile.waker"
+      - "scripts/waker-entrypoint.sh"
+      - ".github/workflows/waker-image.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: waker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Pull requests build without pushing: the image is a deploy artifact, and
+      # a fork PR has no registry credentials anyway. Catching a broken
+      # Dockerfile still has value, so the build itself always runs.
+      - name: Log in to Fly registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: registry.fly.io
+          # Fly's registry takes any username with a deploy token as the
+          # password; `x` is the documented placeholder.
+          username: x
+          password: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          IMAGE="registry.fly.io/buzz-waker"
+          # sha- tag is the one to deploy: immutable, and names the commit the
+          # image was built from. `main` is a convenience pointer that moves.
+          echo "sha_tag=${IMAGE}:sha-${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "main_tag=${IMAGE}:main" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.waker
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.main_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise
+        if: github.event_name != 'pull_request'
+        env:
+          SHA_TAG: ${{ steps.tags.outputs.sha_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Waker image pushed"
+            echo
+            echo '```'
+            echo "image:  $SHA_TAG"
+            echo "digest: $DIGEST"
+            echo '```'
+            echo
+            echo "Deploy it:"
+            echo
+            echo '```bash'
+            echo "fly deploy --config fly.waker.toml --app buzz-waker --image $SHA_TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

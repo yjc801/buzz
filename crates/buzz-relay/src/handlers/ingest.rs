@@ -32,9 +32,9 @@ use buzz_core::kind::{
     KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
     KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
     KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
-    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WAKER_LAUNCH_BUNDLE,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -335,6 +335,15 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
         KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
+        // Waker launch bundles (30180) are owner-authored agent configuration,
+        // addressed by (owner_pubkey, kind, agent_pubkey) and NIP-44-encrypted
+        // to the agent. `UsersWrite` for the same reason the sibling
+        // managed-agent records above take it: the writer is the owner
+        // administering their own agent, not a channel participant. The
+        // payload's confidentiality is enforced on the read side instead
+        // (`P_GATED_KINDS`/`RESULT_GATED_KINDS`), which is why this kind can be
+        // an ordinary user-scoped write without widening what anyone can read.
+        KIND_WAKER_LAUNCH_BUNDLE => Ok(Scope::UsersWrite),
         // NIP-56 reports are ordinary member writes into the mod-only queue.
         // Ingest persists them to `moderation_reports` and suppresses public
         // storage/fanout; reports are signals, never enforcement triggers.
@@ -585,6 +594,11 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // NIP-AM: agent turn metrics are owner-scoped global events.
             // Channel identity is encrypted inside the payload — no `h` tag.
             | KIND_AGENT_TURN_METRIC
+            // Waker launch bundles are addressed by (owner_pubkey, kind,
+            // agent_pubkey) and delivered to one agent; they describe how to
+            // launch it, not anything that happens in a channel. A stray `h`
+            // tag must not channel-scope them.
+            | KIND_WAKER_LAUNCH_BUNDLE
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
     )
@@ -3426,6 +3440,26 @@ mod tests {
         );
         assert!(is_global_only_kind(KIND_PRIVATE_MANAGED_AGENT));
         assert!(!requires_h_channel_scope(KIND_PRIVATE_MANAGED_AGENT));
+    }
+
+    /// The launch bundle's read side was wired without its write side, so
+    /// every publish fell through to `_ => Err("restricted: unknown event
+    /// kind")` and the desktop — which discards the rejection — retried
+    /// forever. Remote wake could never work: the daemon's bundle tap was
+    /// healthy and simply had nothing to receive.
+    #[test]
+    fn waker_launch_bundle_is_an_accepted_owner_scoped_global_write() {
+        let event = make_dummy_event();
+        assert_eq!(
+            required_scope_for_kind(KIND_WAKER_LAUNCH_BUNDLE, &event),
+            Ok(Scope::UsersWrite),
+            "the relay must accept a launch bundle write, not reject it as an unknown kind"
+        );
+        assert!(
+            is_global_only_kind(KIND_WAKER_LAUNCH_BUNDLE),
+            "bundles are addressed by (owner, kind, agent); a stray `h` tag must not scope them"
+        );
+        assert!(!requires_h_channel_scope(KIND_WAKER_LAUNCH_BUNDLE));
     }
 
     #[test]

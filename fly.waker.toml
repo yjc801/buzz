@@ -1,0 +1,60 @@
+# Fly app config for buzz-waker (crates/buzz-waker) — deployed as a normal
+# always-on Fly app, deliberately not a Sprite. Sprites hibernate on idle
+# (crates/buzz-backend-sprites/README.md); this daemon's entire job is
+# staying connected and listening continuously across every watched agent,
+# which is exactly the workload Sprites are built to suspend.
+#
+# Deploy with:
+#   fly deploy --config fly.waker.toml --dockerfile Dockerfile.waker
+#
+# Before the first deploy:
+#   fly apps create <app-name> --org <org>
+#   fly volumes create waker_state --app <app-name> --region <region> --size 1
+#   fly secrets set --app <app-name> \
+#     WAKER_RELAY_URL=wss://... \
+#     WAKER_AGENTS_CONFIG_JSON="$(cat agents.json)" \
+#     SPRITE_TOKEN=...             # only if buzz-backend-sprites is in use
+#
+# `app` below is a placeholder — rename before creating the real app; Fly
+# app names are globally unique.
+app = "buzz-waker"
+primary_region = "sjc"
+
+# No [http_service] block: this is a background worker with no inbound
+# traffic (its connections to the relay are outbound), so there is nothing
+# for Fly's HTTP idle-detection to watch — and nothing here should be reachable
+# from the public internet. Fly's default idle-machine stop only triggers off
+# an [http_service]/[[services]] block; omitting it means this daemon is not
+# subject to that autostop path. min_machines_running below is what actually
+# keeps it running.
+
+[build]
+  dockerfile = "Dockerfile.waker"
+
+[env]
+  RUST_LOG = "buzz_waker=info"
+  # WAKER_RELAY_URL, WAKER_AGENTS_CONFIG_JSON, and (if used)
+  # SPRITE_TOKEN/SPRITES_TOKEN are secrets — set via `fly secrets set`,
+  # never in this file. WAKER_AGENTS_CONFIG_JSON contains each watched
+  # agent's private key (`nsec`); Dockerfile.waker's entrypoint writes it
+  # to a tmpfs path (WAKER_AGENTS_CONFIG_PATH) on every boot, never to the
+  # durable volume below.
+
+[mounts]
+  source = "waker_state"
+  destination = "/data/waker"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# No [processes] override — Dockerfile.waker's ENTRYPOINT is the only
+# command this image runs.
+#
+# Keep exactly one instance running at all times — no autoscaling and no
+# scale-to-zero. A restarted machine still needs the mounted volume for its
+# FloorStore anti-rollback state to survive the restart; running more than
+# one machine against the same watched-agent set is untested and not a
+# goal here (each watch loop is per-agent, not sharded).
+[[restart]]
+  policy = "always"

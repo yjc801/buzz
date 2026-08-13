@@ -151,13 +151,23 @@ needs exactly one, `SPRITE_TOKEN` (`credentials.rs`'s primary lookup;
 enrolment is a new path with no existing callers, so it has no reason to
 also accept the `SPRITES_TOKEN` compatibility alias that exists for
 back-compat elsewhere) — and the enrolment payload carries that shape, not a
-map with unbounded keys. The daemon spawns the provider from an explicitly
-sanitized environment — not the daemon's own environment, and not the
-daemon's environment plus tenant overrides — containing only the
-schema-defined variables for that provider. It is still secret — never
-logged, never in an error string, zeroized after use as the bundle plaintext
-already is — the schema constrains which keys can be set; it doesn't change
-that the values are sensitive.
+map with unbounded keys.
+
+The spawned environment is **two separate inputs, not one sanitized map**:
+a small, fixed, **daemon-controlled runtime baseline**, plus the narrow
+tenant credential schema layered on top — and the tenant input can never
+override a baseline key. A schema-only environment isn't actually safe to
+spawn from: `buzz-backend-sprites`'s own `credentials::resolve` reads `HOME`
+and errors *before it ever checks `SPRITE_TOKEN`*
+(`crates/buzz-backend-sprites/src/credentials.rs:46-47`), so a child process
+missing `HOME` fails every Sprites deploy regardless of how correct the
+tenant's token is. The baseline starts at `HOME` for Sprites specifically,
+proven against whatever each provider's own resolution path actually reads
+— not guessed per-provider, checked against that provider's code the same
+way this one was. Tenant data populates only the schema-defined credential
+keys on top of that fixed baseline; it is still secret — never logged,
+never in an error string, zeroized after use as the bundle plaintext
+already is.
 
 Net secrets, compared to today:
 
@@ -206,15 +216,30 @@ decryption is attempted, mirroring how a bundle from an unpinned
 `owner_pubkey` is refused today.
 
 But an allowlist is per-owner configuration, so a waker meant to serve
-*everyone* cannot use one: the operator would have to add each new user by
-hand, which is the terminal step this document exists to remove, relocated
-rather than eliminated. So the variable is **optional**, and its presence
-selects the mode:
+*everyone* cannot use one long-term: the operator would have to add each new
+user by hand, which is the terminal step this document exists to remove,
+relocated rather than eliminated. Open mode is the eventual answer to that —
+but it is **not implemented by this document** (owner discovery has no
+mechanism yet; see below and Open questions), so today the variable has
+exactly one safe contract:
 
-- **set** — closed. Only those owners may enrol. Single-operator deployments.
-- **empty** — open. Any relay member may enrol, bounded by a total daemon
-  capacity — not a per-owner one; see below for why the earlier per-owner
-  version of this section was wrong.
+- **set (nonempty)** — closed. Only those owners may enrol. The only mode
+  this document specifies as ready to build.
+- **empty or unset** — **enrolment is disabled**, not "open." The daemon
+  must refuse every enrolment (or fail startup outright, if relay-based
+  enrolment is otherwise configured/enabled) rather than admit unbounded
+  unauthenticated owners. This is a deliberate fail-closed default, not a
+  placeholder for open mode: `WAKER_OWNER_PUBKEYS`'s parser already accepts
+  an empty list today (Phase 1, PR #48), so leaving empty ambiguous between
+  "open" and "disabled" is a real path to shipping unbounded admission by
+  accident. Open mode gets its own explicit selector once it has a reviewed
+  design — reusing "empty" for it later, after this document ships enrolment
+  with "empty means disabled," would be its own breaking change and should
+  be treated as one.
+
+The rest of this section describes what open mode's *design* would need to
+satisfy before it earns its own selector — none of it is reachable through
+`WAKER_OWNER_PUBKEYS` today, per the fail-closed contract above.
 
 **Correction: a per-owner cap does not bound anything here.** The original
 version of this section proposed bounding open mode with a per-owner agent
@@ -260,8 +285,11 @@ fully specified as written.
 This splits the work along the right line:
 
 - **deploy time, technical operator**: set the identity secret, publish the
-  waker pubkey, and decide open or closed
-- **runtime, any user**: toggle agents freely, forever
+  waker pubkey, and set `WAKER_OWNER_PUBKEYS` to enable closed-mode
+  enrolment (leaving it unset keeps enrolment disabled, today's only other
+  option)
+- **runtime, any user**: toggle agents freely, forever, once their owner is
+  in the allowlist
 
 The non-technical user never touches configuration. For a hosted waker the
 identity pubkey ships as a client default, so they configure nothing at all.
@@ -283,13 +311,17 @@ owner (refused at the floor, which never rewrites). Reach another owner's
 credentials (separate records, never merged into process env). Spend the
 operator's money (their deploy uses their own token).
 
-**What a stranger can do**, in open mode: consume connections and memory, up
-to the *total* daemon capacity (`WAKER_MAX_AGENTS`), not a per-owner share of
-it — see Two admission modes for why a per-owner cap can't be enforced
-against a signer identity that costs nothing to mint. Bounded by relay
-membership for entry (the relay refuses non-members outright) and by that
-total capacity for how much of the daemon one member — or a hundred fake
-identities controlled by one member — can occupy.
+**What a stranger can do today: nothing.** Closed mode is the only
+implemented admission path, and it requires the stranger's `owner_pubkey` to
+already be in `WAKER_OWNER_PUBKEYS`. **Once open mode exists**, a stranger
+whose relay membership the operator never approved would be able to consume
+connections and memory up to the *total* daemon capacity (`WAKER_MAX_AGENTS`),
+not a per-owner share of it — see Two admission modes for why a per-owner cap
+can't be enforced against a signer identity that costs nothing to mint. That
+would be bounded by relay membership for entry (the relay refuses
+non-members outright) and by that total capacity for how much of the daemon
+one member — or a hundred fake identities controlled by one member — could
+occupy.
 
 ## Rejected alternatives
 

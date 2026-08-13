@@ -64,6 +64,18 @@ pub(crate) fn retain_managed_agent_pending(
         if let Err(e) = retain_waker_bundle_pending(app, state, record) {
             eprintln!("buzz-desktop: waker-bundle-retain: {e}");
         }
+        // Independently best-effort, like the two halves above. Enrolment and
+        // the launch bundle answer different questions — which agents the
+        // daemon watches, versus how it deploys one — so a failure to issue
+        // either must not suppress the other. A daemon that already knows this
+        // agent still gets its reissued bundle if enrolment fails, and an
+        // enrolment that lands without a bundle is a watched agent whose next
+        // config change reissues one.
+        if let Err(e) = crate::commands::agents_waker_enrolment::retain_waker_enrolment_pending(
+            app, state, record,
+        ) {
+            eprintln!("buzz-desktop: waker-enrolment-retain: {e}");
+        }
     }
 }
 
@@ -191,7 +203,7 @@ pub(crate) fn revoke_waker_bundle_pending(
 /// against a tempdir ledger/retention db without a Tauri `AppHandle`, mirroring
 /// `commands::personas::pending::prepare_persona_publication_at`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn sign_and_retain_waker_bundle_at(
+pub(crate) fn sign_and_retain_waker_bundle_at(
     db_path: &std::path::Path,
     owner_keys: &Keys,
     ledger: &crate::managed_agents::waker_bundle::IssuanceLedger,

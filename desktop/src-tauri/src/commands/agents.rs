@@ -1257,7 +1257,7 @@ use profile::{profile_needs_sync, resolve_legacy_avatar};
 pub(crate) use profile::{reconcile_agent_profile, ProfileReconcileData};
 
 #[path = "agents_waker.rs"]
-mod waker;
+pub(crate) mod waker;
 
 #[cfg(test)]
 #[path = "agents_tests.rs"]

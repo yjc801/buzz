@@ -350,7 +350,14 @@ fn validate_roster_body(body: RosterBody) -> Result<RosterBody, EnrolmentError> 
 /// daemon-controlled runtime baseline (`HOME` for Sprites — see
 /// `buzz-backend-sprites::credentials::resolve`) that tenant data can never
 /// override.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand and redacts every variant's secret field —
+/// deriving it would print `sprite_token` verbatim any time this type is
+/// formatted directly (an error path, an assertion, a future log line in
+/// deploy wiring), not just when it's nested inside [`CredentialBody`]'s own
+/// manual formatter. Matches [`CredentialBody`]'s and
+/// `buzz-backend-sprites::Credential`'s existing pattern.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum ProviderCredential {
     /// Sprites: `credentials::resolve()` checks `SPRITE_TOKEN`, then the
@@ -364,6 +371,17 @@ pub enum ProviderCredential {
         /// in an error string, zeroized after use, same as [`CredentialBody::nsec`].
         sprite_token: String,
     },
+}
+
+impl std::fmt::Debug for ProviderCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sprites { .. } => f
+                .debug_struct("Sprites")
+                .field("sprite_token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// The signed content of one agent's delivered credential.
@@ -413,10 +431,7 @@ impl std::fmt::Debug for CredentialBody {
             .field("agent_pubkey", &self.agent_pubkey)
             .field("nsec", &"<redacted>")
             .field("auth_tag", &self.auth_tag)
-            .field(
-                "provider_credential",
-                &self.provider_credential.as_ref().map(|_| "<redacted>"),
-            )
+            .field("provider_credential", &self.provider_credential)
             .field("credential_version", &self.credential_version)
             .field("issued_at", &self.issued_at)
             .field("revoked", &self.revoked)
@@ -985,6 +1000,21 @@ mod tests {
         });
         let rendered = format!("{body:?}");
         assert!(!rendered.contains("tok-should-not-appear"));
+    }
+
+    #[test]
+    fn provider_credentials_own_debug_impl_redacts_the_token() {
+        // Formatted directly, not nested inside CredentialBody — the P1
+        // finding was that CredentialBody's manual formatter only protects
+        // the enclosing-body case, so an error/assert/log path formatting a
+        // bare ProviderCredential (e.g. later deploy wiring) would otherwise
+        // print sprite_token verbatim via the derived impl.
+        let credential = ProviderCredential::Sprites {
+            sprite_token: "tok-should-not-appear".to_string(),
+        };
+        let rendered = format!("{credential:?}");
+        assert!(!rendered.contains("tok-should-not-appear"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

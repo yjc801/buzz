@@ -156,6 +156,13 @@ pub enum EnrolmentError {
     /// [`Self::MalformedNsec`].
     #[error("malformed credential auth_tag: {0}")]
     MalformedAuthTag(String),
+
+    /// [`CredentialBody::provider_credential`], if present, has an
+    /// empty/blank value for a field [`ProviderCredential`]'s schema
+    /// requires. Only checked for a live credential, same reasoning as
+    /// [`Self::MalformedNsec`].
+    #[error("invalid provider_credential: {0}")]
+    InvalidProviderCredential(String),
 }
 
 /// One agent's membership entry inside a [`RosterBody`].
@@ -324,12 +331,48 @@ fn validate_roster_body(body: RosterBody) -> Result<RosterBody, EnrolmentError> 
     })
 }
 
+/// A tenant's provider deploy credential, carried inside a live
+/// [`CredentialBody`] so one daemon can deploy on behalf of several owners.
+///
+/// Deliberately **not** an arbitrary `{String: String}` environment map —
+/// `docs/waker-agent-enrolment.md`'s Per-owner provider credentials section
+/// explains why: `Command::env()` doesn't distinguish a credential from any
+/// other process-control variable, so an unconstrained map would let a
+/// tenant set `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`, or a provider's own
+/// proxy/TLS/debug flags in the trusted subprocess the daemon spawns on
+/// every tenant's behalf. Each variant instead names exactly the narrow set
+/// of variables that provider's own credential resolution reads — nothing
+/// more, so there is nothing extra to inject.
+///
+/// Spawning is a separate, later concern (deploy wiring, not this schema):
+/// the doc specifies these tenant-controlled values as one of two inputs to
+/// the eventual child environment, layered on top of a fixed
+/// daemon-controlled runtime baseline (`HOME` for Sprites — see
+/// `buzz-backend-sprites::credentials::resolve`) that tenant data can never
+/// override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ProviderCredential {
+    /// Sprites: `credentials::resolve()` checks `SPRITE_TOKEN`, then the
+    /// `SPRITES_TOKEN` compatibility alias, then the keychain
+    /// (`crates/buzz-backend-sprites/src/credentials.rs`). Enrolment is a
+    /// new path with no existing callers to stay compatible with, so it
+    /// carries only the primary variable — no reason to also accept the
+    /// alias.
+    Sprites {
+        /// The tenant's own Sprites API token. Secret — never logged, never
+        /// in an error string, zeroized after use, same as [`CredentialBody::nsec`].
+        sprite_token: String,
+    },
+}
+
 /// The signed content of one agent's delivered credential.
 ///
-/// `Debug` is implemented by hand and redacts [`Self::nsec`] — the whole
-/// point of this type is carrying a private key, and a derived `Debug` would
-/// print it into any log line, span field, or failed-assertion message.
-/// Matches how [`crate::bundle::LaunchBundleBody`] redacts `agent_json`.
+/// `Debug` is implemented by hand and redacts [`Self::nsec`] and
+/// [`Self::provider_credential`] — the whole point of this type is carrying
+/// private keys and tokens, and a derived `Debug` would print them into any
+/// log line, span field, or failed-assertion message. Matches how
+/// [`crate::bundle::LaunchBundleBody`] redacts `agent_json`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialBody {
     /// Hex pubkey of the agent this credential belongs to.
@@ -343,6 +386,12 @@ pub struct CredentialBody {
     /// same shape and meaning as `AgentConfig::auth_tag` in `main.rs`.
     #[serde(default)]
     pub auth_tag: Option<Vec<String>>,
+    /// This agent owner's provider deploy credential, if this waker deploys
+    /// on the owner's behalf rather than the daemon's own configured
+    /// provider path. Absent for an agent that doesn't need one. See
+    /// [`ProviderCredential`] for why this is a typed schema, not a map.
+    #[serde(default)]
+    pub provider_credential: Option<ProviderCredential>,
     /// Monotonic issuance counter for this agent's credential, gated the
     /// same way [`crate::floors::FloorStore`] already gates bundle versions
     /// once this crosses into wire I/O (Phase 2/3). Matched against the
@@ -364,6 +413,10 @@ impl std::fmt::Debug for CredentialBody {
             .field("agent_pubkey", &self.agent_pubkey)
             .field("nsec", &"<redacted>")
             .field("auth_tag", &self.auth_tag)
+            .field(
+                "provider_credential",
+                &self.provider_credential.as_ref().map(|_| "<redacted>"),
+            )
             .field("credential_version", &self.credential_version)
             .field("issued_at", &self.issued_at)
             .field("revoked", &self.revoked)
@@ -488,7 +541,7 @@ impl SignedCredential {
 /// [`EnrolmentError::InvalidCredentialAgentPubkey`] if `agent_pubkey` does
 /// not parse as a canonical Nostr public key; for a non-revoked credential,
 /// also [`EnrolmentError::MalformedNsec`], [`EnrolmentError::CredentialKeyMismatch`],
-/// or [`EnrolmentError::MalformedAuthTag`].
+/// [`EnrolmentError::MalformedAuthTag`], or [`EnrolmentError::InvalidProviderCredential`].
 fn validate_credential_body(body: CredentialBody) -> Result<CredentialBody, EnrolmentError> {
     let agent_pubkey = normalize_pubkey(&body.agent_pubkey);
     nostr::PublicKey::from_hex(&agent_pubkey).map_err(|e| {
@@ -507,6 +560,13 @@ fn validate_credential_body(body: CredentialBody) -> Result<CredentialBody, Enro
         if let Some(auth_tag) = &body.auth_tag {
             Tag::parse(auth_tag.clone())
                 .map_err(|e| EnrolmentError::MalformedAuthTag(e.to_string()))?;
+        }
+        if let Some(ProviderCredential::Sprites { sprite_token }) = &body.provider_credential {
+            if sprite_token.trim().is_empty() {
+                return Err(EnrolmentError::InvalidProviderCredential(
+                    "sprites.sprite_token is empty".to_string(),
+                ));
+            }
         }
     }
 
@@ -596,6 +656,7 @@ mod tests {
             agent_pubkey: agent.public_key().to_hex(),
             nsec: agent.secret_key().to_bech32().expect("valid nsec"),
             auth_tag: None,
+            provider_credential: None,
             credential_version: 1,
             issued_at: 1_000,
             revoked: false,
@@ -612,6 +673,7 @@ mod tests {
             // that parse for a revocation.
             nsec: String::new(),
             auth_tag: None,
+            provider_credential: None,
             credential_version: 2,
             issued_at: 2_000,
             revoked: true,
@@ -816,6 +878,64 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_carrying_a_sprites_provider_credential_verifies() {
+        let owner = keypair();
+        let agent = Keys::generate();
+        let mut body = credential_body(&agent);
+        body.provider_credential = Some(ProviderCredential::Sprites {
+            sprite_token: "tok-abc".to_string(),
+        });
+        let signed = SignedCredential::sign(&body, &owner).expect("signs");
+
+        let verified = signed
+            .verify(&[owner_hex(&owner)])
+            .expect("credential with a provider_credential verifies");
+        assert_eq!(
+            verified.provider_credential,
+            Some(ProviderCredential::Sprites {
+                sprite_token: "tok-abc".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_credential_with_an_empty_sprites_token_is_refused() {
+        let owner = keypair();
+        let mut body = credential_body(&Keys::generate());
+        body.provider_credential = Some(ProviderCredential::Sprites {
+            sprite_token: "   ".to_string(),
+        });
+        let signed = SignedCredential::sign(&body, &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("blank sprite_token refused");
+        assert!(matches!(
+            error,
+            EnrolmentError::InvalidProviderCredential(_)
+        ));
+    }
+
+    #[test]
+    fn a_revoked_credential_with_a_provider_credential_skips_its_validation() {
+        // Same placeholder convention as nsec/auth_tag: an issuer could
+        // legally leave a stale provider_credential on a revocation body,
+        // and verify() must not require it to still be well-formed.
+        let owner = keypair();
+        let agent_pubkey = agent_pubkey_hex();
+        let mut body = revoked_credential_body(&agent_pubkey);
+        body.provider_credential = Some(ProviderCredential::Sprites {
+            sprite_token: String::new(),
+        });
+        let signed = SignedCredential::sign(&body, &owner).expect("signs");
+
+        let verified = signed
+            .verify(&[owner_hex(&owner)])
+            .expect("revocation verifies despite an unvalidated provider_credential");
+        assert!(verified.revoked);
+    }
+
+    #[test]
     fn a_revoked_credential_skips_nsec_and_auth_tag_validation() {
         // The issuer leaves nsec as an empty placeholder for a revocation —
         // Keys::parse("") would fail, so verify() must not attempt it here.
@@ -854,6 +974,17 @@ mod tests {
         let rendered = format!("{body:?}");
         assert!(!rendered.contains(&nsec));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn a_credential_debug_impl_redacts_the_provider_credential() {
+        let agent = Keys::generate();
+        let mut body = credential_body(&agent);
+        body.provider_credential = Some(ProviderCredential::Sprites {
+            sprite_token: "tok-should-not-appear".to_string(),
+        });
+        let rendered = format!("{body:?}");
+        assert!(!rendered.contains("tok-should-not-appear"));
     }
 
     #[test]

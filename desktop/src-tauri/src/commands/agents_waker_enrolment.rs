@@ -324,11 +324,21 @@ pub(super) fn sign_and_retain_credential_at(
         &plaintext,
     )?;
 
-    // Only past this point has a credential actually been retained at
-    // `committed_version` — see `IssuanceLedger::committed`. A roster built
-    // from `ledger.current` instead would advertise this version even when an
-    // earlier step above failed and left nothing retained.
-    ledger.record_committed(agent_pubkey, committed_version)
+    // Once the envelope above is retained, the credential (issuance or
+    // revocation) is durably queued for publish — that is the effect that
+    // matters, and it can no longer be un-queued. `record_committed` is only
+    // bookkeeping for `credential_versions_for` (see `IssuanceLedger::committed`):
+    // if this write fails, the roster merely omits or understates this agent
+    // until a later successful call for it updates the ledger, which is the
+    // same safe-direction gap `IssuanceLedger::reserve` already documents for
+    // a burned reservation. Propagating this failure as an `Err` here would
+    // let a caller like `revoke_waker_enrolment_pending` report the disable
+    // as aborted — "waker remains enabled" — while the already-retained
+    // revocation still publishes and tears the agent down regardless.
+    if let Err(e) = ledger.record_committed(agent_pubkey, committed_version) {
+        eprintln!("buzz-desktop: waker-enrolment-credential-commit: {e}");
+    }
+    Ok(())
 }
 
 /// Encrypt `plaintext` to the waker, wrap it in the shared envelope kind, and

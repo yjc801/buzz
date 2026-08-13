@@ -756,7 +756,15 @@ async fn observe_step(
         let spent = attempt;
         attempt += 1;
         let out_of_attempts = spent >= OBSERVE_ATTEMPTS;
-        let out_of_budget = substrate.elapsed() + timeout >= crate::reconcile::DEADLINE;
+        // The retry doesn't start until after the backoff sleep below, so
+        // that pending sleep is part of the budget this attempt needs to
+        // fit — admitting on `elapsed + timeout` alone lets a retry get
+        // admitted here and then miss the deadline during the sleep.
+        let out_of_budget = substrate
+            .elapsed()
+            .saturating_add(OBSERVE_BACKOFF * spent)
+            .saturating_add(timeout)
+            >= crate::reconcile::DEADLINE;
         if out_of_attempts || out_of_budget {
             // The attempt count is in the message on purpose: "failed after
             // 3 attempts" and "failed" name different problems to whoever

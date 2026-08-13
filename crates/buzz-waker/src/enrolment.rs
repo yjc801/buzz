@@ -57,10 +57,23 @@ use nostr::hashes::sha256::Hash as Sha256Hash;
 use nostr::hashes::Hash as _;
 use nostr::secp256k1::schnorr::Signature;
 use nostr::secp256k1::{Keypair, Message, XOnlyPublicKey};
-use nostr::SECP256K1;
+use nostr::{Keys, Tag, SECP256K1};
 use serde::{Deserialize, Serialize};
 
 use crate::decide::normalize_pubkey;
+
+/// Upper bound on a [`RosterBody`]'s entry count.
+///
+/// A daemon-level review finding requires "the intended entry/serialized-size
+/// bound" be enforced, not left implicit. Each entry is a 64-hex-char pubkey
+/// plus a `u64` version — roughly 130 bytes of JSON including field names and
+/// punctuation — so 256 entries is ~33KB of plaintext, comfortably under the
+/// ~65KB practical NIP-44 ceiling `bundle_feed.rs`'s own
+/// `NIP44_CONTENT_LEN_RANGE` (132..=87472 ciphertext chars) already enforces
+/// for this codebase's kind-1059 envelope, after NIP-44/base64 expansion.
+/// Generous for a household waker's real agent count; revisit if that stops
+/// being true.
+pub const MAX_ROSTER_ENTRIES: usize = 256;
 
 /// Domain separator mixed into every roster digest.
 ///
@@ -105,6 +118,44 @@ pub enum EnrolmentError {
     /// The signature verified but the body is not the expected shape.
     #[error("enrolment body is malformed: {0}")]
     MalformedBody(String),
+
+    /// A [`RosterEntry::agent_pubkey`] is not a canonical, parseable Nostr
+    /// public key, the roster names the same agent more than once, or the
+    /// roster carries more than [`MAX_ROSTER_ENTRIES`]. Any of these would
+    /// leave Phase 2/3's diff/fold order-dependent or key durable state by
+    /// an invalid coordinate, so they are refused here rather than left to
+    /// whichever caller happens to notice first.
+    #[error("invalid roster entry: {0}")]
+    InvalidRosterEntry(String),
+
+    /// A [`CredentialBody::agent_pubkey`] is not a canonical, parseable
+    /// Nostr public key.
+    #[error("invalid credential agent_pubkey: {0}")]
+    InvalidCredentialAgentPubkey(String),
+
+    /// [`CredentialBody::nsec`] does not parse as a Nostr private key.
+    /// Only checked for a live credential — see
+    /// [`SignedCredential::verify`]'s doc on why a revocation skips this.
+    #[error("malformed credential nsec: {0}")]
+    MalformedNsec(String),
+
+    /// [`CredentialBody::nsec`] parses, but derives a different public key
+    /// than [`CredentialBody::agent_pubkey`] claims. An owner-valid
+    /// signature over a self-inconsistent body is still a refusal: later
+    /// phases key durable state (floor, roster membership, state
+    /// directory) by `agent_pubkey` while the delivered key would
+    /// authenticate connections as someone else entirely.
+    #[error("credential nsec does not derive the claimed agent_pubkey {claimed}")]
+    CredentialKeyMismatch {
+        /// The `agent_pubkey` the credential body claimed.
+        claimed: String,
+    },
+
+    /// [`CredentialBody::auth_tag`], if present, is not a well-formed Nostr
+    /// tag. Only checked for a live credential, same reasoning as
+    /// [`Self::MalformedNsec`].
+    #[error("malformed credential auth_tag: {0}")]
+    MalformedAuthTag(String),
 }
 
 /// One agent's membership entry inside a [`RosterBody`].
@@ -226,8 +277,51 @@ impl SignedRoster {
         let body: RosterBody = serde_json::from_str(&self.body_json)
             .map_err(|e| EnrolmentError::MalformedBody(e.to_string()))?;
 
-        Ok(body)
+        validate_roster_body(body)
     }
+}
+
+/// Validate and normalize a parsed [`RosterBody`] as one semantic unit,
+/// after signature verification has already established the owner is
+/// trusted — a valid signature over an ambiguous or malformed roster is
+/// still not safe for a caller to act on.
+///
+/// # Errors
+/// [`EnrolmentError::InvalidRosterEntry`] if the roster exceeds
+/// [`MAX_ROSTER_ENTRIES`], names the same agent more than once (even with
+/// matching `credential_version`s — a well-formed roster never needs to),
+/// or contains an `agent_pubkey` that does not parse as a canonical Nostr
+/// public key.
+fn validate_roster_body(body: RosterBody) -> Result<RosterBody, EnrolmentError> {
+    if body.entries.len() > MAX_ROSTER_ENTRIES {
+        return Err(EnrolmentError::InvalidRosterEntry(format!(
+            "{} entries exceeds the {MAX_ROSTER_ENTRIES} limit",
+            body.entries.len()
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(body.entries.len());
+    let mut normalized_entries = Vec::with_capacity(body.entries.len());
+    for entry in body.entries {
+        let agent_pubkey = normalize_pubkey(&entry.agent_pubkey);
+        nostr::PublicKey::from_hex(&agent_pubkey).map_err(|e| {
+            EnrolmentError::InvalidRosterEntry(format!("malformed agent_pubkey: {e}"))
+        })?;
+        if !seen.insert(agent_pubkey.clone()) {
+            return Err(EnrolmentError::InvalidRosterEntry(format!(
+                "agent {agent_pubkey} listed more than once"
+            )));
+        }
+        normalized_entries.push(RosterEntry {
+            agent_pubkey,
+            ..entry
+        });
+    }
+
+    Ok(RosterBody {
+        entries: normalized_entries,
+        ..body
+    })
 }
 
 /// The signed content of one agent's delivered credential.
@@ -333,6 +427,25 @@ impl SignedCredential {
     /// See [`SignedRoster::verify`] — same shape, same ordering, same
     /// authorized-owner argument convention.
     ///
+    /// Beyond signature verification, this binds [`CredentialBody::nsec`] to
+    /// [`CredentialBody::agent_pubkey`]: an owner-valid signature over
+    /// `{agent_pubkey: A, nsec: key-for-B}` is a self-inconsistent body, not
+    /// a trustworthy one — later phases key durable state (floor, roster
+    /// membership, state directory, supervisor identity) by `agent_pubkey`,
+    /// so a caller that skipped this check would authenticate connections
+    /// as an entirely different agent than the one it believes it is
+    /// running. Matches the binding
+    /// `crates/buzz-core/src/private_managed_agent.rs`'s
+    /// `validate_active_definition` already enforces for the same shape of
+    /// data (`agent_keys.public_key() != *agent`).
+    ///
+    /// The nsec/auth_tag checks are skipped when [`CredentialBody::revoked`]
+    /// is `true` — [`CredentialBody`]'s own doc says those fields are unused
+    /// issuer placeholders for a revocation, mirroring
+    /// [`crate::bundle::LaunchBundleBody::revoked`]'s placeholder
+    /// `agent_json`/`provider`. `agent_pubkey` is still validated and
+    /// normalized either way, since a revocation is routed by it.
+    ///
     /// # Errors
     /// See [`EnrolmentError`] — every variant is a refusal to trust the credential.
     pub fn verify(&self, authorized_owners: &[String]) -> Result<CredentialBody, EnrolmentError> {
@@ -362,8 +475,45 @@ impl SignedCredential {
         let body: CredentialBody = serde_json::from_str(&self.body_json)
             .map_err(|e| EnrolmentError::MalformedBody(e.to_string()))?;
 
-        Ok(body)
+        validate_credential_body(body)
     }
+}
+
+/// Validate and normalize a parsed [`CredentialBody`] as one semantic unit,
+/// after signature verification has already established the owner is
+/// trusted — see [`SignedCredential::verify`]'s doc for why the nsec/
+/// auth_tag checks are conditioned on `revoked`.
+///
+/// # Errors
+/// [`EnrolmentError::InvalidCredentialAgentPubkey`] if `agent_pubkey` does
+/// not parse as a canonical Nostr public key; for a non-revoked credential,
+/// also [`EnrolmentError::MalformedNsec`], [`EnrolmentError::CredentialKeyMismatch`],
+/// or [`EnrolmentError::MalformedAuthTag`].
+fn validate_credential_body(body: CredentialBody) -> Result<CredentialBody, EnrolmentError> {
+    let agent_pubkey = normalize_pubkey(&body.agent_pubkey);
+    nostr::PublicKey::from_hex(&agent_pubkey).map_err(|e| {
+        EnrolmentError::InvalidCredentialAgentPubkey(format!("malformed agent_pubkey: {e}"))
+    })?;
+
+    if !body.revoked {
+        let agent_keys = Keys::parse(body.nsec.trim())
+            .map_err(|e| EnrolmentError::MalformedNsec(e.to_string()))?;
+        let derived = normalize_pubkey(&agent_keys.public_key().to_hex());
+        if derived != agent_pubkey {
+            return Err(EnrolmentError::CredentialKeyMismatch {
+                claimed: agent_pubkey,
+            });
+        }
+        if let Some(auth_tag) = &body.auth_tag {
+            Tag::parse(auth_tag.clone())
+                .map_err(|e| EnrolmentError::MalformedAuthTag(e.to_string()))?;
+        }
+    }
+
+    Ok(CredentialBody {
+        agent_pubkey,
+        ..body
+    })
 }
 
 /// Parse `WAKER_OWNER_PUBKEYS` — a comma-separated list of hex owner
@@ -408,6 +558,7 @@ pub fn parse_authorized_owners(raw: &str) -> anyhow::Result<Vec<String>> {
 mod tests {
     use super::*;
     use nostr::secp256k1::rand::rngs::OsRng;
+    use nostr::ToBech32;
 
     fn keypair() -> Keypair {
         Keypair::new(SECP256K1, &mut OsRng)
@@ -418,10 +569,18 @@ mod tests {
         hex::encode(xonly.serialize())
     }
 
-    fn roster_body(owner_agent: &str) -> RosterBody {
+    /// A pubkey suitable for a roster entry where no matching `nsec` is
+    /// needed — real generated key so `nostr::PublicKey::from_hex` accepts
+    /// it, unlike an arbitrary repeated-byte string (not every 32-byte
+    /// value is a valid secp256k1 x-only point).
+    fn agent_pubkey_hex() -> String {
+        Keys::generate().public_key().to_hex()
+    }
+
+    fn roster_body(agent_pubkey: &str) -> RosterBody {
         RosterBody {
             entries: vec![RosterEntry {
-                agent_pubkey: owner_agent.to_string(),
+                agent_pubkey: agent_pubkey.to_string(),
                 credential_version: 1,
             }],
             roster_version: 1,
@@ -429,10 +588,13 @@ mod tests {
         }
     }
 
-    fn credential_body(agent_pubkey: &str) -> CredentialBody {
+    /// A credential whose `nsec` genuinely derives `agent_pubkey` — the
+    /// shape `SignedCredential::verify` now requires for a non-revoked
+    /// delivery.
+    fn credential_body(agent: &Keys) -> CredentialBody {
         CredentialBody {
-            agent_pubkey: agent_pubkey.to_string(),
-            nsec: "nsec1thisisthefakeagentsigningkey".to_string(),
+            agent_pubkey: agent.public_key().to_hex(),
+            nsec: agent.secret_key().to_bech32().expect("valid nsec"),
             auth_tag: None,
             credential_version: 1,
             issued_at: 1_000,
@@ -440,11 +602,27 @@ mod tests {
         }
     }
 
+    fn revoked_credential_body(agent_pubkey: &str) -> CredentialBody {
+        CredentialBody {
+            agent_pubkey: agent_pubkey.to_string(),
+            // Unread by a revoked delivery, same convention
+            // `sign_and_retain_waker_bundle_at` uses for a revoked bundle's
+            // agent_json/provider placeholders — an empty nsec would fail
+            // Keys::parse, which is exactly why verify() must not attempt
+            // that parse for a revocation.
+            nsec: String::new(),
+            auth_tag: None,
+            credential_version: 2,
+            issued_at: 2_000,
+            revoked: true,
+        }
+    }
+
     #[test]
     fn a_roster_signed_by_an_authorized_owner_verifies() {
         let owner = keypair();
         let owner_hex = owner_hex(&owner);
-        let signed = SignedRoster::sign(&roster_body(&"a".repeat(64)), &owner).expect("signs");
+        let signed = SignedRoster::sign(&roster_body(&agent_pubkey_hex()), &owner).expect("signs");
 
         let body = signed
             .verify(&[owner_hex])
@@ -456,7 +634,7 @@ mod tests {
     fn a_roster_signed_by_an_unauthorized_owner_is_refused() {
         let owner = keypair();
         let other = keypair();
-        let signed = SignedRoster::sign(&roster_body(&"a".repeat(64)), &owner).expect("signs");
+        let signed = SignedRoster::sign(&roster_body(&agent_pubkey_hex()), &owner).expect("signs");
 
         let error = signed
             .verify(&[owner_hex(&other)])
@@ -470,9 +648,10 @@ mod tests {
         // allowlist must report UnauthorizedOwner, not BadSignature —
         // identity before cryptography, matching SignedLaunchBundle::verify.
         let owner = keypair();
-        let mut signed = SignedRoster::sign(&roster_body(&"a".repeat(64)), &owner).expect("signs");
+        let mut signed =
+            SignedRoster::sign(&roster_body(&agent_pubkey_hex()), &owner).expect("signs");
         signed.body_json =
-            serde_json::to_string(&roster_body(&"b".repeat(64))).expect("serializes");
+            serde_json::to_string(&roster_body(&agent_pubkey_hex())).expect("serializes");
 
         let other = keypair();
         let error = signed
@@ -484,9 +663,10 @@ mod tests {
     #[test]
     fn a_tampered_roster_body_fails_signature_verification() {
         let owner = keypair();
-        let mut signed = SignedRoster::sign(&roster_body(&"a".repeat(64)), &owner).expect("signs");
+        let mut signed =
+            SignedRoster::sign(&roster_body(&agent_pubkey_hex()), &owner).expect("signs");
         signed.body_json =
-            serde_json::to_string(&roster_body(&"b".repeat(64))).expect("serializes");
+            serde_json::to_string(&roster_body(&agent_pubkey_hex())).expect("serializes");
 
         let error = signed
             .verify(&[owner_hex(&owner)])
@@ -495,16 +675,84 @@ mod tests {
     }
 
     #[test]
+    fn a_roster_naming_the_same_agent_twice_is_refused() {
+        let owner = keypair();
+        let agent = agent_pubkey_hex();
+        let body = RosterBody {
+            entries: vec![
+                RosterEntry {
+                    agent_pubkey: agent.clone(),
+                    credential_version: 1,
+                },
+                RosterEntry {
+                    agent_pubkey: agent,
+                    credential_version: 1,
+                },
+            ],
+            roster_version: 1,
+            issued_at: 1_000,
+        };
+        let signed = SignedRoster::sign(&body, &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("duplicate agent refused");
+        assert!(matches!(error, EnrolmentError::InvalidRosterEntry(_)));
+    }
+
+    #[test]
+    fn a_roster_with_a_malformed_agent_pubkey_is_refused() {
+        let owner = keypair();
+        let signed = SignedRoster::sign(&roster_body("not-a-pubkey"), &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("malformed pubkey refused");
+        assert!(matches!(error, EnrolmentError::InvalidRosterEntry(_)));
+    }
+
+    #[test]
+    fn a_roster_exceeding_the_entry_limit_is_refused() {
+        let owner = keypair();
+        let entries = (0..=MAX_ROSTER_ENTRIES)
+            .map(|_| RosterEntry {
+                agent_pubkey: agent_pubkey_hex(),
+                credential_version: 1,
+            })
+            .collect();
+        let body = RosterBody {
+            entries,
+            roster_version: 1,
+            issued_at: 1_000,
+        };
+        let signed = SignedRoster::sign(&body, &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("over-limit roster refused");
+        assert!(matches!(error, EnrolmentError::InvalidRosterEntry(_)));
+    }
+
+    #[test]
+    fn a_roster_entry_pubkey_is_normalized_to_lowercase() {
+        let owner = keypair();
+        let agent = agent_pubkey_hex().to_uppercase();
+        let signed = SignedRoster::sign(&roster_body(&agent), &owner).expect("signs");
+
+        let body = signed.verify(&[owner_hex(&owner)]).expect("verifies");
+        assert_eq!(body.entries[0].agent_pubkey, agent.to_lowercase());
+    }
+
+    #[test]
     fn a_credential_signed_by_an_authorized_owner_verifies() {
         let owner = keypair();
-        let agent = "a".repeat(64);
+        let agent = Keys::generate();
         let signed = SignedCredential::sign(&credential_body(&agent), &owner).expect("signs");
 
         let body = signed
             .verify(&[owner_hex(&owner)])
             .expect("authorized owner verifies");
-        assert_eq!(body.agent_pubkey, agent);
-        assert_eq!(body.nsec, "nsec1thisisthefakeagentsigningkey");
+        assert_eq!(body.agent_pubkey, agent.public_key().to_hex());
     }
 
     #[test]
@@ -512,7 +760,7 @@ mod tests {
         let owner = keypair();
         let other = keypair();
         let signed =
-            SignedCredential::sign(&credential_body(&"a".repeat(64)), &owner).expect("signs");
+            SignedCredential::sign(&credential_body(&Keys::generate()), &owner).expect("signs");
 
         let error = signed
             .verify(&[owner_hex(&other)])
@@ -521,20 +769,101 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_whose_nsec_derives_a_different_agent_is_refused() {
+        // An owner-valid signature over {agent_pubkey: A, nsec: key-for-B}
+        // must not verify — this is the P1 finding: later phases key
+        // durable state by agent_pubkey while a connection would
+        // authenticate as whatever the nsec actually derives.
+        let owner = keypair();
+        let claimed_agent = Keys::generate();
+        let mut body = credential_body(&Keys::generate());
+        body.agent_pubkey = claimed_agent.public_key().to_hex();
+        let signed = SignedCredential::sign(&body, &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("mismatched nsec/agent_pubkey refused");
+        assert!(matches!(
+            error,
+            EnrolmentError::CredentialKeyMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_credential_with_an_unparseable_nsec_is_refused() {
+        let owner = keypair();
+        let mut body = credential_body(&Keys::generate());
+        body.nsec = "not-an-nsec".to_string();
+        let signed = SignedCredential::sign(&body, &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("unparseable nsec refused");
+        assert!(matches!(error, EnrolmentError::MalformedNsec(_)));
+    }
+
+    #[test]
+    fn a_credential_with_a_malformed_auth_tag_is_refused() {
+        let owner = keypair();
+        let mut body = credential_body(&Keys::generate());
+        body.auth_tag = Some(vec![]);
+        let signed = SignedCredential::sign(&body, &owner).expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("malformed auth_tag refused");
+        assert!(matches!(error, EnrolmentError::MalformedAuthTag(_)));
+    }
+
+    #[test]
+    fn a_revoked_credential_skips_nsec_and_auth_tag_validation() {
+        // The issuer leaves nsec as an empty placeholder for a revocation —
+        // Keys::parse("") would fail, so verify() must not attempt it here.
+        let owner = keypair();
+        let agent = agent_pubkey_hex();
+        let signed =
+            SignedCredential::sign(&revoked_credential_body(&agent), &owner).expect("signs");
+
+        let body = signed
+            .verify(&[owner_hex(&owner)])
+            .expect("revocation verifies despite placeholder nsec");
+        assert!(body.revoked);
+        assert_eq!(body.agent_pubkey, agent);
+    }
+
+    #[test]
+    fn a_revoked_credential_still_validates_its_agent_pubkey() {
+        let owner = keypair();
+        let signed = SignedCredential::sign(&revoked_credential_body("not-a-pubkey"), &owner)
+            .expect("signs");
+
+        let error = signed
+            .verify(&[owner_hex(&owner)])
+            .expect_err("malformed agent_pubkey refused even for a revocation");
+        assert!(matches!(
+            error,
+            EnrolmentError::InvalidCredentialAgentPubkey(_)
+        ));
+    }
+
+    #[test]
     fn a_credential_debug_impl_redacts_the_nsec() {
-        let body = credential_body(&"a".repeat(64));
+        let agent = Keys::generate();
+        let body = credential_body(&agent);
+        let nsec = body.nsec.clone();
         let rendered = format!("{body:?}");
-        assert!(!rendered.contains("nsec1thisisthefakeagentsigningkey"));
+        assert!(!rendered.contains(&nsec));
         assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
     fn a_signed_credential_debug_impl_redacts_body_json() {
         let owner = keypair();
-        let signed =
-            SignedCredential::sign(&credential_body(&"a".repeat(64)), &owner).expect("signs");
+        let agent = Keys::generate();
+        let nsec = agent.secret_key().to_bech32().expect("valid nsec");
+        let signed = SignedCredential::sign(&credential_body(&agent), &owner).expect("signs");
         let rendered = format!("{signed:?}");
-        assert!(!rendered.contains("nsec1thisisthefakeagentsigningkey"));
+        assert!(!rendered.contains(&nsec));
     }
 
     #[test]

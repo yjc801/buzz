@@ -69,12 +69,22 @@ pub(crate) const WAKER_IDENTITY_PUBKEY_ENV: &str = "WAGGLE_WAKER_IDENTITY_PUBKEY
 /// waker and configures it, and users who toggle Remote wake and configure
 /// nothing.
 ///
-/// Empty here because this fork does not yet run a shared waker. The identity
-/// is minted at deploy time (`WAKER_IDENTITY_NSEC`) and only its *pubkey* can
-/// be baked in, so filling this in belongs to whoever stands that service up,
-/// not to this repo. Until then [`WAKER_IDENTITY_PUBKEY_ENV`] is the only
-/// source.
-const DEFAULT_WAKER_IDENTITY_PUBKEY: &str = "";
+/// This is a **public** key and belongs in source. The matching secret is the
+/// daemon's `WAKER_IDENTITY_NSEC`, held only by the service provider; nothing
+/// here can be derived back into it. What baking it in buys is the goal
+/// itself — a user installs the app and their Remote wake toggle already knows
+/// where to send enrolment, with no setting to find and nothing to paste.
+///
+/// Rotating the daemon's identity invalidates every enrolment published to the
+/// old one, so changing this constant is a flag day rather than a config tweak:
+/// every user's roster and credentials must be reissued against the new key,
+/// which happens on their next config change. Treat it as a deliberate release
+/// step, and expect a window where already-enrolled agents go unwatched.
+///
+/// [`WAKER_IDENTITY_PUBKEY_ENV`] still overrides this, which is how a second
+/// service provider points a build at their own daemon without a fork.
+const DEFAULT_WAKER_IDENTITY_PUBKEY: &str =
+    "cb9fdbedefb1a64af79049ed301e21a5da506ae10046b9e9cabccb17142dab08";
 
 /// Which waker identity to encrypt enrolment payloads to, if any.
 ///
@@ -223,6 +233,38 @@ pub(crate) fn sign_enrolment_roster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo in the compiled-in identity would not fail loudly: enrolment is
+    /// encrypted to it via `PublicKey::from_hex`, and the retain path is
+    /// best-effort, so a bad constant surfaces as one line on stderr and a
+    /// toggle that silently enrols nobody — for every user of the build. Since
+    /// the value is only ever changed by hand, check it at compile-test time.
+    ///
+    /// Empty is allowed: that is a build with no hosted waker, where enrolment
+    /// is meant to be a no-op unless [`WAKER_IDENTITY_PUBKEY_ENV`] is set.
+    #[test]
+    fn the_compiled_in_waker_identity_is_a_usable_pubkey() {
+        if DEFAULT_WAKER_IDENTITY_PUBKEY.is_empty() {
+            return;
+        }
+        nostr::PublicKey::from_hex(DEFAULT_WAKER_IDENTITY_PUBKEY)
+            .expect("the compiled-in waker identity must parse as a Nostr public key");
+        assert_eq!(
+            DEFAULT_WAKER_IDENTITY_PUBKEY,
+            DEFAULT_WAKER_IDENTITY_PUBKEY.to_lowercase(),
+            "store it canonically; the daemon's filters compare normalized hex"
+        );
+        // Only meaningful when nothing is overriding it — the override is the
+        // documented escape hatch, and a developer who set it must not see a
+        // failure here.
+        if std::env::var(WAKER_IDENTITY_PUBKEY_ENV).is_err() {
+            assert_eq!(
+                waker_identity_pubkey().as_deref(),
+                Some(DEFAULT_WAKER_IDENTITY_PUBKEY),
+                "a build with a compiled-in identity must enrol against it by default"
+            );
+        }
+    }
 
     fn ledger(dir: &std::path::Path) -> IssuanceLedger {
         IssuanceLedger::open(dir.join("waker-enrolment-versions.json"))

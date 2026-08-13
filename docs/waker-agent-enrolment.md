@@ -1,5 +1,17 @@
 # Onboarding agents to the waker without a terminal
 
+## The goal
+
+Someone downloads Waggle, toggles Remote wake, and it works — because the
+service operator runs one waker for everyone, the way they run one relay for
+everyone.
+
+That needs two things, and neither is sufficient alone. **Enrolment** removes
+the terminal from onboarding. **Per-owner provider credentials** let one daemon
+serve more than one owner. Enrolment alone gives an operator easier onboarding
+for their own agents; per-owner credentials alone give a multi-tenant daemon
+nobody can join without a terminal.
+
 ## The problem
 
 Adding an agent to `buzz-waker` today means editing a JSON array of
@@ -19,6 +31,12 @@ of a human assembling this by hand:
 
 None of these are the user's mistake in any interesting sense. They are what
 happens when secret material is assembled by hand.
+
+And a second problem sits underneath: the Sprites credential is resolved from
+the daemon's own environment (`credentials.rs`: `SPRITE_TOKEN` →
+`SPRITES_TOKEN` → keychain), so one daemon can only ever deploy into one
+account. A shared waker would run every owner's agents on a single bill with no
+isolation between them.
 
 ## The constraint that shapes everything
 
@@ -95,19 +113,51 @@ must select the newest **version**, via the same monotonic floor logic
 "highest `created_at` that happens to be non-revoked," which would resurrect
 an agent whose latest event was actually a revocation.
 
+### Per-owner provider credentials
+
+Enrolment carries the owner's provider credentials alongside the agent's key,
+which is what lets one daemon deploy on behalf of several owners.
+
+The mechanism is smaller than it sounds. `provider_deploy` already spawns the
+provider as a child process (`Command::new(binary)` with piped stdin); it
+inherits the daemon's environment today, and that inheritance is the *only*
+reason the credential is global. `Command::env()` per spawn is the whole
+change. An agent whose enrolment carries no credentials fails with a clear
+reason rather than silently falling back to the daemon's own — a fallback would
+mean one owner's deploy quietly billing another's account.
+
+Enrolment can carry secrets because it is encrypted.
+`validate_provider_config` forbids secret-like keys, but that governs
+`provider_config` — the *signed* envelope inside the bundle, where the property
+is integrity, not secrecy. Enrolment is a different vehicle with different
+properties, and conflating the two is what makes "just put the token in the
+bundle" look reasonable when it is not.
+
+`org` already travels per-agent in the signed `provider_config`, so agents
+already target the right Sprites organization. Only the credential was missing.
+
+Carry it as a map of environment variables (`{"SPRITE_TOKEN": "…"}`) rather
+than a typed credential: the desktop already knows what each provider wants,
+because it launches them locally with exactly that environment, and a map keeps
+the daemon provider-agnostic. It is secret — never logged, never in an error
+string, zeroized after use as the bundle plaintext already is.
+
 Net secrets, compared to today:
 
 | | today | with enrolment |
 |---|---|---|
-| Durable secrets | N agent nsecs | 1 waker identity |
+| Durable secrets | N agent nsecs + 1 provider token | 1 waker identity |
 | Add an agent | edit JSON, `fly secrets set`, redeploy | toggle |
 | Remove an agent | same manual edit | revoke, like a bundle |
+| Who one waker serves | one owner | one, or everyone |
 | Deployment coupling | Fly-specific step | none |
 
 Strictly fewer secrets, and the one that remains belongs to the daemon rather
 than to the agents. `WAKER_OWNER_PUBKEYS` doesn't change that count: it's
 public keys, not secret material, entered once per operator rather than once
-per agent — it doesn't grow as agents are added or removed.
+per agent — it doesn't grow as agents are added or removed. Provider tokens
+move from the daemon's environment into per-owner enrolments, so the daemon
+holds none of its own.
 
 ## Bootstrap: a deploy-time secret, not pairing
 
@@ -126,27 +176,66 @@ into desktop settings once.
 
 That secret authenticates the *recipient* — it proves the daemon can read an
 enrolment, not that whoever sent it was allowed to. A signature alone proves
-only which key signed, not that the signer is the operator's own; anyone who
-learns the waker's pubkey could otherwise encrypt an enrolment to it, sign
-with their own key, and get their agent into the daemon's watch and deploy
-path. The bundle path already has an answer to this: `owner_pubkey` is taken
-from local config and pinned (`FloorStore::enroll`) *before* any bundle is
-accepted, never learned from the event itself. Enrolment needs the same
-independent anchor, so the deploy-time secret is a pair, not a singleton:
-`WAKER_IDENTITY_NSEC` plus `WAKER_OWNER_PUBKEYS` — the operator pubkey(s)
-this daemon instance will ever accept an enrolment from. An enrolment signed
-by anyone outside that set is rejected before decryption is attempted, the
-same way a bundle from an unpinned `owner_pubkey` is today.
+only which key signed, not that the signer is authorized; anyone who learns the
+waker's pubkey could otherwise encrypt an enrolment to it, sign with their own
+key, and get their agent into the daemon's watch and deploy path.
+
+### Two admission modes
+
+`WAKER_OWNER_PUBKEYS` — the operator pubkey(s) this instance will accept
+enrolments from — answers that, and is the right default for a daemon serving
+one operator. An enrolment signed by anyone outside the set is rejected before
+decryption is attempted, mirroring how a bundle from an unpinned
+`owner_pubkey` is refused today.
+
+But an allowlist is per-owner configuration, so a waker meant to serve
+*everyone* cannot use one: the operator would have to add each new user by
+hand, which is the terminal step this document exists to remove, relocated
+rather than eliminated. So the variable is **optional**, and its presence
+selects the mode:
+
+- **set** — closed. Only those owners may enrol. Single-operator deployments.
+- **empty** — open. Any relay member may enrol, bounded by a per-owner agent
+  cap.
+
+Open mode is defensible only *because* credentials are per-owner. A stranger
+who enrols consumes the daemon's connections and memory; they cannot spend the
+operator's money or reach another owner's credentials, because their agent
+deploys on their own Sprites account with their own token. Relay membership is
+the outer gate — the relay already refuses non-members — and the per-owner cap
+bounds what one member can consume. That is a denial-of-service surface, not a
+confidentiality one, and it is the trade a hosted service accepts in exchange
+for being joinable.
 
 This splits the work along the right line:
 
-- **deploy time, technical operator**: set the identity secret, paste the
-  waker pubkey into desktop settings, and enter the operator's own pubkey(s)
-  into `WAKER_OWNER_PUBKEYS`
+- **deploy time, technical operator**: set the identity secret, publish the
+  waker pubkey, and decide open or closed
 - **runtime, any user**: toggle agents freely, forever
 
-The non-technical user never touches configuration. The remaining manual step
-belongs to the person who was already running `fly deploy`.
+The non-technical user never touches configuration. For a hosted waker the
+identity pubkey ships as a client default, so they configure nothing at all.
+
+## Security properties under multi-tenancy
+
+Stated rather than implied. A consequence nobody wrote down is how the previous
+round of waker failures stayed invisible for a day.
+
+**Blast radius grows with tenancy.** One process holds many owners' agent keys
+and provider tokens. Defensible for a hosted service — a relay already holds
+everyone's data — but it is a real change from a single-tenant daemon, and it
+should be accepted deliberately rather than discovered. It also raises the
+value of keeping those secrets off the durable volume, which the tmpfs rule
+above already does.
+
+**What a stranger cannot do.** Enrol an agent already pinned to a different
+owner (refused at the floor, which never rewrites). Reach another owner's
+credentials (separate records, never merged into process env). Spend the
+operator's money (their deploy uses their own token).
+
+**What a stranger can do**, in open mode: consume connections and memory, up to
+the per-owner cap. Bounded by relay membership, since the relay refuses
+non-members outright.
 
 ## Rejected alternatives
 
@@ -199,6 +288,17 @@ here (three review rounds on this exact point is the design-review cap per
 floor has, or removing an agent means editing config again. The bundle's
 `revoked` flag plus a monotonic floor is the obvious model, and the daemon
 already implements exactly that shape.
+
+**Per-owner caps in open mode.** What the limit is, and what the daemon does on
+reaching it — refuse quietly, log, or evict least-recently-active. Unbounded
+enrolment is the whole DoS surface open mode introduces, so the cap is the
+control, not a nicety.
+
+**Credential rotation.** An owner rotating their Sprites token must reissue
+enrolments, or deploys start failing with a credential error that looks
+nothing like the cause. Cheap to do — it is the same reissue path as any
+config change — but it wants a deliberate flow rather than being discovered
+after the fact.
 
 **Desktop offline at first boot.** Enrolment persists on the relay, so a
 daemon that boots with the desktop closed still refetches. Worth confirming

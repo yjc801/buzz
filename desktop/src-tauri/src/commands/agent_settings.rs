@@ -259,6 +259,15 @@ pub async fn set_managed_agent_backend(
                     "buzz-waker could not revoke the launch bundle; backend migration aborted: {e}"
                 )
             })?;
+            // Withdraw enrolment too, and for the same reason: revoking only
+            // the bundle would leave the daemon still watching this agent and
+            // still holding its key, for an agent that no longer runs there.
+            super::agents_waker_enrolment::revoke_waker_enrolment_pending(&app, &state, &pubkey)
+                .map_err(|e| {
+                    format!(
+                        "buzz-waker could not withdraw enrolment; backend migration aborted: {e}"
+                    )
+                })?;
         }
 
         save_managed_agents(&app, &records)?;
@@ -422,6 +431,13 @@ pub async fn set_managed_agent_waker_enabled(
             super::agents::revoke_waker_bundle_pending(&app, &state, &pubkey).map_err(|e| {
                 format!("buzz-waker could not revoke the launch bundle; waker remains enabled: {e}")
             })?;
+            // Turning the toggle off must also withdraw enrolment, or the
+            // daemon keeps watching this agent and keeps its key — the bundle
+            // revocation alone only stops it deploying one.
+            super::agents_waker_enrolment::revoke_waker_enrolment_pending(&app, &state, &pubkey)
+                .map_err(|e| {
+                    format!("buzz-waker could not withdraw enrolment; waker remains enabled: {e}")
+                })?;
         }
 
         {

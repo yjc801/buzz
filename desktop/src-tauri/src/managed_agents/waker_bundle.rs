@@ -104,6 +104,18 @@ pub(crate) fn bundle_expiry_for(
 #[derive(Debug)]
 pub(crate) struct ReservedVersion(u64);
 
+impl ReservedVersion {
+    /// Spend this reservation, yielding the version to write into a body.
+    ///
+    /// Takes `self` by value for the same reason [`sign_launch_bundle`] does:
+    /// the number leaves with the reservation, so it cannot be read once and
+    /// written into two bodies. Signers outside this module need it because
+    /// the field itself stays private — see [`ReservedVersion`]'s own doc.
+    pub(crate) fn spend(self) -> u64 {
+        self.0
+    }
+}
+
 /// The persisted issuance record: the highest version handed out per agent.
 ///
 /// A map rather than a file per agent so one fence orders every reservation;
@@ -189,6 +201,26 @@ impl IssuanceLedger {
         current.versions.insert(agent_pubkey.to_string(), next);
         self.persist(&fence, &current)?;
         Ok(ReservedVersion(next))
+    }
+
+    /// The highest version already handed out for `key`, or 0 if none has been.
+    ///
+    /// Read-only on purpose: the enrolment roster has to *name* the credential
+    /// version each agent currently has, and reserving there would burn a
+    /// version the credential body never carries — leaving the roster pointing
+    /// at a credential that was never issued.
+    ///
+    /// Deliberately unfenced. A reservation racing this read can only make the
+    /// answer stale-low, and the caller that reserves is the same one that
+    /// republishes the roster immediately after, so the roster it writes
+    /// carries the number it just reserved rather than this one.
+    ///
+    /// # Errors
+    /// Propagates a read or parse failure — an unreadable ledger must not be
+    /// reported as "version 0", which would publish a roster claiming every
+    /// agent is unissued.
+    pub(crate) fn current(&self, key: &str) -> Result<u64, String> {
+        Ok(self.read()?.versions.get(key).copied().unwrap_or(0))
     }
 
     /// Record when `agent_pubkey`'s newly retained bundle lapses.
@@ -481,7 +513,7 @@ pub(crate) fn sign_launch_bundle(
             provider_config: inputs.provider_config,
             provider_binary_sha256_by_target: inputs.provider_binary_sha256_by_target,
         },
-        bundle_version: inputs.bundle_version.0,
+        bundle_version: inputs.bundle_version.spend(),
         issued_at: inputs.issued_at,
         expires_at: inputs.issued_at.saturating_add(inputs.lifetime_secs),
         owner_only_access: inputs.owner_only_access,

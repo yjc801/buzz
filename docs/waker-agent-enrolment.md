@@ -54,6 +54,23 @@ materialized on **tmpfs**, never the durable volume — *"nothing durable to
 leak."* Persisting enrolled keys, whether to a Fly secret or the volume, would
 reverse that.
 
+Enrolment reuses the bundle's addressing scheme, not just its transport. The
+bundle is a NIP-33 parameterized-replaceable event addressed by `(owner
+pubkey, kind, d_tag=agent_pubkey)` (`KIND_WAKER_LAUNCH_BUNDLE`); enrolment
+gets a sibling kind under the same scheme, still `d_tag=agent_pubkey`. That
+choice is what makes refetch on restart complete rather than a heuristic: the
+bundle tap narrows its `authors`+`#p` query with a bounded `limit` because
+`#p` there is the *agent's* pubkey and only one bundle is ever live per
+agent — the limit is a safety margin, not the mechanism that bounds the
+result. Enrolment's `#p` is the *waker's* pubkey, shared by every agent under
+one owner, so a bounded newest-N window over that filter would silently drop
+older still-active agents once enough enrolments, reissues, and revocations
+accumulate — exactly the failure mode a restart must not have. Querying by
+the parameterized-replaceable coordinate instead of a bounded window sidesteps
+this rather than tuning around it: the relay returns at most one (the latest)
+event per `d_tag`, so the result set is bounded by the number of distinct
+enrolled agents, not by publish history, and is complete by construction.
+
 Net secrets, compared to today:
 
 | | today | with enrolment |
@@ -64,7 +81,9 @@ Net secrets, compared to today:
 | Deployment coupling | Fly-specific step | none |
 
 Strictly fewer secrets, and the one that remains belongs to the daemon rather
-than to the agents.
+than to the agents. `WAKER_OWNER_PUBKEYS` doesn't change that count: it's
+public keys, not secret material, entered once per operator rather than once
+per agent — it doesn't grow as agents are added or removed.
 
 ## Bootstrap: a deploy-time secret, not pairing
 
@@ -81,9 +100,25 @@ Instead: the waker's identity is a deploy-time secret
 (`WAKER_IDENTITY_NSEC`), and whoever deploys enters the corresponding pubkey
 into desktop settings once.
 
+That secret authenticates the *recipient* — it proves the daemon can read an
+enrolment, not that whoever sent it was allowed to. A signature alone proves
+only which key signed, not that the signer is the operator's own; anyone who
+learns the waker's pubkey could otherwise encrypt an enrolment to it, sign
+with their own key, and get their agent into the daemon's watch and deploy
+path. The bundle path already has an answer to this: `owner_pubkey` is taken
+from local config and pinned (`FloorStore::enroll`) *before* any bundle is
+accepted, never learned from the event itself. Enrolment needs the same
+independent anchor, so the deploy-time secret is a pair, not a singleton:
+`WAKER_IDENTITY_NSEC` plus `WAKER_OWNER_PUBKEYS` — the operator pubkey(s)
+this daemon instance will ever accept an enrolment from. An enrolment signed
+by anyone outside that set is rejected before decryption is attempted, the
+same way a bundle from an unpinned `owner_pubkey` is today.
+
 This splits the work along the right line:
 
-- **deploy time, technical operator**: set one secret, paste one pubkey
+- **deploy time, technical operator**: set the identity secret, paste the
+  waker pubkey into desktop settings, and enter the operator's own pubkey(s)
+  into `WAKER_OWNER_PUBKEYS`
 - **runtime, any user**: toggle agents freely, forever
 
 The non-technical user never touches configuration. The remaining manual step
@@ -114,15 +149,13 @@ this document exists for. Worth doing only as a stopgap.
 
 ## Open questions
 
+(Owner authorization and refetch scope, previously listed here, are
+resolved above — see Bootstrap and Persistence.)
+
 **Revocation.** Un-enrolment needs the same anti-rollback care the bundle
 floor has, or removing an agent means editing config again. The bundle's
 `revoked` flag plus a monotonic floor is the obvious model, and the daemon
 already implements exactly that shape.
-
-**Refetch scope.** The bundle tap queries `authors` + `#p` with a bounded
-limit. Enrolment needs the same, keyed to the waker identity rather than an
-agent — and the daemon must tolerate an enrolment for an agent it has never
-seen, which is the whole point.
 
 **Desktop offline at first boot.** Enrolment persists on the relay, so a
 daemon that boots with the desktop closed still refetches. Worth confirming

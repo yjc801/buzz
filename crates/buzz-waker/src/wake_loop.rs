@@ -54,6 +54,7 @@ use crate::feed::{
 };
 use crate::presence_feed::PresenceState;
 use crate::relay_feed::RelayFeed;
+use crate::watch_list::WatchList;
 
 /// Configuration for one agent's wake loop.
 #[derive(Clone)]
@@ -71,10 +72,11 @@ pub struct WakeLoopConfig {
     pub cursor_path: PathBuf,
     /// The presence tap shared with every wake attempt for this agent.
     pub presence_state: Arc<PresenceState>,
-    /// This daemon's full watch list, normalized — see `effects`'s module
-    /// doc for why this is the accepted `confirm_author_not_known_agent`
-    /// baseline.
-    pub watch_list: Arc<[String]>,
+    /// This daemon's live watch list — see `effects`'s module doc for why
+    /// this is the accepted `confirm_author_not_known_agent` baseline, and
+    /// `crate::watch_list`'s own doc for why it is read live rather than
+    /// snapshotted.
+    pub watch_list: WatchList,
     /// The live cache [`crate::bundle_feed::run_bundle_tap`] writes this
     /// agent's admitted bundle into. Read fresh at the moment each attempt is
     /// spawned (never captured once at loop-construction time) so a reissue
@@ -339,7 +341,7 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                         agent_pubkey.clone(),
                                         Arc::clone(&attempt_state),
                                         Arc::clone(&config.presence_state),
-                                        Arc::clone(&config.watch_list),
+                                        config.watch_list.clone(),
                                         config.bundle_state.current(),
                                         cancel.clone(),
                                     );
@@ -592,7 +594,7 @@ fn spawn_attempt(
     agent_pubkey: String,
     attempt_state: Arc<WakeAttemptState>,
     presence_state: Arc<PresenceState>,
-    watch_list: Arc<[String]>,
+    watch_list: WatchList,
     bundle: Option<Arc<crate::bundle::LaunchBundleBody>>,
     cancel: CancellationToken,
 ) {

@@ -45,13 +45,18 @@
 //! `select_wake_candidates` filtered against can be minutes stale. The
 //! desktop's version re-checks the full managed-agent roster (local ∪
 //! relay-registered). This daemon has no such roster — it only knows the
-//! agents it was configured to watch — so its baseline is that watch list.
-//! Documented in `PLANS/BUZZ_WAKER_DESIGN.md` as an accepted gap: an author
-//! that is a *managed agent this daemon does not watch* is not caught here.
-//! It is still caught by the synchronous baseline at admission time whenever
-//! that baseline is populated the same way; the re-check only narrows the
-//! window, and narrowing it to "this daemon's own agents" is strictly better
-//! than not re-checking at all.
+//! agents it was configured to watch — so its baseline is that watch list,
+//! held in a [`crate::watch_list::WatchList`] and read live rather than
+//! snapshotted, since the dynamic supervisor (`PLANS/BUZZ_WAKER_DESIGN.md`
+//! §12 build order step 3) can add or remove a watched agent at any time —
+//! see that module's own doc for why a frozen snapshot would let a
+//! roster-added agent's mention wake another agent undetected. Still
+//! documented as an accepted gap: an author that is a *managed agent this
+//! daemon does not watch* is not caught here. It is still caught by the
+//! synchronous baseline at admission time whenever that baseline is
+//! populated the same way; the re-check only narrows the window, and
+//! narrowing it to "this daemon's own agents" is strictly better than not
+//! re-checking at all.
 
 use std::sync::Arc;
 
@@ -59,6 +64,7 @@ use crate::attempt::{HeartbeatObservation, WakeEffects};
 use crate::bundle::LaunchBundleBody;
 use crate::decide::normalize_pubkey;
 use crate::presence_feed::{PresenceError, PresenceState};
+use crate::watch_list::WatchList;
 use buzz_core::PresenceStatus;
 use tokio_util::sync::CancellationToken;
 
@@ -138,10 +144,12 @@ pub struct RealWakeEffects {
     /// The presence tap shared with every attempt for this agent — one tap
     /// per watched agent, not per attempt.
     presence_state: Arc<PresenceState>,
-    /// This daemon's full watch list, normalized. Used only by
+    /// This daemon's live watch list. Used only by
     /// `confirm_author_not_known_agent`; see the module note on why this is
-    /// the accepted baseline rather than a full managed-agent roster.
-    watch_list: Arc<[String]>,
+    /// the accepted baseline rather than a full managed-agent roster, and
+    /// `crate::watch_list`'s own doc on why it must be read live rather than
+    /// snapshotted once an agent can be added or removed at runtime.
+    watch_list: WatchList,
     /// The pubkey of the agent this attempt is scoped to — this daemon's own
     /// watched identity, never derived from the bundle. Compared against
     /// `bundle.agent_pubkey` before any deploy, so a bundle transport bug
@@ -178,7 +186,7 @@ impl RealWakeEffects {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         presence_state: Arc<PresenceState>,
-        watch_list: Arc<[String]>,
+        watch_list: WatchList,
         watched_agent_pubkey: &str,
         trigger_author: &str,
         trigger_created_at: u64,
@@ -244,13 +252,13 @@ impl WakeEffects for RealWakeEffects {
 
     async fn confirm_author_not_known_agent(&self) -> Result<bool, Self::Error> {
         // `Ok(true)` means "confirmed not a known agent" — see the trait doc.
-        // Every entry in the watch list is, by definition, a known agent this
-        // daemon manages, so the author is clear exactly when it matches
-        // none of them.
-        Ok(!self
-            .watch_list
-            .iter()
-            .any(|watched| watched == &self.trigger_author))
+        // Every member of the watch list is, by definition, a known agent
+        // this daemon manages, so the author is clear exactly when it is not
+        // currently a member. Read live (`WatchList::contains`), not from a
+        // snapshot taken when this attempt was constructed — the whole point
+        // of a fresh re-check is to catch a watch-list change since the
+        // synchronous baseline ran.
+        Ok(!self.watch_list.contains(&self.trigger_author))
     }
 
     async fn start_managed_agent(&self) -> Result<Option<bool>, Self::Error> {
@@ -364,7 +372,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn effects_with(
         presence_state: Arc<PresenceState>,
-        watch_list: Arc<[String]>,
+        watch_list: WatchList,
         watched_agent_pubkey: &str,
         trigger_author: &str,
         bundle: Option<Arc<LaunchBundleBody>>,
@@ -406,7 +414,7 @@ mod tests {
     async fn an_unresolved_presence_tap_reports_unavailable() {
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
@@ -427,7 +435,7 @@ mod tests {
         presence_state.observe("ev1", PresenceStatus::Online, 1_000);
         let effects = effects_with(
             presence_state,
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
@@ -443,7 +451,7 @@ mod tests {
         let watched = "bb".repeat(32);
         let effects = effects_with(
             state(),
-            Arc::from(vec![watched.clone()]),
+            WatchList::from(vec![watched.clone()]),
             "aa".repeat(32).as_str(),
             &watched,
             None,
@@ -458,7 +466,7 @@ mod tests {
     async fn an_author_off_the_watch_list_is_confirmed_clear() {
         let effects = effects_with(
             state(),
-            Arc::from(vec!["bb".repeat(32)]),
+            WatchList::from(vec!["bb".repeat(32)]),
             "aa".repeat(32).as_str(),
             "cc".repeat(32).as_str(),
             None,
@@ -474,7 +482,7 @@ mod tests {
         let watched = "BB".repeat(32);
         let effects = effects_with(
             state(),
-            Arc::from(vec![normalize_pubkey(&watched)]),
+            WatchList::from(vec![normalize_pubkey(&watched)]),
             "aa".repeat(32).as_str(),
             &watched,
             None,
@@ -489,7 +497,7 @@ mod tests {
     async fn start_managed_agent_without_a_bundle_reports_no_bundle() {
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
@@ -511,7 +519,7 @@ mod tests {
         let bundle = bundle_for(&watched, u64::MAX);
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             &watched,
             "aa".repeat(32).as_str(),
             Some(bundle),
@@ -534,7 +542,7 @@ mod tests {
         let bundle = bundle_for(&other_agent, u64::MAX);
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             &watched,
             "aa".repeat(32).as_str(),
             Some(bundle),
@@ -562,7 +570,7 @@ mod tests {
         let bundle = bundle_for(&watched, 1);
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             &watched,
             "aa".repeat(32).as_str(),
             Some(bundle),
@@ -590,7 +598,7 @@ mod tests {
         let called_clone = called.clone();
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
@@ -607,7 +615,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,
@@ -624,7 +632,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let effects = effects_with(
             state(),
-            Arc::from(vec![]),
+            WatchList::from(vec![]),
             "aa".repeat(32).as_str(),
             "aa".repeat(32).as_str(),
             None,

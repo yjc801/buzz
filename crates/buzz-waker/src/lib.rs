@@ -39,6 +39,13 @@
 //!   the reconnect ladder plus [`feed::step`], and spawns each admitted
 //!   trigger's [`attempt::run_wake_attempt`] onto its own task so the loop
 //!   keeps answering the relay's pings during a liveness proof.
+//! - [`enrolment`] — agent enrolment over the relay: the pure schema/trust
+//!   half (roster + per-agent credential payloads, `WAKER_OWNER_PUBKEYS`) of
+//!   replacing hand-edited `WAKER_AGENTS_CONFIG_PATH` JSON.
+//!   `docs/waker-agent-enrolment.md` (design) and `PLANS/BUZZ_WAKER_DESIGN.md`
+//!   §12 (build order) — wire I/O (a `roster_feed`/credential tap mirroring
+//!   [`bundle_feed`]) and the dynamic per-agent supervisor `main.rs` needs to
+//!   act on it are later phases, not yet implemented.
 //!
 //! Each exists because of a specific review finding and carries the gate id
 //! (`G1`–`G4`) it discharges, so the reason is not lost.
@@ -49,6 +56,7 @@ pub mod bundle_feed;
 pub mod cursor;
 pub mod decide;
 pub mod effects;
+pub mod enrolment;
 pub mod feed;
 mod fence;
 pub mod floors;
@@ -67,6 +75,10 @@ pub use cursor::{Admission, Cursor, CursorError, CursorStore, Resume};
 pub use decide::{
     agent_responds_to_author, compute_wake_replay_floor, event_addresses_agent,
     is_covered_by_replay_floor, select_wake_candidates, RespondTo, TriggerEvent, WakeCandidate,
+};
+pub use enrolment::{
+    parse_authorized_owners, CredentialBody, EnrolmentError, RosterBody, RosterEntry,
+    SignedCredential, SignedRoster,
 };
 pub use floors::{FloorError, FloorStore, Floors};
 

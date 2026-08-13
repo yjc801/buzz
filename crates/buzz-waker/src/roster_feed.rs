@@ -20,13 +20,18 @@
 //! diff against the daemon's current watch list and act on. It does not
 //! spawn, cancel, or otherwise supervise anything itself.
 //!
-//! # Multiple owners, one query
+//! # Multiple owners, several queries
 //!
 //! Unlike a bundle or credential tap (pinned to one already-known owner),
 //! this daemon may be configured with several owners in `WAKER_OWNER_PUBKEYS`
 //! — each with their own roster, at the same fixed `d` coordinate but a
-//! different `authors` entry. One REQ with `authors` set to the whole
-//! authorized list covers all of them; [`RosterState`] then tracks each
+//! different `authors` entry. Each owner gets its own filter — see
+//! [`roster_filters`]'s own doc for why one shared filter would apply the
+//! query's `limit` across every owner combined rather than to each of them —
+//! and [`roster_reqs`] batches those filters into REQ frames of at most
+//! [`ROSTER_MAX_FILTERS_PER_REQ`], the relay's own per-REQ cap, opening
+//! however many subscriptions that takes rather than ever emitting a REQ
+//! the relay would refuse outright. [`RosterState`] then tracks each
 //! owner's latest roster independently, keyed by owner pubkey, because one
 //! owner's roster says nothing about another's membership.
 //!
@@ -73,9 +78,11 @@ use crate::enrolment::{RosterBody, SignedRoster};
 use crate::feed::reconnect_delay_ms;
 use crate::floors::{FloorError, FloorStore};
 
-/// Subscription id for the daemon's one roster tap. Fixed, like every other
-/// tap's own id — a reconnect replaces the old subscription rather than
-/// piling up a fresh one.
+/// Base subscription id for the daemon's roster tap. Fixed, like every other
+/// tap's own id — a reconnect replaces the old subscriptions rather than
+/// piling up fresh ones. Never used bare as a wire subscription id itself:
+/// every actual REQ carries [`roster_subscription_id`]'s batch-suffixed
+/// form, even when there is only one batch — see that function's own doc.
 pub const ROSTER_TAP_SUBSCRIPTION_ID: &str = "buzz-waker-roster";
 
 /// The fixed `d` tag every roster event carries — the public, collision-proof
@@ -136,16 +143,54 @@ pub fn roster_filters(authorized_owners: &[String], waker_pubkey: &str) -> Vec<V
         .collect()
 }
 
-/// The REQ frame opening the daemon's roster tap: one subscription, one
-/// filter per authorized owner (see [`roster_filters`]).
+/// The relay's own per-REQ filter cap: `buzz-relay/src/protocol.rs`'s
+/// `MAX_FILTERS_PER_REQ`, advertised over NIP-11 as `max_filters: 10`
+/// (`crates/buzz-relay/src/nip11.rs`). A REQ over this limit is refused
+/// outright, not truncated — [`roster_reqs`] batches `authorized_owners`
+/// at this bound instead of ever emitting one. Not learned from the
+/// relay at runtime: this tap connects before any HTTP/NIP-11 client
+/// exists in this daemon, and the owner list is deploy-time config, not
+/// something worth an extra round trip to discover. If the relay's own
+/// limit ever changes, this constant has to change with it.
+pub const ROSTER_MAX_FILTERS_PER_REQ: usize = 10;
+
+/// The subscription id for roster batch `index` — every batch gets its own
+/// id so a relay `CLOSED` or delivery can be attributed to the batch it
+/// belongs to. Always suffixed, even for the common case of one batch,
+/// rather than special-casing batch 0 onto the bare
+/// [`ROSTER_TAP_SUBSCRIPTION_ID`] — one shape for [`roster_frame`] to
+/// match against instead of two.
 #[must_use]
-pub fn roster_req(authorized_owners: &[String], waker_pubkey: &str) -> Value {
-    let mut frame = vec![
-        Value::String("REQ".to_string()),
-        Value::String(ROSTER_TAP_SUBSCRIPTION_ID.to_string()),
-    ];
-    frame.extend(roster_filters(authorized_owners, waker_pubkey));
-    Value::Array(frame)
+pub fn roster_subscription_id(index: usize) -> String {
+    format!("{ROSTER_TAP_SUBSCRIPTION_ID}-{index}")
+}
+
+/// The REQ frames opening the daemon's roster tap: `authorized_owners`
+/// split into batches of at most [`ROSTER_MAX_FILTERS_PER_REQ`], one REQ
+/// frame per batch under its own [`roster_subscription_id`].
+///
+/// A daemon with more authorized owners than one REQ can hold still needs
+/// every owner's roster, not just the first ten — multiple subscriptions
+/// on the same connection is how NIP-01 already supports "more filters
+/// than one REQ can carry" (the same reason a client opens several
+/// subscriptions rather than one giant one). Splitting here, rather than
+/// silently dropping owners past the cap or refusing to start, is what
+/// makes an 11-owner configuration behave the same as a 10-owner one.
+#[must_use]
+pub fn roster_reqs(authorized_owners: &[String], waker_pubkey: &str) -> Vec<(String, Value)> {
+    authorized_owners
+        .chunks(ROSTER_MAX_FILTERS_PER_REQ)
+        .enumerate()
+        .map(|(index, owners)| {
+            let subscription_id = roster_subscription_id(index);
+            let mut frame = vec![
+                Value::String("REQ".to_string()),
+                Value::String(subscription_id.clone()),
+            ];
+            frame.extend(roster_filters(owners, waker_pubkey));
+            (subscription_id, Value::Array(frame))
+        })
+        .collect()
 }
 
 /// Shared, thread-safe cache of the latest known roster per owner.
@@ -236,17 +281,26 @@ enum RosterFrame {
 
 /// Classify one relay message for the roster tap.
 ///
+/// `subscription_ids` is every batch id this run of the tap opened (see
+/// [`roster_reqs`]) — more than one once `authorized_owners` exceeds
+/// [`ROSTER_MAX_FILTERS_PER_REQ`], so a single fixed id can no longer be
+/// the test.
+///
 /// Verification proves only that the stated author signed the event — it
 /// does not prove the relay applied this subscription's filter. Re-checking
 /// the `#d` tag and the author against `authorized_owners` here is what stops
 /// a misrouted or replayed event from ever reaching the decrypt step, same
 /// reasoning [`crate::bundle_feed::bundle_frame`] applies for its own tap.
-fn roster_frame(authorized_owners: &[String], message: RelayMessage) -> RosterFrame {
+fn roster_frame(
+    authorized_owners: &[String],
+    subscription_ids: &[String],
+    message: RelayMessage,
+) -> RosterFrame {
     match message {
         RelayMessage::Event {
             subscription_id,
             event,
-        } if subscription_id == ROSTER_TAP_SUBSCRIPTION_ID => {
+        } if subscription_ids.contains(&subscription_id) => {
             if let Err(error) = buzz_core::verify_event(&event) {
                 return RosterFrame::Rejected {
                     event_id: event.id.to_hex(),
@@ -274,7 +328,7 @@ fn roster_frame(authorized_owners: &[String], message: RelayMessage) -> RosterFr
         RelayMessage::Closed {
             subscription_id,
             message,
-        } if subscription_id == ROSTER_TAP_SUBSCRIPTION_ID => RosterFrame::Closed { message },
+        } if subscription_ids.contains(&subscription_id) => RosterFrame::Closed { message },
         _ => RosterFrame::Ignored,
     }
 }
@@ -387,10 +441,13 @@ fn open_or_create_owner_floor(dir: &Path, owner_pubkey: &str) -> Result<FloorSto
 /// Run the daemon's roster tap until `cancel` fires.
 ///
 /// Connects and authenticates as `waker_keys` — **not** any watched agent's
-/// identity, see the module doc — subscribes under
-/// [`ROSTER_TAP_SUBSCRIPTION_ID`], and folds every delivery into `state` via
+/// identity, see the module doc — opens one subscription per
+/// [`roster_reqs`] batch, and folds every delivery into `state` via
 /// [`decrypt_verify_and_track`]. Reconnects on any transport error using the
-/// same ladder every other tap in this daemon uses ([`reconnect_delay_ms`]).
+/// same ladder every other tap in this daemon uses ([`reconnect_delay_ms`]);
+/// a failure partway through subscribing (e.g. batch 2 of 3) reconnects the
+/// whole connection rather than leaving a partial subscription set running,
+/// same as any other subscribe failure.
 ///
 /// Refuses to run at all if `authorized_owners` is empty — see the module
 /// doc's Fail closed section. This is a deliberate no-op, not an error: a
@@ -466,12 +523,18 @@ pub async fn run_roster_tap(
             () = cancel.cancelled() => break,
         };
 
-        if let Err(error) = connection
-            .send_raw(&roster_req(&authorized_owners, &waker_pubkey))
-            .await
-        {
-            tracing::warn!(%error, "roster tap subscribe failed; reconnecting");
-            consecutive_failures = consecutive_failures.saturating_add(1);
+        let reqs = roster_reqs(&authorized_owners, &waker_pubkey);
+        let subscription_ids: Vec<String> = reqs.iter().map(|(id, _)| id.clone()).collect();
+        let mut subscribed = true;
+        for (_, req) in &reqs {
+            if let Err(error) = connection.send_raw(req).await {
+                tracing::warn!(%error, "roster tap subscribe failed; reconnecting");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                subscribed = false;
+                break;
+            }
+        }
+        if !subscribed {
             continue;
         }
         consecutive_failures = 0;
@@ -483,7 +546,7 @@ pub async fn run_roster_tap(
             };
 
             match next {
-                Ok(message) => match roster_frame(&authorized_owners, message) {
+                Ok(message) => match roster_frame(&authorized_owners, &subscription_ids, message) {
                     RosterFrame::Delivered {
                         owner_pubkey,
                         ciphertext,
@@ -621,15 +684,19 @@ mod tests {
     }
 
     #[test]
-    fn the_req_frame_carries_one_filter_per_owner_under_one_subscription() {
+    fn one_owner_still_produces_exactly_one_req_under_a_suffixed_subscription_id() {
         let owner_a = "a".repeat(64);
         let owner_b = "b".repeat(64);
         let waker_pubkey = "c".repeat(64);
-        let req = roster_req(&[owner_a, owner_b], &waker_pubkey);
+        let reqs = roster_reqs(&[owner_a, owner_b], &waker_pubkey);
+
+        assert_eq!(reqs.len(), 1, "two owners fit in one batch");
+        let (subscription_id, req) = &reqs[0];
+        assert_eq!(subscription_id, &roster_subscription_id(0));
         let frame = req.as_array().expect("REQ is an array");
 
         assert_eq!(frame[0], json!("REQ"));
-        assert_eq!(frame[1], json!(ROSTER_TAP_SUBSCRIPTION_ID));
+        assert_eq!(frame[1], json!(subscription_id));
         assert_eq!(
             frame.len(),
             4,
@@ -638,15 +705,74 @@ mod tests {
     }
 
     #[test]
+    fn owners_past_the_relay_filter_cap_split_into_a_second_req() {
+        let waker_pubkey = "c".repeat(64);
+        let owners: Vec<String> = (0..(ROSTER_MAX_FILTERS_PER_REQ + 1))
+            .map(|i| format!("{i:064x}"))
+            .collect();
+
+        let reqs = roster_reqs(&owners, &waker_pubkey);
+
+        assert_eq!(
+            reqs.len(),
+            2,
+            "one owner over the cap must open a second subscription, not be dropped or refuse to start"
+        );
+        let (first_id, first_req) = &reqs[0];
+        let (second_id, second_req) = &reqs[1];
+        assert_eq!(first_id, &roster_subscription_id(0));
+        assert_eq!(second_id, &roster_subscription_id(1));
+        assert_ne!(first_id, second_id);
+
+        let first_filters = first_req.as_array().expect("array").len() - 2;
+        let second_filters = second_req.as_array().expect("array").len() - 2;
+        assert_eq!(first_filters, ROSTER_MAX_FILTERS_PER_REQ);
+        assert_eq!(second_filters, 1);
+        assert_eq!(
+            first_filters + second_filters,
+            owners.len(),
+            "every owner must appear in exactly one batch"
+        );
+    }
+
+    #[test]
     fn a_verified_delivery_from_an_authorized_owner_is_delivered() {
         let owner = Keys::generate();
         let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
         let event = roster_event(&owner, "ciphertext-bytes");
+        let subscription_id = roster_subscription_id(0);
 
         let frame = roster_frame(
             std::slice::from_ref(&owner_pubkey),
+            std::slice::from_ref(&subscription_id),
             RelayMessage::Event {
-                subscription_id: ROSTER_TAP_SUBSCRIPTION_ID.to_string(),
+                subscription_id: subscription_id.clone(),
+                event: Box::new(event),
+            },
+        );
+        assert_eq!(
+            frame,
+            RosterFrame::Delivered {
+                owner_pubkey,
+                ciphertext: "ciphertext-bytes".to_string()
+            }
+        );
+    }
+
+    /// A daemon with owners split across two batches must still recognize a
+    /// delivery on the second batch's subscription id, not just the first.
+    #[test]
+    fn a_delivery_on_a_later_batchs_subscription_is_still_delivered() {
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let event = roster_event(&owner, "ciphertext-bytes");
+        let subscription_ids = vec![roster_subscription_id(0), roster_subscription_id(1)];
+
+        let frame = roster_frame(
+            std::slice::from_ref(&owner_pubkey),
+            &subscription_ids,
+            RelayMessage::Event {
+                subscription_id: roster_subscription_id(1),
                 event: Box::new(event),
             },
         );
@@ -664,11 +790,13 @@ mod tests {
         let owner = Keys::generate();
         let other_authorized = Keys::generate();
         let event = roster_event(&owner, "ciphertext-bytes");
+        let subscription_id = roster_subscription_id(0);
 
         let frame = roster_frame(
             &[normalize_pubkey(&other_authorized.public_key().to_hex())],
+            std::slice::from_ref(&subscription_id),
             RelayMessage::Event {
-                subscription_id: ROSTER_TAP_SUBSCRIPTION_ID.to_string(),
+                subscription_id: subscription_id.clone(),
                 event: Box::new(event),
             },
         );
@@ -693,11 +821,13 @@ mod tests {
         ])
         .sign_with_keys(&owner)
         .expect("sign");
+        let subscription_id = roster_subscription_id(0);
 
         let frame = roster_frame(
             &[owner_pubkey],
+            std::slice::from_ref(&subscription_id),
             RelayMessage::Event {
-                subscription_id: ROSTER_TAP_SUBSCRIPTION_ID.to_string(),
+                subscription_id: subscription_id.clone(),
                 event: Box::new(event),
             },
         );
@@ -712,6 +842,7 @@ mod tests {
 
         let frame = roster_frame(
             &[owner_pubkey],
+            std::slice::from_ref(&roster_subscription_id(0)),
             RelayMessage::Event {
                 subscription_id: "some-other-subscription".to_string(),
                 event: Box::new(event),
@@ -722,10 +853,12 @@ mod tests {
 
     #[test]
     fn a_closed_frame_for_this_subscription_is_reported() {
+        let subscription_id = roster_subscription_id(0);
         let frame = roster_frame(
             &["a".repeat(64)],
+            std::slice::from_ref(&subscription_id),
             RelayMessage::Closed {
-                subscription_id: ROSTER_TAP_SUBSCRIPTION_ID.to_string(),
+                subscription_id: subscription_id.clone(),
                 message: "auth-required".to_string(),
             },
         );

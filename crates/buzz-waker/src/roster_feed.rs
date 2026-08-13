@@ -41,8 +41,22 @@
 //! at best match nothing and at worst behave relay-implementation-defined —
 //! refusing before ever constructing one is the same defense-in-depth
 //! reasoning the design doc already applies to the `#d` tag re-check below.
+//!
+//! # Durable per-owner version floor
+//!
+//! [`RosterState`] alone only tracks the highest `roster_version` seen this
+//! process lifetime. Because the envelope kind is not replaceable, an owner's
+//! old reissues stay queryable forever, so a relay can replay one after a
+//! restart and this tap would accept it — resurrecting an agent a newer
+//! roster already removed. [`run_roster_tap`] closes that hole the same way
+//! [`crate::floors::FloorStore`] already closes it for bundle versions
+//! (**G2**): one [`FloorStore`] per owner, opened lazily under
+//! `roster_floor_dir` and re-read from disk on every delivery, so the floor
+//! survives a restart even though [`RosterState`] itself does not.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -57,6 +71,7 @@ use crate::bundle_feed::NIP44_CONTENT_LEN_RANGE;
 use crate::decide::normalize_pubkey;
 use crate::enrolment::{RosterBody, SignedRoster};
 use crate::feed::reconnect_delay_ms;
+use crate::floors::{FloorError, FloorStore};
 
 /// Subscription id for the daemon's one roster tap. Fixed, like every other
 /// tap's own id — a reconnect replaces the old subscription rather than
@@ -91,35 +106,46 @@ pub const ROSTER_TAP_IDLE_TIMEOUT_SECS: u64 = 300;
 /// as [`crate::bundle_feed::BUNDLE_QUERY_LIMIT`] for the same margin.
 pub const ROSTER_QUERY_LIMIT: u32 = 16;
 
-/// The REQ filter for the daemon's roster tap: global, `authors` set to every
-/// authorized owner, `#p` pinned to the waker's own identity, `#d` pinned to
-/// the fixed roster coordinate.
+/// One REQ filter per authorized owner: same `#p`/`#d` pinning as before, but
+/// `authors` narrowed to a single owner so each filter gets its own
+/// [`ROSTER_QUERY_LIMIT`].
+///
+/// A single filter with every owner in `authors` would apply the limit once
+/// across *all* of them combined — `buzz-relay`'s `handle_req` runs a
+/// multi-filter REQ as one independent, independently-limited DB query per
+/// filter (NIP-01 OR semantics), so a burst of reissues from one owner can
+/// only ever crowd out that owner's own history, never another authorized
+/// owner's latest roster.
 ///
 /// `#p` is not optional, mirroring [`crate::bundle_feed::bundle_filter`]'s
 /// own doc: the relay refuses an envelope query that omits it.
 #[must_use]
-pub fn roster_filter(authorized_owners: &[String], waker_pubkey: &str) -> Value {
-    let authors: Vec<String> = authorized_owners
+pub fn roster_filters(authorized_owners: &[String], waker_pubkey: &str) -> Vec<Value> {
+    let waker_pubkey = normalize_pubkey(waker_pubkey);
+    authorized_owners
         .iter()
-        .map(|o| normalize_pubkey(o))
-        .collect();
-    json!({
-        "kinds": [KIND_WAKER_BUNDLE_ENVELOPE],
-        "authors": authors,
-        "#p": [normalize_pubkey(waker_pubkey)],
-        "#d": [ROSTER_D_TAG],
-        "limit": ROSTER_QUERY_LIMIT,
-    })
+        .map(|owner| {
+            json!({
+                "kinds": [KIND_WAKER_BUNDLE_ENVELOPE],
+                "authors": [normalize_pubkey(owner)],
+                "#p": [waker_pubkey],
+                "#d": [ROSTER_D_TAG],
+                "limit": ROSTER_QUERY_LIMIT,
+            })
+        })
+        .collect()
 }
 
-/// The REQ frame opening the daemon's roster tap.
+/// The REQ frame opening the daemon's roster tap: one subscription, one
+/// filter per authorized owner (see [`roster_filters`]).
 #[must_use]
 pub fn roster_req(authorized_owners: &[String], waker_pubkey: &str) -> Value {
-    json!([
-        "REQ",
-        ROSTER_TAP_SUBSCRIPTION_ID,
-        roster_filter(authorized_owners, waker_pubkey)
-    ])
+    let mut frame = vec![
+        Value::String("REQ".to_string()),
+        Value::String(ROSTER_TAP_SUBSCRIPTION_ID.to_string()),
+    ];
+    frame.extend(roster_filters(authorized_owners, waker_pubkey));
+    Value::Array(frame)
 }
 
 /// Shared, thread-safe cache of the latest known roster per owner.
@@ -257,15 +283,18 @@ fn roster_frame(authorized_owners: &[String], message: RelayMessage) -> RosterFr
 #[derive(Debug, PartialEq, Eq)]
 enum RosterOutcome {
     /// A newer roster than whatever was previously tracked for this owner —
-    /// now recorded in [`RosterState`].
+    /// now recorded in [`RosterState`] and durably admitted by this owner's
+    /// [`FloorStore`].
     Updated(RosterBody),
     /// A roster whose `roster_version` did not exceed what is already
-    /// tracked for this owner — a replay or a reconnect re-delivering
-    /// history. Left in place, not an error.
+    /// tracked for this owner — either this process's own [`RosterState`]
+    /// or, after a restart, the durable per-owner [`FloorStore`] floor. A
+    /// replay or a reconnect re-delivering history. Left in place, not an
+    /// error.
     Stale,
 }
 
-/// Decrypt, verify, and track one delivered roster.
+/// Decrypt, verify, durably admit, and track one delivered roster.
 ///
 /// `waker_keys` is the daemon's own identity (the NIP-44 recipient); the
 /// ciphertext was encrypted to it. The sender side of the ECDH is
@@ -275,17 +304,26 @@ enum RosterOutcome {
 /// body's own signature, independent of which key the outer envelope
 /// happened to arrive signed by.
 ///
+/// `floor_store` is `owner_pubkey`'s own durable version floor (see the
+/// module doc's Durable per-owner version floor section) — checked and
+/// advanced, under its own fence, before the delivery ever reaches
+/// [`RosterState`]. This is what makes the anti-replay guarantee survive a
+/// restart; [`RosterState`] alone only remembers for this process's
+/// lifetime.
+///
 /// # Errors
 /// A human-readable message on any failure — malformed/oversized ciphertext,
-/// a decrypt failure, a parse failure, or a failed inner signature/roster
-/// validation. Every path is a refusal to track, never a credential in the
-/// error text (a roster carries none, but keeps the same contract as
+/// a decrypt failure, a parse failure, a failed inner signature/roster
+/// validation, or a durable floor that could not be persisted. Every path is
+/// a refusal to track, never a credential in the error text (a roster
+/// carries none, but keeps the same contract as
 /// [`crate::bundle_feed::decrypt_verify_and_admit`] for consistency).
 fn decrypt_verify_and_track(
     waker_keys: &Keys,
     authorized_owners: &[String],
     owner_pubkey: &str,
     ciphertext: &str,
+    floor_store: &mut FloorStore,
     state: &RosterState,
 ) -> Result<RosterOutcome, String> {
     if !NIP44_CONTENT_LEN_RANGE.contains(&ciphertext.len()) {
@@ -307,10 +345,42 @@ fn decrypt_verify_and_track(
         .verify(authorized_owners)
         .map_err(|error| format!("roster verification failed: {error}"))?;
 
+    // Durable floor first: it is the only part of this that survives a
+    // restart, so it must gate `RosterState` rather than the other way
+    // round. `RolledBack` is exactly the replay-after-restart case this
+    // floor exists for — a stale delivery, not an error.
+    match floor_store.admit(body.roster_version) {
+        Ok(()) => {}
+        Err(FloorError::RolledBack { .. }) => return Ok(RosterOutcome::Stale),
+        Err(error) => {
+            return Err(format!("roster floor could not be advanced: {error}"));
+        }
+    }
+
     if state.update_if_newer(owner_pubkey, body.clone()) {
         Ok(RosterOutcome::Updated(body))
     } else {
         Ok(RosterOutcome::Stale)
+    }
+}
+
+/// Open `owner_pubkey`'s durable roster floor under `dir`, creating it at
+/// version 0 the first time this daemon ever sees that owner.
+///
+/// Unlike [`FloorStore::enroll`]'s use for bundle/credential state, a
+/// missing file here is the ordinary cold-start case (this daemon has never
+/// tracked a roster from this owner before) rather than a suspicious gap —
+/// the owner's authenticity already comes from `WAKER_OWNER_PUBKEYS` and
+/// [`SignedRoster::verify`], not from anything pinned in this file. Once
+/// created, the file is fenced and read-before-decide exactly like every
+/// other [`FloorStore`], so a version this daemon has already admitted
+/// cannot be forgotten by a later restart.
+fn open_or_create_owner_floor(dir: &Path, owner_pubkey: &str) -> Result<FloorStore, FloorError> {
+    let path = dir.join(format!("{owner_pubkey}.json"));
+    match FloorStore::open(&path) {
+        Ok(store) => Ok(store),
+        Err(FloorError::NotEnrolled { .. }) => FloorStore::enroll(&path, owner_pubkey),
+        Err(error) => Err(error),
     }
 }
 
@@ -327,14 +397,25 @@ fn decrypt_verify_and_track(
 /// daemon started with enrolment disabled should log why once and return,
 /// not busy-loop reconnecting a query that can never usefully match.
 ///
+/// `roster_floor_dir` holds each authorized owner's durable version floor
+/// (one file per owner, opened lazily — see the module doc's Durable
+/// per-owner version floor section). Owned by this task for its lifetime,
+/// the same single-writer shape [`crate::bundle_feed::run_bundle_tap`] uses
+/// for its own `floor_store`.
+///
 /// A malformed, undecryptable, or verification-refused delivery is logged
 /// and skipped, not a reconnect — an unauthorized or stale publisher must not
-/// be able to knock this tap offline.
+/// be able to knock this tap offline. The same is true of an owner whose
+/// durable floor this daemon cannot open or create (e.g. a permissions
+/// problem under `roster_floor_dir`): that owner's deliveries are skipped
+/// and logged, not treated as a reason to drop the whole connection.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_roster_tap(
     relay_url: &str,
     waker_keys: &Keys,
     auth_tag: Option<&Tag>,
     authorized_owners: &[String],
+    roster_floor_dir: &Path,
     state: &RosterState,
     cancel: &CancellationToken,
 ) {
@@ -346,11 +427,21 @@ pub async fn run_roster_tap(
         return;
     }
 
+    if let Err(error) = std::fs::create_dir_all(roster_floor_dir) {
+        tracing::error!(
+            dir = %roster_floor_dir.display(),
+            %error,
+            "roster tap could not create its durable floor directory; refusing to run"
+        );
+        return;
+    }
+
     let waker_pubkey = waker_keys.public_key().to_hex();
     let authorized_owners: Vec<String> = authorized_owners
         .iter()
         .map(|owner| normalize_pubkey(owner))
         .collect();
+    let mut floors: HashMap<String, FloorStore> = HashMap::new();
     let mut consecutive_failures = 0u32;
 
     while !cancel.is_cancelled() {
@@ -397,11 +488,28 @@ pub async fn run_roster_tap(
                         owner_pubkey,
                         ciphertext,
                     } => {
+                        let floor_store = match floors.entry(owner_pubkey.clone()) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                match open_or_create_owner_floor(roster_floor_dir, &owner_pubkey) {
+                                    Ok(store) => entry.insert(store),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            owner = %owner_pubkey,
+                                            %error,
+                                            "roster tap could not open this owner's durable floor; skipping delivery"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         match decrypt_verify_and_track(
                             waker_keys,
                             &authorized_owners,
                             &owner_pubkey,
                             &ciphertext,
+                            floor_store,
                             state,
                         ) {
                             Ok(RosterOutcome::Updated(body)) => {
@@ -481,20 +589,51 @@ mod tests {
         }
     }
 
+    /// A fresh durable floor for one owner, backed by its own tempdir file —
+    /// mirrors [`open_or_create_owner_floor`] but lets a test hold the
+    /// `TempDir` so a later reopen in the same test simulates a restart.
+    fn test_floor(dir: &tempfile::TempDir, owner_pubkey: &str) -> FloorStore {
+        open_or_create_owner_floor(dir.path(), owner_pubkey).expect("open or create floor")
+    }
+
     #[test]
-    fn the_query_names_every_authorized_owner_and_the_fixed_roster_coordinate() {
+    fn each_filter_names_one_owner_with_its_own_bounded_limit() {
         let owner_a = "a".repeat(64);
         let owner_b = "b".repeat(64);
         let waker_pubkey = "c".repeat(64);
-        let filter = roster_filter(&[owner_a.clone(), owner_b.clone()], &waker_pubkey);
+        let filters = roster_filters(&[owner_a.clone(), owner_b.clone()], &waker_pubkey);
 
-        assert_eq!(filter["kinds"], json!([KIND_WAKER_BUNDLE_ENVELOPE]));
-        assert_eq!(filter["authors"], json!([owner_a, owner_b]));
-        assert_eq!(filter["#p"], json!([waker_pubkey]));
-        assert_eq!(filter["#d"], json!([ROSTER_D_TAG]));
-        assert!(
-            filter["limit"].is_number(),
-            "the envelope is not replaceable, so the query must be bounded"
+        assert_eq!(filters.len(), 2, "one filter per authorized owner");
+        for (filter, owner) in filters.iter().zip([&owner_a, &owner_b]) {
+            assert_eq!(filter["kinds"], json!([KIND_WAKER_BUNDLE_ENVELOPE]));
+            assert_eq!(
+                filter["authors"],
+                json!([owner]),
+                "each filter's authors must be exactly its own owner, not every owner"
+            );
+            assert_eq!(filter["#p"], json!([waker_pubkey]));
+            assert_eq!(filter["#d"], json!([ROSTER_D_TAG]));
+            assert!(
+                filter["limit"].is_number(),
+                "the envelope is not replaceable, so every filter must be bounded"
+            );
+        }
+    }
+
+    #[test]
+    fn the_req_frame_carries_one_filter_per_owner_under_one_subscription() {
+        let owner_a = "a".repeat(64);
+        let owner_b = "b".repeat(64);
+        let waker_pubkey = "c".repeat(64);
+        let req = roster_req(&[owner_a, owner_b], &waker_pubkey);
+        let frame = req.as_array().expect("REQ is an array");
+
+        assert_eq!(frame[0], json!("REQ"));
+        assert_eq!(frame[1], json!(ROSTER_TAP_SUBSCRIPTION_ID));
+        assert_eq!(
+            frame.len(),
+            4,
+            "\"REQ\", subscription id, then one filter per owner"
         );
     }
 
@@ -603,6 +742,8 @@ mod tests {
         let waker = Keys::generate();
         let owner_pubkey = "a".repeat(64);
         let state = RosterState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut floor = test_floor(&dir, &owner_pubkey);
 
         let too_long = "x".repeat(NIP44_CONTENT_LEN_RANGE.end() + 1);
         let error = decrypt_verify_and_track(
@@ -610,6 +751,7 @@ mod tests {
             std::slice::from_ref(&owner_pubkey),
             &owner_pubkey,
             &too_long,
+            &mut floor,
             &state,
         )
         .unwrap_err();
@@ -622,6 +764,8 @@ mod tests {
         let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
         let waker = Keys::generate();
         let state = RosterState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut floor = test_floor(&dir, &owner_pubkey);
 
         let agent = Keys::generate().public_key().to_hex();
         let body = roster_body(
@@ -648,6 +792,7 @@ mod tests {
             std::slice::from_ref(&owner_pubkey),
             &owner_pubkey,
             &ciphertext,
+            &mut floor,
             &state,
         )
         .expect("round trip");
@@ -670,6 +815,8 @@ mod tests {
         let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
         let waker = Keys::generate();
         let state = RosterState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut floor = test_floor(&dir, &owner_pubkey);
         let owner_keypair =
             nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
 
@@ -693,6 +840,7 @@ mod tests {
             std::slice::from_ref(&owner_pubkey),
             &owner_pubkey,
             &encrypt(&v2),
+            &mut floor,
             &state,
         )
         .expect("v2 tracks");
@@ -703,6 +851,7 @@ mod tests {
             std::slice::from_ref(&owner_pubkey),
             &owner_pubkey,
             &encrypt(&v1),
+            &mut floor,
             &state,
         )
         .expect("v1 is not an error");
@@ -717,6 +866,80 @@ mod tests {
         );
     }
 
+    /// The P1 fix's headline case: [`RosterState`] alone forgets on restart,
+    /// but the durable per-owner floor must not. Simulates a restart by
+    /// dropping the in-memory `RosterState` and reopening the on-disk
+    /// [`FloorStore`] from the same path, then replays the old, still
+    /// validly-signed v1 roster a relay could still serve from history.
+    #[test]
+    fn a_replayed_older_roster_is_refused_after_a_simulated_restart() {
+        let owner = Keys::generate();
+        let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
+        let waker = Keys::generate();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner_keypair =
+            nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
+
+        let encrypt = |body: &RosterBody| -> String {
+            let signed = SignedRoster::sign(body, &owner_keypair).unwrap();
+            let plaintext = serde_json::to_string(&signed).unwrap();
+            nostr::nips::nip44::encrypt(
+                owner.secret_key(),
+                &waker.public_key(),
+                &plaintext,
+                nostr::nips::nip44::Version::V2,
+            )
+            .unwrap()
+        };
+
+        let v9 = roster_body(vec![], 9);
+        let v4 = roster_body(vec![], 4);
+
+        {
+            let state = RosterState::new();
+            let mut floor = test_floor(&dir, &owner_pubkey);
+            let outcome = decrypt_verify_and_track(
+                &waker,
+                std::slice::from_ref(&owner_pubkey),
+                &owner_pubkey,
+                &encrypt(&v9),
+                &mut floor,
+                &state,
+            )
+            .expect("v9 tracks");
+            assert!(matches!(outcome, RosterOutcome::Updated(_)));
+        }
+
+        // Simulated restart: fresh RosterState (nothing tracked this
+        // process lifetime), floor reopened from disk.
+        let state = RosterState::new();
+        let mut floor = test_floor(&dir, &owner_pubkey);
+        assert_eq!(
+            floor.snapshot().highest_accepted_version,
+            9,
+            "the durable floor must have survived the simulated restart"
+        );
+
+        let outcome = decrypt_verify_and_track(
+            &waker,
+            std::slice::from_ref(&owner_pubkey),
+            &owner_pubkey,
+            &encrypt(&v4),
+            &mut floor,
+            &state,
+        )
+        .expect("a replayed older roster is refused, not an error");
+        assert_eq!(
+            outcome,
+            RosterOutcome::Stale,
+            "the durable floor must refuse the replay even though RosterState forgot it"
+        );
+        assert!(
+            state.current(&owner_pubkey).is_none(),
+            "a refused delivery must never reach RosterState"
+        );
+    }
+
     #[test]
     fn each_owner_is_tracked_independently() {
         let owner_a = Keys::generate();
@@ -725,6 +948,9 @@ mod tests {
         let owner_b_pubkey = normalize_pubkey(&owner_b.public_key().to_hex());
         let waker = Keys::generate();
         let state = RosterState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut floor_a = test_floor(&dir, &owner_a_pubkey);
+        let mut floor_b = test_floor(&dir, &owner_b_pubkey);
 
         let encrypt_for = |owner: &Keys, body: &RosterBody| -> String {
             let owner_keypair =
@@ -746,6 +972,7 @@ mod tests {
             &authorized,
             &owner_a_pubkey,
             &encrypt_for(&owner_a, &roster_body(vec![], 5)),
+            &mut floor_a,
             &state,
         )
         .expect("owner a tracks");
@@ -754,6 +981,7 @@ mod tests {
             &authorized,
             &owner_b_pubkey,
             &encrypt_for(&owner_b, &roster_body(vec![], 1)),
+            &mut floor_b,
             &state,
         )
         .expect("owner b tracks");
@@ -776,6 +1004,8 @@ mod tests {
         let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
         let waker = Keys::generate();
         let state = RosterState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut floor = test_floor(&dir, &owner_pubkey);
         let owner_keypair =
             nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
         let signed = SignedRoster::sign(&roster_body(vec![], 1), &owner_keypair).unwrap();
@@ -793,6 +1023,7 @@ mod tests {
             &["z".repeat(64)],
             &owner_pubkey,
             &ciphertext,
+            &mut floor,
             &state,
         )
         .expect_err("unauthorized owner refused");

@@ -36,6 +36,7 @@
 //! | `WAKER_AGENTS_CONFIG_PATH` | yes | Path to a JSON file listing the agents to statically watch — see [`AgentConfig`]. |
 //! | `WAKER_OWNER_PUBKEYS` | no | Comma-separated list of owner pubkeys this daemon discovers agents for dynamically. Empty or unset disables dynamic enrolment entirely — see [`buzz_waker::enrolment::parse_authorized_owners`]'s own fail-closed doc. |
 //! | `WAKER_IDENTITY_NSEC` | only if `WAKER_OWNER_PUBKEYS` is set | This daemon's own Nostr identity — the roster and credential taps decrypt as this key, never as any watched agent's. |
+//! | `WAKER_ADMISSION` | no | `closed` (default) or `open`. Closed reads its authorized owners from `WAKER_OWNER_PUBKEYS`. Open reads them from the relay's own signed membership list (kind:13534), so joining the community *is* admission and adding a user needs no config change or redeploy. Open still bounds total agents by `WAKER_MAX_AGENTS`; see [`buzz_waker::roster_feed::Admission`] for what it does and does not bound. |
 //! | `WAKER_IDENTITY_AUTH_TAG` | no | This daemon's own NIP-OA delegation, as a JSON array (`["auth", …]`), minted by a relay-member owner for the identity above. Needed whenever that identity is not itself a relay member: `enforce_relay_membership` admits it as `ViaOwner`. Absent, the taps connect with no delegation and fail NIP-42 with `restricted: not a relay member` — silently, as an empty watch list. See [`parse_identity_auth_tag`]. |
 //! | `WAKER_MAX_AGENTS` | only if `WAKER_OWNER_PUBKEYS` is set | Total ceiling on supervised agents — config, pending, and running together — dynamic enrolment can ever push this daemon to. Refuse-not-evict: an authorized owner's roster past this ceiling is refused new admissions, never made to cancel an existing agent to make room. See [`reconcile_roster`]'s own doc. |
 //! | `RUST_LOG` | no | `tracing-subscriber` env filter. Defaults to `buzz_waker=info`. |
@@ -77,7 +78,7 @@ use buzz_waker::decide::normalize_pubkey;
 use buzz_waker::enrolment::{parse_authorized_owners, RosterEntry};
 use buzz_waker::floors::{FloorError, FloorStore};
 use buzz_waker::presence_feed::{run_presence_tap, PresenceState};
-use buzz_waker::roster_feed::{run_roster_tap, RosterState};
+use buzz_waker::roster_feed::{run_roster_tap, Admission, RosterState};
 use buzz_waker::wake_loop::{run_wake_loop, WakeLoopConfig};
 use buzz_waker::watch_list::WatchList;
 
@@ -489,6 +490,40 @@ fn compute_desired_roster_agents(
 /// The value is set but is not a JSON array of strings, or does not parse as a
 /// Nostr tag. A malformed tag is refused rather than dropped: a daemon that
 /// silently ignored it would present no tag and fail exactly as above.
+/// Resolve `WAKER_ADMISSION` into the admission mode the roster tap runs in.
+///
+/// Defaults to closed, and closed with an empty owner list still means
+/// enrolment is disabled — the fail-closed contract is unchanged, because
+/// open admission gets its own explicit selector rather than reusing "empty"
+/// for it. Overloading absence would make "shipped unbounded admission by
+/// accident" a one-typo mistake.
+///
+/// Open ignores `WAKER_OWNER_PUBKEYS` rather than merging with it: two
+/// sources of authorization silently unioned is how an owner stays admitted
+/// long after the community removed them.
+///
+/// # Errors
+/// The value is set to anything other than `open` or `closed`. Refused rather
+/// than defaulted, because guessing at admission policy is the one place a
+/// silent fallback is least acceptable.
+fn parse_admission(raw: Option<&str>, owner_pubkeys: Vec<String>) -> anyhow::Result<Admission> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("closed") => Ok(Admission::Closed(owner_pubkeys)),
+        Some("open") => {
+            if !owner_pubkeys.is_empty() {
+                tracing::warn!(
+                    "WAKER_ADMISSION=open ignores WAKER_OWNER_PUBKEYS; authorized owners come \
+                     from the relay's membership list. Unset it to make that unambiguous"
+                );
+            }
+            Ok(Admission::Open)
+        }
+        Some(other) => {
+            anyhow::bail!("WAKER_ADMISSION must be \"open\" or \"closed\", got {other:?}")
+        }
+    }
+}
+
 fn parse_identity_auth_tag(
     raw: Option<&str>,
     enrolment_enabled: bool,
@@ -701,7 +736,6 @@ fn reconcile_roster(
     // the *agent's* auth tag, which arrives inside that agent's delivered
     // credential and is passed to `spawn_agent_watch` instead.
     waker_auth_tag: Option<&Tag>,
-    authorized_owners: &[String],
     max_agents: usize,
     roster_state: &RosterState,
     supervised: &mut HashMap<String, SupervisedAgent>,
@@ -709,13 +743,13 @@ fn reconcile_roster(
     cancel: &CancellationToken,
     tasks: &mut JoinSet<TaskExit>,
 ) {
-    let rosters: Vec<(String, Vec<RosterEntry>)> = authorized_owners
-        .iter()
-        .filter_map(|owner| {
-            roster_state
-                .current(owner)
-                .map(|body| (owner.clone(), body.entries.clone()))
-        })
+    // Whatever the tap actually admitted, not a configured list: under open
+    // admission there is no configured list, and everything in this map has
+    // already passed the same owner authorization the closed path applies.
+    let rosters: Vec<(String, Vec<RosterEntry>)> = roster_state
+        .tracked()
+        .into_iter()
+        .map(|(owner, body)| (owner, body.entries.clone()))
         .collect();
 
     let existing_sources: HashMap<String, AgentSource> = supervised
@@ -996,12 +1030,22 @@ async fn main() -> anyhow::Result<()> {
     let agents_config_path = env_var("WAKER_AGENTS_CONFIG_PATH")?;
     let authorized_owners =
         parse_authorized_owners(&std::env::var("WAKER_OWNER_PUBKEYS").unwrap_or_default())?;
-    let waker_keys = if authorized_owners.is_empty() {
+    let admission = parse_admission(
+        std::env::var("WAKER_ADMISSION").ok().as_deref(),
+        authorized_owners.clone(),
+    )?;
+    // Open admission needs the identity and the ceiling exactly as closed
+    // mode does — it just sources the owner list from the relay instead of
+    // from config, so an empty `WAKER_OWNER_PUBKEYS` no longer means
+    // "disabled" once it is selected.
+    let enrolment_enabled =
+        !matches!(admission, Admission::Closed(ref owners) if owners.is_empty());
+    let waker_keys = if !enrolment_enabled {
         None
     } else {
         let nsec = env_var("WAKER_IDENTITY_NSEC").map_err(|_| {
             anyhow::anyhow!(
-                "WAKER_OWNER_PUBKEYS is set but WAKER_IDENTITY_NSEC is not; the roster and \
+                "enrolment is enabled but WAKER_IDENTITY_NSEC is not set; the roster and \
                  credential taps have no identity to connect as"
             )
         })?;
@@ -1019,13 +1063,14 @@ async fn main() -> anyhow::Result<()> {
     // config, pending, and running together — not roster-sourced agents
     // alone, so a daemon cannot be pushed past the operator's own stated
     // ceiling regardless of source.
-    let max_agents: usize = if authorized_owners.is_empty() {
+    let max_agents: usize = if !enrolment_enabled {
         0
     } else {
         let raw = env_var("WAKER_MAX_AGENTS").map_err(|_| {
             anyhow::anyhow!(
-                "WAKER_OWNER_PUBKEYS is set but WAKER_MAX_AGENTS is not; dynamic enrolment \
-                 needs an explicit total-agent ceiling"
+                "enrolment is enabled but WAKER_MAX_AGENTS is not set; dynamic enrolment \
+                 needs an explicit total-agent ceiling — in open admission it is the only \
+                 bound on how many agents the community can ask this daemon to run"
             )
         })?;
         let parsed: usize = raw
@@ -1058,11 +1103,7 @@ async fn main() -> anyhow::Result<()> {
         keys_by_agent.push((keys, auth_tag, owner_pubkey));
     }
 
-    ensure_static_agent_count_fits_cap(
-        keys_by_agent.len(),
-        max_agents,
-        !authorized_owners.is_empty(),
-    )?;
+    ensure_static_agent_count_fits_cap(keys_by_agent.len(), max_agents, enrolment_enabled)?;
 
     std::fs::create_dir_all(&state_dir).map_err(|e| {
         anyhow::anyhow!(
@@ -1110,7 +1151,7 @@ async fn main() -> anyhow::Result<()> {
             let relay_url = relay_url.clone();
             let waker_keys = waker_keys.clone();
             let waker_auth_tag = waker_auth_tag.clone();
-            let authorized_owners = authorized_owners.clone();
+            let admission = admission.clone();
             let roster_state = Arc::clone(&roster_state);
             let cancel = cancel.clone();
             tasks.spawn(async move {
@@ -1118,7 +1159,7 @@ async fn main() -> anyhow::Result<()> {
                     &relay_url,
                     &waker_keys,
                     waker_auth_tag.as_ref(),
-                    &authorized_owners,
+                    &admission,
                     &roster_floor_dir,
                     &roster_state,
                     &cancel,
@@ -1155,7 +1196,6 @@ async fn main() -> anyhow::Result<()> {
                     &state_dir,
                     waker_keys,
                     waker_auth_tag.as_ref(),
-                    &authorized_owners,
                     max_agents,
                     roster_state,
                     &mut supervised,
@@ -1250,6 +1290,51 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Absence and `closed` are the same thing, and closed-with-nothing is
+    /// still disabled — the fail-closed contract survives adding open mode,
+    /// which is the whole reason open got its own selector instead of
+    /// reusing an empty owner list.
+    #[test]
+    fn admission_defaults_to_closed_and_empty_closed_stays_disabled() {
+        let owners = vec!["a".repeat(64)];
+        assert_eq!(
+            parse_admission(None, owners.clone()).expect("default"),
+            Admission::Closed(owners.clone())
+        );
+        assert_eq!(
+            parse_admission(Some("closed"), owners.clone()).expect("closed"),
+            Admission::Closed(owners)
+        );
+        assert_eq!(
+            parse_admission(None, vec![]).expect("empty"),
+            Admission::Closed(vec![]),
+            "empty still means disabled, never open"
+        );
+    }
+
+    /// Open ignores the configured list rather than unioning with it: two
+    /// sources of authorization silently merged is how someone stays
+    /// admitted after the community removed them.
+    #[test]
+    fn open_admission_does_not_merge_the_configured_owner_list() {
+        assert_eq!(
+            parse_admission(Some("open"), vec!["a".repeat(64)]).expect("open"),
+            Admission::Open
+        );
+        assert_eq!(
+            parse_admission(Some(" open "), vec![]).expect("open"),
+            Admission::Open
+        );
+    }
+
+    /// A typo must not silently pick a policy. This is the one setting where
+    /// guessing is least acceptable, so an unknown value refuses to start.
+    #[test]
+    fn an_unrecognized_admission_value_refuses_to_start() {
+        assert!(parse_admission(Some("public"), vec![]).is_err());
+        assert!(parse_admission(Some("Open"), vec![]).is_err());
+    }
 
     /// The shape the desktop already mints for agents
     /// (`buzz_sdk::nip_oa::compute_auth_tag` returns this JSON), reused

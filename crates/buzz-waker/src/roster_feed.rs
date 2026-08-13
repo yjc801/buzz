@@ -85,6 +85,101 @@ use crate::floors::{FloorError, FloorStore};
 /// form, even when there is only one batch — see that function's own doc.
 pub const ROSTER_TAP_SUBSCRIPTION_ID: &str = "buzz-waker-roster";
 
+/// Subscription id for the relay membership list, open only in
+/// [`Admission::Open`]. Held live, not one-shot: a member joining or leaving
+/// republishes kind:13534, and that is what makes admission self-service
+/// rather than a redeploy.
+pub const MEMBERSHIP_SUBSCRIPTION_ID: &str = "buzz-waker-membership";
+
+/// Who this daemon accepts enrolments from.
+///
+/// The two modes differ only in where the authorized-owner set comes from;
+/// everything downstream — roster verification, floors, credential taps — is
+/// identical, because both produce the same thing: a list of owner pubkeys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// A fixed allowlist from `WAKER_OWNER_PUBKEYS`. Adding a user means
+    /// editing config and restarting the daemon.
+    Closed(Vec<String>),
+    /// Every current member of the relay's own community, read from the
+    /// relay-signed membership list (kind:13534).
+    ///
+    /// This is not "anyone": the relay refuses to ingest a client-authored
+    /// 13534 ([`buzz_core::kind::is_relay_only_kind`]), so the list can only
+    /// come from the relay itself, and membership is granted by a community
+    /// admin. A freshly minted key is not a member, never enters the authors
+    /// set, and its rosters are never read — which is the bound a per-owner
+    /// cap could not provide, because kind 1059 is exempt from the relay's
+    /// `event.pubkey == authenticated identity` check and identities are
+    /// therefore free to mint.
+    ///
+    /// What it does *not* bound: a real member can still enrol agents that
+    /// deploy on the service provider's account. `WAKER_MAX_AGENTS` is the
+    /// only ceiling on that, and community membership is the spending
+    /// boundary.
+    Open,
+}
+
+/// The REQ filter for the relay's membership list.
+///
+/// No `authors` pin, deliberately: the relay's own signing pubkey is not
+/// advertised over NIP-11 (`pubkey` is null on the deployment this runs
+/// against), so there is nothing to pin to. What makes that safe is that the
+/// relay **refuses client submissions** of this kind at ingest, so anything
+/// readable here was authored by the relay. The guarantee is enforced at
+/// write time rather than verified at read time.
+///
+/// `limit: 1` because the list is replaceable — one current snapshot per
+/// community, not a history to page through.
+#[must_use]
+pub fn membership_filter() -> Value {
+    json!({
+        "kinds": [buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST],
+        "limit": 1,
+    })
+}
+
+/// The REQ frame opening the membership subscription.
+#[must_use]
+pub fn membership_req() -> Value {
+    json!(["REQ", MEMBERSHIP_SUBSCRIPTION_ID, membership_filter()])
+}
+
+/// Every member pubkey named by a kind:13534 membership list, normalized.
+///
+/// The relay writes one `["member", "<pubkey>", "<role>"]` tag per member
+/// (`buzz-admin`'s `publish_membership_list_with_bump`). Role is deliberately
+/// ignored: an owner, an admin, and an ordinary member all equally may run
+/// agents, and filtering by role here would silently deny enrolment to people
+/// who are legitimately in the community.
+///
+/// Malformed tags are skipped rather than failing the whole list — a single
+/// bad entry must not cost every other member their admission.
+#[must_use]
+pub fn members_from_event(event: &Value) -> Vec<String> {
+    let Some(tags) = event.get("tags").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tag in tags {
+        let Some(parts) = tag.as_array() else {
+            continue;
+        };
+        if parts.first().and_then(Value::as_str) != Some("member") {
+            continue;
+        }
+        let Some(pubkey) = parts.get(1).and_then(Value::as_str) else {
+            continue;
+        };
+        let pubkey = normalize_pubkey(pubkey);
+        if nostr::PublicKey::from_hex(&pubkey).is_ok() && seen.insert(pubkey.clone()) {
+            members.push(pubkey);
+        }
+    }
+    members
+}
+
 /// The fixed `d` tag every roster event carries — the public, collision-proof
 /// discriminator `docs/waker-agent-enrolment.md`'s Discriminator section
 /// settles on. A credential's own `d` is always a canonical 64-hex-char agent
@@ -240,6 +335,22 @@ impl RosterState {
         should_apply
     }
 
+    /// Every owner with a roster currently tracked, and that roster.
+    ///
+    /// Reconciliation iterates this rather than a configured owner list,
+    /// because under [`Admission::Open`] there is no configured list — the
+    /// authorized set is whatever the relay's membership list resolved to on
+    /// the tap's current connection, and only the tap knows it. Iterating
+    /// what was actually admitted is correct for both modes: nothing reaches
+    /// this map without having passed the same authorization check.
+    #[must_use]
+    pub fn tracked(&self) -> Vec<(String, Arc<RosterBody>)> {
+        self.lock()
+            .iter()
+            .map(|(owner, (_, body))| (owner.clone(), Arc::clone(body)))
+            .collect()
+    }
+
     /// The current roster for one owner, if any has been delivered and
     /// tracked on this daemon run yet.
     #[must_use]
@@ -331,6 +442,66 @@ fn roster_frame(
         } if subscription_ids.contains(&subscription_id) => RosterFrame::Closed { message },
         _ => RosterFrame::Ignored,
     }
+}
+
+/// Read the membership snapshot for this connection, up to its EOSE.
+///
+/// `None` means the relay reached EOSE without ever sending a kind:13534 —
+/// this deployment has never published a membership list, so open admission
+/// has no source of owners. `Some(list)` means one arrived; the list may
+/// still be empty if it named no members.
+///
+/// Frames for other subscriptions cannot arrive here: this runs immediately
+/// after connect, before any roster REQ is sent, the same pre-subscribe
+/// window `relay_feed`'s own discovery query relies on.
+async fn read_membership_snapshot(
+    connection: &mut NostrWsConnection,
+    cancel: &CancellationToken,
+) -> Option<Vec<String>> {
+    let mut snapshot: Option<Vec<String>> = None;
+    loop {
+        let next = tokio::select! {
+            result = connection.next_event(Duration::from_secs(ROSTER_TAP_IDLE_TIMEOUT_SECS)) => result,
+            () = cancel.cancelled() => return None,
+        };
+        match next {
+            Ok(RelayMessage::Event {
+                subscription_id,
+                event,
+            }) if subscription_id == MEMBERSHIP_SUBSCRIPTION_ID => {
+                // Verify before trusting: the relay refuses client-authored
+                // 13534 at ingest, but a compromised or hostile relay is
+                // exactly what a signature check is for, and this list
+                // decides who may enrol.
+                if buzz_core::verify_event(&event).is_err() {
+                    continue;
+                }
+                if buzz_core::kind::event_kind_u32(&event)
+                    != buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST
+                {
+                    continue;
+                }
+                let json = serde_json::to_value(&*event).unwrap_or(Value::Null);
+                snapshot = Some(members_from_event(&json));
+            }
+            Ok(RelayMessage::Eose { subscription_id })
+                if subscription_id == MEMBERSHIP_SUBSCRIPTION_ID =>
+            {
+                return snapshot;
+            }
+            Ok(_) => {}
+            Err(_) => return snapshot,
+        }
+    }
+}
+
+/// Whether `message` is a fresh membership list, meaning the authorized-owner
+/// set this connection resolved is now stale.
+fn is_membership_update(message: &RelayMessage) -> bool {
+    matches!(
+        message,
+        RelayMessage::Event { subscription_id, .. } if subscription_id == MEMBERSHIP_SUBSCRIPTION_ID
+    )
 }
 
 /// What a decrypted, verified roster delivery means for the tap's caller.
@@ -471,12 +642,12 @@ pub async fn run_roster_tap(
     relay_url: &str,
     waker_keys: &Keys,
     auth_tag: Option<&Tag>,
-    authorized_owners: &[String],
+    admission: &Admission,
     roster_floor_dir: &Path,
     state: &RosterState,
     cancel: &CancellationToken,
 ) {
-    if authorized_owners.is_empty() {
+    if matches!(admission, Admission::Closed(owners) if owners.is_empty()) {
         tracing::warn!(
             "roster tap has no authorized owners configured (WAKER_OWNER_PUBKEYS is empty); \
              enrolment is disabled — refusing to open a connection"
@@ -494,10 +665,6 @@ pub async fn run_roster_tap(
     }
 
     let waker_pubkey = waker_keys.public_key().to_hex();
-    let authorized_owners: Vec<String> = authorized_owners
-        .iter()
-        .map(|owner| normalize_pubkey(owner))
-        .collect();
     let mut floors: HashMap<String, FloorStore> = HashMap::new();
     let mut consecutive_failures = 0u32;
 
@@ -523,6 +690,55 @@ pub async fn run_roster_tap(
             () = cancel.cancelled() => break,
         };
 
+        // Open mode resolves its authorized-owner set per connection, from
+        // the relay's own signed membership list, and keeps that
+        // subscription open so a join or leave re-resolves it live. Closed
+        // mode's set is deploy-time config and never changes here.
+        let authorized_owners: Vec<String> = match admission {
+            Admission::Closed(owners) => {
+                owners.iter().map(|owner| normalize_pubkey(owner)).collect()
+            }
+            Admission::Open => {
+                if let Err(error) = connection.send_raw(&membership_req()).await {
+                    tracing::warn!(%error, "roster tap membership subscribe failed; reconnecting");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    continue;
+                }
+                match read_membership_snapshot(&mut connection, cancel).await {
+                    Some(members) if !members.is_empty() => {
+                        tracing::info!(
+                            members = members.len(),
+                            "roster tap resolved admission from the relay's membership list"
+                        );
+                        members
+                    }
+                    Some(_) => {
+                        // The relay answered and named nobody. Nothing to
+                        // query, and inventing an owner set would be worse
+                        // than waiting — back off and re-read on reconnect.
+                        tracing::warn!(
+                            "roster tap read an empty relay membership list; no owners to \
+                             query for enrolment on this connection"
+                        );
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        continue;
+                    }
+                    None => {
+                        // No snapshot at all: this relay has never published
+                        // one. Say so plainly — open admission is simply not
+                        // available here, and the operator needs closed mode.
+                        tracing::warn!(
+                            "roster tap found no relay membership list (kind:13534) on this \
+                             relay, so open admission has no source of authorized owners; set \
+                             WAKER_OWNER_PUBKEYS and use closed admission instead"
+                        );
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
+        };
+
         let reqs = roster_reqs(&authorized_owners, &waker_pubkey);
         let subscription_ids: Vec<String> = reqs.iter().map(|(id, _)| id.clone()).collect();
         let mut subscribed = true;
@@ -546,6 +762,15 @@ pub async fn run_roster_tap(
             };
 
             match next {
+                Ok(message) if is_membership_update(&message) => {
+                    // Someone joined or left the community. The authorized
+                    // set this connection subscribed with is stale, so
+                    // reconnect and re-resolve rather than keep querying the
+                    // old one — this is what makes admission take effect
+                    // without a redeploy. Not a failure: no backoff.
+                    tracing::info!("roster tap saw a membership change; re-resolving admission");
+                    break;
+                }
                 Ok(message) => match roster_frame(&authorized_owners, &subscription_ids, message) {
                     RosterFrame::Delivered {
                         owner_pubkey,
@@ -631,6 +856,84 @@ pub async fn run_roster_tap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The membership query must be bounded and kind-pinned: the list is
+    /// replaceable, so one event is the whole answer, and an open-ended
+    /// query would hit the relay's p-gate.
+    #[test]
+    fn the_membership_filter_asks_for_one_current_snapshot() {
+        let filter = membership_filter();
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST])
+        );
+        assert_eq!(filter["limit"], json!(1));
+        assert!(
+            filter.get("authors").is_none(),
+            "the relay's signing pubkey is not advertised over NIP-11; ingest refusing \
+             client-authored 13534 is what makes this safe, not an authors pin"
+        );
+    }
+
+    /// Every member becomes an authorized owner regardless of role — an
+    /// owner, an admin and a plain member may all run agents, and filtering
+    /// by role would silently deny enrolment to real community members.
+    #[test]
+    fn every_member_is_authorized_whatever_their_role() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let event = json!({"tags": [
+            ["-"],
+            ["member", a, "owner"],
+            ["member", b, "admin"],
+            ["member", c, "member"],
+        ]});
+        assert_eq!(members_from_event(&event), vec![a, b, c]);
+    }
+
+    /// One malformed entry must not cost every other member their
+    /// admission, and a duplicate must not produce a duplicate filter.
+    #[test]
+    fn malformed_and_duplicate_member_tags_are_skipped_not_fatal() {
+        let good = "d".repeat(64);
+        let event = json!({"tags": [
+            ["member"],                        // no pubkey
+            ["member", "not-hex", "member"],   // unparseable
+            ["member", good, "member"],
+            ["member", good, "owner"],         // duplicate
+            ["name", "ignored"],               // not a member tag
+        ]});
+        assert_eq!(members_from_event(&event), vec![good]);
+    }
+
+    /// A list naming nobody is a legitimate answer the caller must be able
+    /// to distinguish, so it parses to an empty set rather than an error.
+    #[test]
+    fn a_membership_list_with_no_members_parses_empty() {
+        assert!(members_from_event(&json!({"tags": [["-"]]})).is_empty());
+        assert!(members_from_event(&json!({})).is_empty());
+    }
+
+    /// Only the membership subscription triggers re-resolution; a roster
+    /// delivery must not, or every enrolment would cause a reconnect.
+    #[test]
+    fn only_a_membership_delivery_re_resolves_admission() {
+        let event = Box::new(
+            nostr::EventBuilder::new(nostr::Kind::Custom(13534), "")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign"),
+        );
+        assert!(is_membership_update(&RelayMessage::Event {
+            subscription_id: MEMBERSHIP_SUBSCRIPTION_ID.to_string(),
+            event: event.clone(),
+        }));
+        assert!(!is_membership_update(&RelayMessage::Event {
+            subscription_id: roster_subscription_id(0),
+            event,
+        }));
+    }
+
     use crate::enrolment::RosterEntry;
     use nostr::{EventBuilder, Kind};
 

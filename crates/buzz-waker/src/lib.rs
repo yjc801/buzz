@@ -39,6 +39,21 @@
 //!   the reconnect ladder plus [`feed::step`], and spawns each admitted
 //!   trigger's [`attempt::run_wake_attempt`] onto its own task so the loop
 //!   keeps answering the relay's pings during a liveness proof.
+//! - [`enrolment`] — agent enrolment over the relay: the pure schema/trust
+//!   half (roster + per-agent credential payloads, `WAKER_OWNER_PUBKEYS`) of
+//!   replacing hand-edited `WAKER_AGENTS_CONFIG_PATH` JSON.
+//! - [`roster_feed`] — the **roster tap**: one connection for the whole
+//!   daemon, authenticated as its own waker identity, that discovers which
+//!   agent pubkeys each authorized owner currently enrols.
+//! - [`credential_feed`] — the **per-agent credential tap**: mirrors
+//!   [`bundle_feed`]'s connect/backoff/idle-timeout shape, also authenticated
+//!   as the waker's own identity, decrypting and admitting one agent's
+//!   delivered `nsec` against a per-agent [`floors::FloorStore`].
+//!   `docs/waker-agent-enrolment.md` (design) and `PLANS/BUZZ_WAKER_DESIGN.md`
+//!   §12 (build order) — the dynamic per-agent supervisor `main.rs` needs to
+//!   diff [`roster_feed::RosterState`] against the daemon's watch list and
+//!   spawn/cancel [`credential_feed::run_credential_tap`] instances is the
+//!   next phase, not yet implemented.
 //!
 //! Each exists because of a specific review finding and carries the gate id
 //! (`G1`–`G4`) it discharges, so the reason is not lost.
@@ -46,14 +61,17 @@
 pub mod attempt;
 pub mod bundle;
 pub mod bundle_feed;
+pub mod credential_feed;
 pub mod cursor;
 pub mod decide;
 pub mod effects;
+pub mod enrolment;
 pub mod feed;
 mod fence;
 pub mod floors;
 pub mod presence_feed;
 pub mod relay_feed;
+pub mod roster_feed;
 pub mod wake_loop;
 
 pub use attempt::{
@@ -67,6 +85,10 @@ pub use cursor::{Admission, Cursor, CursorError, CursorStore, Resume};
 pub use decide::{
     agent_responds_to_author, compute_wake_replay_floor, event_addresses_agent,
     is_covered_by_replay_floor, select_wake_candidates, RespondTo, TriggerEvent, WakeCandidate,
+};
+pub use enrolment::{
+    parse_authorized_owners, CredentialBody, EnrolmentError, RosterBody, RosterEntry,
+    SignedCredential, SignedRoster,
 };
 pub use floors::{FloorError, FloorStore, Floors};
 

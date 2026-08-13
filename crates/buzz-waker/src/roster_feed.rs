@@ -365,6 +365,27 @@ impl RosterState {
     pub fn known_owners(&self) -> Vec<String> {
         self.lock().keys().cloned().collect()
     }
+
+    /// Drop every tracked owner not in `authorized_owners`.
+    ///
+    /// Called on every (re)connect once the tap has resolved the current
+    /// authorized set — see [`run_roster_tap`]. Without this, an owner
+    /// removed from the relay's membership list (open admission) or from
+    /// `WAKER_OWNER_PUBKEYS` (closed admission, on restart) stays in
+    /// [`tracked`](Self::tracked) forever: the tap simply stops querying
+    /// their roster, but never un-tracks the last one it already saw, so
+    /// [`reconcile_roster`](crate::reconcile_roster)'s "no longer listed"
+    /// pass never fires for their agents and membership removal does not
+    /// revoke admission. Each owner's on-disk [`FloorStore`] is untouched —
+    /// only the in-memory roster is dropped, so a rejoin still starts from
+    /// the same anti-rollback floor rather than a fresh one.
+    pub fn retain_owners(&self, authorized_owners: &[String]) {
+        let authorized: std::collections::HashSet<String> = authorized_owners
+            .iter()
+            .map(|owner| normalize_pubkey(owner))
+            .collect();
+        self.lock().retain(|owner, _| authorized.contains(owner));
+    }
 }
 
 /// What one delivered relay message means for this tap.
@@ -738,6 +759,12 @@ pub async fn run_roster_tap(
                 }
             }
         };
+
+        // An owner missing from the freshly-resolved set (left the
+        // community under open admission, or dropped from config on
+        // restart under closed admission) must stop being tracked here too,
+        // not just stop being queried — see `retain_owners`'s doc.
+        state.retain_owners(&authorized_owners);
 
         let reqs = roster_reqs(&authorized_owners, &waker_pubkey);
         let subscription_ids: Vec<String> = reqs.iter().map(|(id, _)| id.clone()).collect();
@@ -1300,6 +1327,29 @@ mod tests {
             2,
             "the newer roster must remain tracked"
         );
+    }
+
+    /// An owner dropped from the authorized set (left the community under
+    /// open admission, or removed from config under closed) must disappear
+    /// from [`RosterState::tracked`] too, not just stop being queried —
+    /// otherwise `reconcile_roster`'s "no longer listed" pass never sees
+    /// them and their agents keep running after membership removal.
+    #[test]
+    fn retain_owners_drops_a_deauthorized_owner_from_tracked() {
+        let state = RosterState::new();
+        let kept = normalize_pubkey(&Keys::generate().public_key().to_hex());
+        let removed = normalize_pubkey(&Keys::generate().public_key().to_hex());
+
+        assert!(state.update_if_newer(&kept, roster_body(vec![], 1)));
+        assert!(state.update_if_newer(&removed, roster_body(vec![], 1)));
+        assert_eq!(state.tracked().len(), 2);
+
+        state.retain_owners(std::slice::from_ref(&kept));
+
+        let tracked = state.tracked();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].0, kept);
+        assert!(state.current(&removed).is_none());
     }
 
     /// The P1 fix's headline case: [`RosterState`] alone forgets on restart,

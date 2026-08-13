@@ -34,7 +34,7 @@
 //! resulting completion or abandonment serially, interleaved with incoming
 //! frames in one `select!`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -237,6 +237,38 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                 continue 'reconnect;
             }
         };
+        // Membership says which channels this agent is in; it does not say
+        // which still accept messages. An archived channel cannot receive a
+        // mention at all — the relay refuses the publish — so subscribing to
+        // one spends rate-limit budget on an event that cannot occur. Fail
+        // open: a probe failure means subscribe to everything, because a
+        // wasted subscription is cheap and a wrongly skipped live channel
+        // loses every wake in it.
+        let archived = match transport.archived_channels(&discovered_channels).await {
+            Ok(archived) => archived,
+            Err(error) => {
+                tracing::warn!(
+                    agent = %agent_pubkey, %error,
+                    "buzz-waker: could not read channel metadata; subscribing to every \
+                     discovered channel including any archived ones"
+                );
+                HashSet::new()
+            }
+        };
+        let discovered_total = discovered_channels.len();
+        let discovered_channels: Vec<Uuid> = discovered_channels
+            .into_iter()
+            .filter(|channel_id| !archived.contains(channel_id))
+            .collect();
+        if !archived.is_empty() {
+            tracing::info!(
+                agent = %agent_pubkey,
+                skipped_archived = discovered_total - discovered_channels.len(),
+                subscribing = discovered_channels.len(),
+                "buzz-waker: skipped archived channels; they cannot receive a mention"
+            );
+        }
+
         if let Err(error) = transport.subscribe_membership(since).await {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: membership watch subscribe failed");
             consecutive_failures = consecutive_failures.saturating_add(1);

@@ -49,6 +49,14 @@ const DISCOVER_CHANNELS_SUBSCRIPTION_ID: &str = "buzz-waker-discover";
 /// missing feature.
 const DISCOVER_CHANNELS_TIMEOUT_SECS: u64 = 20;
 
+/// Subscription id for the archived-channel probe. Runs in the same
+/// pre-subscribe window as discovery, so no other subscription is open.
+const ARCHIVED_CHANNELS_SUBSCRIPTION_ID: &str = "buzz-waker-archived";
+
+/// Timeout for the archived-channel probe. Same budget as discovery: it is
+/// one bounded query answered from the relay's current metadata rows.
+const ARCHIVED_CHANNELS_TIMEOUT_SECS: u64 = 20;
+
 /// A NIP-42-authenticated connection to one relay, **as one agent**,
 /// reconnectable in place.
 ///
@@ -163,6 +171,49 @@ impl FeedTransport for RelayFeed {
         Ok(channel_ids)
     }
 
+    async fn archived_channels(
+        &mut self,
+        channel_ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, Self::Error> {
+        let mut archived = std::collections::HashSet::new();
+        if channel_ids.is_empty() {
+            return Ok(archived);
+        }
+
+        let req = json!([
+            "REQ",
+            ARCHIVED_CHANNELS_SUBSCRIPTION_ID,
+            channel_metadata_filter(channel_ids)
+        ]);
+        self.connection_mut()?.send_raw(&req).await?;
+
+        loop {
+            match self.next_frame(ARCHIVED_CHANNELS_TIMEOUT_SECS).await? {
+                Some(FeedFrame::Event {
+                    subscription_id,
+                    event,
+                }) if subscription_id == ARCHIVED_CHANNELS_SUBSCRIPTION_ID => {
+                    if event_is_archived(&event) {
+                        if let Some(channel_id) = extract_d_tag_uuid(&event) {
+                            archived.insert(channel_id);
+                        }
+                    }
+                }
+                Some(FeedFrame::Eose { subscription_id })
+                    if subscription_id == ARCHIVED_CHANNELS_SUBSCRIPTION_ID =>
+                {
+                    break;
+                }
+                // Same reasoning as `discover_channels`: nothing else is
+                // subscribed yet, and ignoring a stray frame is cheaper than
+                // tearing down the connection over one.
+                Some(_) => {}
+                None => return Err(WsClientError::Timeout),
+            }
+        }
+        Ok(archived)
+    }
+
     async fn subscribe_membership(&mut self, since: u64) -> Result<(), Self::Error> {
         let req = wake_membership_req(&self.agent_pubkey, since);
         self.connection_mut()?.send_raw(&req).await
@@ -226,6 +277,41 @@ impl FeedTransport for RelayFeed {
 /// *content* events (and membership-change notifications) carry instead. Only
 /// [`RelayFeed::discover_channels`]'s one-shot query reads this; nothing else
 /// in the crate needs it.
+/// The REQ filter reading channel metadata for a known set of channels.
+///
+/// `#d` is the channel id for kind:39000 (addressable), so this is bounded by
+/// the discovered channel count rather than by history — every channel has
+/// exactly one current metadata event.
+#[must_use]
+pub fn channel_metadata_filter(channel_ids: &[Uuid]) -> Value {
+    json!({
+        "kinds": [buzz_core::kind::KIND_NIP29_GROUP_METADATA],
+        "#d": channel_ids
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Whether a kind:39000 metadata event marks its channel archived.
+///
+/// The relay emits `["archived", "true"]` and carries no timestamp in the tag
+/// — the same shape the desktop reads in `nostr_convert.rs`. Anything else,
+/// including an absent tag or `"false"`, means live.
+#[must_use]
+pub fn event_is_archived(event: &Value) -> bool {
+    let Some(tags) = event.get("tags").and_then(Value::as_array) else {
+        return false;
+    };
+    tags.iter().any(|tag| {
+        let Some(parts) = tag.as_array() else {
+            return false;
+        };
+        parts.first().and_then(Value::as_str) == Some("archived")
+            && parts.get(1).and_then(Value::as_str) == Some("true")
+    })
+}
+
 fn extract_d_tag_uuid(event: &Value) -> Option<Uuid> {
     event.get("tags")?.as_array()?.iter().find_map(|tag| {
         let parts = tag.as_array()?;
@@ -292,6 +378,62 @@ mod tests {
     use super::*;
     use buzz_ws_client::OkResponse;
     use futures_util::{SinkExt, StreamExt};
+
+    /// The probe must ask for exactly the discovered channels' metadata —
+    /// kind pinned (an open-ended query hits the relay's p-gate) and `#d`
+    /// carrying every id, so one bounded request answers for all of them.
+    #[test]
+    fn the_metadata_filter_asks_for_every_discovered_channel() {
+        let ids = [Uuid::from_u128(1), Uuid::from_u128(2)];
+        let filter = channel_metadata_filter(&ids);
+
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_NIP29_GROUP_METADATA])
+        );
+        assert_eq!(
+            filter["#d"],
+            json!([ids[0].to_string(), ids[1].to_string()]),
+            "every discovered channel must be asked about in the one query"
+        );
+    }
+
+    /// An empty discovery result must not produce a query at all — a `#d`
+    /// with no values would ask the relay for every channel's metadata.
+    #[test]
+    fn the_metadata_filter_is_empty_for_no_channels() {
+        assert_eq!(channel_metadata_filter(&[])["#d"], json!([]));
+    }
+
+    /// Only `["archived","true"]` means archived. Absent, `"false"`, and a
+    /// same-named tag with no value are all live — and reading any of them as
+    /// archived would silently stop watching a channel that still works,
+    /// which is the expensive direction of this decision.
+    #[test]
+    fn only_an_explicit_archived_true_tag_counts() {
+        assert!(event_is_archived(&json!({"tags": [["archived", "true"]]})));
+        assert!(event_is_archived(&json!({
+            "tags": [["d", "x"], ["archived", "true"], ["name", "general"]]
+        })));
+
+        assert!(!event_is_archived(
+            &json!({"tags": [["archived", "false"]]})
+        ));
+        assert!(!event_is_archived(&json!({"tags": [["archived"]]})));
+        assert!(!event_is_archived(&json!({"tags": [["name", "general"]]})));
+        assert!(!event_is_archived(&json!({"tags": []})));
+        assert!(!event_is_archived(&json!({})));
+    }
+
+    /// The archived channel has to be identifiable from the same event, or
+    /// the probe learns a channel is archived without learning which one.
+    #[test]
+    fn an_archived_metadata_event_still_yields_its_channel_id() {
+        let id = Uuid::from_u128(7);
+        let event = json!({"tags": [["d", id.to_string()], ["archived", "true"]]});
+        assert!(event_is_archived(&event));
+        assert_eq!(extract_d_tag_uuid(&event), Some(id));
+    }
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     /// A real, local, in-process WebSocket relay double: completes the NIP-42

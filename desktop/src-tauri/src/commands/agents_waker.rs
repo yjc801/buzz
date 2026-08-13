@@ -291,7 +291,20 @@ pub(super) fn sign_and_retain_waker_bundle_at(
             raw_event: event.as_json(),
             pending_sync: true,
         },
-    )
+    )?;
+
+    // Only now that a bundle is actually retained. A revocation clears the
+    // entry instead of setting one: it leaves no bundle to lapse, so recording
+    // a window for it would put a countdown on something already gone.
+    //
+    // Best-effort on purpose. This is the input to a warning, not to a
+    // security decision — failing the whole reissue because a display hint
+    // could not be written would trade a working bundle for a cosmetic one.
+    let expiry = (!revoked).then(|| issued_at.saturating_add(DEFAULT_BUNDLE_LIFETIME_SECS));
+    if let Err(error) = ledger.record_expiry(agent_pubkey, expiry) {
+        eprintln!("waggle: could not record the waker bundle expiry: {error}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,16 +1,20 @@
 import * as React from "react";
 import { toast } from "sonner";
 
+import {
+  wakerBundleHealth,
+  wakerBundleWarning,
+} from "@/features/agents/lib/wakerBundleHealth";
 import { useSetManagedAgentWakerEnabledMutation } from "@/features/agents/useSetManagedAgentWakerEnabledMutation";
 import type { ManagedAgent } from "@/shared/api/types";
 
 /** Toggle `buzz-waker` remote-wake enrolment for a managed agent, with toasts. */
 export function useToggleManagedAgentWaker(
   managedAgent: ManagedAgent | undefined,
-): { toggle: () => Promise<void>; isPending: boolean } {
+): { onToggle: () => Promise<void>; pending: boolean; warning: string | null } {
   const mutation = useSetManagedAgentWakerEnabledMutation();
 
-  const toggle = React.useCallback(async () => {
+  const onToggle = React.useCallback(async () => {
     if (!managedAgent) return;
 
     try {
@@ -32,5 +36,18 @@ export function useToggleManagedAgentWaker(
     }
   }, [managedAgent, mutation]);
 
-  return { toggle, isPending: mutation.isPending };
+  // Computed here rather than at the call site: this hook already owns the
+  // agent and everything else about its waker state, and the panel that renders
+  // the toggle should not have to know that enrolment can silently lapse.
+  const warning = managedAgent
+    ? wakerBundleWarning(
+        wakerBundleHealth({
+          wakerEnabled: managedAgent.wakerEnabled,
+          wakerBundleExpiresAt: managedAgent.wakerBundleExpiresAt,
+          nowSeconds: Math.floor(Date.now() / 1000),
+        }),
+      )
+    : null;
+
+  return { onToggle, pending: mutation.isPending, warning };
 }

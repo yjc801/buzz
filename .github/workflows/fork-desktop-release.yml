@@ -122,6 +122,14 @@ jobs:
           fi
           echo "All six signing credentials present."
 
+      # Stamped here and reported at the end, because the run-level timestamps
+      # from the API are not settled for a minute or so after a run finishes —
+      # reading them immediately returns a completion time of 00:00:00.
+      - name: Stamp build start
+        if: steps.freshness.outputs.build == 'true'
+        id: started
+        run: echo "at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
         if: steps.freshness.outputs.build == 'true'
 
@@ -256,6 +264,27 @@ jobs:
           echo "path=$RUNNER_TEMP/$NAME" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
+      # macOS reads the menu bar, the Dock label, and the About box from
+      # CFBundleName/CFBundleDisplayName, which come from a hand-written
+      # Info.plist merged over Tauri's generated one — NOT from productName.
+      # They disagreed for two releases: correctly named Waggle.app, correctly
+      # identified xyz.waggle.app, signed and notarized, announcing itself as
+      # Buzz in the one place a user looks first. Nothing in the build could
+      # see it, because nothing read it back.
+      - name: Verify the bundle's display name
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          PLIST=desktop/src-tauri/target/release/bundle/macos/Waggle.app/Contents/Info.plist
+          for key in CFBundleName CFBundleDisplayName; do
+            value=$(/usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" 2>/dev/null || echo "<missing>")
+            if [[ "$value" != "Waggle" ]]; then
+              echo "::error::$key is '$value', expected 'Waggle' — check desktop/src-tauri/Info.plist"
+              exit 1
+            fi
+            echo "ok: $key = $value"
+          done
+
       # Verifies the sidecars actually made it in, so a stub regression fails
       # the build instead of shipping.
       - name: Verify bundled sidecars
@@ -324,3 +353,17 @@ jobs:
             --target "$GITHUB_SHA" \
             --prerelease \
             "$DMG_PATH"
+
+      # Reported by the job itself. The Cargo cache key includes the lockfile
+      # hash, so an upstream merge that moves Cargo.lock costs roughly the
+      # difference between the warm and cold numbers here — worth seeing
+      # without having to correlate two API timestamps after the fact.
+      - name: Report build time
+        if: always() && steps.freshness.outputs.build == 'true'
+        env:
+          STARTED_AT: ${{ steps.started.outputs.at }}
+        run: |
+          set -euo pipefail
+          [[ -n "${STARTED_AT:-}" ]] || exit 0
+          elapsed=$(( $(date -u +%s) - STARTED_AT ))
+          printf 'build took %dm %ds\n' $(( elapsed / 60 )) $(( elapsed % 60 ))

@@ -74,6 +74,26 @@ use crate::managed_agents::storage::managed_agents_base_dir;
 /// is the control that works while the desktop is off.
 pub(crate) const DEFAULT_BUNDLE_LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
 
+/// When `record`'s current launch bundle lapses, for the agent summary.
+///
+/// `None` for an agent that is not enrolled, and `None` when the ledger cannot
+/// be read — a display hint must never fail the summary that carries it, and
+/// the UI already treats absence as "not known" rather than as healthy.
+///
+/// Gated on enrolment because this is the one summary field that costs a file
+/// read; every other agent would pay it for an answer that is always `None`.
+pub(crate) fn bundle_expiry_for(
+    app: &AppHandle,
+    record: &crate::managed_agents::ManagedAgentRecord,
+) -> Option<u64> {
+    if !record.waker_enabled {
+        return None;
+    }
+    issuance_ledger(app)
+        .and_then(|ledger| ledger.expiry(&record.pubkey))
+        .unwrap_or(None)
+}
+
 /// A version reserved by [`IssuanceLedger::reserve`] and not yet signed.
 ///
 /// Neither `Copy` nor `Clone`, and [`sign_launch_bundle`] takes it by value, so
@@ -92,6 +112,21 @@ pub(crate) struct ReservedVersion(u64);
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct IssuedVersions {
     versions: BTreeMap<String, u64>,
+    /// When each agent's current bundle lapses, unix seconds.
+    ///
+    /// Nothing else on disk records this. `expires_at` is computed into the
+    /// signed body and then published, so once the pending row drains there is
+    /// no local answer to "when does this stop working" — and the failure it
+    /// leads to is silent and a quarter away: the toggle still reads on, the
+    /// bundle still sits at its relay coordinate, and the daemon refuses every
+    /// deploy with `BundleExpired`.
+    ///
+    /// Separate from `versions` because the two have different lifetimes: a
+    /// version is burned at reservation and must never be reused even if
+    /// signing fails, while an expiry is only true once a bundle has actually
+    /// been retained.
+    #[serde(default)]
+    expiries: BTreeMap<String, u64>,
 }
 
 /// The durable per-agent version allocator.
@@ -154,6 +189,42 @@ impl IssuanceLedger {
         current.versions.insert(agent_pubkey.to_string(), next);
         self.persist(&fence, &current)?;
         Ok(ReservedVersion(next))
+    }
+
+    /// Record when `agent_pubkey`'s newly retained bundle lapses.
+    ///
+    /// Called *after* retention succeeds, never at reservation. A version is
+    /// burned the moment it is reserved and that is deliberately cheap, but an
+    /// expiry recorded for a bundle that was never retained would be a lie in
+    /// the safest-looking direction: the UI would report a healthy window for
+    /// something that does not exist. Recording late can only lose the expiry
+    /// of a bundle that does exist, which surfaces as "unknown" rather than as
+    /// false reassurance.
+    ///
+    /// `None` clears the entry, which is the revocation case: there is no
+    /// bundle left to lapse.
+    pub(crate) fn record_expiry(
+        &self,
+        agent_pubkey: &str,
+        expires_at: Option<u64>,
+    ) -> Result<(), String> {
+        let fence = Fence::acquire(&self.lock_path)?;
+        let mut current = self.read()?;
+        match expires_at {
+            Some(at) => current.expiries.insert(agent_pubkey.to_string(), at),
+            None => current.expiries.remove(agent_pubkey),
+        };
+        self.persist(&fence, &current)
+    }
+
+    /// When `agent_pubkey`'s current bundle lapses, if one has been retained.
+    ///
+    /// A missing entry is not "no bundle" — it is "not known": ledgers written
+    /// before expiries were recorded have none, and so does a bundle whose
+    /// post-retention write failed. Callers must treat absence as unknown and
+    /// say so, rather than rendering it as expired or as fine.
+    pub(crate) fn expiry(&self, agent_pubkey: &str) -> Result<Option<u64>, String> {
+        Ok(self.read()?.expiries.get(agent_pubkey).copied())
     }
 
     fn read(&self) -> Result<IssuedVersions, String> {
@@ -744,5 +815,68 @@ mod tests {
         std::fs::write(&store.path, b"{ not json").expect("corrupt it");
 
         assert!(store.reserve(AGENT).is_err());
+    }
+
+    // ── expiry ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_agent_with_no_recorded_expiry_reads_as_unknown() {
+        // Not "expired" and not "fine" — a ledger written before expiries were
+        // recorded has no entry, and callers must be able to tell that apart.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(ledger(&dir).expiry(AGENT).expect("expiry"), None);
+    }
+
+    #[test]
+    fn a_recorded_expiry_survives_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ledger(&dir)
+            .record_expiry(AGENT, Some(1_777_000_000))
+            .expect("record");
+        // A fresh handle, because the point is that it is on disk rather than
+        // cached in the instance that wrote it.
+        assert_eq!(
+            ledger(&dir).expiry(AGENT).expect("expiry"),
+            Some(1_777_000_000)
+        );
+    }
+
+    #[test]
+    fn recording_an_expiry_does_not_disturb_the_version_counter() {
+        // The two maps share a file and a fence; a write to one must not roll
+        // the other back, which is the lost update the fence exists to stop.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ledger(&dir);
+        assert_eq!(store.reserve(AGENT).expect("reserve").0, 1);
+        store
+            .record_expiry(AGENT, Some(1_777_000_000))
+            .expect("record");
+        assert_eq!(store.reserve(AGENT).expect("reserve").0, 2);
+        assert_eq!(store.expiry(AGENT).expect("expiry"), Some(1_777_000_000));
+    }
+
+    #[test]
+    fn revocation_clears_the_expiry_rather_than_dating_it() {
+        // A revoked agent has no bundle left to lapse. Leaving the old window
+        // in place would put a countdown on something already gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ledger(&dir);
+        store
+            .record_expiry(AGENT, Some(1_777_000_000))
+            .expect("record");
+        store.record_expiry(AGENT, None).expect("clear");
+        assert_eq!(store.expiry(AGENT).expect("expiry"), None);
+    }
+
+    #[test]
+    fn a_ledger_written_before_expiries_still_loads() {
+        // Backward compatibility: every existing install has a versions-only
+        // ledger, and failing to parse it would refuse to issue.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("waker-bundle-versions.json");
+        std::fs::write(&path, br#"{"versions":{"agent-one":7}}"#).expect("seed");
+        let store = IssuanceLedger::open(&path);
+        assert_eq!(store.expiry(AGENT).expect("expiry"), None);
+        assert_eq!(store.reserve(AGENT).expect("reserve").0, 8);
     }
 }

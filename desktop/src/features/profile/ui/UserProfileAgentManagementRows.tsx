@@ -56,6 +56,10 @@ export function UserProfileAgentManagementRows({
     enabled: boolean;
     pending: boolean;
     onToggle: () => void;
+    /** Rendered under the toggle when the launch bundle is near or past
+     *  expiry. The lapse is otherwise invisible here: the toggle keeps
+     *  reading on while the daemon refuses every deploy. */
+    warning: string | null;
   };
 }) {
   if (
@@ -72,13 +76,23 @@ export function UserProfileAgentManagementRows({
   return (
     <PanelSectionGroup testId="user-profile-agent-management-section">
       {wakerToggle ? (
-        <ProfileToggleActionRow
-          checked={wakerToggle.enabled}
-          disabled={wakerToggle.pending}
-          label="Remote wake"
-          onToggle={wakerToggle.onToggle}
-          testId={`user-profile-agent-waker-${managedAgent?.pubkey}`}
-        />
+        <>
+          <ProfileToggleActionRow
+            checked={wakerToggle.enabled}
+            disabled={wakerToggle.pending}
+            label="Remote wake"
+            onToggle={wakerToggle.onToggle}
+            testId={`user-profile-agent-waker-${managedAgent?.pubkey}`}
+          />
+          {wakerToggle.warning ? (
+            <p
+              className="px-3 pb-2 text-xs text-muted-foreground"
+              data-testid="user-profile-agent-waker-warning"
+            >
+              {wakerToggle.warning}
+            </p>
+          ) : null}
+        </>
       ) : null}
       {onDuplicateAgent ? (
         <ProfileAgentActionRow

@@ -116,4 +116,12 @@ export type ManagedAgent = {
    * Tauri command refuses to enable it for `"local"`.
    */
   wakerEnabled: boolean;
+  /**
+   * When this agent's launch bundle lapses, unix seconds.
+   *
+   * `null` is "not known", not "no bundle" — an agent enrolled before
+   * expiries were recorded has none. Render it as unknown rather than as
+   * healthy or expired.
+   */
+  wakerBundleExpiresAt: number | null;
 };

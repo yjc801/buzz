@@ -351,7 +351,7 @@ export function UserProfilePanel({
     stopAgentMutation.isPending ||
     deleteAgentMutation.isPending ||
     startOnLaunchMutation.isPending ||
-    wakerToggle.isPending ||
+    wakerToggle.pending ||
     createPersonaMutation.isPending ||
     updatePersonaMutation.isPending ||
     deletePersonaMutation.isPending ||
@@ -846,11 +846,7 @@ export function UserProfilePanel({
           userStatus={userStatus}
           wakerToggle={
             managedAgent?.backend.type === "provider"
-              ? {
-                  enabled: managedAgent.wakerEnabled,
-                  onToggle: wakerToggle.toggle,
-                  pending: wakerToggle.isPending,
-                }
+              ? { enabled: managedAgent.wakerEnabled, ...wakerToggle }
               : undefined
           }
         />

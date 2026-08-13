@@ -23,6 +23,7 @@ pub fn invoke_provider(
         request,
         timeout,
         super::default_agent_workdir().as_deref(),
+        None,
     )
 }
 
@@ -41,6 +42,7 @@ pub fn provider_deploy(
         agent,
         provider_config,
         super::default_agent_workdir().as_deref(),
+        None,
     )
 }
 

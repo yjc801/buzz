@@ -16,8 +16,35 @@
 //! desktop resolves `~/.buzz`; a headless daemon may have none) and, for a
 //! caller acting on a signed launch bundle, pinning the expected binary
 //! digest via [`provider_deploy_pinned`] — see that function's doc for why.
+//!
+//! # The child's environment
+//!
+//! Every entry point takes an `env: Option<&HashMap<String, String>>`. `None`
+//! (every caller before `buzz-waker`'s dynamic multi-tenant enrolment)
+//! leaves the child's environment exactly as `std::process::Command`
+//! defaults it — the parent process's own environment, untouched — so this
+//! parameter changed no existing caller's behavior when it was added.
+//! `Some(map)` layers `map`'s keys on top via
+//! [`std::process::Command::envs`], overriding any inherited variable with
+//! the same name.
+//!
+//! **This is an overlay, not isolation.** The child still inherits every
+//! other variable from this process's own environment — this crate never
+//! calls `env_clear`. For `buzz-waker`'s multi-tenant use (layering one
+//! enrolled owner's provider credential, e.g. `SPRITE_TOKEN`, onto the
+//! deploy call for that owner's agent) that is enough to fix "the wrong
+//! credential is used"; it does not, on its own, stop that child process
+//! from also seeing whatever else the daemon's own environment carries
+//! (`WAKER_IDENTITY_NSEC` among them). Full isolation — an explicit,
+//! daemon-controlled baseline the tenant credential is layered onto, with
+//! the rest of the parent's environment cleared — is real future work, not
+//! implemented here: the design doc's own reference to it predates any
+//! concrete environment-injection mechanism existing anywhere in this
+//! codebase (desktop's own provider calls never passed one either), so
+//! there was no existing baseline definition to reuse or extend.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -102,7 +129,8 @@ fn validate_provider_info(info: &serde_json::Value) -> Result<(), String> {
 /// `workdir` is the child's working directory (`None` inherits the caller's
 /// own CWD) — callers with a notion of a stable agent home (the desktop's
 /// `~/.buzz`) should resolve and pass it; a caller without one may pass
-/// `None`.
+/// `None`. `env` overlays the child's environment — see the module doc's
+/// The child's environment section.
 ///
 /// Reader threads stream lines/chunks over channels so the caller can receive
 /// data as it arrives and time-box the wait. No `read_to_end` — if a provider
@@ -119,6 +147,7 @@ pub fn invoke_provider(
     request: &serde_json::Value,
     timeout: Duration,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
 ) -> Result<serde_json::Value, String> {
     let request_bytes = format!(
         "{}\n",
@@ -128,6 +157,9 @@ pub fn invoke_provider(
     let mut cmd = std::process::Command::new(binary);
     if let Some(workdir) = workdir {
         cmd.current_dir(workdir);
+    }
+    if let Some(env) = env {
+        cmd.envs(env);
     }
     configure_no_window(&mut cmd);
     let mut child = cmd
@@ -563,7 +595,8 @@ fn stage_provider(
 /// Deploy through one immutable staged copy: negotiate protocol v1 before the
 /// secret-bearing request, then invoke deploy on those exact same bytes.
 ///
-/// `workdir` is passed straight through to [`invoke_provider`] — see its doc.
+/// `workdir` and `env` are passed straight through to [`invoke_provider`] —
+/// see its doc.
 ///
 /// # Errors
 /// See [`invoke_provider`] and [`stage_provider`] — every path returns a
@@ -573,8 +606,9 @@ pub fn provider_deploy(
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
 ) -> Result<ProviderDeployOutcome, String> {
-    deploy(binary, agent, provider_config, workdir, None)
+    deploy(binary, agent, provider_config, workdir, env, None)
 }
 
 /// Like [`provider_deploy`], but refuses to run unless the staged binary's
@@ -595,11 +629,13 @@ pub fn provider_deploy(
 /// # Errors
 /// A digest mismatch is reported before any process is spawned. Otherwise
 /// see [`provider_deploy`].
+#[allow(clippy::too_many_arguments)]
 pub fn provider_deploy_pinned(
     binary: &Path,
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
     expected_sha256_hex: &str,
 ) -> Result<ProviderDeployOutcome, String> {
     deploy(
@@ -607,15 +643,18 @@ pub fn provider_deploy_pinned(
         agent,
         provider_config,
         workdir,
+        env,
         Some(expected_sha256_hex),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deploy(
     binary: &Path,
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
     expected_sha256_hex: Option<&str>,
 ) -> Result<ProviderDeployOutcome, String> {
     let (_directory, staged, digest, _execution_guard) = stage_provider(binary)?;
@@ -633,7 +672,13 @@ fn deploy(
         "op": "info",
         "request_id": uuid::Uuid::new_v4().to_string(),
     });
-    let info = invoke_provider(&staged, &info_request, Duration::from_secs(10), workdir)?;
+    let info = invoke_provider(
+        &staged,
+        &info_request,
+        Duration::from_secs(10),
+        workdir,
+        env,
+    )?;
     validate_provider_info(&info)?;
 
     let request = serde_json::json!({
@@ -642,7 +687,7 @@ fn deploy(
         "agent": agent,
         "provider_config": provider_config,
     });
-    let resp = invoke_provider(&staged, &request, Duration::from_secs(600), workdir)?;
+    let resp = invoke_provider(&staged, &request, Duration::from_secs(600), workdir, env)?;
     let agent_id = resp["agent_id"]
         .as_str()
         .map(String::from)

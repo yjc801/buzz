@@ -58,6 +58,7 @@
 //! narrowing it to "this daemon's own agents" is strictly better than not
 //! re-checking at all.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::attempt::{HeartbeatObservation, WakeEffects};
@@ -166,6 +167,17 @@ pub struct RealWakeEffects {
     /// This attempt's launch bundle, if one is available. `None` until
     /// bundle transport is wired into this daemon — see the module note.
     bundle: Option<Arc<LaunchBundleBody>>,
+    /// This agent's own provider credential, if it has one — a dynamically
+    /// (roster-)enrolled agent's [`crate::enrolment::ProviderCredential`],
+    /// already converted to its wire-shape environment variables
+    /// ([`crate::enrolment::ProviderCredential::to_env`]) at credential
+    /// delivery time. `None` for a statically configured agent (no
+    /// per-tenant credential exists to overlay) and for a roster-enrolled
+    /// agent whose delivered credential didn't carry one. Layered onto the
+    /// deploy subprocess's environment — see
+    /// `buzz_provider_deploy`'s own module doc for what "layered" means
+    /// (an overlay on the inherited environment, not isolation from it).
+    provider_env: Option<Arc<HashMap<String, String>>>,
     /// Fires on daemon shutdown. Deliberately **not** tied to the mention
     /// feed's own connection lifecycle: a wake attempt does not touch that
     /// socket, so a feed reconnect must not cancel an attempt that is still
@@ -191,6 +203,7 @@ impl RealWakeEffects {
         trigger_author: &str,
         trigger_created_at: u64,
         bundle: Option<Arc<LaunchBundleBody>>,
+        provider_env: Option<Arc<HashMap<String, String>>>,
         cancel: CancellationToken,
         on_deployed: impl Fn() + Send + Sync + 'static,
     ) -> Self {
@@ -201,6 +214,7 @@ impl RealWakeEffects {
             trigger_author: normalize_pubkey(trigger_author),
             trigger_created_at,
             bundle,
+            provider_env,
             cancel,
             on_deployed: Box::new(on_deployed),
         }
@@ -336,6 +350,7 @@ impl WakeEffects for RealWakeEffects {
             serde_json::Value::String(self.trigger_created_at.to_string());
 
         let provider_config = bundle.provider.provider_config.clone();
+        let provider_env = self.provider_env.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
             buzz_provider_deploy::provider_deploy_pinned(
@@ -343,6 +358,7 @@ impl WakeEffects for RealWakeEffects {
                 &agent_json,
                 &provider_config,
                 None,
+                provider_env.as_deref(),
                 &expected_digest,
             )
         })
@@ -386,6 +402,7 @@ mod tests {
             trigger_author,
             1_000,
             bundle,
+            None,
             cancel,
             on_deployed,
         )

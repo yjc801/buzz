@@ -384,6 +384,26 @@ impl std::fmt::Debug for ProviderCredential {
     }
 }
 
+impl ProviderCredential {
+    /// This credential as the environment variable(s) a provider subprocess
+    /// reads it from — `buzz-provider-deploy`'s `env` overlay param, laid
+    /// over the deployed process's environment for exactly one tenant's own
+    /// deploy call. One key per variant today
+    /// (`credentials::resolve()` in `crates/buzz-backend-sprites` for
+    /// `Sprites`'s own `SPRITE_TOKEN`), but returns a map rather than a
+    /// single pair since a future provider variant may need more than one.
+    #[must_use]
+    pub fn to_env(&self) -> std::collections::HashMap<String, String> {
+        let mut env = std::collections::HashMap::new();
+        match self {
+            Self::Sprites { sprite_token } => {
+                env.insert("SPRITE_TOKEN".to_string(), sprite_token.clone());
+            }
+        }
+        env
+    }
+}
+
 /// The signed content of one agent's delivered credential.
 ///
 /// `Debug` is implemented by hand and redacts [`Self::nsec`] and
@@ -1015,6 +1035,19 @@ mod tests {
         let rendered = format!("{credential:?}");
         assert!(!rendered.contains("tok-should-not-appear"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sprites_credential_maps_to_sprite_token_env() {
+        let credential = ProviderCredential::Sprites {
+            sprite_token: "sprt-real-value".to_string(),
+        };
+        let env = credential.to_env();
+        assert_eq!(
+            env.get("SPRITE_TOKEN"),
+            Some(&"sprt-real-value".to_string())
+        );
+        assert_eq!(env.len(), 1);
     }
 
     #[test]

@@ -83,6 +83,10 @@ pub struct WakeLoopConfig {
     /// admitted mid-run takes effect on the very next wake, with no daemon
     /// restart required.
     pub bundle_state: Arc<crate::bundle_feed::BundleState>,
+    /// This agent's own provider credential's environment overlay, if it has
+    /// one — see `effects::RealWakeEffects`'s own doc for what this is and
+    /// why it's `None` for a statically configured agent.
+    pub provider_env: Option<Arc<HashMap<String, String>>>,
 }
 
 fn now_secs() -> u64 {
@@ -343,6 +347,7 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                         Arc::clone(&config.presence_state),
                                         config.watch_list.clone(),
                                         config.bundle_state.current(),
+                                        config.provider_env.clone(),
                                         cancel.clone(),
                                     );
                                 }
@@ -596,6 +601,7 @@ fn spawn_attempt(
     presence_state: Arc<PresenceState>,
     watch_list: WatchList,
     bundle: Option<Arc<crate::bundle::LaunchBundleBody>>,
+    provider_env: Option<Arc<HashMap<String, String>>>,
     cancel: CancellationToken,
 ) {
     attempts.spawn(async move {
@@ -609,6 +615,7 @@ fn spawn_attempt(
             &event.author,
             event.created_at,
             bundle,
+            provider_env,
             cancel,
             move || {
                 tracing::info!(

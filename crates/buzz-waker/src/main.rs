@@ -36,6 +36,7 @@
 //! | `WAKER_AGENTS_CONFIG_PATH` | yes | Path to a JSON file listing the agents to statically watch — see [`AgentConfig`]. |
 //! | `WAKER_OWNER_PUBKEYS` | no | Comma-separated list of owner pubkeys this daemon discovers agents for dynamically. Empty or unset disables dynamic enrolment entirely — see [`buzz_waker::enrolment::parse_authorized_owners`]'s own fail-closed doc. |
 //! | `WAKER_IDENTITY_NSEC` | only if `WAKER_OWNER_PUBKEYS` is set | This daemon's own Nostr identity — the roster and credential taps decrypt as this key, never as any watched agent's. |
+//! | `WAKER_MAX_AGENTS` | only if `WAKER_OWNER_PUBKEYS` is set | Total ceiling on supervised agents — config, pending, and running together — dynamic enrolment can ever push this daemon to. Refuse-not-evict: an authorized owner's roster past this ceiling is refused new admissions, never made to cancel an existing agent to make room. See [`reconcile_roster`]'s own doc. |
 //! | `RUST_LOG` | no | `tracing-subscriber` env filter. Defaults to `buzz_waker=info`. |
 //!
 //! # What is still deliberately not here
@@ -49,15 +50,14 @@
 //! against `WAKER_OWNER_PUBKEYS` before this daemon ever trusts it (see
 //! [`buzz_waker::roster_feed`]'s module doc).
 //!
-//! Not implemented this round, and deliberately deferred rather than
-//! guessed at: a `WAKER_MAX_AGENTS` total-capacity bound (recorded as an
-//! open tuning value in the design doc's multi-tenant extension, not part
-//! of this step's own build-order text) and reacting to a credential
-//! *rotation* for an already-running dynamically watched agent (this
-//! daemon's credential tap keeps running for that agent's whole lifetime
-//! and would log a rotation or revocation, but nothing currently acts on it
-//! — only the *first* delivered credential is used, to bootstrap that
-//! agent's identity).
+//! A dynamically watched agent's `provider_credential`, when its delivered
+//! credential carries one, is layered onto that agent's own deploy
+//! subprocess environment (`buzz_provider_deploy`'s `env` overlay) — but
+//! only as an overlay on top of this daemon's own inherited environment,
+//! not full isolation from it. See `buzz_provider_deploy`'s own module doc,
+//! The child's environment section, for exactly what that does and does
+//! not protect against; full isolation is real future work, not
+//! implemented here.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -229,17 +229,34 @@ struct SupervisedAgent {
     /// with everything else, on shutdown.
     cancel: CancellationToken,
     source: AgentSource,
-    /// `Some` while a [`AgentSource::Roster`] agent is still waiting for its
-    /// first credential delivery — the reconciliation loop polls it each
-    /// tick and, once populated, spawns this agent's presence/bundle/wake
-    /// tasks and clears this field. Always `None` for [`AgentSource::Config`]
-    /// (which already has its `nsec` from local config) and for a
-    /// [`AgentSource::Roster`] agent whose bootstrap has already completed.
-    credential_bootstrap: Option<Arc<CredentialState>>,
     /// The owner that published this pubkey's roster entry. Unused for
     /// [`AgentSource::Config`] (each config entry already carries its own
     /// `owner_pubkey` separately, read once at spawn time).
     owner_pubkey: String,
+    /// `Some` for [`AgentSource::Roster`] only — the credential tap's live
+    /// state, watched for this agent's **entire** supervised lifetime, not
+    /// just while bootstrapping. A rotation or revocation delivered after
+    /// this agent is already running has to be seen too, or the old
+    /// identity (and, for a revocation, a credential the owner explicitly
+    /// withdrew) would keep running indefinitely — the exact gap Alex's
+    /// review round caught. `None` for [`AgentSource::Config`].
+    credential_state: Option<Arc<CredentialState>>,
+    /// `Some` for [`AgentSource::Roster`] only — the `credential_version`
+    /// the *most recent* roster reconciliation observed for this pubkey.
+    /// Compared against `credential_state.current()`'s own
+    /// `credential_version` every tick: promotion requires an exact match
+    /// (a stale or not-yet-caught-up delivery must not start this agent),
+    /// and the roster diff tears this agent down the moment the roster's
+    /// own claimed version moves, so it re-bootstraps from the new one
+    /// rather than continuing to run under the old identity. `None` for
+    /// [`AgentSource::Config`], which has no roster-published version at
+    /// all.
+    expected_credential_version: Option<u64>,
+    /// Whether this agent's presence/bundle/wake tasks have been spawned.
+    /// `true` immediately for [`AgentSource::Config`]. `false` for a
+    /// [`AgentSource::Roster`] agent until its credential (at the expected
+    /// version) arrives and [`spawn_agent_watch`] succeeds.
+    running: bool,
 }
 
 /// Why one of this daemon's tasks finished, for the join-handling loop in
@@ -312,6 +329,11 @@ fn classify_exit(source: Option<AgentSource>, was_cancelled: bool) -> ExitDispos
 struct DesiredRosterAgent {
     pubkey: String,
     owner_pubkey: String,
+    /// The [`RosterEntry::credential_version`] the roster currently expects
+    /// — the exact version [`SupervisedAgent::expected_credential_version`]
+    /// must match before this agent is promoted, or must still match for
+    /// an already-running agent to keep running unchanged.
+    credential_version: u64,
 }
 
 /// Diff every authorized owner's current roster into the set of pubkeys this
@@ -360,6 +382,7 @@ fn compute_desired_roster_agents(
                     desired.push(DesiredRosterAgent {
                         pubkey,
                         owner_pubkey: owner_pubkey.clone(),
+                        credential_version: entry.credential_version,
                     });
                 }
             }
@@ -401,9 +424,12 @@ fn open_pinned_floor_store(path: &Path, owner_pubkey: &str) -> anyhow::Result<Fl
 ///
 /// The extracted "per-agent spawn block"
 /// `PLANS/BUZZ_WAKER_DESIGN.md` §12 build order step 3 calls for — shared by
-/// both a statically configured agent (called once per entry at startup)
-/// and a roster-discovered one (called once its credential tap delivers a
-/// first `nsec`), so there is exactly one place this wiring can drift.
+/// both a statically configured agent (called once per entry at startup,
+/// always with `provider_env: None` — no per-tenant credential exists for
+/// one) and a roster-discovered one (called once its credential tap
+/// delivers a first `nsec` at the expected version, `provider_env` derived
+/// from that same delivery's `provider_credential` if it carried one), so
+/// there is exactly one place this wiring can drift.
 ///
 /// # Errors
 /// The agent's state directory or bundle [`FloorStore`] cannot be
@@ -416,6 +442,7 @@ fn spawn_agent_watch(
     keys: &Keys,
     auth_tag: Option<&Tag>,
     owner_pubkey: &str,
+    provider_env: Option<Arc<HashMap<String, String>>>,
     watch_list: &WatchList,
     cancel: CancellationToken,
     tasks: &mut JoinSet<TaskExit>,
@@ -492,6 +519,7 @@ fn spawn_agent_watch(
             presence_state,
             watch_list: watch_list.clone(),
             bundle_state,
+            provider_env: provider_env.clone(),
         };
         let cancel = cancel.clone();
         let pubkey = pubkey.clone();
@@ -518,15 +546,45 @@ fn spawn_agent_watch(
 /// loop.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One reconciliation pass: tear down roster-sourced agents no longer
-/// listed anywhere, adopt newly-listed ones (spawning a credential tap for
-/// each), and promote any pending agent whose credential has now arrived.
+/// Cancel and drop one roster-sourced agent's entry — shared by every
+/// tear-down path in [`reconcile_roster`] (no longer listed, version
+/// changed, revoked while running, or a spawn/parse failure) so each stays
+/// a one-line call rather than a repeated three-statement block.
+fn tear_down_roster_agent(
+    supervised: &mut HashMap<String, SupervisedAgent>,
+    watch_list: &WatchList,
+    pubkey: &str,
+) {
+    if let Some(agent) = supervised.remove(pubkey) {
+        agent.cancel.cancel();
+    }
+    watch_list.remove(pubkey);
+}
+
+/// One reconciliation pass, in order:
+///
+/// 1. Tear down [`AgentSource::Roster`] agents no longer listed by any
+///    authorized owner's roster.
+/// 2. Tear down [`AgentSource::Roster`] agents still listed but whose
+///    roster-claimed `credential_version` has moved since the last pass —
+///    pending or already running, so a rotation cancels the old identity
+///    immediately rather than only affecting a not-yet-started one.
+/// 3. Adopt newly-listed agents (spawn a credential tap for each), bounded
+///    by `max_agents` counting every currently supervised pubkey
+///    (config, pending, and running together) — see [`main`]'s own
+///    `WAKER_MAX_AGENTS` doc.
+/// 4. For every [`AgentSource::Roster`] agent (pending or running),
+///    re-check its credential tap's live state against the version it is
+///    expected to be at: promote a pending agent whose delivery now
+///    matches exactly, tear down a running agent whose credential was
+///    revoked (the tap's state going from `Some` to `None`).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_roster(
     relay_url: &str,
     state_dir: &Path,
     waker_keys: &Keys,
     authorized_owners: &[String],
+    max_agents: usize,
     roster_state: &RosterState,
     supervised: &mut HashMap<String, SupervisedAgent>,
     watch_list: &WatchList,
@@ -555,20 +613,21 @@ fn reconcile_roster(
              misconfiguration"
         );
     }
+    let desired_versions: HashMap<&str, u64> = desired
+        .iter()
+        .map(|d| (d.pubkey.as_str(), d.credential_version))
+        .collect();
 
-    let desired_pubkeys: HashSet<&str> = desired.iter().map(|d| d.pubkey.as_str()).collect();
-    let to_remove: Vec<String> = supervised
+    // Pass 1: no longer listed anywhere.
+    let no_longer_listed: Vec<String> = supervised
         .iter()
         .filter(|(pubkey, agent)| {
-            agent.source == AgentSource::Roster && !desired_pubkeys.contains(pubkey.as_str())
+            agent.source == AgentSource::Roster && !desired_versions.contains_key(pubkey.as_str())
         })
         .map(|(pubkey, _)| pubkey.clone())
         .collect();
-    for pubkey in to_remove {
-        if let Some(agent) = supervised.remove(&pubkey) {
-            agent.cancel.cancel();
-        }
-        watch_list.remove(&pubkey);
+    for pubkey in no_longer_listed {
+        tear_down_roster_agent(supervised, watch_list, &pubkey);
         tracing::info!(
             agent = %pubkey,
             "buzz-waker: no authorized owner's roster lists this agent anymore; \
@@ -576,8 +635,43 @@ fn reconcile_roster(
         );
     }
 
+    // Pass 2: still listed, but the roster's own claimed version moved —
+    // pending or already running, tear down either way so re-adoption
+    // (pass 3, same tick) starts fresh under the new version rather than
+    // leaving the old identity running or a stale bootstrap in place.
+    let version_changed: Vec<String> = supervised
+        .iter()
+        .filter(|(pubkey, agent)| {
+            agent.source == AgentSource::Roster
+                && desired_versions
+                    .get(pubkey.as_str())
+                    .is_some_and(|&v| Some(v) != agent.expected_credential_version)
+        })
+        .map(|(pubkey, _)| pubkey.clone())
+        .collect();
+    for pubkey in version_changed {
+        tear_down_roster_agent(supervised, watch_list, &pubkey);
+        tracing::info!(
+            agent = %pubkey,
+            "buzz-waker: roster's credential_version for this agent changed; \
+             cancelling and re-bootstrapping from the new version"
+        );
+    }
+
+    // Pass 3: adopt anything not currently supervised (newly listed, or
+    // just torn down above for a version change), bounded by max_agents.
     for desired_agent in &desired {
         if supervised.contains_key(&desired_agent.pubkey) {
+            continue;
+        }
+        if supervised.len() >= max_agents {
+            tracing::warn!(
+                agent = %desired_agent.pubkey,
+                max_agents,
+                "buzz-waker: refusing to adopt this roster-discovered agent; \
+                 WAKER_MAX_AGENTS reached (refuse, not evict — an existing agent is never \
+                 cancelled to make room)"
+            );
             continue;
         }
         let agent_cancel = cancel.child_token();
@@ -642,6 +736,7 @@ fn reconcile_roster(
         tracing::info!(
             agent = %desired_agent.pubkey,
             owner = %desired_agent.owner_pubkey,
+            credential_version = desired_agent.credential_version,
             "buzz-waker: roster lists a new agent; waiting for its credential"
         );
         supervised.insert(
@@ -649,93 +744,113 @@ fn reconcile_roster(
             SupervisedAgent {
                 cancel: agent_cancel,
                 source: AgentSource::Roster,
-                credential_bootstrap: Some(credential_state),
                 owner_pubkey: desired_agent.owner_pubkey.clone(),
+                credential_state: Some(credential_state),
+                expected_credential_version: Some(desired_agent.credential_version),
+                running: false,
             },
         );
     }
 
-    let ready: Vec<String> = supervised
+    // Pass 4: re-check every roster-sourced agent's credential tap against
+    // the version it is expected to be at — pending or already running.
+    let pubkeys_to_check: Vec<String> = supervised
         .iter()
-        .filter_map(|(pubkey, agent)| {
-            agent
-                .credential_bootstrap
-                .as_ref()
-                .and_then(|state| state.current())
-                .map(|_| pubkey.clone())
-        })
+        .filter(|(_, agent)| agent.credential_state.is_some())
+        .map(|(pubkey, _)| pubkey.clone())
         .collect();
-    for pubkey in ready {
+    for pubkey in pubkeys_to_check {
         let Some(agent) = supervised.get(&pubkey) else {
             continue;
         };
-        let Some(body) = agent
-            .credential_bootstrap
-            .as_ref()
-            .and_then(|state| state.current())
-        else {
+        let Some(credential_state) = &agent.credential_state else {
             continue;
         };
-        let agent_cancel = agent.cancel.clone();
+        let expected_version = agent.expected_credential_version;
+        let running = agent.running;
         let owner_pubkey = agent.owner_pubkey.clone();
+        let agent_cancel = agent.cancel.clone();
 
-        let keys = match Keys::parse(&body.nsec) {
-            Ok(keys) => keys,
-            Err(error) => {
-                tracing::error!(
-                    agent = %pubkey,
-                    %error,
-                    "buzz-waker: delivered credential's nsec does not parse; tearing down this agent"
-                );
-                if let Some(agent) = supervised.remove(&pubkey) {
-                    agent.cancel.cancel();
+        match credential_state.current() {
+            None => {
+                if running {
+                    tear_down_roster_agent(supervised, watch_list, &pubkey);
+                    tracing::error!(
+                        agent = %pubkey,
+                        "buzz-waker: this agent's credential was revoked while running; \
+                         cancelling its watch tasks"
+                    );
                 }
-                watch_list.remove(&pubkey);
-                continue;
+                // Not yet running: still waiting for the first delivery,
+                // nothing to do this tick.
             }
-        };
-        let auth_tag = match body.auth_tag.clone().map(Tag::parse).transpose() {
-            Ok(auth_tag) => auth_tag,
-            Err(error) => {
-                tracing::error!(
-                    agent = %pubkey,
-                    %error,
-                    "buzz-waker: delivered credential's auth_tag does not parse; tearing down this agent"
-                );
-                if let Some(agent) = supervised.remove(&pubkey) {
-                    agent.cancel.cancel();
+            Some(body) if Some(body.credential_version) == expected_version => {
+                if running {
+                    continue; // already running this exact version
                 }
-                watch_list.remove(&pubkey);
-                continue;
-            }
-        };
+                let keys = match Keys::parse(&body.nsec) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        tracing::error!(
+                            agent = %pubkey,
+                            %error,
+                            "buzz-waker: delivered credential's nsec does not parse; tearing down this agent"
+                        );
+                        tear_down_roster_agent(supervised, watch_list, &pubkey);
+                        continue;
+                    }
+                };
+                let auth_tag = match body.auth_tag.clone().map(Tag::parse).transpose() {
+                    Ok(auth_tag) => auth_tag,
+                    Err(error) => {
+                        tracing::error!(
+                            agent = %pubkey,
+                            %error,
+                            "buzz-waker: delivered credential's auth_tag does not parse; tearing down this agent"
+                        );
+                        tear_down_roster_agent(supervised, watch_list, &pubkey);
+                        continue;
+                    }
+                };
+                let provider_env = body
+                    .provider_credential
+                    .as_ref()
+                    .map(|credential| Arc::new(credential.to_env()));
 
-        match spawn_agent_watch(
-            relay_url,
-            state_dir,
-            &keys,
-            auth_tag.as_ref(),
-            &owner_pubkey,
-            watch_list,
-            agent_cancel,
-            tasks,
-        ) {
-            Ok(()) => {
-                if let Some(agent) = supervised.get_mut(&pubkey) {
-                    agent.credential_bootstrap = None;
+                match spawn_agent_watch(
+                    relay_url,
+                    state_dir,
+                    &keys,
+                    auth_tag.as_ref(),
+                    &owner_pubkey,
+                    provider_env,
+                    watch_list,
+                    agent_cancel,
+                    tasks,
+                ) {
+                    Ok(()) => {
+                        if let Some(agent) = supervised.get_mut(&pubkey) {
+                            agent.running = true;
+                        }
+                        tracing::info!(agent = %pubkey, "buzz-waker: roster-discovered agent's credential arrived; now watching it");
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            agent = %pubkey,
+                            %error,
+                            "buzz-waker: could not start watching a roster-discovered agent; tearing it down"
+                        );
+                        tear_down_roster_agent(supervised, watch_list, &pubkey);
+                    }
                 }
-                tracing::info!(agent = %pubkey, "buzz-waker: roster-discovered agent's credential arrived; now watching it");
             }
-            Err(error) => {
-                tracing::error!(
-                    agent = %pubkey,
-                    %error,
-                    "buzz-waker: could not start watching a roster-discovered agent; tearing it down"
-                );
-                if let Some(agent) = supervised.remove(&pubkey) {
-                    agent.cancel.cancel();
-                }
-                watch_list.remove(&pubkey);
+            Some(_stale_or_mismatched) => {
+                // A delivery that doesn't match the roster's current
+                // expectation — a lagging reconnect replay, or the
+                // credential simply hasn't caught up to a just-bumped
+                // roster yet. Left in place, not acted on; either the tap
+                // eventually delivers the right version (self-heals) or
+                // the roster catches up (pass 2 next tick).
             }
         }
     }
@@ -771,6 +886,31 @@ async fn main() -> anyhow::Result<()> {
             )
         })?;
         Some(Keys::parse(&nsec).map_err(|e| anyhow::anyhow!("invalid WAKER_IDENTITY_NSEC: {e}"))?)
+    };
+    // Required alongside WAKER_IDENTITY_NSEC, same reasoning: dynamic
+    // enrolment needs an explicit ceiling on how many agents an authorized
+    // owner's roster can cause this daemon to run — refuse-not-evict, per
+    // the approved multi-tenant design (`PLANS/BUZZ_WAKER_DESIGN.md` §12's
+    // multi-tenant extension). Counts every currently supervised pubkey —
+    // config, pending, and running together — not roster-sourced agents
+    // alone, so a daemon cannot be pushed past the operator's own stated
+    // ceiling regardless of source.
+    let max_agents: usize = if authorized_owners.is_empty() {
+        0
+    } else {
+        let raw = env_var("WAKER_MAX_AGENTS").map_err(|_| {
+            anyhow::anyhow!(
+                "WAKER_OWNER_PUBKEYS is set but WAKER_MAX_AGENTS is not; dynamic enrolment \
+                 needs an explicit total-agent ceiling"
+            )
+        })?;
+        let parsed: usize = raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid WAKER_MAX_AGENTS {raw:?}: {e}"))?;
+        if parsed == 0 {
+            anyhow::bail!("WAKER_MAX_AGENTS must be at least 1, got 0");
+        }
+        parsed
     };
 
     let agent_configs = load_agents(&agents_config_path)?;
@@ -815,6 +955,7 @@ async fn main() -> anyhow::Result<()> {
             &keys,
             auth_tag.as_ref(),
             &owner_pubkey,
+            None,
             &watch_list,
             agent_cancel.clone(),
             &mut tasks,
@@ -824,8 +965,10 @@ async fn main() -> anyhow::Result<()> {
             SupervisedAgent {
                 cancel: agent_cancel,
                 source: AgentSource::Config,
-                credential_bootstrap: None,
                 owner_pubkey,
+                credential_state: None,
+                expected_credential_version: None,
+                running: true,
             },
         );
     }
@@ -881,6 +1024,7 @@ async fn main() -> anyhow::Result<()> {
                     &state_dir,
                     waker_keys,
                     &authorized_owners,
+                    max_agents,
                     roster_state,
                     &mut supervised,
                     &watch_list,
@@ -1047,9 +1191,13 @@ mod tests {
     }
 
     fn entry(pubkey: &str) -> RosterEntry {
+        entry_at_version(pubkey, 1)
+    }
+
+    fn entry_at_version(pubkey: &str, credential_version: u64) -> RosterEntry {
         RosterEntry {
             agent_pubkey: pubkey.to_string(),
-            credential_version: 1,
+            credential_version,
         }
     }
 
@@ -1080,7 +1228,24 @@ mod tests {
         assert_eq!(desired.len(), 1);
         assert_eq!(desired[0].pubkey, normalize_pubkey(&pubkey));
         assert_eq!(desired[0].owner_pubkey, owner);
+        assert_eq!(desired[0].credential_version, 1);
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn the_roster_entrys_credential_version_is_carried_through() {
+        let pubkey = "a".repeat(64);
+        let owner = "b".repeat(64);
+
+        let (desired, _) = compute_desired_roster_agents(
+            &[(owner, vec![entry_at_version(&pubkey, 7)])],
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            desired[0].credential_version, 7,
+            "the exact version reconcile_roster gates promotion on must survive the fold"
+        );
     }
 
     #[test]

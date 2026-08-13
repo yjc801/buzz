@@ -426,7 +426,11 @@ jobs:
             # the add is replayed to it and a card posted before it is not.
             local CH="$1" P
             for P in "$OWNER_PUBKEY" "$CODER_PUBKEY"; do
-              if ! buzz channels add-member --channel "$CH" --pubkey "$P"; then
+              # Stdout redirected: `create_and_seed` is captured with $(...)
+              # by the `closed` recovery path, and add-member's structured
+              # success JSON would otherwise land in that capture ahead of
+              # the channel UUID it returns.
+              if ! buzz channels add-member --channel "$CH" --pubkey "$P" >/dev/null; then
                 echo "add-member failed for $P — job fails; the rerun resumes this partial channel" >&2
                 return 1
               fi
@@ -630,8 +634,16 @@ jobs:
               # lost, after a prior run's archive already applied) must
               # converge here rather than repeat a message send the relay's
               # archived-room fence will reject.
-              channel_is_archived "$CH"
-              case "$?" in
+              #
+              # This runs under Actions' default `bash -eo pipefail`, and
+              # `channel_is_archived` returns 1 for the ordinary active-channel
+              # case — a bare call would trip `errexit` on every normal close
+              # before the case below ever ran. `||` on the call suppresses
+              # that: the compound command's own status is 0 whichever branch
+              # runs, since either the call succeeded or the assignment did.
+              ARCHIVE_STATE=0
+              channel_is_archived "$CH" || ARCHIVE_STATE=$?
+              case "$ARCHIVE_STATE" in
                 0) echo "channel $NAME already archived — closed event already converged"
                    exit 0 ;;
                 2) exit 1 ;;

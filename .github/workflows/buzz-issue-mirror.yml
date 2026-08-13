@@ -1,0 +1,687 @@
+name: buzz-issue-mirror
+
+# Gives every ISSUE on this fork its own Buzz channel (#buzz-issue-N):
+#   opened   → create the channel, seed it with the issue card, add Will and
+#              MENTION him so the harness fires a turn on it
+#   closed   → post a close notice, then archive. If no channel exists yet
+#              (a backlog issue that predates this workflow, or an `opened`
+#              run that failed before `create_channel`), create and seed one
+#              first so the Buzz record and Will notification are never
+#              permanently dropped. If the channel is already archived (a
+#              retry of a `closed` event whose success was never recorded),
+#              converge without re-posting or re-archiving.
+#   reopened → unarchive, and re-provision anything a partial run left behind
+#
+# Sibling of buzz-pr-mirror.yml and deliberately built on ITS primitives, not
+# on yjc801/velvet's older buzz-issue-channels.yml. Velvet's version predates
+# three fixes this repo already paid for, and porting it verbatim would import
+# all three: it resolves rooms with `channels search` (a capped newest-first
+# window filtered client-side, whose empty result carries no information — an
+# unusable proof of absence), it names rooms bare `issue-N` (a collision with
+# velvet's own issue rooms in the shared community), and its close path falls
+# back to an idle TTL whose application nothing can observe. Keep THIS file in
+# sync with buzz-pr-mirror.yml; the two share every helper below verbatim
+# except for the payload.
+#
+# CHANNEL NAMES CARRY THE PROJECT PREFIX: `buzz-issue-N`, never bare `issue-N`.
+# openvelvet is shared with velvet, which already mirrors its issues into
+# `issue-N` — unprefixed, velvet issue #12 and buzz issue #12 resolve to one
+# room and each workflow would post into the other's. Do not "tidy" it away.
+#
+# WHY THE MENTION IS THE POINT. Adding Will as a member only makes the room
+# visible to him; it is the `--mention` on the seed card that p-tags him and
+# fires a turn. The PR mirror adds Will as a member and mentions only Alex, so
+# Will has never been tagged by CI on anything — that is the gap this closes.
+#
+# The mention only fires a turn if Will's author gate admits the CI identity.
+# `author_allowed` (buzz-acp/src/lib.rs) resolves `owner-only` through
+# `is_owner_or_sibling`, which admits the owner, or an author whose kind:0
+# profile carries a Schnorr-valid NIP-OA `auth` tag naming the SAME owner.
+# Will is `respond_to: owner-only` with an empty allowlist, so CI must be a
+# verified sibling — see this workflow's PR description for the one-line
+# config change if the first live issue seeds the room but draws no turn.
+# Alex works in the PR mirror today only because he is `respond_to: anyone`,
+# which sidesteps the question entirely.
+#
+# Channel pickup needs NO agent restart. `buzz-acp` subscribes to membership
+# notifications at startup and, on KIND_MEMBER_ADDED_NOTIFICATION, subscribes
+# to the new channel from the membership event's timestamp
+# (`subscribe_channel_from(ch, filter, Some(ts))`). Because that `since` floor
+# is the add-member event, the seed card posted AFTER the add is inside the
+# replay window and is delivered even though the room did not exist when the
+# harness started. Velvet's "the harness may need a restart to pick up new
+# channels" caveat is stale for this generation of the code — but the ordering
+# is load-bearing: members are added BEFORE the card is posted, never after.
+#
+# `issues` workflows run only from the DEFAULT BRANCH, so this file cannot be
+# exercised from a PR. The first issue opened after merge is the live test.
+#
+# NO cancel-in-progress here, unlike the PR mirror. Issue events arrive at
+# human pace rather than per-push, so there is nothing to coalesce, and the
+# recovery paths below exist to repair partials — not to invite them.
+#
+# ACCEPTED IS NOT APPLIED, and every invariant that follows from it is
+# inherited unchanged from buzz-pr-mirror.yml, whose header documents each in
+# full: the relay stores a channel-mutating event and only then runs its side
+# effect, logging and swallowing any failure, so a clean `buzz channels …`
+# exit proves the event exists and never that the mutation applied. No success
+# path below reports an unverified mutation — memberships are re-read from the
+# kind-39002 roster, the archive is fenced by the relay's own pre-storage
+# refusal of writes to an archived room, and no success path ever sets a TTL
+# (a TTL write is unobservable through the CLI, so it can never be confirmed).
+#
+# THE ISSUE→CHANNEL BINDING IS DURABLE AND CI-OWNED — a NIP-23 note at an
+# exact addressable coordinate (kind, author, d-tag), read back uncapped and
+# writable by no one else. Its slug namespace (`issue-mirror-…`) is disjoint
+# from the PR mirror's (`pr-mirror-…`), so the two never collide on a repo
+# where an issue and a PR share a number. As there, the binding is a FAST
+# PATH, NEVER THE PROOF OF ABSENCE: room and note are two separate writes, so
+# absence is established by listing the channels THIS CI IDENTITY IS A MEMBER
+# OF and finding no room of ours named `buzz-issue-N`. A full window is
+# INDETERMINATE and fails the job rather than reading as absence.
+#
+# Requires the same two repo secrets as buzz-pr-mirror.yml, and the same
+# identity — provision with scripts/buzz-mint-auth-tag.py:
+#   BUZZ_CI_PRIVATE_KEY — a DEDICATED Nostr key for CI (never the owner key).
+#   BUZZ_CI_AUTH_TAG    — NIP-OA auth tag for that key, signed by the community
+#     owner. Satisfies the relay's ViaOwner membership gate.
+# EXPECTED_CI_PUBKEY below pins the identity for the same reason it does
+# there: every view this workflow has of the world is scoped to the key it
+# holds, so a rotated key sees an EMPTY WORLD and would read that as "no room
+# exists". Rotating for real means, in one reviewed change: transfer ownership
+# of every live room to the new pubkey, re-point each binding note, and update
+# the constant in both workflows together.
+
+on:
+  issues:
+    types: [opened, closed, reopened]
+
+concurrency:
+  group: buzz-issue-${{ github.event.issue.number }}
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Issue events always run in this repo's context WITH secrets, including
+    # for issues opened by people who cannot push here. Mirroring those would
+    # let any passer-by create a room and wake a coding agent, so the trigger
+    # is scoped to authors who already have write-side standing. Drop this
+    # `if:` to mirror every issue — the workflow itself is indifferent.
+    if: contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install buzz CLI (sprig multicall)
+        run: |
+          URL=https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz
+          curl -fsSL -o sprig.tar.gz "$URL"
+          curl -fsSL -o sprig.sha256 "$URL.sha256"
+          sed 's|  .*|  sprig.tar.gz|' sprig.sha256 | sha256sum -c -
+          echo "sprig sha256 (provenance): $(cut -c1-64 sprig.sha256)"
+          mkdir -p "$HOME/.sprig" && tar -xzf sprig.tar.gz -C "$HOME/.sprig"
+          ln -s "$HOME/.sprig/sprig" "$HOME/.sprig/buzz"
+          echo "$HOME/.sprig" >> "$GITHUB_PATH"
+
+      - name: Sync issue channel
+        env:
+          BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
+          BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
+          # Issue text reaches the shell as ENV, never as `${{ }}` inside the
+          # run block: it is attacker-controlled on a public repo, and env is
+          # the one form the runner does not re-parse as script.
+          ISSUE_ACTION: ${{ github.event.action }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ', ') }}
+          ISSUE_STATE_REASON: ${{ github.event.issue.state_reason }}
+          # Will — the buzz platform coding agent. He is MENTIONED here, not
+          # merely added: an issue is work to pick up, and only the p-tag
+          # fires a turn. NOT Chris (velvet's coder): his instructions scope
+          # him to velvet's apps/api + packages/* and tell him to stop rather
+          # than work outside them, so pointing him at a Rust workspace either
+          # gets a refusal or gets work his own prompt disowns.
+          CODER_NAME: Will
+          CODER_PUBKEY: 15e158a9408649cc82dbe8637d25a63f9cde38cfb1b4ca35f59a8075080b470b
+          # Community owner — added to every new channel so it shows up in
+          # their sidebar (open channels are joinable but not auto-joined).
+          OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+          # Deliberately NOT Alex. He is the reviewer, his known failure mode
+          # is review-loop volume, and an issue room has nothing to review
+          # until a PR exists — at which point buzz-pr-mirror.yml brings him
+          # in on the PR's own channel. Add him to the provisioning loop and
+          # to verify_members together if that judgement changes.
+          EXPECTED_CI_PUBKEY: fbc33a2cf3637867fa90e9e3e334304701e1fdf3c57eae4283cea60134f604af
+        run: |
+          NAME="buzz-issue-${ISSUE_NUMBER}"
+          # Scratch file for the stderr of commands whose FAILURE MODE has to
+          # be read, not just detected (see read_binding and archive_channel).
+          ERRFILE=$(mktemp)
+
+          # CI's own pubkey — authenticates the seed marker (only a
+          # CI-authored card proves provisioning; the channel is open, so
+          # anyone authenticated can post the predictable prefix), proves
+          # channel ownership on adoption, and is derived locally from the
+          # runtime secret so nothing is hardcoded and no relay read is
+          # trusted for it.
+          CI_PUB=$(NOSTR_SECRET="$BUZZ_PRIVATE_KEY" python3 scripts/buzz-mint-auth-tag.py pubkey)
+          printf '%s' "$CI_PUB" | grep -qE '^[0-9a-f]{64}$' || {
+            echo "CI pubkey derivation failed — failing so the rerun re-probes" >&2
+            exit 1
+          }
+
+          # Identity fence, FIRST — before the binding read, before any scan,
+          # before anything is created. Every question this workflow asks the
+          # relay is scoped to the key it is holding, so a different key does
+          # not see a conflict, it sees an EMPTY WORLD, and every downstream
+          # "provably absent" becomes true-but-meaningless.
+          if [ "$CI_PUB" != "$EXPECTED_CI_PUBKEY" ]; then
+            echo "BUZZ_CI_PRIVATE_KEY derives to ${CI_PUB}," >&2
+            echo "but this workflow is pinned to ${EXPECTED_CI_PUBKEY}." >&2
+            echo "Refusing to run: the pinned identity owns every existing #buzz-issue-N room" >&2
+            echo "and authors every binding note, and this key can see neither. Continuing" >&2
+            echo "would fork the room history rather than rotate it." >&2
+            echo "To rotate: transfer ownership of every live room to the new pubkey, re-point" >&2
+            echo "each binding note, and update EXPECTED_CI_PUBKEY in both mirrors." >&2
+            exit 1
+          fi
+
+          # Slug of this issue's binding note. The `issue-mirror-` prefix keeps
+          # it disjoint from the PR mirror's `pr-mirror-` namespace, so issue
+          # #12 and PR #12 never read each other's binding. Asserted rather
+          # than assumed, because a slug the CLI rejects would turn every
+          # lookup into a hard error.
+          BINDING_SLUG=$(printf 'issue-mirror-%s-%s' "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" \
+            | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+          printf '%s' "$BINDING_SLUG" | grep -qE '^[a-z0-9._-]{1,80}$' || {
+            echo "binding slug '$BINDING_SLUG' is outside the note-slug charset" >&2
+            exit 1
+          }
+
+          # Ceiling on the membership scan that proves a room's absence. It has
+          # to exceed the number of channels this CI identity belongs to —
+          # roughly one per PR and one per issue mirrored by every repo sharing
+          # the identity — or the scan reports "unproven" and fails the job
+          # rather than guessing. Raise it in both mirrors together.
+          MEMBER_SCAN_LIMIT=2000
+
+          # FAILURE IS SIGNALLED BY STATUS AND CHECKED AT EVERY CALL SITE.
+          # No helper below may report a broken relay by returning an empty
+          # string: empty means "absent" to its caller, and absent means
+          # "create a second channel". They return non-zero instead, and every
+          # call site tests it explicitly rather than leaning on `bash -e` —
+          # `exit` inside `$(…)` only ends that subshell, so a helper called
+          # from inside another command substitution does NOT reliably abort
+          # the step.
+
+          read_binding() {
+            # Prints the bound channel UUID, or nothing when the binding is
+            # PROVABLY absent. Unlike a name search this is an exact
+            # addressable read (kind 30023, author = CI, d = slug): not
+            # scanned, not capped, and writable by no one else. The CLI's exit
+            # 1 *with* a not_found category is the only outcome that means "no
+            # such note"; every other failure — including a bare exit 1 from a
+            # usage error — reports failure to the caller, because absence
+            # inferred from a broken read mints a duplicate channel.
+            local OUT STATUS=0
+            OUT=$(buzz notes get --name "$BINDING_SLUG" --author me --content-only 2>"$ERRFILE") \
+              || STATUS=$?
+            if [ "$STATUS" -eq 0 ]; then
+              printf '%s' "$OUT" | tr -d '[:space:]'
+              return 0
+            fi
+            if [ "$STATUS" -eq 1 ] && grep -q '"error":"not_found"' "$ERRFILE"; then
+              return 0
+            fi
+            echo "binding lookup failed (exit $STATUS): $(cat "$ERRFILE")" >&2
+            return 1
+          }
+
+          write_binding() {
+            # Output is redirected because callers run this inside a command
+            # substitution that is capturing a channel UUID.
+            printf '%s\n' "$1" | buzz notes set --name "$BINDING_SLUG" \
+              --title "Issue mirror binding: ${GITHUB_REPOSITORY}#${ISSUE_NUMBER}" \
+              --tag issue-mirror --content - >/dev/null
+          }
+
+          channel_roster() {
+            # kind-39002 group members, read at an exact `#d` coordinate rather
+            # than through the capped name scan. The relay rebuilds this
+            # snapshot from its members table AFTER the membership write
+            # commits, so a pubkey's PRESENCE here proves that write applied.
+            # Its ABSENCE proves nothing — the emission itself is best-effort
+            # and can leave the snapshot stale — so callers must fail rather
+            # than conclude "not a member".
+            buzz channels members --channel "$1"
+          }
+
+          ci_owns() {
+            # 0 = CI holds the channel's owner role, 1 = it does not,
+            # 2 = the roster could not be read (never "not owned").
+            # `channels create` makes the creator the owner, so CI owns exactly
+            # the rooms it created — that is what separates our room from a
+            # squatter's room of the same name.
+            local ROSTER
+            ROSTER=$(channel_roster "$1") || return 2
+            printf '%s' "$ROSTER" | jq -e --arg ci "$CI_PUB" \
+              'any(.[]?; .pubkey == $ci and .role == "owner")' >/dev/null || return 1
+            return 0
+          }
+
+          assert_ci_owner() {
+            # Post-create sanity check: we just made this room, so anything but
+            # "owned" means the create did not apply the way we were told.
+            local CH="$1"
+            ci_owns "$CH"
+            case "$?" in
+              0) return 0 ;;
+              1) echo "channel $CH (#${NAME}) is not owned by this CI identity." >&2
+                 echo "Either the create did not apply, or BUZZ_CI_PRIVATE_KEY was rotated" >&2
+                 echo "without migrating channel ownership; see this workflow's header." >&2
+                 return 1 ;;
+              *) echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+                 return 1 ;;
+            esac
+          }
+
+          verify_members() {
+            # The postcondition for add-member. Accepted-and-unapplied is
+            # invisible in the CLI's exit code, so re-read the roster and
+            # require every REQUIRED pubkey to be present; anything else fails
+            # the job so the next action retries the add instead of sealing a
+            # half-provisioned room with a seed card. Will's membership is not
+            # cosmetic here — it is what makes the relay emit the member-added
+            # notification his harness subscribes to.
+            local CH="$1" ROSTER P
+            ROSTER=$(channel_roster "$CH") || {
+              echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+              return 1
+            }
+            for P in "$OWNER_PUBKEY" "$CODER_PUBKEY"; do
+              printf '%s' "$ROSTER" | jq -e --arg p "$P" 'any(.[]?; .pubkey == $p)' >/dev/null || {
+                echo "add-member for $P was accepted but is not applied — failing so the rerun retries" >&2
+                return 1
+              }
+            done
+          }
+
+          resolve_by_membership() {
+            # Establish, without guessing, whether a room of ours already
+            # exists. Prints its UUID, or nothing when there provably is none;
+            # returns non-zero when the answer is unknowable.
+            #
+            # Scoped to the channels this CI identity is a MEMBER of: CI owns
+            # every room it creates, so the room is in that set if it exists,
+            # the set includes archived rooms (verified live), and it grows by
+            # roughly one room per mirrored issue or PR — a bound this
+            # workflow controls, unlike the whole shared community.
+            local LIST N COUNT I CH
+            LIST=$(buzz channels list --member --limit "$MEMBER_SCAN_LIMIT") || {
+              echo "membership listing failed — failing so the rerun re-probes" >&2
+              return 1
+            }
+            N=$(printf '%s' "$LIST" | jq 'length') || return 1
+            if [ "$N" -ge "$MEMBER_SCAN_LIMIT" ]; then
+              # A full window is indistinguishable from a truncated one, so
+              # absence stays UNPROVEN and must not be acted on.
+              echo "membership listing filled its window ($N of $MEMBER_SCAN_LIMIT) — absence unproven." >&2
+              echo "Raise MEMBER_SCAN_LIMIT; creating a room on this evidence could duplicate one." >&2
+              return 1
+            fi
+            COUNT=$(printf '%s' "$LIST" | jq --arg n "$NAME" '[.[] | select(.name == $n)] | length') || return 1
+            I=0
+            while [ "$I" -lt "$COUNT" ]; do
+              CH=$(printf '%s' "$LIST" | jq -r --arg n "$NAME" --argjson i "$I" \
+                '[.[] | select(.name == $n)][$i].channel_id') || return 1
+              ci_owns "$CH"
+              case "$?" in
+                0) write_binding "$CH" || return 1
+                   printf '%s' "$CH"
+                   return 0 ;;
+                1) # Someone else's room that happens to share the name and has
+                   # CI in it. Skipping rather than failing means a squatter
+                   # cannot wedge this workflow; we simply use our own room.
+                   echo "ignoring #${NAME} room $CH — not owned by this CI identity" >&2 ;;
+                *) echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+                   return 1 ;;
+              esac
+              I=$((I + 1))
+            done
+            # Stdout is the resolved UUID, so this goes to stderr.
+            echo "no #${NAME} room among this identity's ${N} channels — none exists" >&2
+          }
+
+          resolve_channel() {
+            # The binding note is the fast path, not the proof of absence: the
+            # room and its note are two separate writes, so a run interrupted
+            # between them leaves a room with no note. Only the membership scan
+            # can tell "never created" from "created, note lost".
+            local BOUND
+            BOUND=$(read_binding) || return 1
+            if [ -z "$BOUND" ]; then
+              resolve_by_membership
+              return $?
+            fi
+            printf '%s' "$BOUND" \
+              | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || {
+              echo "binding note holds '${BOUND}', not a channel UUID — refusing to guess" >&2
+              return 1
+            }
+            printf '%s' "$BOUND"
+          }
+
+          create_channel() {
+            buzz channels create --name "$NAME" --type stream --visibility open \
+              --description "GitHub issue #${ISSUE_NUMBER} (${GITHUB_REPOSITORY}): ${ISSUE_TITLE}" \
+              | jq -r .channel_id
+          }
+
+          seed_card() {
+            # The marker line is the first line and is matched verbatim by
+            # channel_seed_state — keep the two in step.
+            printf '**Issue #%s — %s**\n' "$ISSUE_NUMBER" "$ISSUE_TITLE"
+            printf 'opened by %s' "$ISSUE_AUTHOR"
+            if [ -n "$ISSUE_LABELS" ]; then
+              printf ' · %s' "$ISSUE_LABELS"
+            fi
+            printf '\n%s\n' "$ISSUE_URL"
+            if [ -n "$ISSUE_BODY" ]; then
+              if [ "${#ISSUE_BODY}" -gt 1500 ]; then
+                EXCERPT=$(printf '%s' "$ISSUE_BODY" | head -c 1500 | sed '$d')
+                if [ -z "$EXCERPT" ]; then
+                  EXCERPT=$(printf '%s' "$ISSUE_BODY" | head -c 1500)
+                fi
+                printf '\n---\n%s\n\n_…description truncated — full text on GitHub._\n' "$EXCERPT"
+              else
+                printf '\n---\n%s\n' "$ISSUE_BODY"
+              fi
+            fi
+            printf '\n@%s please pick this up.\n' "$CODER_NAME"
+          }
+
+          provision_members() {
+            # Roleless add-member is the role-preserving upsert: the relay
+            # keeps an existing member's role and defaults only a genuinely
+            # NEW member to "member" (verified against the live relay). Every
+            # add is REQUIRED, and every add is then CONFIRMED against the
+            # roster, because the relay stores the membership event before
+            # applying it and swallows an application failure. The seed marker
+            # is posted only after both are confirmed, so a partial leaves the
+            # channel unseeded and a later action retries provisioning instead
+            # of sealing the gap. The partial is left in place, never deleted —
+            # a soft-delete can strand a searchable-but-unwritable discovery
+            # ghost.
+            #
+            # This runs BEFORE the seed card, and that order is the mechanism
+            # rather than tidiness: the harness subscribes to a new channel
+            # from the member-added event's timestamp, so a card posted after
+            # the add is replayed to it and a card posted before it is not.
+            local CH="$1" P
+            for P in "$OWNER_PUBKEY" "$CODER_PUBKEY"; do
+              # Stdout redirected: `create_and_seed` is captured with $(...)
+              # by the `closed` recovery path, and add-member's structured
+              # success JSON would otherwise land in that capture ahead of
+              # the channel UUID it returns.
+              if ! buzz channels add-member --channel "$CH" --pubkey "$P" >/dev/null; then
+                echo "add-member failed for $P — job fails; the rerun resumes this partial channel" >&2
+                return 1
+              fi
+            done
+            verify_members "$CH"
+          }
+
+          post_seed() {
+            # `--mention` is what p-tags Will and fires a turn; without it this
+            # is just a card in a room he can see. Re-posting on a resumed
+            # partial re-mentions him, which is the intended retry.
+            seed_card | buzz messages send --channel "$1" --content - --mention "$CODER_PUBKEY"
+          }
+
+          channel_seed_state() {
+            # Prints "seeded" or "unseeded"; returns non-zero when the
+            # lookup itself fails, so callers retry instead of mistaking a
+            # transport error for a missing marker. Only a CI-AUTHORED
+            # marker counts: the channel is open, so any authenticated user
+            # could post the predictable prefix into a partial and seal it
+            # against recovery. The seed card is posted LAST in provisioning
+            # and is therefore the OLDEST message, so a bounded newest-page
+            # probe would eventually false-negative on any long-lived channel;
+            # this walks the full history backward with --before (an inclusive
+            # cursor). Message history is the relay's primary event store,
+            # unlike the kind-39002 discovery snapshots, so the marker itself
+            # is trustworthy. Only an EMPTY page ends the walk — a count-based
+            # stop would misread a silent relay page cap as end-of-history —
+            # and a stalled full page (every message in one second) steps the
+            # cursor back one second rather than terminating.
+            local CH="$1" BEFORE="" PAGE OLDEST MATCH COUNT
+            while :; do
+              if [ -z "$BEFORE" ]; then
+                PAGE=$(buzz messages get --channel "$CH" --limit 100) || return 1
+              else
+                PAGE=$(buzz messages get --channel "$CH" --limit 100 --before "$BEFORE") || return 1
+              fi
+              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
+              if [ "$COUNT" -eq 0 ]; then
+                echo unseeded; return 0   # walked past the start of history
+              fi
+              MATCH=0
+              printf '%s' "$PAGE" | jq -e --arg p "**Issue #${ISSUE_NUMBER} —" --arg ci "$CI_PUB" \
+                '[(.messages? // .)[]? | select(.pubkey == $ci and (.content | startswith($p)))] | length > 0' \
+                >/dev/null || MATCH=$?
+              case "$MATCH" in
+                0) echo seeded; return 0 ;;
+                1) ;;             # valid page without the marker — keep paging
+                *) return 1 ;;    # page unparseable — lookup failure, not absence
+              esac
+              OLDEST=$(printf '%s' "$PAGE" \
+                | jq -r '[(.messages? // .)[]?.created_at] | min') || return 1
+              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
+                # Full page of one timestamp: step past it. A marker hidden
+                # beyond the page size inside a single second is unreachable,
+                # which would take >100 channel events in that second.
+                BEFORE=$((OLDEST - 1))
+              else
+                BEFORE="$OLDEST"
+              fi
+            done
+          }
+
+          ensure_provisioned() {
+            # Runs on EVERY action that finds an existing channel, not just
+            # opened reruns: a failed or interrupted opened run's partial can
+            # meet its next workflow event at closed or reopened, and skipping
+            # recovery there would launder an owner-less, never-mentioned
+            # channel into green forever.
+            local CH="$1" STATE
+            if ! STATE=$(channel_seed_state "$CH"); then
+              echo "seed-marker lookup failed — failing so the rerun re-probes instead of guessing" >&2
+              return 1
+            fi
+            if [ "$STATE" = seeded ]; then
+              echo "channel $NAME fully provisioned"
+              return 0
+            fi
+            echo "channel $NAME exists but is unseeded — resuming provisioning"
+            provision_members "$CH" || return 1
+            post_seed "$CH"
+          }
+
+          create_and_seed() {
+            local CH
+            CH=$(create_channel)
+            printf '%s' "$CH" \
+              | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || {
+              echo "channel create returned no UUID (got: '${CH}') — failing so the rerun re-probes" >&2
+              return 1
+            }
+            # Prove the room exists and is ours BEFORE recording it: a binding
+            # written from an unverified create would point later runs at a
+            # room that may not be there, and they would fail on it forever.
+            # Widening the create→bind window costs nothing now, because a lost
+            # binding is recovered by the membership scan — which finds any
+            # room CI owns — rather than by the note's absence.
+            assert_ci_owner "$CH" || return 1
+            write_binding "$CH" || return 1
+            provision_members "$CH" || return 1
+            post_seed "$CH" >/dev/null || return 1
+            # Printed last and only on full success, so a command-substitution
+            # caller (the `closed` recovery path, which needs the UUID back to
+            # archive what it just created) captures exactly the channel id
+            # and nothing else off stdout.
+            printf '%s' "$CH"
+          }
+
+          channel_is_archived() {
+            # Probes the same pre-storage archived-room fence `archive_channel`
+            # uses to prove ITS OWN write applied, rather than trusting any
+            # local state. 0 = proven archived (the relay rejected this
+            # no-op write), 1 = proven active (the relay accepted it),
+            # 2 = unknowable. The `closed` retry path needs this BEFORE
+            # posting the close message: on an already-archived room that
+            # send would hit the identical fence and be rejected, and this
+            # script runs under the Actions default `bash -eo pipefail`, so
+            # the step would abort right there and never reach
+            # `archive_channel` to record the convergence it already reached.
+            local CH="$1" ERR=""
+            buzz channels update --channel "$CH" --no-ttl >/dev/null 2>"$ERRFILE" || ERR=$(cat "$ERRFILE")
+            case "$ERR" in
+              *"channel is archived"*) return 0 ;;
+              "") return 1 ;;
+              *) echo "archive-state probe failed: $ERR" >&2; return 2 ;;
+            esac
+          }
+
+          archive_channel() {
+            # `buzz channels archive` exits 0 once the relay STORES the
+            # kind-9002 event; the archive itself runs afterwards as a side
+            # effect whose failure is logged and swallowed, so a clean exit
+            # does not mean `archived_at` was set. The fence is the relay's own
+            # PRE-storage gate: an archived channel rejects every
+            # channel-scoped write except unarchive, and that rejection is
+            # decided before any side effect runs, so unlike the archive
+            # command it cannot false-succeed. The probe is `--no-ttl`: these
+            # rooms never carry a TTL, so on a live channel it changes nothing,
+            # and the only thing read from it is whether the relay refused.
+            local CH="$1" ATTEMPT ARCHIVE_ERR PROBE_ERR
+            for ATTEMPT in 1 2 3; do
+              if ! buzz channels archive --channel "$CH" >/dev/null 2>"$ERRFILE"; then
+                # No TTL fallback here, unlike velvet's issue workflow. Archive
+                # works on this relay, and the fallback's only effect was to
+                # report success from a write whose application nothing can
+                # observe. A red job is the honest outcome, and rerunning
+                # retries.
+                ARCHIVE_ERR=$(cat "$ERRFILE")
+                echo "archive rejected: $ARCHIVE_ERR" >&2
+                return 1
+              fi
+              PROBE_ERR=""
+              buzz channels update --channel "$CH" --no-ttl >/dev/null 2>"$ERRFILE" \
+                || PROBE_ERR=$(cat "$ERRFILE")
+              case "$PROBE_ERR" in
+                *"channel is archived"*)
+                  echo "channel archived — proved by the relay refusing a write to it"
+                  return 0 ;;
+                "")
+                  echo "attempt ${ATTEMPT}: archive accepted but not applied — retrying" ;;
+                *)
+                  echo "archive fence probe failed: $PROBE_ERR" >&2
+                  return 1 ;;
+              esac
+            done
+            # Out of attempts: the room is still live and we cannot prove
+            # otherwise. Set a short idle TTL so the relay's reaper closes it
+            # anyway — but this is a mitigation on a path that ALREADY fails,
+            # never evidence, precisely because a swallowed TTL is invisible.
+            buzz channels update --channel "$CH" --ttl 60 >/dev/null 2>&1 \
+              || echo "idle-TTL mitigation also rejected" >&2
+            echo "archive never took effect after 3 attempts — room may still be live" >&2
+            return 1
+          }
+
+          case "$ISSUE_ACTION" in
+            opened)
+              CH=$(resolve_channel) || exit 1
+              if [ -n "$CH" ]; then
+                ensure_provisioned "$CH" || exit 1
+                exit 0
+              fi
+              create_and_seed || exit 1
+              ;;
+            closed)
+              CH=$(resolve_channel) || exit 1
+              if [ -z "$CH" ]; then
+                # Unlike the PR mirror, there IS a pre-workflow backlog here:
+                # every issue already open when this workflow was merged
+                # (including the motivating #51) reaches `closed` having
+                # never seen `opened`, and an `opened` run can also fail
+                # before `create_channel` runs. Because no later event is
+                # guaranteed, a no-op here would permanently drop that
+                # issue's Buzz record and Will notification — so create and
+                # seed the room now and fall through to close it.
+                echo "no #${NAME} channel — creating one so this closed issue still gets a Buzz record and Will notification"
+                CH=$(create_and_seed) || exit 1
+              fi
+              # Recognize an already-archived room BEFORE writing anything:
+              # a retried `closed` event (runner cancelled, or its response
+              # lost, after a prior run's archive already applied) must
+              # converge here rather than repeat a message send the relay's
+              # archived-room fence will reject.
+              #
+              # This runs under Actions' default `bash -eo pipefail`, and
+              # `channel_is_archived` returns 1 for the ordinary active-channel
+              # case — a bare call would trip `errexit` on every normal close
+              # before the case below ever ran. `||` on the call suppresses
+              # that: the compound command's own status is 0 whichever branch
+              # runs, since either the call succeeded or the assignment did.
+              ARCHIVE_STATE=0
+              channel_is_archived "$CH" || ARCHIVE_STATE=$?
+              case "$ARCHIVE_STATE" in
+                0) echo "channel $NAME already archived — closed event already converged"
+                   exit 0 ;;
+                2) exit 1 ;;
+              esac
+              # Even the close path recovers a partial first, so an owner-less
+              # channel is never archived into invisibility.
+              ensure_provisioned "$CH" || exit 1
+              if [ "$ISSUE_STATE_REASON" = "not_planned" ]; then
+                STATUS="🚫 **Closed as not planned**"
+              else
+                STATUS="✅ **Closed**"
+              fi
+              printf '%s — archiving this channel.\n%s\n' "$STATUS" "$ISSUE_URL" \
+                | buzz messages send --channel "$CH" --content - || exit 1
+              archive_channel "$CH" || exit 1
+              ;;
+            reopened)
+              CH=$(resolve_channel) || exit 1
+              if [ -z "$CH" ]; then
+                create_and_seed || exit 1
+                exit 0
+              fi
+              # Restoration is driven by write outcomes, not the discovery
+              # snapshot (the reaper commits archived_at before its discovery
+              # emission, so snapshots can be stale). Unarchive is best-effort
+              # — rejected harmlessly when the channel is already active. The
+              # reopen notice is the fence, and it is sent FIRST: the relay
+              # refuses every channel-scoped write on an archived room BEFORE
+              # storing it, so this send succeeding proves the room is live no
+              # matter what any snapshot said, and it fails loudly here rather
+              # than as a confusing add-member error further down.
+              buzz channels unarchive --channel "$CH" \
+                || echo "unarchive rejected (channel likely already active) — proceeding"
+              printf '♻️ **Reopened** — issue #%s reopened on GitHub, channel unarchived.\n%s\n' \
+                "$ISSUE_NUMBER" "$ISSUE_URL" | buzz messages send --channel "$CH" --content -
+              # Recovery runs after the fence: a create-then-interrupt partial
+              # can reach reopened without ever having been provisioned, and
+              # writes are only accepted on an active channel.
+              ensure_provisioned "$CH" || exit 1
+              ;;
+          esac

@@ -39,6 +39,26 @@ const CLAUDE_SETTINGS_PATH: &str = "/home/sprite/.claude/settings.json";
 /// narrower than its work half-blocks it in ways that read as bugs.
 const PREAPPROVED_TOOLS: [&str; 7] = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"];
 
+/// Attempts an observation step gets before its failure is treated as real
+/// — see [`observe_step`].
+///
+/// Three, because the failure this exists for is contention, not breakage.
+/// A wake deploy reads the sprite's state while the box may be saturated by
+/// a *concurrent* deploy's adapter install, and a single budget loses that
+/// race outright: an observed wake failed on
+/// `provision step "read provision intent" failed: exec did not finish
+/// within 30s` while an `npm install` held the shared CPU, and the mention
+/// that asked for the wake was dropped with it. Two attempts only halve
+/// that; three plus the backoff below outlives an adapter install's spike
+/// while still fitting several times over inside the deploy deadline.
+const OBSERVE_ATTEMPTS: u32 = 3;
+
+/// Backoff before an observation step's next attempt, multiplied by the
+/// attempt just spent (2s, then 4s). Load is what this waits out, so it
+/// climbs; but the whole ladder stays small against the step budgets it
+/// sits between, because a wake is a user waiting for an answer.
+const OBSERVE_BACKOFF: Duration = Duration::from_secs(2);
+
 /// The sprite-wide deploy lease. Two deploys of the same agent that both
 /// find an existing, stopped sprite share every provisioning path — the
 /// tarball, the adapter tree, the `*.tmp` staging names, the intent record —
@@ -216,14 +236,13 @@ async fn fetch_published_digest(
     arch: &str,
 ) -> Result<String, String> {
     let url = format!("{}.sha256", sprig_url(version, arch));
-    let result = run_step(
+    let result = observe_step(
         substrate,
         sprite,
         "read the published digest",
         &sh(&format!(
             "curl -fsSL --retry 2 {url:?} | awk '{{print $1}}'"
         )),
-        None,
         Duration::from_secs(60),
     )
     .await?;
@@ -299,12 +318,11 @@ pub async fn resolve(
     sprite: &str,
     cfg: &ProviderConfig,
 ) -> Result<Resolved, String> {
-    let uname = run_step(
+    let uname = observe_step(
         substrate,
         sprite,
         "detect architecture",
         &["uname".into(), "-m".into()],
-        None,
         Duration::from_secs(30),
     )
     .await?;
@@ -338,12 +356,11 @@ pub async fn recorded_fingerprint(
     substrate: &impl Substrate,
     sprite: &str,
 ) -> Result<Option<Fingerprint>, String> {
-    let result = run_step(
+    let result = observe_step(
         substrate,
         sprite,
         "read provision intent",
         &sh(&format!("cat {INTENT_PATH} 2>/dev/null || true")),
-        None,
         Duration::from_secs(30),
     )
     .await?;
@@ -355,14 +372,13 @@ pub async fn recorded_fingerprint(
 /// sprig binary still hashes to what install-time recorded (evidence over
 /// recollection). A failure means the fast path lies — do a full provision.
 pub async fn spot_check(substrate: &impl Substrate, sprite: &str) -> Result<bool, String> {
-    let result = run_step(
+    let result = observe_step(
         substrate,
         sprite,
         "spot-check sprig",
         &sh(&format!(
             "cd {BUZZ_DIR}/bin && sha256sum -c --quiet {BUZZ_DIR}/sprig.sha256"
         )),
-        None,
         Duration::from_secs(60),
     )
     .await;
@@ -706,6 +722,52 @@ async fn run_step(
         .run(sprite, argv, stdin, timeout)
         .await
         .map_err(|SubstrateError(e)| format!("provision step {step:?} failed: {e}"))
+}
+
+/// [`run_step`] for a step that only READS sprite state, retrying a
+/// substrate failure instead of failing the whole deploy on it.
+///
+/// Retries cover exactly the [`SubstrateError`] class — the exec timed out
+/// or its stream died, i.e. the substrate never delivered an answer. A
+/// command that ran and exited non-zero comes back `Ok` here and stays the
+/// caller's business, so this can never retry past, or paper over, a real
+/// failure on the sprite.
+///
+/// Read-only steps ONLY. A mutation must not be replayed blindly: a timeout
+/// there can equally mean "the sprite did it and the answer was lost", and
+/// the second attempt would then be writing over a completed one.
+///
+/// A retry is not attempted when the deploy deadline cannot fit another
+/// full budget — past that point the loop returns `startup_not_confirmed`
+/// anyway, so waiting would only delay the same answer.
+async fn observe_step(
+    substrate: &impl Substrate,
+    sprite: &str,
+    step: &str,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<crate::substrate::ExecResult, String> {
+    let mut attempt: u32 = 1;
+    loop {
+        let error = match substrate.run(sprite, argv, None, timeout).await {
+            Ok(result) => return Ok(result),
+            Err(SubstrateError(e)) => e,
+        };
+        let spent = attempt;
+        attempt += 1;
+        let out_of_attempts = spent >= OBSERVE_ATTEMPTS;
+        let out_of_budget = substrate.elapsed() + timeout >= crate::reconcile::DEADLINE;
+        if out_of_attempts || out_of_budget {
+            // The attempt count is in the message on purpose: "failed after
+            // 3 attempts" and "failed" name different problems to whoever
+            // reads it, and only the first says the substrate was given
+            // every chance.
+            return Err(format!(
+                "provision step {step:?} failed after {spent} attempt(s): {error}"
+            ));
+        }
+        substrate.sleep(OBSERVE_BACKOFF * spent).await;
+    }
 }
 
 fn expect_ok(result: crate::substrate::ExecResult) -> Result<(), String> {

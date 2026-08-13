@@ -325,20 +325,31 @@ pub(super) fn sign_and_retain_credential_at(
     )?;
 
     // Once the envelope above is retained, the credential (issuance or
-    // revocation) is durably queued for publish — that is the effect that
-    // matters, and it can no longer be un-queued. `record_committed` is only
-    // bookkeeping for `credential_versions_for` (see `IssuanceLedger::committed`):
-    // if this write fails, the roster merely omits or understates this agent
-    // until a later successful call for it updates the ledger, which is the
-    // same safe-direction gap `IssuanceLedger::reserve` already documents for
-    // a burned reservation. Propagating this failure as an `Err` here would
-    // let a caller like `revoke_waker_enrolment_pending` report the disable
-    // as aborted — "waker remains enabled" — while the already-retained
-    // revocation still publishes and tears the agent down regardless.
-    if let Err(e) = ledger.record_committed(agent_pubkey, committed_version) {
-        eprintln!("buzz-desktop: waker-enrolment-credential-commit: {e}");
+    // revocation) is durably queued for publish and can no longer be
+    // un-queued. Whether a `record_committed` failure past that point may
+    // still fail this call depends on which operation this is:
+    //
+    // - A revocation's irreversible effect is the thing that matters; a
+    //   caller like `revoke_waker_enrolment_pending` must persist the disable
+    //   once the revocation is queued, not report "waker remains enabled"
+    //   while it tears the agent down regardless. So this failure is logged
+    //   and swallowed — the roster omitting this agent is moot, since a
+    //   disabled agent is excluded from it anyway.
+    // - A live issuance needs both the queued credential *and* a roster
+    //   entry naming its committed version, or the daemon has nothing to
+    //   discover it by. Swallowing this failure here would let the caller
+    //   report Remote wake as enabled while `credential_versions_for` (see
+    //   `IssuanceLedger::committed`) keeps reading version 0 and the agent
+    //   stays silently unwatched. So this failure must propagate, the same
+    //   way a burned-but-uncommitted reservation already does.
+    match ledger.record_committed(agent_pubkey, committed_version) {
+        Ok(()) => Ok(()),
+        Err(e) if revoked => {
+            eprintln!("buzz-desktop: waker-enrolment-credential-commit: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
 /// Encrypt `plaintext` to the waker, wrap it in the shared envelope kind, and

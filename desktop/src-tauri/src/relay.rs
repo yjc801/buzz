@@ -11,6 +11,14 @@ use crate::app_state::AppState;
 
 const DEFAULT_RELAY_WS_URL: &str = "ws://localhost:3000";
 
+/// Per-request timeout for relay control-plane HTTP calls (`POST /query`,
+/// `POST /events`). These carry small JSON payloads and should complete in
+/// well under a second on a healthy relay; a stuck relay or blackholed
+/// response must surface as an error rather than hang the caller forever
+/// (`http_client` has no client-level default — it's shared with huddle
+/// model downloads and media uploads that are expected to run long).
+pub(crate) const RELAY_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // A reached-but-malformed 2xx body is NOT a connectivity failure, so this
 // message must never carry the "relay unreachable:" prefix the frontend
 // classifier keys on. Extracted to a const so a test can pin that contract.
@@ -329,6 +337,7 @@ pub async fn query_relay_at(
         .header("Authorization", auth)
         .header("Content-Type", "application/json")
         .body(body_bytes)
+        .timeout(RELAY_HTTP_TIMEOUT)
         .send()
         .await
         .map_err(|e| classify_request_error(&e))?;
@@ -362,6 +371,7 @@ pub async fn query_relay_at_with_keys(
     }
     let response = request
         .body(body_bytes)
+        .timeout(RELAY_HTTP_TIMEOUT)
         .send()
         .await
         .map_err(|e| classify_request_error(&e))?;
@@ -465,6 +475,7 @@ pub async fn sync_managed_agent_profile(
     }
     let response = request
         .body(body_bytes)
+        .timeout(RELAY_HTTP_TIMEOUT)
         .send()
         .await
         .map_err(|e| classify_request_error(&e))?;
@@ -581,6 +592,7 @@ pub async fn submit_signed_event_with_keys(
 
     let response = request
         .body(body_bytes)
+        .timeout(RELAY_HTTP_TIMEOUT)
         .send()
         .await
         .map_err(|e| classify_request_error(&e))?;

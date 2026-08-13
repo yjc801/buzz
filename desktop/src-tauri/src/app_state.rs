@@ -175,6 +175,12 @@ pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(1)
         .redirect(reqwest::redirect::Policy::none())
+        // Defense-in-depth default — the sole current caller (media_download.rs)
+        // already sets its own longer per-request `.timeout()`, which overrides
+        // this. This guards any future caller that forgets to: without it, a
+        // relay that accepts the connection but never responds hangs the
+        // request forever (no default timeout in reqwest).
+        .timeout(std::time::Duration::from_secs(120))
         .build()
 }
 

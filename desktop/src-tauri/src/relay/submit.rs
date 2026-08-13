@@ -34,6 +34,7 @@ pub async fn submit_signed_event_at_with_keys(
         .header("Authorization", auth_header)
         .header("Content-Type", "application/json")
         .body(body_bytes)
+        .timeout(RELAY_HTTP_TIMEOUT)
         .send()
         .await
         .map_err(|e| classify_request_error(&e))?;

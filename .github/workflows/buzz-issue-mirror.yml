@@ -3,7 +3,13 @@ name: buzz-issue-mirror
 # Gives every ISSUE on this fork its own Buzz channel (#buzz-issue-N):
 #   opened   → create the channel, seed it with the issue card, add Will and
 #              MENTION him so the harness fires a turn on it
-#   closed   → post a close notice, then archive
+#   closed   → post a close notice, then archive. If no channel exists yet
+#              (a backlog issue that predates this workflow, or an `opened`
+#              run that failed before `create_channel`), create and seed one
+#              first so the Buzz record and Will notification are never
+#              permanently dropped. If the channel is already archived (a
+#              retry of a `closed` event whose success was never recorded),
+#              converge without re-posting or re-archiving.
 #   reopened → unarchive, and re-provision anything a partial run left behind
 #
 # Sibling of buzz-pr-mirror.yml and deliberately built on ITS primitives, not
@@ -521,7 +527,32 @@ jobs:
             assert_ci_owner "$CH" || return 1
             write_binding "$CH" || return 1
             provision_members "$CH" || return 1
-            post_seed "$CH"
+            post_seed "$CH" >/dev/null || return 1
+            # Printed last and only on full success, so a command-substitution
+            # caller (the `closed` recovery path, which needs the UUID back to
+            # archive what it just created) captures exactly the channel id
+            # and nothing else off stdout.
+            printf '%s' "$CH"
+          }
+
+          channel_is_archived() {
+            # Probes the same pre-storage archived-room fence `archive_channel`
+            # uses to prove ITS OWN write applied, rather than trusting any
+            # local state. 0 = proven archived (the relay rejected this
+            # no-op write), 1 = proven active (the relay accepted it),
+            # 2 = unknowable. The `closed` retry path needs this BEFORE
+            # posting the close message: on an already-archived room that
+            # send would hit the identical fence and be rejected, and this
+            # script runs under the Actions default `bash -eo pipefail`, so
+            # the step would abort right there and never reach
+            # `archive_channel` to record the convergence it already reached.
+            local CH="$1" ERR=""
+            buzz channels update --channel "$CH" --no-ttl >/dev/null 2>"$ERRFILE" || ERR=$(cat "$ERRFILE")
+            case "$ERR" in
+              *"channel is archived"*) return 0 ;;
+              "") return 1 ;;
+              *) echo "archive-state probe failed: $ERR" >&2; return 2 ;;
+            esac
           }
 
           archive_channel() {
@@ -583,13 +614,28 @@ jobs:
             closed)
               CH=$(resolve_channel) || exit 1
               if [ -z "$CH" ]; then
-                # No fallback channel here, unlike the PR mirror: every issue
-                # this workflow will ever see gets a room at `opened`, and
-                # there is no pre-workflow backlog to catch, so a close notice
-                # with nowhere to go is a no-op rather than a lost message.
-                echo "no #${NAME} channel — nothing to archive"
-                exit 0
+                # Unlike the PR mirror, there IS a pre-workflow backlog here:
+                # every issue already open when this workflow was merged
+                # (including the motivating #51) reaches `closed` having
+                # never seen `opened`, and an `opened` run can also fail
+                # before `create_channel` runs. Because no later event is
+                # guaranteed, a no-op here would permanently drop that
+                # issue's Buzz record and Will notification — so create and
+                # seed the room now and fall through to close it.
+                echo "no #${NAME} channel — creating one so this closed issue still gets a Buzz record and Will notification"
+                CH=$(create_and_seed) || exit 1
               fi
+              # Recognize an already-archived room BEFORE writing anything:
+              # a retried `closed` event (runner cancelled, or its response
+              # lost, after a prior run's archive already applied) must
+              # converge here rather than repeat a message send the relay's
+              # archived-room fence will reject.
+              channel_is_archived "$CH"
+              case "$?" in
+                0) echo "channel $NAME already archived — closed event already converged"
+                   exit 0 ;;
+                2) exit 1 ;;
+              esac
               # Even the close path recovers a partial first, so an owner-less
               # channel is never archived into invisibility.
               ensure_provisioned "$CH" || exit 1
@@ -599,7 +645,7 @@ jobs:
                 STATUS="✅ **Closed**"
               fi
               printf '%s — archiving this channel.\n%s\n' "$STATUS" "$ISSUE_URL" \
-                | buzz messages send --channel "$CH" --content -
+                | buzz messages send --channel "$CH" --content - || exit 1
               archive_channel "$CH" || exit 1
               ;;
             reopened)

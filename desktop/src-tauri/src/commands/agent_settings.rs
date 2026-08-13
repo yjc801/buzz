@@ -267,6 +267,12 @@ pub async fn set_managed_agent_backend(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        // Same reissue as every other settings mutator (see
+        // `set_managed_agent_start_on_app_launch`). A no-op when `leaving_provider_waker`
+        // already revoked above, since `record.waker_enabled` now reads false; otherwise
+        // this is the path that picks up the new `provider_binary_path` a same-provider
+        // config change or a re-migration onto `Provider` just wrote.
+        super::agents::retain_managed_agent_pending(&app, &state, record);
         build_managed_agent_summary(&app, record, &runtimes, &personas, &global)
     })
     .await
@@ -341,6 +347,10 @@ pub async fn set_managed_agent_community(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        // See the matching reissue call in `set_managed_agent_start_on_app_launch` above:
+        // this is a user-facing settings mutator, so the "change any setting to reissue"
+        // copy in `wakerBundleHealth.ts` must hold here too.
+        super::agents::retain_managed_agent_pending(&app, &state, record);
         let personas = load_personas(&app).unwrap_or_default();
         build_managed_agent_summary(
             &app,

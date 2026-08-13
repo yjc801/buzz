@@ -2,15 +2,24 @@
 
 ## The goal
 
-Someone downloads Waggle, toggles Remote wake, and it works — because the
-service operator runs one waker for everyone, the way they run one relay for
+Someone downloads Waggle, toggles Remote wake, and it works — because a
+service provider runs one waker for everyone, the way they run one relay for
 everyone.
 
-That needs two things, and neither is sufficient alone. **Enrolment** removes
-the terminal from onboarding. **Per-owner provider credentials** let one daemon
-serve more than one owner. Enrolment alone gives an operator easier onboarding
-for their own agents; per-owner credentials alone give a multi-tenant daemon
-nobody can join without a terminal.
+**There are two roles, and keeping them straight decides most of this
+document.** A *service provider* stands the daemon up and configures it: the
+identity secret, the relay, the provider token it deploys with. *Users* toggle
+Remote wake and configure nothing.
+
+A third word appears throughout and is neither of those: **owner**. In this
+codebase "owner" is the key that signs an agent's events — a user's own desktop
+key. `WAKER_OWNER_PUBKEYS` holds *users'* pubkeys, not the service provider's.
+Reading "owner" as "the person running the service" is what made an earlier
+draft of this document specify per-owner provider credentials, a field no user
+could ever fill.
+
+**Enrolment** is the mechanism: it removes the terminal from onboarding, so
+adding an agent is a toggle rather than a secret assembled by hand.
 
 ## The problem
 
@@ -31,12 +40,6 @@ of a human assembling this by hand:
 
 None of these are the user's mistake in any interesting sense. They are what
 happens when secret material is assembled by hand.
-
-And a second problem sits underneath: the Sprites credential is resolved from
-the daemon's own environment (`credentials.rs`: `SPRITE_TOKEN` →
-`SPRITES_TOKEN` → keychain), so one daemon can only ever deploy into one
-account. A shared waker would run every owner's agents on a single bill with no
-isolation between them.
 
 ## The constraint that shapes everything
 
@@ -113,78 +116,58 @@ must select the newest **version**, via the same monotonic floor logic
 "highest `created_at` that happens to be non-revoked," which would resurrect
 an agent whose latest event was actually a revocation.
 
-### Per-owner provider credentials
+### Provider credentials stay with the service provider
 
-Enrolment carries the owner's provider credentials alongside the agent's key,
-which is what lets one daemon deploy on behalf of several owners.
+An earlier version of this section specified **per-owner provider
+credentials**: each enrolment would carry that owner's own Sprites token, so
+one daemon could deploy on several owners' accounts. Under the two-role model
+above, that field can never be filled. A user of a hosted waker has no Sprites
+token to send — `sprite login` is not part of using the service — so building a
+keychain path on the desktop to feed it would have been work in service of a
+value that does not exist.
 
-The mechanism is smaller than it sounds. `provider_deploy` already spawns the
-provider as a child process (`Command::new(binary)` with piped stdin); it
-inherits the daemon's environment today, and that inheritance is the *only*
-reason the credential is global. `Command::env()` per spawn is the whole
-change. An agent whose enrolment carries no credentials fails with a clear
-reason rather than silently falling back to the daemon's own — a fallback would
-mean one owner's deploy quietly billing another's account.
+The enrolment credential therefore carries the agent's `nsec` and `auth_tag`
+and nothing else: exactly what the daemon needs to open a connection *as* that
+agent, which is the one thing no amount of relay-side discovery avoids. The
+provider token stays in the daemon's own environment, where it already is.
 
-Enrolment can carry secrets because it is encrypted.
-`validate_provider_config` forbids secret-like keys, but that governs
-`provider_config` — the *signed* envelope inside the bundle, where the property
-is integrity, not secrecy. Enrolment is a different vehicle with different
-properties, and conflating the two is what makes "just put the token in the
-bundle" look reasonable when it is not.
+That is the safer wire, not merely the smaller one:
 
-`org` already travels per-agent in the signed `provider_config`, so agents
-already target the right Sprites organization. Only the credential was missing.
+- **No provider token ever transits the relay.** The only secrets that do are
+  agent keys, which the daemon genuinely cannot work without.
+- **No user can influence which token the daemon spends**, because none is
+  delivered. An enrolment cannot carry a credential, so it cannot carry a
+  malicious one.
+- **Nothing needs a sanitized environment map.** The earlier design had to
+  reason carefully about `LD_PRELOAD`, `PATH`, and a fixed daemon-controlled
+  baseline, because tenant-supplied data was going to reach `Command::env()`.
+  With no tenant credential that surface is gone rather than guarded — the
+  strongest argument for dropping it.
 
-**Not** as an arbitrary environment map. `Command::env()` doesn't distinguish
-a credential from any other process-control variable — an unconstrained
-`{key: value}` map lets a tenant set `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`,
-or a provider's own proxy/TLS/debug flags in a subprocess the daemon spawns
-and trusts on behalf of every tenant, which is exactly the isolation boundary
-multi-tenancy is supposed to hold. Provider-agnosticism doesn't make
-arbitrary environment mutation safe; it just means the hole is
-provider-agnostic too.
+`org` still travels per agent inside the signed `provider_config`, which is
+where per-agent provider targeting already belonged. What a token can reach is
+a property of the token, so a service provider whose users need different
+Sprites organizations runs one daemon per organization. That is a deployment
+question, not a protocol one.
 
-Carry it as a **typed, per-provider credential schema** instead. Each
-provider defines the narrow set of variables it actually needs — Sprites
-needs exactly one, `SPRITE_TOKEN` (`credentials.rs`'s primary lookup;
-enrolment is a new path with no existing callers, so it has no reason to
-also accept the `SPRITES_TOKEN` compatibility alias that exists for
-back-compat elsewhere) — and the enrolment payload carries that shape, not a
-map with unbounded keys.
-
-The spawned environment is **two separate inputs, not one sanitized map**:
-a small, fixed, **daemon-controlled runtime baseline**, plus the narrow
-tenant credential schema layered on top — and the tenant input can never
-override a baseline key. A schema-only environment isn't actually safe to
-spawn from: `buzz-backend-sprites`'s own `credentials::resolve` reads `HOME`
-and errors *before it ever checks `SPRITE_TOKEN`*
-(`crates/buzz-backend-sprites/src/credentials.rs:46-47`), so a child process
-missing `HOME` fails every Sprites deploy regardless of how correct the
-tenant's token is. The baseline starts at `HOME` for Sprites specifically,
-proven against whatever each provider's own resolution path actually reads
-— not guessed per-provider, checked against that provider's code the same
-way this one was. Tenant data populates only the schema-defined credential
-keys on top of that fixed baseline; it is still secret — never logged,
-never in an error string, zeroized after use as the bundle plaintext
-already is.
+**This makes open mode more dangerous, not less** — see Security properties.
+With per-owner credentials, a stranger who got in spent their own money. With
+one shared token they spend the service provider's. The reasoning that made
+open admission look tolerable does not survive this change.
 
 Net secrets, compared to today:
 
 | | today | with enrolment |
 |---|---|---|
-| Durable secrets | N agent nsecs + 1 provider token | 1 waker identity |
+| Durable secrets | N agent nsecs + 1 provider token | 1 waker identity + 1 provider token |
 | Add an agent | edit JSON, `fly secrets set`, redeploy | toggle |
 | Remove an agent | same manual edit | revoke, like a bundle |
-| Who one waker serves | one owner | one, or everyone |
+| Who configures anything | every agent's owner | the service provider, once |
 | Deployment coupling | Fly-specific step | none |
 
-Strictly fewer secrets, and the one that remains belongs to the daemon rather
-than to the agents. `WAKER_OWNER_PUBKEYS` doesn't change that count: it's
-public keys, not secret material, entered once per operator rather than once
-per agent — it doesn't grow as agents are added or removed. Provider tokens
-move from the daemon's environment into per-owner enrolments, so the daemon
-holds none of its own.
+Two secrets instead of N+1, and neither of the survivors belongs to an agent.
+`WAKER_OWNER_PUBKEYS` doesn't change the count: public keys, not secret
+material.
 
 ## Bootstrap: a deploy-time secret, not pairing
 
@@ -209,16 +192,17 @@ key, and get their agent into the daemon's watch and deploy path.
 
 ### Two admission modes
 
-`WAKER_OWNER_PUBKEYS` — the operator pubkey(s) this instance will accept
-enrolments from — answers that, and is the right default for a daemon serving
-one operator. An enrolment signed by anyone outside the set is rejected before
-decryption is attempted, mirroring how a bundle from an unpinned
+`WAKER_OWNER_PUBKEYS` — the **owner** pubkeys this instance accepts enrolments
+from — answers that. Note whose keys those are: users' signing keys, not the
+service provider's. An enrolment signed by anyone outside the set is rejected
+before decryption is attempted, mirroring how a bundle from an unpinned
 `owner_pubkey` is refused today.
 
-But an allowlist is per-owner configuration, so a waker meant to serve
-*everyone* cannot use one long-term: the operator would have to add each new
-user by hand, which is the terminal step this document exists to remove,
-relocated rather than eliminated. Open mode is the eventual answer to that —
+But an allowlist is per-user configuration, so a waker meant to serve
+*everyone* cannot use one long-term: the service provider would have to add
+each new user by hand. That is the terminal step this document exists to
+remove, relocated from once-per-agent to once-per-user rather than
+eliminated. Open mode is the eventual answer to that —
 but it is **not implemented by this document** (owner discovery has no
 mechanism yet; see below and Open questions), so today the variable has
 exactly one safe contract:
@@ -255,7 +239,7 @@ and enrol past a per-owner cap under each of them. The cap bounds an identity
 that costs nothing to mint, which is the same as not bounding it.
 
 What actually bounds open mode's resource use, without a relay change: a
-**total daemon capacity** (`WAKER_MAX_AGENTS`, operator-configured), refused
+**total daemon capacity** (`WAKER_MAX_AGENTS`, set by the service provider), refused
 against directly rather than through an owner-identity proxy. The count this
 compares against must be **durable and recomputed from the daemon's actual
 supervised-agent set on every restart** — derived from the roster refetch,
@@ -284,44 +268,73 @@ fully specified as written.
 
 This splits the work along the right line:
 
-- **deploy time, technical operator**: set the identity secret, publish the
-  waker pubkey, and set `WAKER_OWNER_PUBKEYS` to enable closed-mode
-  enrolment (leaving it unset keeps enrolment disabled, today's only other
-  option)
-- **runtime, any user**: toggle agents freely, forever, once their owner is
-  in the allowlist
+- **deploy time, service provider**: set the identity secret, publish the
+  waker pubkey, and set `WAKER_OWNER_PUBKEYS` to enable closed-mode enrolment
+  (leaving it unset keeps enrolment disabled, today's only other option)
+- **runtime, any user**: toggle agents freely, forever, once their key is in
+  the allowlist
 
-The non-technical user never touches configuration. For a hosted waker the
-identity pubkey ships as a client default, so they configure nothing at all.
+A user never edits a config file, never installs the Fly CLI, and never
+handles a key. For a hosted waker the identity pubkey ships as a client
+default, so there is nothing in the app for them to fill in either.
+
+**But closed mode does not reach the goal at the top of this document, and it
+should not be described as if it does.** "Downloads Waggle, toggles Remote
+wake, and it works" requires that nobody act on that user's behalf first.
+Closed mode requires exactly that: the service provider adds their key and
+redeploys. The user configures nothing, but they must *ask*, and someone must
+answer. That is a smaller burden than the per-agent one this document
+removes — once per user, not once per agent, and it never grows as they add
+agents — and it is honestly the right thing to ship first. It is not the
+stated goal.
+
+Closing that last gap needs owner discovery to work without an allowlist,
+which is the unresolved mechanism in Open questions — not a policy flag. The
+choice it eventually presents is a product decision rather than a technical
+one: a service provider who admits everyone accepts that a stranger's agents
+run on their bill, because after the change above there is no per-user token
+to bill instead.
 
 ## Security properties under multi-tenancy
 
 Stated rather than implied. A consequence nobody wrote down is how the previous
 round of waker failures stayed invisible for a day.
 
-**Blast radius grows with tenancy.** One process holds many owners' agent keys
-and provider tokens. Defensible for a hosted service — a relay already holds
-everyone's data — but it is a real change from a single-tenant daemon, and it
-should be accepted deliberately rather than discovered. It also raises the
-value of keeping those secrets off the durable volume, which the tmpfs rule
-above already does.
+**Blast radius grows with tenancy.** One process holds many users' agent keys.
+Defensible for a hosted service — a relay already holds everyone's data — but
+it is a real change from a single-tenant daemon and should be accepted
+deliberately rather than discovered. It also raises the value of keeping those
+keys off the durable volume, which the tmpfs rule above already does.
+
+The provider token is *not* part of that growth, and this is the one place
+where dropping per-owner credentials makes the picture better rather than
+worse: there is one token, it never leaves the daemon's environment, and no
+enrolment can carry one. A compromised daemon exposes one provider account
+either way, so holding N of them was strictly worse — the earlier design
+increased this blast radius in exchange for cost attribution.
 
 **What a stranger cannot do.** Enrol an agent already pinned to a different
-owner (refused at the floor, which never rewrites). Reach another owner's
-credentials (separate records, never merged into process env). Spend the
-operator's money (their deploy uses their own token).
+owner (refused at the floor, which never rewrites). Reach another user's agent
+keys (separate records, never merged into process env). Read the provider
+token (it is never delivered to anyone, so there is nothing to intercept).
 
-**What a stranger can do today: nothing.** Closed mode is the only
-implemented admission path, and it requires the stranger's `owner_pubkey` to
-already be in `WAKER_OWNER_PUBKEYS`. **Once open mode exists**, a stranger
-whose relay membership the operator never approved would be able to consume
-connections and memory up to the *total* daemon capacity (`WAKER_MAX_AGENTS`),
-not a per-owner share of it — see Two admission modes for why a per-owner cap
-can't be enforced against a signer identity that costs nothing to mint. That
-would be bounded by relay membership for entry (the relay refuses
-non-members outright) and by that total capacity for how much of the daemon
-one member — or a hundred fake identities controlled by one member — could
-occupy.
+**What a stranger can do today: nothing.** Closed mode is the only implemented
+admission path, and it requires the stranger's `owner_pubkey` to already be in
+`WAKER_OWNER_PUBKEYS`.
+
+**Once open mode exists, a stranger spends the service provider's money.**
+This is now the sharpest argument for the fail-closed default, and it is
+sharper than it was: with per-owner credentials a stranger's deploy ran on
+their own Sprites account, so the exposure was the daemon's connections and
+memory. With one shared token there is no such separation — an admitted
+stranger's agents deploy on the service provider's account and bill. They
+would be bounded by relay membership for entry (the relay refuses non-members
+outright, where the relay requires membership at all — `MembershipDecision`
+has an `OpenRelay` arm) and by `WAKER_MAX_AGENTS` for volume, but *not* by any
+per-owner share of it: see Two admission modes for why a per-owner cap cannot
+be enforced against a signer identity that costs nothing to mint. A hundred
+fake identities controlled by one member occupy the whole ceiling, and every
+deploy they cause is paid for by the person running the waker.
 
 ## Rejected alternatives
 
@@ -400,11 +413,21 @@ should not be treated as an implemented, offerable admission option until
 this is resolved and this section is corrected to name the chosen
 mechanism**, per the same rule Refetch scope already commits to.
 
-**Credential rotation.** An owner rotating their Sprites token must reissue
-enrolments, or deploys start failing with a credential error that looks
-nothing like the cause. Cheap to do — it is the same reissue path as any
-config change — but it wants a deliberate flow rather than being discovered
-after the fact.
+The cost of getting this wrong also changed with Provider credentials stay
+with the service provider. Open mode used to mean an unapproved stranger
+consuming the daemon's connections and memory on their own Sprites bill; it
+now means them consuming the service provider's compute budget as well, since
+one shared token deploys everything. That does not change the mechanism this
+entry is waiting on, but it raises what shipping it prematurely would cost —
+and it is a product decision about who pays, not only a technical one.
+
+**Credential rotation — resolved by removal.** This previously asked how an
+owner rotating their Sprites token would reissue enrolments without deploys
+failing on an error that looks nothing like the cause. Enrolment no longer
+carries a provider token, so there is nothing to reissue: the service provider
+rotating their own token restarts the daemon with a new environment, which is
+an ordinary deployment step and touches no user. The question existed only
+because of per-owner credentials, and goes with them.
 
 **Desktop offline at first boot.** Enrolment persists on the relay, so a
 daemon that boots with the desktop closed still refetches. Worth confirming

@@ -136,11 +136,28 @@ bundle" look reasonable when it is not.
 `org` already travels per-agent in the signed `provider_config`, so agents
 already target the right Sprites organization. Only the credential was missing.
 
-Carry it as a map of environment variables (`{"SPRITE_TOKEN": "…"}`) rather
-than a typed credential: the desktop already knows what each provider wants,
-because it launches them locally with exactly that environment, and a map keeps
-the daemon provider-agnostic. It is secret — never logged, never in an error
-string, zeroized after use as the bundle plaintext already is.
+**Not** as an arbitrary environment map. `Command::env()` doesn't distinguish
+a credential from any other process-control variable — an unconstrained
+`{key: value}` map lets a tenant set `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`,
+or a provider's own proxy/TLS/debug flags in a subprocess the daemon spawns
+and trusts on behalf of every tenant, which is exactly the isolation boundary
+multi-tenancy is supposed to hold. Provider-agnosticism doesn't make
+arbitrary environment mutation safe; it just means the hole is
+provider-agnostic too.
+
+Carry it as a **typed, per-provider credential schema** instead. Each
+provider defines the narrow set of variables it actually needs — Sprites
+needs exactly one, `SPRITE_TOKEN` (`credentials.rs`'s primary lookup;
+enrolment is a new path with no existing callers, so it has no reason to
+also accept the `SPRITES_TOKEN` compatibility alias that exists for
+back-compat elsewhere) — and the enrolment payload carries that shape, not a
+map with unbounded keys. The daemon spawns the provider from an explicitly
+sanitized environment — not the daemon's own environment, and not the
+daemon's environment plus tenant overrides — containing only the
+schema-defined variables for that provider. It is still secret — never
+logged, never in an error string, zeroized after use as the bundle plaintext
+already is — the schema constrains which keys can be set; it doesn't change
+that the values are sensitive.
 
 Net secrets, compared to today:
 
@@ -195,17 +212,50 @@ rather than eliminated. So the variable is **optional**, and its presence
 selects the mode:
 
 - **set** — closed. Only those owners may enrol. Single-operator deployments.
-- **empty** — open. Any relay member may enrol, bounded by a per-owner agent
-  cap.
+- **empty** — open. Any relay member may enrol, bounded by a total daemon
+  capacity — not a per-owner one; see below for why the earlier per-owner
+  version of this section was wrong.
 
-Open mode is defensible only *because* credentials are per-owner. A stranger
-who enrols consumes the daemon's connections and memory; they cannot spend the
-operator's money or reach another owner's credentials, because their agent
-deploys on their own Sprites account with their own token. Relay membership is
-the outer gate — the relay already refuses non-members — and the per-owner cap
-bounds what one member can consume. That is a denial-of-service surface, not a
-confidentiality one, and it is the trade a hosted service accepts in exchange
-for being joinable.
+**Correction: a per-owner cap does not bound anything here.** The original
+version of this section proposed bounding open mode with a per-owner agent
+cap, reasoning that relay membership plus that cap bounds one member's
+consumption. It doesn't. Kind 1059 (NIP-59 gift wrap) is deliberately exempt
+from the relay's `event.pubkey == authenticated identity` check —
+`crates/buzz-relay/src/handlers/ingest.rs:1996-1997`, with a comment above it
+confirming this is intentional NIP-59 behavior ("gift wraps deliberately use
+an unrelated ephemeral pubkey") — and the relay does not retain which
+authenticated connection published a given stored event. One relay member can
+therefore sign enrolments under any number of freshly minted `owner_pubkey`s
+and enrol past a per-owner cap under each of them. The cap bounds an identity
+that costs nothing to mint, which is the same as not bounding it.
+
+What actually bounds open mode's resource use, without a relay change: a
+**total daemon capacity** (`WAKER_MAX_AGENTS`, operator-configured), refused
+against directly rather than through an owner-identity proxy. The count this
+compares against must be **durable and recomputed from the daemon's actual
+supervised-agent set on every restart** — derived from the roster refetch,
+never an in-memory counter that resets and could double-admit across a
+restart. On reaching the ceiling the daemon **refuses** the new enrolment
+outright; it never evicts an already-running agent to make room; a running
+enrolment stays running until its own roster entry is removed or revoked,
+regardless of what else is being admitted concurrently. This is a real
+bound — the resource it protects (daemon connections and memory) is exactly
+what it measures — but it gives up per-owner *fairness*: nothing stops one
+signer from consuming the entire capacity. That was already true before this
+correction; the difference is that this document no longer claims the
+per-owner cap prevented it.
+
+Restoring per-owner fairness needs either a relay change (the relay itself
+recording the authenticated publisher on a stored gift-wrap event, so a
+query can distinguish signers worth trusting individually) or some other
+quota identity that can't be freely re-minted client-side. Neither is
+designed here — see Open questions, Admission capacity and owner discovery.
+Fairness aside, open mode has a second, separate blocker in the same Open
+questions entry: without an owner allowlist, the daemon has no bounded way
+to *discover* which owners exist to query in the first place. That gap, not
+just the capacity bound above, is why open mode is not an implemented
+admission option yet — closed mode is unaffected by either issue and is
+fully specified as written.
 
 This splits the work along the right line:
 
@@ -233,9 +283,13 @@ owner (refused at the floor, which never rewrites). Reach another owner's
 credentials (separate records, never merged into process env). Spend the
 operator's money (their deploy uses their own token).
 
-**What a stranger can do**, in open mode: consume connections and memory, up to
-the per-owner cap. Bounded by relay membership, since the relay refuses
-non-members outright.
+**What a stranger can do**, in open mode: consume connections and memory, up
+to the *total* daemon capacity (`WAKER_MAX_AGENTS`), not a per-owner share of
+it — see Two admission modes for why a per-owner cap can't be enforced
+against a signer identity that costs nothing to mint. Bounded by relay
+membership for entry (the relay refuses non-members outright) and by that
+total capacity for how much of the daemon one member — or a hundred fake
+identities controlled by one member — can occupy.
 
 ## Rejected alternatives
 
@@ -289,10 +343,30 @@ floor has, or removing an agent means editing config again. The bundle's
 `revoked` flag plus a monotonic floor is the obvious model, and the daemon
 already implements exactly that shape.
 
-**Per-owner caps in open mode.** What the limit is, and what the daemon does on
-reaching it — refuse quietly, log, or evict least-recently-active. Unbounded
-enrolment is the whole DoS surface open mode introduces, so the cap is the
-control, not a nicety.
+**Admission capacity and owner discovery — both block open mode until
+resolved.** Two admission modes specifies the *policy* — refuse a new
+enrolment once the durable, refetch-derived supervised-agent count reaches
+`WAKER_MAX_AGENTS`, never evict a running one — but not the number itself,
+which is an operational tuning question, not a design one, and can be set
+when a real hosted waker exists to tune it against.
+
+The harder gap is upstream of capacity: **open mode has no owner-discovery
+mechanism at all.** Every mechanism this document specifies elsewhere —
+the roster, the per-agent credential tap — is scoped by `authors=[owner]`,
+which requires already knowing the owner's pubkey. Closed mode gets that for
+free from `WAKER_OWNER_PUBKEYS`. Open mode, by definition, doesn't have an
+owner allowlist, so the daemon has no set of authors to query in the first
+place — it would need to discover unknown owners from an undifferentiated
+stream, which reproduces the same class of problem Refetch scope names above
+(a bounded query over an open-ended stream silently loses old entries once
+enough newer ones accumulate), one layer higher: agents under an owner
+instead of owner enrolments under a waker. This document does not pick a
+mechanism for the same reason it doesn't pick one for refetch — it needs to
+be run against a real relay, not asserted here — but unlike refetch, closed
+mode has no working fallback for open mode to fall back to. **Open mode
+should not be treated as an implemented, offerable admission option until
+this is resolved and this section is corrected to name the chosen
+mechanism**, per the same rule Refetch scope already commits to.
 
 **Credential rotation.** An owner rotating their Sprites token must reissue
 enrolments, or deploys start failing with a credential error that looks

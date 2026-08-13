@@ -1,6 +1,13 @@
 //! Publishing enrolment to `buzz-waker`: which agents an owner has enrolled,
 //! and the credentials to watch them with.
 //!
+//! "Owner" is this codebase's term for the key that signs an agent's events —
+//! the **user's** own desktop key. It is not the person running the waker.
+//! There are two roles: a **service provider** who stands the daemon up and
+//! configures it (identity, relay, provider token), and **users** who toggle
+//! Remote wake and configure nothing. Nothing published here carries a
+//! provider token, because a user has none to carry.
+//!
 //! Sibling of `agents::waker` (`agents_waker.rs`), which issues the *launch
 //! bundle*. The bundle answers "how do I deploy this agent"; enrolment answers
 //! "which agents am I watching, and as whom" — the half that today's daemon
@@ -70,19 +77,15 @@ pub(crate) fn retain_waker_enrolment_pending(
     record: &ManagedAgentRecord,
 ) -> Result<(), String> {
     use crate::managed_agents::waker_enrolment::{
-        enrolment_ledger, parse_auth_tag_elements, resolve_provider_credential,
-        waker_identity_pubkey,
+        enrolment_ledger, parse_auth_tag_elements, waker_identity_pubkey,
     };
 
     let Some(waker_pubkey) = waker_identity_pubkey() else {
         return Ok(());
     };
-    let BackendKind::Provider {
-        id: provider_id, ..
-    } = record.backend.clone()
-    else {
+    if !matches!(record.backend, BackendKind::Provider { .. }) {
         return Ok(());
-    };
+    }
 
     let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
     let ledger = enrolment_ledger(app)?;
@@ -101,7 +104,6 @@ pub(crate) fn retain_waker_enrolment_pending(
         &record.pubkey,
         record.private_key_nsec.clone(),
         parse_auth_tag_elements(record.auth_tag.as_deref())?,
-        resolve_provider_credential(&provider_id),
         issued_at,
         false,
     )?;
@@ -162,7 +164,6 @@ pub(crate) fn revoke_waker_enrolment_pending(
         // rather than the real key: a revocation that still carried a usable
         // nsec would put the agent's private key on the relay for no reason.
         String::new(),
-        None,
         None,
         issued_at,
         true,
@@ -277,7 +278,6 @@ pub(super) fn sign_and_retain_credential_at(
     agent_pubkey: &str,
     nsec: String,
     auth_tag: Option<Vec<String>>,
-    provider_credential: Option<buzz_waker_pkg::enrolment::ProviderCredential>,
     issued_at: u64,
     revoked: bool,
 ) -> Result<(), String> {
@@ -289,7 +289,6 @@ pub(super) fn sign_and_retain_credential_at(
             agent_pubkey: agent_pubkey.to_string(),
             nsec,
             auth_tag,
-            provider_credential,
             credential_version,
             issued_at,
             revoked,
@@ -447,9 +446,6 @@ mod tests {
                 "sig".into(),
                 String::new(),
             ]),
-            Some(buzz_waker_pkg::enrolment::ProviderCredential::Sprites {
-                sprite_token: "sprt_tok_example".into(),
-            }),
             1_000,
             false,
         )
@@ -469,7 +465,11 @@ mod tests {
 
         assert_eq!(body.agent_pubkey, agent_pubkey);
         assert_eq!(body.credential_version, 1);
-        assert!(body.provider_credential.is_some(), "per-owner credential");
+        assert!(
+            body.provider_credential.is_none(),
+            "a user has no provider token to send; the service provider's own \
+             credential stays in the daemon's environment and never transits the relay"
+        );
     }
 
     /// The collision this module exists to avoid: a credential must not
@@ -508,7 +508,6 @@ mod tests {
             &waker.public_key().to_hex(),
             &agent_pubkey,
             "nsec1fake".to_string(),
-            None,
             None,
             1_000,
             false,
@@ -564,7 +563,6 @@ mod tests {
                 &agent_pubkey,
                 nsec.clone(),
                 None,
-                None,
                 issued_at,
                 false,
             )
@@ -604,7 +602,6 @@ mod tests {
             &agent_pubkey,
             "nsec1realkey".to_string(),
             None,
-            None,
             1_000,
             false,
         )
@@ -617,7 +614,6 @@ mod tests {
             &waker.public_key().to_hex(),
             &agent_pubkey,
             String::new(),
-            None,
             None,
             2_000,
             true,
@@ -685,7 +681,6 @@ mod tests {
             &waker.public_key().to_hex(),
             &agent_pubkey,
             "nsec1fake".to_string(),
-            None,
             None,
             1_000,
             false,

@@ -11,9 +11,11 @@
 //!   the daemon's roster `#p` is its *own* identity, shared by every agent, so
 //!   a bounded per-agent query like the bundle tap's cannot enumerate them —
 //!   see `buzz_waker::enrolment`'s module doc.
-//! - A [`SignedCredential`] carries one agent's `nsec`, `auth_tag`, and the
-//!   owner's own provider credential. Delivered per agent at the same shape
-//!   the bundle tap already uses.
+//! - A [`SignedCredential`] carries one agent's `nsec` and `auth_tag` — the
+//!   two things the daemon needs to connect *as* that agent, and nothing
+//!   else. Delivered per agent at the same shape the bundle tap already
+//!   uses. It carries no provider credential; see
+//!   [`sign_enrolment_credential`] for why that field stays empty.
 //!
 //! Both are signed by the owner and NIP-44-encrypted **to the waker identity**,
 //! not to the agent — the daemon decrypts these as itself, which is the whole
@@ -33,7 +35,6 @@
 
 use std::collections::BTreeMap;
 
-use buzz_waker_pkg::enrolment::ProviderCredential;
 use buzz_waker_pkg::{CredentialBody, RosterBody, RosterEntry, SignedCredential, SignedRoster};
 use nostr::secp256k1::Keypair;
 use nostr::{Keys, SECP256K1};
@@ -58,26 +59,29 @@ pub(crate) const ROSTER_D_TAG: &str = buzz_waker_pkg::roster_feed::ROSTER_D_TAG;
 /// Enrolment is a no-op when this resolves to nothing, which is the state of
 /// every install that does not use a remote waker: [`waker_identity_pubkey`]
 /// returns `None`, and the retain path returns `Ok(())` without publishing.
-/// Deliberately fail-quiet rather than fail-loud — an owner who never asked
-/// for a remote waker should not see an error about one.
+/// Deliberately fail-quiet rather than fail-loud — a user who never asked for
+/// a remote waker should not see an error about one.
 pub(crate) const WAKER_IDENTITY_PUBKEY_ENV: &str = "WAGGLE_WAKER_IDENTITY_PUBKEY";
 
-/// The hosted waker's identity, compiled in so a fresh install enrols against
-/// the service operator's daemon without configuring anything.
+/// The hosted waker's identity, compiled in so a user enrols against the
+/// service provider's daemon without configuring anything — which is the
+/// whole point: there are two roles here, a service provider who runs the
+/// waker and configures it, and users who toggle Remote wake and configure
+/// nothing.
 ///
-/// Empty here because this fork does not yet run a shared waker: the identity
+/// Empty here because this fork does not yet run a shared waker. The identity
 /// is minted at deploy time (`WAKER_IDENTITY_NSEC`) and only its *pubkey* can
-/// be baked in, so filling this in is a step for whoever operates that daemon,
-/// not something this repo can know. Until then [`WAKER_IDENTITY_PUBKEY_ENV`]
-/// is the only source, which is exactly the single-operator case the merged
-/// daemon supports.
+/// be baked in, so filling this in belongs to whoever stands that service up,
+/// not to this repo. Until then [`WAKER_IDENTITY_PUBKEY_ENV`] is the only
+/// source.
 const DEFAULT_WAKER_IDENTITY_PUBKEY: &str = "";
 
 /// Which waker identity to encrypt enrolment payloads to, if any.
 ///
-/// The environment wins over the compiled-in default so an operator can point
-/// a build at their own daemon without a rebuild — the same precedence
-/// `WAKER_AGENTS_CONFIG_PATH` has over enrolment on the daemon side.
+/// The environment wins over the compiled-in default so a service provider
+/// can point a build at their own daemon without a rebuild — the same
+/// precedence `WAKER_AGENTS_CONFIG_PATH` has over enrolment on the daemon
+/// side.
 #[must_use]
 pub(crate) fn waker_identity_pubkey() -> Option<String> {
     let resolved = std::env::var(WAKER_IDENTITY_PUBKEY_ENV)
@@ -113,10 +117,6 @@ pub(crate) struct CredentialInputs {
     /// string into the tag elements the daemon calls `Tag::parse` on. See
     /// [`parse_auth_tag_elements`] for why parsing happens before signing.
     pub auth_tag: Option<Vec<String>>,
-    /// This owner's own provider credential, so the daemon deploys on their
-    /// account rather than its own. `None` leaves the daemon using its own
-    /// configured credentials — see [`resolve_provider_credential`].
-    pub provider_credential: Option<ProviderCredential>,
     /// The version reserved for *this* body by `IssuanceLedger::reserve`.
     pub credential_version: ReservedVersion,
     /// Issuance time, unix seconds.
@@ -153,35 +153,22 @@ pub(crate) fn parse_auth_tag_elements(stored: Option<&str>) -> Result<Option<Vec
         })
 }
 
-/// This owner's provider credential for `provider_id`, if one is resolvable.
-///
-/// Only the environment is read. The production resolution order for a Sprites
-/// token is `SPRITE_TOKEN` → `SPRITES_TOKEN` → the macOS keychain
-/// (`buzz-backend-sprites`'s `credentials::resolve`), and the keychain arm is
-/// the one that answers for a Finder-launched desktop — but that crate is
-/// bin-only, so reaching it from here means either restructuring it into a
-/// library or duplicating its `~/.sprites` walk. Neither belongs in this
-/// change.
-///
-/// `None` is not a failure. The daemon treats an absent provider credential as
-/// "deploy with my own configured credentials", which is exactly what it does
-/// today for every statically configured agent — so omitting it costs nothing
-/// that currently works, and only leaves genuine multi-tenancy (each owner's
-/// deploy billed to their own account) waiting on the keychain arm.
-#[must_use]
-pub(crate) fn resolve_provider_credential(provider_id: &str) -> Option<ProviderCredential> {
-    if provider_id != "sprites" {
-        return None;
-    }
-    ["SPRITE_TOKEN", "SPRITES_TOKEN"]
-        .into_iter()
-        .find_map(|key| std::env::var(key).ok())
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-        .map(|sprite_token| ProviderCredential::Sprites { sprite_token })
-}
-
 /// Sign one agent's credential with the owner's key.
+///
+/// # No provider credential
+///
+/// `provider_credential` is deliberately always `None`. There are two roles
+/// here, not three: the **service provider** runs the waker and holds the one
+/// Sprites token it deploys with, and **users** toggle Remote wake and
+/// configure nothing. A user has no Sprites token to send — `sprite login` is
+/// not part of using a hosted waker — so a per-user credential would be a
+/// field nothing could ever fill.
+///
+/// Leaving it empty is also the safer wire: the daemon's own environment
+/// stays the only place a provider token lives, so none ever transits the
+/// relay and no user can choose which token the daemon spends. `org` still
+/// travels per agent in the signed `provider_config`, which is where the
+/// per-agent part of provider targeting belongs.
 ///
 /// # Errors
 /// Propagates a serialization failure from the enrolment crate.
@@ -193,7 +180,7 @@ pub(crate) fn sign_enrolment_credential(
         agent_pubkey: inputs.agent_pubkey,
         nsec: inputs.nsec,
         auth_tag: inputs.auth_tag,
-        provider_credential: inputs.provider_credential,
+        provider_credential: None,
         credential_version: inputs.credential_version.spend(),
         issued_at: inputs.issued_at,
         revoked: inputs.revoked,
@@ -258,9 +245,6 @@ mod tests {
                     "sig".into(),
                     String::new(),
                 ]),
-                provider_credential: Some(ProviderCredential::Sprites {
-                    sprite_token: "sprt_tok_example".into(),
-                }),
                 credential_version: ledger(dir.path()).reserve("agent").expect("reserve"),
                 issued_at: 1_000,
                 revoked: false,
@@ -347,12 +331,5 @@ mod tests {
             parse_auth_tag_elements(Some("not json")).is_err(),
             "a malformed tag must be refused at issuance, not delivered"
         );
-    }
-
-    /// A non-Sprites provider has no credential shape to resolve, so it must
-    /// not pick up a Sprites token that happens to be in the environment.
-    #[test]
-    fn only_sprites_resolves_a_sprites_credential() {
-        assert!(resolve_provider_credential("kubernetes").is_none());
     }
 }

@@ -36,6 +36,7 @@
 //! | `WAKER_AGENTS_CONFIG_PATH` | yes | Path to a JSON file listing the agents to statically watch — see [`AgentConfig`]. |
 //! | `WAKER_OWNER_PUBKEYS` | no | Comma-separated list of owner pubkeys this daemon discovers agents for dynamically. Empty or unset disables dynamic enrolment entirely — see [`buzz_waker::enrolment::parse_authorized_owners`]'s own fail-closed doc. |
 //! | `WAKER_IDENTITY_NSEC` | only if `WAKER_OWNER_PUBKEYS` is set | This daemon's own Nostr identity — the roster and credential taps decrypt as this key, never as any watched agent's. |
+//! | `WAKER_IDENTITY_AUTH_TAG` | no | This daemon's own NIP-OA delegation, as a JSON array (`["auth", …]`), minted by a relay-member owner for the identity above. Needed whenever that identity is not itself a relay member: `enforce_relay_membership` admits it as `ViaOwner`. Absent, the taps connect with no delegation and fail NIP-42 with `restricted: not a relay member` — silently, as an empty watch list. See [`parse_identity_auth_tag`]. |
 //! | `WAKER_MAX_AGENTS` | only if `WAKER_OWNER_PUBKEYS` is set | Total ceiling on supervised agents — config, pending, and running together — dynamic enrolment can ever push this daemon to. Refuse-not-evict: an authorized owner's roster past this ceiling is refused new admissions, never made to cancel an existing agent to make room. See [`reconcile_roster`]'s own doc. |
 //! | `RUST_LOG` | no | `tracing-subscriber` env filter. Defaults to `buzz_waker=info`. |
 //!
@@ -454,6 +455,64 @@ fn compute_desired_roster_agents(
 /// # Errors
 /// The store cannot be created/opened, or its pinned owner disagrees with
 /// `owner_pubkey`.
+/// Parse `WAKER_IDENTITY_AUTH_TAG` into the tag the roster and credential taps
+/// present at NIP-42 time.
+///
+/// # Why the identity needs one at all
+///
+/// The daemon's own identity is a freshly minted key, and a fresh key is not a
+/// member of anyone's relay. `enforce_relay_membership` runs on every
+/// authenticated connection and takes the auth tag as its second chance: with
+/// no tag the pubkey must already be a direct member, and with a NIP-OA tag it
+/// is admitted as `MembershipDecision::ViaOwner` — the same delegation that
+/// lets a non-member *agent* connect under its member owner. Minting one for
+/// the waker's pubkey uses exactly the machinery the desktop already runs for
+/// agents (`buzz_sdk::nip_oa::compute_auth_tag`).
+///
+/// Note this is a different thing from [`AgentConfig::auth_tag`]'s doc, which
+/// describes NIP-42's optional *connection class* request. The tag here is
+/// carrying NIP-OA owner delegation for membership; the two share a name and
+/// nothing else.
+///
+/// # Absence is a warning, not an error
+///
+/// Relays vary — `MembershipDecision` has an `OpenRelay` arm, and a service
+/// provider may simply have added the identity as a member directly. Refusing
+/// to start would break both. But the failure absence leads to is the one that
+/// cost the most during bring-up: the taps connect, NIP-42 fails with
+/// `restricted: not a relay member`, and the daemon reports no enrolled agents
+/// rather than an error — indistinguishable from "nobody has enrolled yet". So
+/// it is said out loud at startup instead of discovered from a silent watch
+/// list.
+///
+/// # Errors
+/// The value is set but is not a JSON array of strings, or does not parse as a
+/// Nostr tag. A malformed tag is refused rather than dropped: a daemon that
+/// silently ignored it would present no tag and fail exactly as above.
+fn parse_identity_auth_tag(
+    raw: Option<&str>,
+    enrolment_enabled: bool,
+) -> anyhow::Result<Option<Tag>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        if enrolment_enabled {
+            tracing::warn!(
+                "buzz-waker: WAKER_IDENTITY_AUTH_TAG is not set; the roster and credential taps \
+                 will connect with no NIP-OA delegation, which only works if this daemon's own \
+                 pubkey is already a relay member. If it is not, both taps fail NIP-42 with \
+                 'restricted: not a relay member' and this daemon will report no enrolled agents \
+                 rather than an error"
+            );
+        }
+        return Ok(None);
+    };
+    let elements: Vec<String> = serde_json::from_str(raw).map_err(|e| {
+        anyhow::anyhow!("WAKER_IDENTITY_AUTH_TAG is not a JSON array of strings: {e}")
+    })?;
+    let tag = Tag::parse(elements)
+        .map_err(|e| anyhow::anyhow!("invalid WAKER_IDENTITY_AUTH_TAG: {e}"))?;
+    Ok(Some(tag))
+}
+
 fn open_pinned_floor_store(path: &Path, owner_pubkey: &str) -> anyhow::Result<FloorStore> {
     let store = match FloorStore::open(path) {
         Ok(store) => store,
@@ -637,6 +696,11 @@ fn reconcile_roster(
     relay_url: &str,
     state_dir: &Path,
     waker_keys: &Keys,
+    // This daemon's own NIP-OA delegation, presented by every per-agent
+    // credential tap it spawns — see `parse_identity_auth_tag`. Distinct from
+    // the *agent's* auth tag, which arrives inside that agent's delivered
+    // credential and is passed to `spawn_agent_watch` instead.
+    waker_auth_tag: Option<&Tag>,
     authorized_owners: &[String],
     max_agents: usize,
     roster_state: &RosterState,
@@ -764,6 +828,7 @@ fn reconcile_roster(
         {
             let relay_url = relay_url.to_string();
             let waker_keys = waker_keys.clone();
+            let waker_auth_tag = waker_auth_tag.cloned();
             let owner_pubkey = desired_agent.owner_pubkey.clone();
             let agent_pubkey = desired_agent.pubkey.clone();
             let credential_state = Arc::clone(&credential_state);
@@ -773,7 +838,7 @@ fn reconcile_roster(
                 run_credential_tap(
                     &relay_url,
                     &waker_keys,
-                    None,
+                    waker_auth_tag.as_ref(),
                     &owner_pubkey,
                     &agent_pubkey,
                     &mut credential_floor_store,
@@ -942,6 +1007,10 @@ async fn main() -> anyhow::Result<()> {
         })?;
         Some(Keys::parse(&nsec).map_err(|e| anyhow::anyhow!("invalid WAKER_IDENTITY_NSEC: {e}"))?)
     };
+    let waker_auth_tag = parse_identity_auth_tag(
+        std::env::var("WAKER_IDENTITY_AUTH_TAG").ok().as_deref(),
+        waker_keys.is_some(),
+    )?;
     // Required alongside WAKER_IDENTITY_NSEC, same reasoning: dynamic
     // enrolment needs an explicit ceiling on how many agents an authorized
     // owner's roster can cause this daemon to run — refuse-not-evict, per
@@ -1040,6 +1109,7 @@ async fn main() -> anyhow::Result<()> {
         {
             let relay_url = relay_url.clone();
             let waker_keys = waker_keys.clone();
+            let waker_auth_tag = waker_auth_tag.clone();
             let authorized_owners = authorized_owners.clone();
             let roster_state = Arc::clone(&roster_state);
             let cancel = cancel.clone();
@@ -1047,7 +1117,7 @@ async fn main() -> anyhow::Result<()> {
                 run_roster_tap(
                     &relay_url,
                     &waker_keys,
-                    None,
+                    waker_auth_tag.as_ref(),
                     &authorized_owners,
                     &roster_floor_dir,
                     &roster_state,
@@ -1084,6 +1154,7 @@ async fn main() -> anyhow::Result<()> {
                     &relay_url,
                     &state_dir,
                     waker_keys,
+                    waker_auth_tag.as_ref(),
                     &authorized_owners,
                     max_agents,
                     roster_state,
@@ -1179,6 +1250,51 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape the desktop already mints for agents
+    /// (`buzz_sdk::nip_oa::compute_auth_tag` returns this JSON), reused
+    /// verbatim for the daemon's own identity.
+    #[test]
+    fn the_identity_auth_tag_parses_the_shape_nip_oa_mints() {
+        let raw = format!(r#"["auth","{}","sig",""]"#, "b".repeat(64));
+        let tag = parse_identity_auth_tag(Some(&raw), true)
+            .expect("a well-formed NIP-OA tag must parse")
+            .expect("and must be present");
+        assert_eq!(tag.clone().to_vec()[0], "auth");
+    }
+
+    /// Absence is legitimate — an identity that is already a relay member, or
+    /// a relay with no membership requirement at all — so it must not refuse
+    /// to start. The startup warning is what makes it visible.
+    #[test]
+    fn an_absent_identity_auth_tag_is_allowed() {
+        assert_eq!(parse_identity_auth_tag(None, true).expect("allowed"), None);
+        assert_eq!(
+            parse_identity_auth_tag(Some("   "), true).expect("allowed"),
+            None
+        );
+        assert_eq!(parse_identity_auth_tag(None, false).expect("allowed"), None);
+    }
+
+    /// A malformed tag must fail startup rather than be dropped. Dropping it
+    /// would present no delegation at all, and the daemon would then fail
+    /// NIP-42 and report an empty watch list — the silent failure this whole
+    /// variable exists to prevent.
+    #[test]
+    fn a_malformed_identity_auth_tag_refuses_to_start() {
+        assert!(
+            parse_identity_auth_tag(Some("not json"), true).is_err(),
+            "a tag that is not JSON must fail loudly"
+        );
+        assert!(
+            parse_identity_auth_tag(Some(r#"{"auth":"tag"}"#), true).is_err(),
+            "a JSON object is not a tag"
+        );
+        assert!(
+            parse_identity_auth_tag(Some("[1, 2, 3]"), true).is_err(),
+            "a tag's elements must be strings"
+        );
+    }
 
     #[test]
     fn agent_config_parses_the_documented_shape() {

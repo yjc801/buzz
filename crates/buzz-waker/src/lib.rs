@@ -42,10 +42,18 @@
 //! - [`enrolment`] — agent enrolment over the relay: the pure schema/trust
 //!   half (roster + per-agent credential payloads, `WAKER_OWNER_PUBKEYS`) of
 //!   replacing hand-edited `WAKER_AGENTS_CONFIG_PATH` JSON.
+//! - [`roster_feed`] — the **roster tap**: one connection for the whole
+//!   daemon, authenticated as its own waker identity, that discovers which
+//!   agent pubkeys each authorized owner currently enrols.
+//! - [`credential_feed`] — the **per-agent credential tap**: mirrors
+//!   [`bundle_feed`]'s connect/backoff/idle-timeout shape, also authenticated
+//!   as the waker's own identity, decrypting and admitting one agent's
+//!   delivered `nsec` against a per-agent [`floors::FloorStore`].
 //!   `docs/waker-agent-enrolment.md` (design) and `PLANS/BUZZ_WAKER_DESIGN.md`
-//!   §12 (build order) — wire I/O (a `roster_feed`/credential tap mirroring
-//!   [`bundle_feed`]) and the dynamic per-agent supervisor `main.rs` needs to
-//!   act on it are later phases, not yet implemented.
+//!   §12 (build order) — the dynamic per-agent supervisor `main.rs` needs to
+//!   diff [`roster_feed::RosterState`] against the daemon's watch list and
+//!   spawn/cancel [`credential_feed::run_credential_tap`] instances is the
+//!   next phase, not yet implemented.
 //!
 //! Each exists because of a specific review finding and carries the gate id
 //! (`G1`–`G4`) it discharges, so the reason is not lost.
@@ -53,6 +61,7 @@
 pub mod attempt;
 pub mod bundle;
 pub mod bundle_feed;
+pub mod credential_feed;
 pub mod cursor;
 pub mod decide;
 pub mod effects;
@@ -62,6 +71,7 @@ mod fence;
 pub mod floors;
 pub mod presence_feed;
 pub mod relay_feed;
+pub mod roster_feed;
 pub mod wake_loop;
 
 pub use attempt::{

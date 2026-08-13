@@ -55,7 +55,11 @@ pub const BUNDLE_TAP_IDLE_TIMEOUT_SECS: u64 = 300;
 /// (`buzz_core::pairing::session`'s own NIP-AB validation applies the same
 /// range) — reject anything outside it before attempting decryption rather
 /// than handing an oversized or malformed string to the decryptor.
-const NIP44_CONTENT_LEN_RANGE: std::ops::RangeInclusive<usize> = 132..=87472;
+///
+/// `pub(crate)` so [`crate::roster_feed`] and [`crate::credential_feed`] (the
+/// enrolment taps, which decrypt the same kind-1059 envelope) apply the exact
+/// same bound rather than a second copy of this magic range.
+pub(crate) const NIP44_CONTENT_LEN_RANGE: std::ops::RangeInclusive<usize> = 132..=87472;
 
 /// How many envelopes to ask for on subscribe.
 ///

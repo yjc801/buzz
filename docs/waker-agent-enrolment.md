@@ -54,22 +54,43 @@ materialized on **tmpfs**, never the durable volume — *"nothing durable to
 leak."* Persisting enrolled keys, whether to a Fly secret or the volume, would
 reverse that.
 
-Enrolment reuses the bundle's addressing scheme, not just its transport. The
-bundle is a NIP-33 parameterized-replaceable event addressed by `(owner
-pubkey, kind, d_tag=agent_pubkey)` (`KIND_WAKER_LAUNCH_BUNDLE`); enrolment
-gets a sibling kind under the same scheme, still `d_tag=agent_pubkey`. That
-choice is what makes refetch on restart complete rather than a heuristic: the
-bundle tap narrows its `authors`+`#p` query with a bounded `limit` because
-`#p` there is the *agent's* pubkey and only one bundle is ever live per
-agent — the limit is a safety margin, not the mechanism that bounds the
-result. Enrolment's `#p` is the *waker's* pubkey, shared by every agent under
-one owner, so a bounded newest-N window over that filter would silently drop
-older still-active agents once enough enrolments, reissues, and revocations
-accumulate — exactly the failure mode a restart must not have. Querying by
-the parameterized-replaceable coordinate instead of a bounded window sidesteps
-this rather than tuning around it: the relay returns at most one (the latest)
-event per `d_tag`, so the result set is bounded by the number of distinct
-enrolled agents, not by publish history, and is complete by construction.
+Enrolment reuses the bundle's actual wire transport: `KIND_WAKER_BUNDLE_ENVELOPE`
+(kind 1059, aliasing `KIND_GIFT_WRAP`), not a dedicated 30xxx payload kind.
+Bundles moved onto this envelope for a specific, documented reason — an
+unrecognised custom kind is refused outright by any relay that hasn't
+adopted it, which is exactly what made remote wake silently impossible
+before the move. A sibling 30xxx kind for enrolment would reopen that same
+gap, and would only behave as parameterized-replaceable on a relay that
+actually stores that kind under NIP-33 semantics — nothing here guarantees
+that. Kind 1059 buys portability, not replacement: `bundle_feed.rs` documents
+that the envelope is *not* parameterized-replaceable, so a reissue lands
+beside its predecessor rather than superseding it. Bundle correctness for one
+agent comes from the daemon's own monotonic `FloorStore`, not from the relay
+ever discarding an old copy — `revoke_waker_bundle_pending`'s own comment is
+explicit that a revoked bundle "stays readable on the relay."
+
+The bundle tap gets away with a small bounded query
+(`BUNDLE_QUERY_LIMIT = 16`) because its `#p` already scopes the query to one
+*already-known* agent: the daemon only ever asks "what's current for the
+agent I'm already watching." Enrolment doesn't have that luxury — its whole
+purpose is to tell the daemon which agents to watch in the first place, so
+the query can't be pre-scoped to a `d`-tag it doesn't yet know. A bounded
+`limit` over the undifferentiated stream (every agent under one owner
+sharing the same `#p=waker`) is exactly the failure mode the original P2
+finding named: a fixed newest-N window can silently omit an agent that
+hasn't been reissued recently.
+
+So restart discovery for enrolment carries no `limit` at all:
+`authors=[owner], #p=[waker], kinds=[KIND_WAKER_BUNDLE_ENVELOPE]`, paginated
+to EOSE, folded client-side by the `d`-tag convention the envelope already
+carries (`d=agent_pubkey`, present today purely for the desktop's local
+retention lookup — see `agents_waker.rs`), keeping the highest-`created_at`
+non-revoked entry per agent. This is complete by construction — it reads
+every enrolment event that exists, not a window into them — and it reuses
+primitives that are already there (the `d` tag, the floor's monotonic-version
+logic) rather than claiming a relay guarantee kind 1059 doesn't provide. The
+only new cost is pagination itself, bounded by how many enrolment events
+exist in total for one owner, not by an arbitrary window size.
 
 Net secrets, compared to today:
 

@@ -51,13 +51,12 @@
 //! [`buzz_waker::roster_feed`]'s module doc).
 //!
 //! A dynamically watched agent's `provider_credential`, when its delivered
-//! credential carries one, is layered onto that agent's own deploy
-//! subprocess environment (`buzz_provider_deploy`'s `env` overlay) — but
-//! only as an overlay on top of this daemon's own inherited environment,
-//! not full isolation from it. See `buzz_provider_deploy`'s own module doc,
-//! The child's environment section, for exactly what that does and does
-//! not protect against; full isolation is real future work, not
-//! implemented here.
+//! credential carries one, becomes that agent's own deploy subprocess
+//! environment (`buzz_provider_deploy`'s `env` parameter): the child's
+//! environment is cleared and rebuilt from a small fixed baseline plus this
+//! credential, not this daemon's own inherited environment. See
+//! `buzz_provider_deploy`'s own module doc, The child's environment
+//! section, for exactly what that baseline is and why.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -150,6 +149,36 @@ fn ensure_owner_pin_matches(
             "floor store for {pubkey} is pinned to owner {pinned_owner}, but \
              the configured owner is now {configured_owner}; refusing to run with \
              disagreeing owners"
+        );
+    }
+    Ok(())
+}
+
+/// `WAKER_MAX_AGENTS` is documented as a total ceiling over config, pending,
+/// and running agents together, not just a dynamic-admission threshold —
+/// [`reconcile_roster`]'s own refuse-not-evict check only ever guards
+/// roster *additions* against it, so an oversized static baseline would
+/// otherwise start unchecked and stay that way for the daemon's whole life.
+/// Called once at startup, before any agent (static or otherwise) is
+/// spawned or gets per-agent state on disk — the one place this can still
+/// fail closed. A no-op when dynamic enrolment is disabled
+/// (`authorized_owners` empty): `max_agents` is `0` in that case by
+/// definition (see [`main`]'s own parsing), not a real ceiling to enforce.
+///
+/// # Errors
+/// Dynamic enrolment is enabled and `static_agent_count` alone already
+/// exceeds `max_agents`.
+fn ensure_static_agent_count_fits_cap(
+    static_agent_count: usize,
+    max_agents: usize,
+    dynamic_enrolment_enabled: bool,
+) -> anyhow::Result<()> {
+    if dynamic_enrolment_enabled && static_agent_count > max_agents {
+        anyhow::bail!(
+            "WAKER_MAX_AGENTS={max_agents} but WAKER_AGENTS_CONFIG_PATH already lists \
+             {static_agent_count} statically configured agents; WAKER_MAX_AGENTS is a total \
+             ceiling over config, pending, and running agents together, so the static \
+             baseline alone must fit within it"
         );
     }
     Ok(())
@@ -264,12 +293,33 @@ struct SupervisedAgent {
 enum TaskExit {
     /// One of a watched agent's three tasks (`"presence_tap"`,
     /// `"bundle_tap"`, or `"wake_loop"`).
-    Agent { pubkey: String, task: &'static str },
+    ///
+    /// `generation` is a clone of the exact [`SupervisedAgent::cancel`]
+    /// token this task was spawned under, captured at spawn time — not
+    /// re-derived from `supervised` at exit time. A roster version change
+    /// tears down and re-adopts the same pubkey within one
+    /// [`reconcile_roster`] pass, so by the time a *predecessor*
+    /// generation's task actually finishes, `supervised` already holds the
+    /// *replacement* generation's fresh, uncancelled token under that same
+    /// pubkey — looking it up by pubkey at exit time would misclassify the
+    /// predecessor's expected exit as the replacement's unsolicited one.
+    /// Checking this captured token's own `is_cancelled()` instead is
+    /// correct regardless of what currently occupies that pubkey, because
+    /// [`tear_down_roster_agent`] always cancels a generation's token
+    /// before anything replaces its `supervised` entry.
+    Agent {
+        pubkey: String,
+        task: &'static str,
+        generation: CancellationToken,
+    },
     /// A [`AgentSource::Roster`] agent's credential tap, tracked separately
     /// from `Agent` only so log lines name it correctly — it shares that
     /// agent's own [`SupervisedAgent::cancel`] and is classified exactly the
-    /// same way.
-    CredentialTap { pubkey: String },
+    /// same way, `generation` included for the same reason.
+    CredentialTap {
+        pubkey: String,
+        generation: CancellationToken,
+    },
     /// A daemon-wide task with no per-agent scope: the roster tap. Expected
     /// to run until the global token cancels; any other exit is fatal.
     Component(&'static str),
@@ -480,6 +530,7 @@ fn spawn_agent_watch(
             TaskExit::Agent {
                 pubkey,
                 task: "presence_tap",
+                generation: cancel,
             }
         });
     }
@@ -506,6 +557,7 @@ fn spawn_agent_watch(
             TaskExit::Agent {
                 pubkey,
                 task: "bundle_tap",
+                generation: cancel,
             }
         });
     }
@@ -522,12 +574,14 @@ fn spawn_agent_watch(
             provider_env: provider_env.clone(),
         };
         let cancel = cancel.clone();
+        let generation = cancel.clone();
         let pubkey = pubkey.clone();
         tasks.spawn(async move {
             run_wake_loop(config, cancel).await;
             TaskExit::Agent {
                 pubkey,
                 task: "wake_loop",
+                generation,
             }
         });
     }
@@ -729,6 +783,7 @@ fn reconcile_roster(
                 .await;
                 TaskExit::CredentialTap {
                     pubkey: pubkey_for_exit,
+                    generation: tap_cancel,
                 }
             });
         }
@@ -934,6 +989,12 @@ async fn main() -> anyhow::Result<()> {
         keys_by_agent.push((keys, auth_tag, owner_pubkey));
     }
 
+    ensure_static_agent_count_fits_cap(
+        keys_by_agent.len(),
+        max_agents,
+        !authorized_owners.is_empty(),
+    )?;
+
     std::fs::create_dir_all(&state_dir).map_err(|e| {
         anyhow::anyhow!(
             "could not create WAKER_STATE_DIR {}: {e}",
@@ -1049,7 +1110,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(exit) => {
                         let pubkey = match &exit {
-                            TaskExit::Agent { pubkey, .. } | TaskExit::CredentialTap { pubkey } => pubkey.clone(),
+                            TaskExit::Agent { pubkey, .. } | TaskExit::CredentialTap { pubkey, .. } => pubkey.clone(),
                             TaskExit::Component(_) => unreachable!("handled above"),
                         };
                         let task_name: &'static str = match &exit {
@@ -1057,10 +1118,19 @@ async fn main() -> anyhow::Result<()> {
                             TaskExit::CredentialTap { .. } => "credential_tap",
                             TaskExit::Component(_) => unreachable!("handled above"),
                         };
-                        let was_cancelled = supervised
-                            .get(&pubkey)
-                            .map(|agent| agent.cancel.is_cancelled())
-                            .unwrap_or(true);
+                        // Classify against the exact token this task was
+                        // spawned under, not whatever `supervised` currently
+                        // holds for this pubkey — a version change tears
+                        // down and re-adopts the same pubkey within one
+                        // `reconcile_roster` pass, so a predecessor
+                        // generation's exit can land after `supervised`
+                        // already holds the replacement's fresh, uncancelled
+                        // token. See `TaskExit::Agent`'s own doc.
+                        let was_cancelled = match &exit {
+                            TaskExit::Agent { generation, .. }
+                            | TaskExit::CredentialTap { generation, .. } => generation.is_cancelled(),
+                            TaskExit::Component(_) => unreachable!("handled above"),
+                        };
                         let source = supervised.get(&pubkey).map(|agent| agent.source);
                         match classify_exit(source, was_cancelled) {
                             ExitDisposition::Expected => {}
@@ -1171,6 +1241,25 @@ mod tests {
         let configured = normalize_pubkey(&"b".repeat(64));
         let error = ensure_owner_pin_matches("agent", &pinned, &configured).unwrap_err();
         assert!(error.to_string().contains("disagreeing owners"), "{error}");
+    }
+
+    #[test]
+    fn a_static_baseline_within_the_cap_is_accepted() {
+        assert!(ensure_static_agent_count_fits_cap(10, 10, true).is_ok());
+        assert!(ensure_static_agent_count_fits_cap(5, 10, true).is_ok());
+    }
+
+    #[test]
+    fn a_static_baseline_exceeding_the_cap_is_refused_when_dynamic_enrolment_is_enabled() {
+        let error = ensure_static_agent_count_fits_cap(20, 10, true).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("WAKER_MAX_AGENTS=10"), "{message}");
+        assert!(message.contains("20"), "{message}");
+    }
+
+    #[test]
+    fn a_static_baseline_exceeding_the_cap_is_ignored_when_dynamic_enrolment_is_disabled() {
+        assert!(ensure_static_agent_count_fits_cap(20, 0, false).is_ok());
     }
 
     #[test]

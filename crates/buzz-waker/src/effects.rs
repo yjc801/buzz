@@ -172,11 +172,11 @@ pub struct RealWakeEffects {
     /// already converted to its wire-shape environment variables
     /// ([`crate::enrolment::ProviderCredential::to_env`]) at credential
     /// delivery time. `None` for a statically configured agent (no
-    /// per-tenant credential exists to overlay) and for a roster-enrolled
-    /// agent whose delivered credential didn't carry one. Layered onto the
-    /// deploy subprocess's environment — see
-    /// `buzz_provider_deploy`'s own module doc for what "layered" means
-    /// (an overlay on the inherited environment, not isolation from it).
+    /// per-tenant credential exists) and for a roster-enrolled agent whose
+    /// delivered credential didn't carry one. Passed as the deploy
+    /// subprocess's `env` — see `buzz_provider_deploy`'s own module doc for
+    /// what that does (isolates the child's environment, not an overlay on
+    /// this daemon's own).
     provider_env: Option<Arc<HashMap<String, String>>>,
     /// Fires on daemon shutdown. Deliberately **not** tied to the mention
     /// feed's own connection lifecycle: a wake attempt does not touch that

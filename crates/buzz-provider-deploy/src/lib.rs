@@ -24,24 +24,26 @@
 //! leaves the child's environment exactly as `std::process::Command`
 //! defaults it — the parent process's own environment, untouched — so this
 //! parameter changed no existing caller's behavior when it was added.
-//! `Some(map)` layers `map`'s keys on top via
-//! [`std::process::Command::envs`], overriding any inherited variable with
-//! the same name.
 //!
-//! **This is an overlay, not isolation.** The child still inherits every
-//! other variable from this process's own environment — this crate never
-//! calls `env_clear`. For `buzz-waker`'s multi-tenant use (layering one
-//! enrolled owner's provider credential, e.g. `SPRITE_TOKEN`, onto the
-//! deploy call for that owner's agent) that is enough to fix "the wrong
-//! credential is used"; it does not, on its own, stop that child process
-//! from also seeing whatever else the daemon's own environment carries
-//! (`WAKER_IDENTITY_NSEC` among them). Full isolation — an explicit,
-//! daemon-controlled baseline the tenant credential is layered onto, with
-//! the rest of the parent's environment cleared — is real future work, not
-//! implemented here: the design doc's own reference to it predates any
-//! concrete environment-injection mechanism existing anywhere in this
-//! codebase (desktop's own provider calls never passed one either), so
-//! there was no existing baseline definition to reuse or extend.
+//! **`Some(map)` is isolation, not an overlay.** The child's environment is
+//! cleared ([`std::process::Command::env_clear`]), then
+//! [`tenant_child_environment_baseline`] is applied (today: `HOME` — required
+//! by `buzz-backend-sprites::credentials::resolve` before it even checks
+//! `SPRITE_TOKEN`, for its keychain fallback and `~/.sprites` metadata dir —
+//! and `PATH`, which that same binary's own provisioning code needs to
+//! resolve `bash` by relative name), then `map`'s keys are layered on top,
+//! overriding any baseline variable with the same name. This stops the
+//! child from also seeing whatever else the daemon's own environment
+//! carries (`WAKER_IDENTITY_NSEC`, another tenant's already-resolved
+//! provider credential, proxy/TLS controls) — the gap the original overlay-
+//! only version of this parameter left open, since in `buzz-waker`'s
+//! multi-tenant model the tenant's own bundle authorizes which provider
+//! binary/digest runs, so an unisolated child could otherwise read and
+//! exfiltrate secrets across the shared-daemon boundary.
+//!
+//! `TENANT_BASELINE_VARS` is deliberately small and reviewed per addition,
+//! not "whatever the parent happens to have" — growing it back to the full
+//! parent environment would silently undo the isolation this exists for.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -55,6 +57,27 @@ const STDERR_CAP: usize = 65536;
 /// buggy or malicious provider from OOM-ing the caller's process.
 const STDOUT_CAP: usize = 1_048_576; // 1 MB
 const PROVIDER_PROTOCOL_VERSION: u64 = 1;
+
+/// Variables kept from this process's own environment when a tenant-scoped
+/// `env` overlay is supplied — see the module doc's The child's environment
+/// section for why each one is here. Provider-agnostic on purpose: this
+/// crate has no notion of which provider binary it is invoking, so it keeps
+/// the same small baseline regardless of provider, rather than branching on
+/// provider identity.
+const TENANT_BASELINE_VARS: &[&str] = &["HOME", "PATH"];
+
+/// Build the fixed baseline applied under a tenant-scoped `env` overlay,
+/// read fresh from this process's own environment (never from `env` itself).
+fn tenant_child_environment_baseline() -> HashMap<String, String> {
+    TENANT_BASELINE_VARS
+        .iter()
+        .filter_map(|&key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
+}
 
 /// On Windows, a console-subsystem child gets a fresh, briefly-visible
 /// console window per invocation unless `CREATE_NO_WINDOW` is set. A pure
@@ -129,7 +152,7 @@ fn validate_provider_info(info: &serde_json::Value) -> Result<(), String> {
 /// `workdir` is the child's working directory (`None` inherits the caller's
 /// own CWD) — callers with a notion of a stable agent home (the desktop's
 /// `~/.buzz`) should resolve and pass it; a caller without one may pass
-/// `None`. `env` overlays the child's environment — see the module doc's
+/// `None`. `Some` isolates the child's environment — see the module doc's
 /// The child's environment section.
 ///
 /// Reader threads stream lines/chunks over channels so the caller can receive
@@ -159,6 +182,8 @@ pub fn invoke_provider(
         cmd.current_dir(workdir);
     }
     if let Some(env) = env {
+        cmd.env_clear();
+        cmd.envs(tenant_child_environment_baseline());
         cmd.envs(env);
     }
     configure_no_window(&mut cmd);

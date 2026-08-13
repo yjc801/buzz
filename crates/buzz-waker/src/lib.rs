@@ -49,11 +49,11 @@
 //!   [`bundle_feed`]'s connect/backoff/idle-timeout shape, also authenticated
 //!   as the waker's own identity, decrypting and admitting one agent's
 //!   delivered `nsec` against a per-agent [`floors::FloorStore`].
-//!   `docs/waker-agent-enrolment.md` (design) and `PLANS/BUZZ_WAKER_DESIGN.md`
-//!   §12 (build order) — the dynamic per-agent supervisor `main.rs` needs to
-//!   diff [`roster_feed::RosterState`] against the daemon's watch list and
-//!   spawn/cancel [`credential_feed::run_credential_tap`] instances is the
-//!   next phase, not yet implemented.
+//! - [`watch_list`] — [`watch_list::WatchList`], this daemon's live known-agent
+//!   set. `main.rs`'s dynamic supervisor (`PLANS/BUZZ_WAKER_DESIGN.md` §12
+//!   build order step 3) diffs [`roster_feed::RosterState`] against it,
+//!   spawning/cancelling [`credential_feed::run_credential_tap`] plus each
+//!   agent's presence/bundle/wake-loop tasks as the roster changes.
 //!
 //! Each exists because of a specific review finding and carries the gate id
 //! (`G1`–`G4`) it discharges, so the reason is not lost.
@@ -73,6 +73,7 @@ pub mod presence_feed;
 pub mod relay_feed;
 pub mod roster_feed;
 pub mod wake_loop;
+pub mod watch_list;
 
 pub use attempt::{
     is_managed_agent_live, is_presumed_delivered_by_floor, is_wake_attempt_debounced,

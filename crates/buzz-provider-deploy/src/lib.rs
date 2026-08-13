@@ -16,8 +16,37 @@
 //! desktop resolves `~/.buzz`; a headless daemon may have none) and, for a
 //! caller acting on a signed launch bundle, pinning the expected binary
 //! digest via [`provider_deploy_pinned`] — see that function's doc for why.
+//!
+//! # The child's environment
+//!
+//! Every entry point takes an `env: Option<&HashMap<String, String>>`. `None`
+//! (every caller before `buzz-waker`'s dynamic multi-tenant enrolment)
+//! leaves the child's environment exactly as `std::process::Command`
+//! defaults it — the parent process's own environment, untouched — so this
+//! parameter changed no existing caller's behavior when it was added.
+//!
+//! **`Some(map)` is isolation, not an overlay.** The child's environment is
+//! cleared ([`std::process::Command::env_clear`]), then
+//! [`tenant_child_environment_baseline`] is applied (today: `HOME` — required
+//! by `buzz-backend-sprites::credentials::resolve` before it even checks
+//! `SPRITE_TOKEN`, for its keychain fallback and `~/.sprites` metadata dir —
+//! and `PATH`, which that same binary's own provisioning code needs to
+//! resolve `bash` by relative name), then `map`'s keys are layered on top,
+//! overriding any baseline variable with the same name. This stops the
+//! child from also seeing whatever else the daemon's own environment
+//! carries (`WAKER_IDENTITY_NSEC`, another tenant's already-resolved
+//! provider credential, proxy/TLS controls) — the gap the original overlay-
+//! only version of this parameter left open, since in `buzz-waker`'s
+//! multi-tenant model the tenant's own bundle authorizes which provider
+//! binary/digest runs, so an unisolated child could otherwise read and
+//! exfiltrate secrets across the shared-daemon boundary.
+//!
+//! `TENANT_BASELINE_VARS` is deliberately small and reviewed per addition,
+//! not "whatever the parent happens to have" — growing it back to the full
+//! parent environment would silently undo the isolation this exists for.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -28,6 +57,27 @@ const STDERR_CAP: usize = 65536;
 /// buggy or malicious provider from OOM-ing the caller's process.
 const STDOUT_CAP: usize = 1_048_576; // 1 MB
 const PROVIDER_PROTOCOL_VERSION: u64 = 1;
+
+/// Variables kept from this process's own environment when a tenant-scoped
+/// `env` overlay is supplied — see the module doc's The child's environment
+/// section for why each one is here. Provider-agnostic on purpose: this
+/// crate has no notion of which provider binary it is invoking, so it keeps
+/// the same small baseline regardless of provider, rather than branching on
+/// provider identity.
+const TENANT_BASELINE_VARS: &[&str] = &["HOME", "PATH"];
+
+/// Build the fixed baseline applied under a tenant-scoped `env` overlay,
+/// read fresh from this process's own environment (never from `env` itself).
+fn tenant_child_environment_baseline() -> HashMap<String, String> {
+    TENANT_BASELINE_VARS
+        .iter()
+        .filter_map(|&key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
+}
 
 /// On Windows, a console-subsystem child gets a fresh, briefly-visible
 /// console window per invocation unless `CREATE_NO_WINDOW` is set. A pure
@@ -102,7 +152,8 @@ fn validate_provider_info(info: &serde_json::Value) -> Result<(), String> {
 /// `workdir` is the child's working directory (`None` inherits the caller's
 /// own CWD) — callers with a notion of a stable agent home (the desktop's
 /// `~/.buzz`) should resolve and pass it; a caller without one may pass
-/// `None`.
+/// `None`. `Some` isolates the child's environment — see the module doc's
+/// The child's environment section.
 ///
 /// Reader threads stream lines/chunks over channels so the caller can receive
 /// data as it arrives and time-box the wait. No `read_to_end` — if a provider
@@ -119,6 +170,7 @@ pub fn invoke_provider(
     request: &serde_json::Value,
     timeout: Duration,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
 ) -> Result<serde_json::Value, String> {
     let request_bytes = format!(
         "{}\n",
@@ -128,6 +180,11 @@ pub fn invoke_provider(
     let mut cmd = std::process::Command::new(binary);
     if let Some(workdir) = workdir {
         cmd.current_dir(workdir);
+    }
+    if let Some(env) = env {
+        cmd.env_clear();
+        cmd.envs(tenant_child_environment_baseline());
+        cmd.envs(env);
     }
     configure_no_window(&mut cmd);
     let mut child = cmd
@@ -563,7 +620,8 @@ fn stage_provider(
 /// Deploy through one immutable staged copy: negotiate protocol v1 before the
 /// secret-bearing request, then invoke deploy on those exact same bytes.
 ///
-/// `workdir` is passed straight through to [`invoke_provider`] — see its doc.
+/// `workdir` and `env` are passed straight through to [`invoke_provider`] —
+/// see its doc.
 ///
 /// # Errors
 /// See [`invoke_provider`] and [`stage_provider`] — every path returns a
@@ -573,8 +631,9 @@ pub fn provider_deploy(
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
 ) -> Result<ProviderDeployOutcome, String> {
-    deploy(binary, agent, provider_config, workdir, None)
+    deploy(binary, agent, provider_config, workdir, env, None)
 }
 
 /// Like [`provider_deploy`], but refuses to run unless the staged binary's
@@ -595,11 +654,13 @@ pub fn provider_deploy(
 /// # Errors
 /// A digest mismatch is reported before any process is spawned. Otherwise
 /// see [`provider_deploy`].
+#[allow(clippy::too_many_arguments)]
 pub fn provider_deploy_pinned(
     binary: &Path,
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
     expected_sha256_hex: &str,
 ) -> Result<ProviderDeployOutcome, String> {
     deploy(
@@ -607,15 +668,18 @@ pub fn provider_deploy_pinned(
         agent,
         provider_config,
         workdir,
+        env,
         Some(expected_sha256_hex),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deploy(
     binary: &Path,
     agent: &serde_json::Value,
     provider_config: &serde_json::Value,
     workdir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
     expected_sha256_hex: Option<&str>,
 ) -> Result<ProviderDeployOutcome, String> {
     let (_directory, staged, digest, _execution_guard) = stage_provider(binary)?;
@@ -633,7 +697,13 @@ fn deploy(
         "op": "info",
         "request_id": uuid::Uuid::new_v4().to_string(),
     });
-    let info = invoke_provider(&staged, &info_request, Duration::from_secs(10), workdir)?;
+    let info = invoke_provider(
+        &staged,
+        &info_request,
+        Duration::from_secs(10),
+        workdir,
+        env,
+    )?;
     validate_provider_info(&info)?;
 
     let request = serde_json::json!({
@@ -642,7 +712,7 @@ fn deploy(
         "agent": agent,
         "provider_config": provider_config,
     });
-    let resp = invoke_provider(&staged, &request, Duration::from_secs(600), workdir)?;
+    let resp = invoke_provider(&staged, &request, Duration::from_secs(600), workdir, env)?;
     let agent_id = resp["agent_id"]
         .as_str()
         .map(String::from)

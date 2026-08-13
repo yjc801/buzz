@@ -162,6 +162,7 @@ esac"#,
         &serde_json::json!({}),
         &serde_json::json!({}),
         None,
+        None,
     )
     .expect("staged deploy");
     assert_eq!(outcome.agent_id, "remote-1");
@@ -207,6 +208,7 @@ esac"#
             &provider,
             &serde_json::json!({}),
             &serde_json::json!({}),
+            None,
             None,
         )
         .expect("staged deploy");
@@ -257,6 +259,7 @@ esac"#,
         &serde_json::json!({}),
         &serde_json::json!({}),
         None,
+        None,
     )
     .expect("deploy from immutable staged copy")
     .agent_id;
@@ -304,6 +307,7 @@ esac"#,
         &serde_json::json!({}),
         &serde_json::json!({}),
         None,
+        None,
     )
     .expect("deploy from immutable staged copy")
     .agent_id;
@@ -342,6 +346,7 @@ esac"#,
         &serde_json::json!({"private_key_nsec": "nsec1must-not-cross"}),
         &serde_json::json!({}),
         None,
+        None,
     )
     .unwrap_err();
     assert!(error.contains("protocol version 2"), "{error}");
@@ -364,6 +369,7 @@ printf '%s\n' '{"ok":true,"version":"1.0.0"}'"#,
         &provider,
         &serde_json::json!({}),
         &serde_json::json!({}),
+        None,
         None,
     )
     .unwrap_err();
@@ -390,6 +396,7 @@ fn provider_deploy_pinned_refuses_a_digest_mismatch_before_any_negotiation() {
         &provider,
         &serde_json::json!({"private_key_nsec": "nsec1must-not-cross"}),
         &serde_json::json!({}),
+        None,
         None,
         &"f".repeat(64),
     )
@@ -424,10 +431,142 @@ esac"#,
         &serde_json::json!({}),
         &serde_json::json!({}),
         None,
+        None,
         &expected,
     )
     .expect("digest matched, deploy proceeds");
     assert_eq!(outcome.agent_id, "pinned-1");
+}
+
+/// The headline case `env` exists for: a caller's overlay must actually
+/// reach the child process, not just be accepted and silently dropped.
+#[cfg(unix)]
+#[test]
+fn provider_deploy_env_overlay_reaches_the_child_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    write_test_provider(
+        &provider,
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,"description":"test provider","config_schema":{}}' ;;
+  *\"op\":\"deploy\"*) printf '{"ok":true,"agent_id":"%s"}\n' "$TEST_TENANT_TOKEN" ;;
+esac"#,
+    );
+
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "TEST_TENANT_TOKEN".to_string(),
+        "sprt-tenant-abc".to_string(),
+    );
+
+    let outcome = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+        Some(&env),
+    )
+    .expect("deploy with an env overlay");
+    assert_eq!(
+        outcome.agent_id, "sprt-tenant-abc",
+        "the child must see the overlaid variable"
+    );
+}
+
+/// `Some(map)` overrides an inherited variable of the same name — the
+/// module doc's own contract, and the property `buzz-waker` relies on if a
+/// baseline var and a tenant var ever collide.
+#[cfg(unix)]
+#[test]
+fn provider_deploy_env_overlay_overrides_an_inherited_variable() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    write_test_provider(
+        &provider,
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,"description":"test provider","config_schema":{}}' ;;
+  *\"op\":\"deploy\"*) printf '{"ok":true,"agent_id":"%s"}\n' "$TEST_TENANT_TOKEN" ;;
+esac"#,
+    );
+
+    // SAFETY: test-only, single-threaded at this point in the process
+    // (no other test in this crate reads or writes this exact variable).
+    unsafe {
+        std::env::set_var("TEST_TENANT_TOKEN", "inherited-from-parent");
+    }
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "TEST_TENANT_TOKEN".to_string(),
+        "overlaid-value".to_string(),
+    );
+
+    let outcome = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+        Some(&env),
+    )
+    .expect("deploy with an env overlay");
+    assert_eq!(outcome.agent_id, "overlaid-value");
+
+    unsafe {
+        std::env::remove_var("TEST_TENANT_TOKEN");
+    }
+}
+
+/// A tenant-scoped `env` overlay must isolate the child from this process's
+/// own environment, not merely overlay on top of it — an unrelated inherited
+/// variable (standing in for a daemon secret like `WAKER_IDENTITY_NSEC` or
+/// another tenant's already-resolved provider credential) must not reach the
+/// child, even though it is never mentioned in `env` or in
+/// `TENANT_BASELINE_VARS`.
+#[cfg(unix)]
+#[test]
+fn provider_deploy_env_overlay_clears_unrelated_inherited_variables() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    write_test_provider(
+        &provider,
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{"ok":true,"name":"test","version":"1.0.0","protocol_version":1,"description":"test provider","config_schema":{}}' ;;
+  *\"op\":\"deploy\"*)
+    if [ -z "${TEST_SHOULD_NOT_LEAK:-}" ]; then
+      printf '{"ok":true,"agent_id":"cleared"}\n'
+    else
+      printf '{"ok":true,"agent_id":"leaked"}\n'
+    fi
+    ;;
+esac"#,
+    );
+
+    // SAFETY: test-only, single-threaded at this point in the process
+    // (no other test in this crate reads or writes this exact variable).
+    unsafe {
+        std::env::set_var("TEST_SHOULD_NOT_LEAK", "daemon-secret");
+    }
+    let env = std::collections::HashMap::new();
+
+    let outcome = provider_deploy(
+        &provider,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        None,
+        Some(&env),
+    )
+    .expect("deploy with an empty tenant env overlay");
+    assert_eq!(
+        outcome.agent_id, "cleared",
+        "a variable inherited from this process but absent from both the tenant overlay \
+         and TENANT_BASELINE_VARS must not reach the child"
+    );
+
+    unsafe {
+        std::env::remove_var("TEST_SHOULD_NOT_LEAK");
+    }
 }
 
 #[test]

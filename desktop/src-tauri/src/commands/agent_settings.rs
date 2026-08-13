@@ -376,11 +376,12 @@ pub async fn set_managed_agent_community(
 /// Opt an agent into (or out of) `buzz-waker` deployment.
 ///
 /// Turning this on for a `Provider`-backend agent is the enrolment moment
-/// (`PLANS/BUZZ_WAKER_DESIGN.md` §11): `retain_managed_agent_pending` below
-/// issues and retains that agent's first signed launch bundle in the same
+/// (`PLANS/BUZZ_WAKER_DESIGN.md` §11): this issues and retains both that
+/// agent's first signed launch bundle and its first enrolment credential
+/// (the roster entry that lets the daemon discover it at all) in the same
 /// call. Every later edit that already calls `retain_managed_agent_pending`
 /// (model/provider changes, persona-propagated updates, rollback restores)
-/// reissues it — never a bare liveness ping (G3).
+/// reissues both — never a bare liveness ping (G3).
 ///
 /// Refused for a `Local` backend: there is nothing for a remote daemon to
 /// invoke, so an enabled flag would sit there silently doing nothing.
@@ -465,6 +466,23 @@ pub async fn set_managed_agent_waker_enabled(
                 save_managed_agents(&app, &records)?;
                 return Err(format!(
                     "buzz-waker enrolment failed to issue a launch bundle: {e}"
+                ));
+            }
+            // The bundle alone only tells the daemon how to deploy this agent
+            // once it already knows to watch it. Without also issuing the
+            // enrolment credential and roster entry here, the daemon never
+            // discovers a freshly enabled agent unless some unrelated later
+            // settings mutation happens to call the generic retain helper
+            // that covers both (`retain_managed_agent_pending`).
+            if let Err(e) =
+                super::agents_waker_enrolment::retain_waker_enrolment_pending(&app, &state, record)
+            {
+                let record = find_managed_agent_mut(&mut records, &pubkey)?;
+                record.waker_enabled = false;
+                record.updated_at = now_iso();
+                save_managed_agents(&app, &records)?;
+                return Err(format!(
+                    "buzz-waker enrolment failed to issue watch credentials: {e}"
                 ));
             }
         } else {

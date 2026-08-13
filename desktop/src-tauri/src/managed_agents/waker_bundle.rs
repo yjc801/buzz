@@ -114,6 +114,18 @@ impl ReservedVersion {
     pub(crate) fn spend(self) -> u64 {
         self.0
     }
+
+    /// The version number this reservation carries, without spending it.
+    ///
+    /// For bookkeeping that needs the number alongside the reservation
+    /// itself — e.g. recording which version a caller is *about* to spend,
+    /// so it can mark that number committed once the body it goes into is
+    /// actually retained. Reading the number does not weaken `spend`'s
+    /// single-write guarantee: that guarantee is about the reservation only
+    /// ever being written into one signed body, not about who may read it.
+    pub(crate) fn number(&self) -> u64 {
+        self.0
+    }
 }
 
 /// The persisted issuance record: the highest version handed out per agent.
@@ -139,6 +151,16 @@ struct IssuedVersions {
     /// been retained.
     #[serde(default)]
     expiries: BTreeMap<String, u64>,
+    /// The highest version of each key that was actually retained, as opposed
+    /// to merely reserved.
+    ///
+    /// `versions` is burned at reservation and advances even when the sign or
+    /// retain step that follows fails, so a reader that needs to know what was
+    /// *actually issued* — e.g. a roster naming the credential version each
+    /// agent is expected to hold — must not read `versions` directly. Recorded
+    /// after retention succeeds, like `expiries`.
+    #[serde(default)]
+    committed: BTreeMap<String, u64>,
 }
 
 /// The durable per-agent version allocator.
@@ -203,26 +225,6 @@ impl IssuanceLedger {
         Ok(ReservedVersion(next))
     }
 
-    /// The highest version already handed out for `key`, or 0 if none has been.
-    ///
-    /// Read-only on purpose: the enrolment roster has to *name* the credential
-    /// version each agent currently has, and reserving there would burn a
-    /// version the credential body never carries — leaving the roster pointing
-    /// at a credential that was never issued.
-    ///
-    /// Deliberately unfenced. A reservation racing this read can only make the
-    /// answer stale-low, and the caller that reserves is the same one that
-    /// republishes the roster immediately after, so the roster it writes
-    /// carries the number it just reserved rather than this one.
-    ///
-    /// # Errors
-    /// Propagates a read or parse failure — an unreadable ledger must not be
-    /// reported as "version 0", which would publish a roster claiming every
-    /// agent is unissued.
-    pub(crate) fn current(&self, key: &str) -> Result<u64, String> {
-        Ok(self.read()?.versions.get(key).copied().unwrap_or(0))
-    }
-
     /// Record when `agent_pubkey`'s newly retained bundle lapses.
     ///
     /// Called *after* retention succeeds, never at reservation. A version is
@@ -257,6 +259,29 @@ impl IssuanceLedger {
     /// say so, rather than rendering it as expired or as fine.
     pub(crate) fn expiry(&self, agent_pubkey: &str) -> Result<Option<u64>, String> {
         Ok(self.read()?.expiries.get(agent_pubkey).copied())
+    }
+
+    /// Record that `version` for `key` was actually retained, not merely
+    /// reserved.
+    ///
+    /// Called *after* retention succeeds, mirroring [`Self::record_expiry`]:
+    /// a version recorded here before the write it describes has landed would
+    /// let a reader believe an issuance exists that a later step could still
+    /// fail to produce.
+    pub(crate) fn record_committed(&self, key: &str, version: u64) -> Result<(), String> {
+        let fence = Fence::acquire(&self.lock_path)?;
+        let mut current = self.read()?;
+        current.committed.insert(key.to_string(), version);
+        self.persist(&fence, &current)
+    }
+
+    /// The highest version of `key` actually retained, or 0 if none has been.
+    ///
+    /// Unlike [`Self::current`], this never reflects a version that was
+    /// reserved but whose signing or retention step then failed — see the
+    /// `committed` field doc on [`IssuedVersions`].
+    pub(crate) fn committed(&self, key: &str) -> Result<u64, String> {
+        Ok(self.read()?.committed.get(key).copied().unwrap_or(0))
     }
 
     fn read(&self) -> Result<IssuedVersions, String> {

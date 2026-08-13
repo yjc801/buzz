@@ -128,17 +128,29 @@ pub(crate) fn retain_waker_enrolment_pending(
 /// raises that agent's durable credential floor, so the superseded credential
 /// is refused from then on even though it is still readable on the relay.
 ///
-/// Like [`super::agents::waker::revoke_waker_bundle_pending`](super::agents) and unlike every other
-/// retention write here, this is **not** best-effort: revocation is the
+/// Like [`super::agents::waker::revoke_waker_bundle_pending`](super::agents),
+/// the credential half below is **not** best-effort: revocation is the
 /// security effect of the calling command, so a caller must propagate `Err`
 /// and refuse to persist the disable rather than report success with the agent
-/// still enrolled. Call it *before* mutating and saving the record — a failure
-/// then needs no rollback, and `exclude` below is what keeps the roster
-/// correct while the store still says the agent is enabled.
+/// still enrolled. Call it *before* mutating and saving the record — a
+/// failure there needs no rollback, and `exclude` below is what keeps the
+/// roster correct while the store still says the agent is enabled.
+///
+/// The roster half that follows is best-effort once the credential half has
+/// landed. The credential retain is what queues the revocation for publish —
+/// by the time it succeeds the security effect is already committed and
+/// cannot be un-queued, so a caller that then refused to persist the disable
+/// because the roster write failed would report "waker remains enabled" while
+/// the in-flight revocation tears the agent down regardless: local state and
+/// the external effect would claim opposites. A roster that still names this
+/// agent self-corrects the next time any other agent's enrolment is retained,
+/// since [`enrolled_credential_versions`] filters on `waker_enabled`, which
+/// the caller persists as `false` once this returns `Ok`.
 ///
 /// # Errors
-/// Propagates a failure to resolve the scope, reserve a version, sign, or
-/// retain either half.
+/// Propagates a failure to resolve the scope, reserve a version, or sign or
+/// retain the credential revocation. A roster retract failure after that is
+/// logged and swallowed, not propagated.
 pub(crate) fn revoke_waker_enrolment_pending(
     app: &AppHandle,
     state: &AppState,
@@ -171,7 +183,7 @@ pub(crate) fn revoke_waker_enrolment_pending(
 
     // The record still says `waker_enabled` at this point by design, so the
     // agent is excluded explicitly rather than by reloading the store.
-    retain_roster_at(
+    if let Err(e) = retain_roster_at(
         app,
         &scope.db_path,
         &scope.owner_keys,
@@ -179,7 +191,11 @@ pub(crate) fn revoke_waker_enrolment_pending(
         &waker_pubkey,
         Some(agent_pubkey),
         issued_at,
-    )
+    ) {
+        eprintln!("buzz-desktop: waker-enrolment-roster-retract: {e}");
+    }
+
+    Ok(())
 }
 
 /// Every agent this owner currently has enrolled, with the credential version
@@ -221,7 +237,7 @@ fn credential_versions_for(
         if exclude.is_some_and(|excluded| excluded == agent_pubkey) {
             continue;
         }
-        let version = ledger.current(&agent_pubkey)?;
+        let version = ledger.committed(&agent_pubkey)?;
         if version > 0 {
             versions.insert(agent_pubkey, version);
         }
@@ -284,6 +300,7 @@ pub(super) fn sign_and_retain_credential_at(
     use crate::managed_agents::waker_enrolment::{sign_enrolment_credential, CredentialInputs};
 
     let credential_version = ledger.reserve(agent_pubkey)?;
+    let committed_version = credential_version.number();
     let signed = sign_enrolment_credential(
         CredentialInputs {
             agent_pubkey: agent_pubkey.to_string(),
@@ -305,7 +322,13 @@ pub(super) fn sign_and_retain_credential_at(
         agent_pubkey,
         &credential_retention_d_tag(agent_pubkey),
         &plaintext,
-    )
+    )?;
+
+    // Only past this point has a credential actually been retained at
+    // `committed_version` — see `IssuanceLedger::committed`. A roster built
+    // from `ledger.current` instead would advertise this version even when an
+    // earlier step above failed and left nothing retained.
+    ledger.record_committed(agent_pubkey, committed_version)
 }
 
 /// Encrypt `plaintext` to the waker, wrap it in the shared envelope kind, and
@@ -646,8 +669,13 @@ mod tests {
         let (kept, revoked, never_issued) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
 
         // `kept` and `revoked` have credentials; `never_issued` does not.
+        // Reserving alone is not enough — only a committed version (recorded
+        // once a credential is actually retained, not merely reserved) counts
+        // as issued. See `IssuanceLedger::committed`.
         ledger.reserve(&kept).expect("reserve");
+        ledger.record_committed(&kept, 1).expect("commit");
         ledger.reserve(&revoked).expect("reserve");
+        ledger.record_committed(&revoked, 1).expect("commit");
 
         let versions = credential_versions_for(
             [kept.clone(), revoked.clone(), never_issued.clone()],
@@ -662,6 +690,30 @@ mod tests {
             "only the still-enrolled agent with an issued credential belongs"
         );
         assert_eq!(versions[&kept], 1);
+    }
+
+    /// A version that was reserved but never committed — the durable-before-
+    /// signing gap `IssuanceLedger::reserve` documents, e.g. an invalid waker
+    /// key or a retention failure after the reservation lands — must not be
+    /// advertised in the roster. A version the roster names is a promise that
+    /// a credential exists at it; naming one that was only reserved would send
+    /// the daemon to open a tap against a coordinate nothing was ever
+    /// published to.
+    #[test]
+    fn a_reserved_but_never_committed_version_is_absent_from_the_roster() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = ledger(dir.path());
+        let agent_pubkey = "a".repeat(64);
+
+        ledger.reserve(&agent_pubkey).expect("reserve");
+
+        let versions =
+            credential_versions_for([agent_pubkey.clone()], &ledger, None).expect("build");
+
+        assert!(
+            versions.is_empty(),
+            "a reserved-only version must not appear in the roster: {versions:?}"
+        );
     }
 
     /// The event the daemon sees must carry the tags its filters pin: `p` at

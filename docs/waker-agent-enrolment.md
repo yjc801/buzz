@@ -80,17 +80,20 @@ sharing the same `#p=waker`) is exactly the failure mode the original P2
 finding named: a fixed newest-N window can silently omit an agent that
 hasn't been reissued recently.
 
-So restart discovery for enrolment carries no `limit` at all:
-`authors=[owner], #p=[waker], kinds=[KIND_WAKER_BUNDLE_ENVELOPE]`, paginated
-to EOSE, folded client-side by the `d`-tag convention the envelope already
-carries (`d=agent_pubkey`, present today purely for the desktop's local
-retention lookup — see `agents_waker.rs`), keeping the highest-`created_at`
-non-revoked entry per agent. This is complete by construction — it reads
-every enrolment event that exists, not a window into them — and it reuses
-primitives that are already there (the `d` tag, the floor's monotonic-version
-logic) rather than claiming a relay guarantee kind 1059 doesn't provide. The
-only new cost is pagination itself, bounded by how many enrolment events
-exist in total for one owner, not by an arbitrary window size.
+The exact recovery mechanism is **not settled by this document** — see
+Open questions, Refetch scope. Omitting `limit` does not fix the problem by
+itself: `filter_to_query_params` clamps every REQ, limited or not, to
+`buzz_db::DEFAULT_MAX_PAGE_LIMIT` (1,000) and the relay then emits EOSE, so
+an unlimited subscription still reads one capped page, not full history —
+and this document does not have a demonstrated tie-safe cursor for reading
+past it (a seconds-only `until` boundary can skip events sharing that
+second). The `d`-tag the envelope already carries (`d=agent_pubkey`, present
+today purely for the desktop's local retention lookup — see
+`agents_waker.rs`) is the right fold key, but whichever mechanism reaches it
+must select the newest **version**, via the same monotonic floor logic
+`FloorStore` already uses, before reading that entry's revoked state — not
+"highest `created_at` that happens to be non-revoked," which would resurrect
+an agent whose latest event was actually a revocation.
 
 Net secrets, compared to today:
 
@@ -170,8 +173,27 @@ this document exists for. Worth doing only as a stopgap.
 
 ## Open questions
 
-(Owner authorization and refetch scope, previously listed here, are
-resolved above — see Bootstrap and Persistence.)
+(Owner authorization, previously listed here, is resolved above — see
+Bootstrap.)
+
+**Refetch scope — explicitly deferred to implementation.** Restart discovery
+needs a mechanism that reconstructs every currently-enrolled agent, not a
+bounded heuristic — reasoning is in Persistence, above — but this document
+does not pick one, because the candidates need to be run against the real
+relay rather than asserted here. Constraints any candidate must satisfy:
+the relay clamps a REQ to `DEFAULT_MAX_PAGE_LIMIT` (1,000 events) regardless
+of `limit`, so completeness needs either a demonstrated tie-safe cursor past
+that page or a representation that doesn't depend on reading unbounded
+history at all (a bounded authoritative snapshot/shard, a durable
+non-secret index, or an explicit cursor-capable relay path are the
+candidates worth evaluating). Whichever is chosen, the fold must select the
+newest **version** per agent — via the same monotonic floor logic
+`FloorStore` already uses for bundles — before reading that entry's revoked
+state, not by comparing `created_at` values directly. This document should
+be corrected to name the chosen mechanism once implementation has proven it
+against a real relay, rather than iterating further on an unverified claim
+here (three review rounds on this exact point is the design-review cap per
+`GUIDES/REVIEW_PROTOCOL.md`).
 
 **Revocation.** Un-enrolment needs the same anti-rollback care the bundle
 floor has, or removing an agent means editing config again. The bundle's

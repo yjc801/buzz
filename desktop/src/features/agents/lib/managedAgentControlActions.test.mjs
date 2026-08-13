@@ -450,18 +450,18 @@ test("a dead remote agent offers Deploy, a live one offers Shutdown", () => {
   assert.equal(getManagedAgentPrimaryActionLabel(remote(), "away"), "Shutdown");
 });
 
-test("local agent labels are unchanged", () => {
+test("local agent labels are Stop/Start agent regardless of prior status", () => {
   assert.equal(
     getManagedAgentPrimaryActionLabel(agent({ status: "running" })),
     "Stop",
   );
   assert.equal(
     getManagedAgentPrimaryActionLabel(agent({ status: "stopped" })),
-    "Restart Agent",
+    "Start agent",
   );
   assert.equal(
     getManagedAgentPrimaryActionLabel(agent({ status: "idle" })),
-    "Start Agent",
+    "Start agent",
   );
 });
 

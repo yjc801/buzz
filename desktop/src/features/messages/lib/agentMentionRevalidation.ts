@@ -23,6 +23,7 @@ type DirectoryResult<T> = {
 export async function revalidateAgentMentionPubkeys({
   pubkeys,
   agentPubkeys,
+  memberPubkeys,
   activeCommunityRelayUrl,
   currentPubkey,
   eligibilityScope,
@@ -35,6 +36,7 @@ export async function revalidateAgentMentionPubkeys({
 }: {
   pubkeys: readonly string[];
   agentPubkeys: ReadonlySet<string>;
+  memberPubkeys: ReadonlySet<string>;
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
   eligibilityScope: AgentEligibilityScope;
@@ -74,6 +76,9 @@ export async function revalidateAgentMentionPubkeys({
   const managedPubkeys = new Set(
     managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
   );
+  const directoryAgentPubkeys = new Set(
+    relayResult.data.map((agent) => normalizePubkey(agent.pubkey)),
+  );
   const mentionablePubkeys = getMentionableAgentPubkeys({
     activeCommunityRelayUrl,
     currentPubkey,
@@ -88,10 +93,12 @@ export async function revalidateAgentMentionPubkeys({
         getAgentMentionAdmission({
           isAgent: true,
           isManagedAgent: managedPubkeys.has(pubkey),
+          isMember: memberPubkeys.has(pubkey),
           pubkey,
           ownerPubkey: ownerProfiles?.profiles[pubkey]?.ownerPubkey,
           currentPubkey,
           mentionableAgentPubkeys: mentionablePubkeys,
+          directoryAgentPubkeys,
           directoryReady: true,
           ownerOnly,
         }) === "allow",
@@ -102,6 +109,7 @@ export async function revalidateAgentMentionPubkeys({
 
 export function useAgentMentionRevalidation({
   agentPubkeys,
+  memberPubkeys,
   getSelectedAgentPubkeys,
   activeCommunityRelayUrl,
   currentPubkey,
@@ -113,6 +121,7 @@ export function useAgentMentionRevalidation({
   refetchRelayAgents,
 }: {
   agentPubkeys: ReadonlySet<string>;
+  memberPubkeys: ReadonlySet<string>;
   getSelectedAgentPubkeys: () => ReadonlySet<string>;
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
@@ -136,6 +145,7 @@ export function useAgentMentionRevalidation({
       revalidateAgentMentionPubkeys({
         pubkeys,
         agentPubkeys: new Set([...agentPubkeys, ...getSelectedAgentPubkeys()]),
+        memberPubkeys,
         activeCommunityRelayUrl,
         currentPubkey,
         eligibilityScope,
@@ -152,6 +162,7 @@ export function useAgentMentionRevalidation({
       currentPubkey,
       eligibilityScope,
       getSelectedAgentPubkeys,
+      memberPubkeys,
       ownerOnly,
       ownerPolicyError,
       refetchManagedAgents,

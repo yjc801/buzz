@@ -793,6 +793,7 @@ export function useMentions(
   ).current;
   const revalidateMentionPubkeys = useAgentMentionRevalidation({
     agentPubkeys: agentIdentityPubkeys,
+    memberPubkeys,
     getSelectedAgentPubkeys,
     activeCommunityRelayUrl,
     currentPubkey,

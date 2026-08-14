@@ -12,6 +12,7 @@ function options(refetchOwnerProfiles) {
   return {
     pubkeys: [HUMAN, AGENT],
     agentPubkeys: new Set([AGENT]),
+    memberPubkeys: new Set(),
     activeCommunityRelayUrl: null,
     currentPubkey: CURRENT,
     eligibilityScope: { type: "channel", channelId: "general" },
@@ -33,6 +34,28 @@ function options(refetchOwnerProfiles) {
     refetchOwnerProfiles,
   };
 }
+
+test("revalidation preserves member admission for a member agent with no directory record", async () => {
+  const result = await revalidateAgentMentionPubkeys({
+    pubkeys: [HUMAN, AGENT],
+    agentPubkeys: new Set([AGENT]),
+    memberPubkeys: new Set([AGENT]),
+    activeCommunityRelayUrl: null,
+    currentPubkey: CURRENT,
+    eligibilityScope: { type: "channel", channelId: "general" },
+    sharedChannelIds: new Set(["general"]),
+    ownerOnly: false,
+    ownerPolicyError: null,
+    refetchManagedAgents: async () => ({ data: [], error: null }),
+    // No relay directory entry for AGENT — mirrors the picker's admitted
+    // member-agent case (getAdmittedMemberAgentPubkeys), which revalidation
+    // must not silently strip.
+    refetchRelayAgents: async () => ({ data: [], error: null }),
+    refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
+  });
+
+  assert.deepEqual(result, [HUMAN, AGENT]);
+});
 
 test("owner-only revalidation admits an agent only from a fresh same-owner proof", async () => {
   const requested = [];

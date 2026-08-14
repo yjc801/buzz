@@ -25,7 +25,6 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 export function useMentionAgentPubkeys({
   activeCommunityRelayUrl,
   currentPubkey,
-  directoryAgentPubkeys,
   isArchived,
   managedAgentNamesByPubkey,
   managedAgents,
@@ -38,7 +37,6 @@ export function useMentionAgentPubkeys({
 }: {
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
-  directoryAgentPubkeys: ReadonlySet<string>;
   isArchived: (pubkey: string) => boolean;
   managedAgentNamesByPubkey: ReadonlyMap<string, string>;
   managedAgents: readonly ManagedAgentScopeInput[] | undefined;
@@ -51,6 +49,7 @@ export function useMentionAgentPubkeys({
 }): {
   mentionableAgentPubkeys: ReadonlySet<string>;
   memberAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys: ReadonlySet<string>;
   knownAgentPubkeys: ReadonlySet<string>;
 } {
   const mentionableAgentPubkeys = React.useMemo(
@@ -73,6 +72,14 @@ export function useMentionAgentPubkeys({
       relayAgents,
       sharedChannelIds,
     ],
+  );
+
+  const directoryAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (relayAgents ?? []).map((agent) => normalizePubkey(agent.pubkey)),
+      ),
+    [relayAgents],
   );
 
   const memberAgentPubkeys = React.useMemo(() => {
@@ -113,5 +120,10 @@ export function useMentionAgentPubkeys({
     mentionableAgentPubkeys,
   ]);
 
-  return { mentionableAgentPubkeys, memberAgentPubkeys, knownAgentPubkeys };
+  return {
+    mentionableAgentPubkeys,
+    memberAgentPubkeys,
+    directoryAgentPubkeys,
+    knownAgentPubkeys,
+  };
 }

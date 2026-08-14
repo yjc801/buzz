@@ -637,6 +637,7 @@ export function AppShell() {
     [],
   );
   useAppShellKeyboardShortcuts({
+    activeChannelId: selectedView === "channel" ? selectedChannelId : null,
     canSearchCurrentChannel:
       selectedView === "channel" && Boolean(activeChannel),
     disabled: settingsOpen || isHuddleRoom,

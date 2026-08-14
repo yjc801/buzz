@@ -55,11 +55,20 @@ export async function revalidateAgentMentionPubkeys({
     return [...pubkeys];
   }
 
+  // Roster proof only matters to the lenient channel-member admission
+  // branch. A "managed-only"/"community" scope (e.g. a new-DM composer with
+  // no channel yet) has no roster to fetch — requiring one would fail-close
+  // a valid managed-agent mention before the channel even exists.
   const [managedResult, relayResult, membersResult, ownerProfiles] =
     await Promise.all([
       refetchManagedAgents(),
       refetchRelayAgents(),
-      refetchMembers(),
+      eligibilityScope.type === "channel"
+        ? refetchMembers()
+        : Promise.resolve<DirectoryResult<ChannelMember[]>>({
+            data: [],
+            error: null,
+          }),
       ownerOnly
         ? refetchOwnerProfiles([...requestedAgentPubkeys]).catch(() => null)
         : Promise.resolve(null),

@@ -110,6 +110,32 @@ test("revalidation fails closed when the channel roster cannot be refreshed", as
   assert.deepEqual(result, [HUMAN]);
 });
 
+test("revalidation admits a managed agent when no channel exists yet (managed-only scope)", async () => {
+  // Mirrors NewMessageScreen: MessageComposer runs with channelId=null before
+  // onPrepareSendChannel creates the DM, so there is no roster to fetch.
+  const result = await revalidateAgentMentionPubkeys({
+    pubkeys: [HUMAN, AGENT],
+    agentPubkeys: new Set([AGENT]),
+    refetchMembers: async () => {
+      throw new Error("must not be called for a managed-only scope");
+    },
+    activeCommunityRelayUrl: null,
+    currentPubkey: CURRENT,
+    eligibilityScope: { type: "managed-only" },
+    sharedChannelIds: new Set(),
+    ownerOnly: false,
+    ownerPolicyError: null,
+    refetchManagedAgents: async () => ({
+      data: [{ pubkey: AGENT, communityRelayUrl: null }],
+      error: null,
+    }),
+    refetchRelayAgents: async () => ({ data: [], error: null }),
+    refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
+  });
+
+  assert.deepEqual(result, [HUMAN, AGENT]);
+});
+
 test("owner-only revalidation admits an agent only from a fresh same-owner proof", async () => {
   const requested = [];
   const result = await revalidateAgentMentionPubkeys(

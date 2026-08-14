@@ -91,7 +91,6 @@ import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { AuxiliaryPanelBody } from "@/shared/layout/AuxiliaryPanel";
 import { cn } from "@/shared/lib/cn";
-import { normalizePubkey } from "@/shared/lib/pubkey";
 import type {
   AgentPersona,
   Channel,
@@ -169,25 +168,21 @@ export function UserProfilePanel({
     React.useState<AgentPersona | null>(null);
   const [cardMintTarget, setCardMintTarget] =
     React.useState<CardMintTarget | null>(null);
-  const [requestedInstancePubkey, setRequestedInstancePubkey] = React.useState<
-    string | null
-  >(null);
-  const preserveRequestedInstance = Boolean(
-    pubkey &&
-      requestedInstancePubkey &&
-      normalizePubkey(pubkey) === normalizePubkey(requestedInstancePubkey),
-  );
 
   const personasQuery = usePersonasQuery();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: true });
-  const { linkedPersonaId, managedAgent, personaInstances } =
-    useCanonicalManagedAgentProfile({
-      currentPubkey,
-      managedAgents: managedAgentsQuery.data,
-      personaId: persona?.id,
-      preserveRequestedInstance,
-      pubkey,
-    });
+  const {
+    linkedPersonaId,
+    managedAgent,
+    personaInstances,
+    preserveRequestedInstance,
+    requestInstance,
+  } = useCanonicalManagedAgentProfile({
+    currentPubkey,
+    managedAgents: managedAgentsQuery.data,
+    personaId: persona?.id,
+    pubkey,
+  });
   const resolvedPersonaFromSource = React.useMemo(() => {
     const personaId = linkedPersonaId ?? managedAgent?.personaId;
     if (personaId) {
@@ -389,10 +384,10 @@ export function UserProfilePanel({
     if (prevTargetKeyRef.current === targetKey) return;
     prevTargetKeyRef.current = targetKey;
     if (preserveRequestedInstance) return;
-    setRequestedInstancePubkey(null);
+    requestInstance(null);
     setView("summary", { replace: true });
     setTab("info", { replace: true });
-  }, [preserveRequestedInstance, setTab, setView, targetKey]);
+  }, [preserveRequestedInstance, requestInstance, setTab, setView, targetKey]);
   const {
     canHuddle,
     canMessage,
@@ -831,7 +826,7 @@ export function UserProfilePanel({
             isBot && canManagePersona ? handleExportPersona : undefined
           }
           onOpenInstance={(instancePubkey) => {
-            setRequestedInstancePubkey(instancePubkey);
+            requestInstance(instancePubkey);
             onOpenProfile?.(instancePubkey);
             setTab("runtime");
           }}

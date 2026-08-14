@@ -1,0 +1,292 @@
+name: Fork Upstream Release Watch
+
+# Cuts a Waggle release whenever upstream block/buzz cuts a desktop release.
+#
+# GitHub cannot trigger a workflow on another repository's events, so this
+# polls. Like fork-desktop-release.yml, the file deliberately does not exist
+# upstream, so `git merge upstream/main` never conflicts here.
+#
+# Two things about upstream's release mechanics drive the whole design, and
+# both are easy to get wrong:
+#
+#   * The signal is upstream's `desktop-v<X.Y.Z>` TAG, not its GitHub Release.
+#     Upstream tags the moment a version-bump PR merges; the release page
+#     appears later, and sometimes not at all — desktop-v0.5.12 and
+#     desktop-v0.5.13 are both tagged with no published release. Gating on the
+#     release page would have left this fork sitting on 0.5.11 indefinitely.
+#   * That tag is NOT mergeable. Upstream squash-merges its version-bump PRs
+#     and tags the PR HEAD, so the tag is a commit that never lands on main
+#     (`compare main...desktop-v0.5.13` reports diverged, ahead 1 / behind 1).
+#     Merging it would drag a duplicate of the squashed commit into this fork.
+#     So the tag supplies the version number only; the code comes from
+#     `upstream/main`, which is what carries the release commit.
+#
+# What a run does:
+#   1. reads the newest upstream desktop-v tag           → the released version
+#   2. compares it to the newest version this fork built → anything to do?
+#   3. merges upstream/main into fork main (clean merges only)
+#   4. confirms the merged tree really is at that released version
+#   5. dispatches fork-desktop-release.yml, which builds the signed DMG
+#
+# Step 4 is the loop guard, not a formality. The fork's release version is
+# derived from desktop/package.json, and step 2's marker is derived from the
+# releases that version produces. If those two could disagree, a run that
+# released the "wrong" version would leave the marker behind and re-fire on
+# every poll, building a DMG every two hours. Requiring the merged tree to sit
+# exactly on the released version makes the mismatch a skip instead — and it
+# self-heals, since upstream tagging is minutes behind its own version bump.
+#
+# Deliberately NOT gated on the fork's CI being green: main carries known
+# failing inherited tests, so a green-CI gate would block releases forever.
+# The release workflow's own checks — signing, notarization, sidecar presence,
+# bundle identity, Gatekeeper assessment — are what stand between a bad build
+# and the release page.
+#
+# This complements, rather than replaces, the twice-daily buzz-fork-sync
+# launchd job on the maintainer's Mac: that keeps main current between
+# releases, this guarantees a release lands even while that machine is off.
+# Both merge cleanly-or-not-at-all and both file the same single "fork sync
+# conflict" issue, so a conflict never produces two.
+
+on:
+  schedule:
+    # Every two hours, off the top of the hour (scheduled runs queue behind
+    # everyone else's :00 cron). Upstream ships every day or two, so this
+    # costs a few seconds per run and adds at most two hours of latency.
+    - cron: "37 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if the newest upstream version was already built"
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-upstream-release-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    name: Watch upstream desktop releases
+    # Forks only. Guards against this ever running upstream if the file is
+    # merged there by accident.
+    if: github.repository != 'block/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # merge upstream into main and push
+      actions: write # dispatch fork-desktop-release.yml
+      issues: write # file the conflict issue
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the newest upstream desktop release
+        id: upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/block/buzz.git
+          # Explicit refspecs, and upstream's tags land in a private namespace:
+          # this fork carries its own desktop-v* tags from the fork point, and
+          # nothing here should depend on which copy of a tag won.
+          git fetch --no-tags --quiet upstream \
+            '+refs/heads/main:refs/remotes/upstream/main' \
+            '+refs/tags/desktop-v*:refs/upstream-releases/desktop-v*'
+          VERSION=$(git for-each-ref --format='%(refname:strip=2)' refs/upstream-releases/ \
+                    | sed 's/^desktop-v//' \
+                    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                    | sort -V | tail -1 || true)
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::No upstream desktop-v<X.Y.Z> tags found — has block/buzz changed its tag scheme?"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "upstream latest release: $VERSION"
+
+      - name: Read the newest version this fork has built
+        id: fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Derived state, not stored state: every fork release is tagged
+          # fork-desktop-v<upstream base>-fork.<date>.<run>, so the releases
+          # themselves are the marker. Take the highest base version rather
+          # than the newest release, so a rebuild of an older commit cannot
+          # make the fork look further ahead than it is.
+          LAST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --order desc \
+                   --exclude-drafts --json tagName --jq '.[].tagName' \
+                 | sed -n 's/^fork-desktop-v\([0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}\)-fork\..*$/\1/p' \
+                 | sort -V | tail -1 || true)
+          echo "version=$LAST" >> "$GITHUB_OUTPUT"
+          echo "newest fork build: ${LAST:-<none>}"
+
+      - name: Decide whether to release
+        id: decide
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+          LAST: ${{ steps.fork.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          decision() { echo "release=$1" >> "$GITHUB_OUTPUT"; }
+          if [[ "$FORCE" == "true" ]]; then
+            decision true
+            echo "Forced: releasing upstream $UPSTREAM regardless of what this fork has built."
+          elif [[ -z "$LAST" ]]; then
+            decision true
+            echo "No fork desktop release exists yet; releasing upstream $UPSTREAM."
+          elif [[ "$UPSTREAM" == "$LAST" ]]; then
+            decision false
+            echo "::notice::Upstream $UPSTREAM is already built as a fork release; nothing to do."
+          elif [[ "$(printf '%s\n%s\n' "$UPSTREAM" "$LAST" | sort -V | tail -1)" == "$UPSTREAM" ]]; then
+            decision true
+            echo "Upstream $UPSTREAM is newer than this fork's $LAST."
+          else
+            decision false
+            echo "::notice::This fork has built $LAST, ahead of upstream $UPSTREAM; nothing to do."
+          fi
+
+      - name: Merge upstream main into fork main
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          PUSH_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Clean merges only. A conflict is always a human act to resolve, so
+          # abort, file one issue, and stop — never leave main half-merged.
+          # The title matches the launchd sync's exactly so its dedup search
+          # (`fork sync conflict in:title`) covers issues filed from either.
+          report_conflict_and_stop() {
+            FILES=$(git diff --name-only --diff-filter=U | head -20)
+            git merge --abort || true
+            echo "::error::Merge conflict with upstream main in: $(echo "$FILES" | tr '\n' ' ')"
+            EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                         --search "fork sync conflict in:title" --json number --jq 'length' \
+                       2>/dev/null || echo 0)
+            if [[ "${EXISTING:-0}" == "0" ]]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" \
+                --title "fork sync conflict with block/buzz main ($(date -u +%Y-%m-%d))" \
+                --body "$(cat <<EOF
+          Upstream released \`desktop-v${UPSTREAM}\`, but merging block/buzz main
+          (\`$(git rev-parse --short refs/remotes/upstream/main)\`) into fork main
+          (\`$(git rev-parse --short HEAD)\`) hit conflicts, so no Waggle release was built.
+
+          Conflicting files:
+          \`\`\`
+          ${FILES}
+          \`\`\`
+
+          Resolve in any clone: \`git fetch upstream && git merge upstream/main\`, fix, push,
+          close this issue. The next scheduled watch run will build the release.
+
+          _Filed by the Fork Upstream Release Watch workflow._
+          EOF
+          )" && echo "conflict issue filed"
+            else
+              echo "an open fork sync conflict issue already exists — not filing another"
+            fi
+            exit 1
+          }
+
+          # Re-sync to remote main at the top of each attempt, so a push lost to
+          # the launchd sync (or a maintainer) is retried against what actually
+          # landed rather than failing the run.
+          pushed=false
+          for attempt in 1 2 3; do
+            git fetch --quiet origin main
+            git reset --hard --quiet FETCH_HEAD
+            if git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+              echo "fork main already contains upstream main; nothing to merge"
+              pushed=true
+              break
+            fi
+            git merge --no-edit --signoff \
+              -m "chore: merge block/buzz main for desktop-v${UPSTREAM}" \
+              refs/remotes/upstream/main || report_conflict_and_stop
+            if git push "$PUSH_URL" HEAD:main; then
+              echo "merged upstream and pushed $(git rev-parse --short HEAD)"
+              pushed=true
+              break
+            fi
+            echo "::warning::push rejected on attempt ${attempt} — fork main moved mid-run; retrying"
+          done
+          if [[ "$pushed" != "true" ]]; then
+            echo "::error::Could not push the upstream merge after 3 attempts. The next scheduled run will retry."
+            exit 1
+          fi
+
+      # The loop guard described at the top of this file. fork-desktop-release
+      # labels its build from desktop/package.json, so releasing while the tree
+      # sits on some other version would never advance the marker step 2 reads,
+      # and every poll from then on would build another DMG.
+      - name: Confirm the merged tree is at the released version
+        id: verify
+        if: steps.decide.outputs.release == 'true'
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          MERGED=$(jq -r '.version' desktop/package.json)
+          if [[ "$MERGED" == "$UPSTREAM" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "fork main is at desktop $MERGED, matching upstream's newest release"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Fork main is at desktop $MERGED but the newest upstream tag is $UPSTREAM — skipping the release. This resolves itself once upstream's tag and its version bump agree."
+          fi
+
+      - name: Trigger the signed desktop release
+        if: steps.verify.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch is one of the two events GitHub still runs when
+          # the trigger came from GITHUB_TOKEN, so no PAT or App token is
+          # needed here. The dispatched run checks out main at its own start,
+          # which is the merge this job just pushed.
+          if [[ "$FORCE" == "true" ]]; then
+            gh workflow run fork-desktop-release.yml --repo "$GITHUB_REPOSITORY" --ref main -f force=true
+          else
+            gh workflow run fork-desktop-release.yml --repo "$GITHUB_REPOSITORY" --ref main
+          fi
+          echo "dispatched: https://github.com/${GITHUB_REPOSITORY}/actions/workflows/fork-desktop-release.yml"
+
+      - name: Summary
+        if: always()
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.version }}
+          LAST: ${{ steps.fork.outputs.version }}
+          RELEASE: ${{ steps.decide.outputs.release }}
+          READY: ${{ steps.verify.outputs.ready }}
+        run: |
+          set -euo pipefail
+          if [[ "$READY" == "true" ]]; then
+            OUTCOME="release dispatched"
+          elif [[ "$RELEASE" == "true" ]]; then
+            OUTCOME="held — see the log"
+          else
+            OUTCOME="nothing to do"
+          fi
+          {
+            echo "### Upstream release watch"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| newest upstream release | \`${UPSTREAM:-unknown}\` |"
+            echo "| newest fork build | \`${LAST:-none}\` |"
+            echo "| outcome | ${OUTCOME} |"
+          } >> "$GITHUB_STEP_SUMMARY"

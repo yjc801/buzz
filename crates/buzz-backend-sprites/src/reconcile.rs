@@ -33,7 +33,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The operation deadline (spec §Deploy: 600s). It bounds how long ONE
 /// deploy waits synchronously — never when anything is destroyed (nothing
 /// ever is).
-const DEADLINE: Duration = Duration::from_secs(600);
+///
+/// Visible to [`crate::provision`] so an observation step's retry ladder can
+/// refuse an attempt this deadline cannot fit, rather than spending the
+/// budget on a wait whose answer arrives after the loop has already given up.
+pub(crate) const DEADLINE: Duration = Duration::from_secs(600);
 
 /// Bounded probe exec. Short: it is a `bash` one-liner over an existing VM,
 /// and a slow one is better retried by the loop than waited on.

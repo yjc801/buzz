@@ -43,7 +43,17 @@ struct FakeState {
     /// When true, the sprig spot-check fails until a provision re-records
     /// the intent (emulating a repair of the broken artifact).
     spot_check_fails: bool,
+    /// Consecutive SUBSTRATE failures — the exec-timeout class, where no
+    /// answer is delivered at all — to return for read-only observation
+    /// steps before answering normally. Models a sprite whose CPU is held
+    /// by a concurrent deploy's adapter install.
+    observe_failures: usize,
 }
+
+/// The read-only steps [`crate::provision::observe_step`] retries. A
+/// mutation is deliberately absent: replaying one is not safe, and the
+/// fake must not imply it is.
+const OBSERVATION_KINDS: [&str; 4] = ["uname", "fetch-digest", "read-intent", "spot-check"];
 
 struct Fake {
     state: RefCell<FakeState>,
@@ -167,6 +177,10 @@ impl Substrate for Fake {
         let kind = script_kind(argv);
         self.record(format!("run:{kind}"));
         let mut state = self.state.borrow_mut();
+        if OBSERVATION_KINDS.contains(&kind) && state.observe_failures > 0 {
+            state.observe_failures -= 1;
+            return Err(SubstrateError("exec did not finish within 30s".to_string()));
+        }
         let ok = |stdout: String| {
             Ok(ExecResult {
                 exit_code: 0,
@@ -1099,4 +1113,79 @@ fn each_start_stamps_a_fresh_generation() {
     let b = crate::naming::new_generation();
     assert_ne!(a, b);
     assert_eq!(a.len(), 8);
+}
+
+/// A read-only observation step that times out does NOT fail the deploy.
+///
+/// This is the wake-path regression: a mention deployed a stopped agent
+/// while a concurrent deploy's `npm install` held the sprite's shared CPU,
+/// `read provision intent` blew its 30s budget, and the deploy failed with
+/// `deploy-failed` — dropping the mention that asked for the wake. Nothing
+/// about the sprite was wrong; it was busy. The step reads state and
+/// changes none, so the answer is to ask again.
+#[test]
+fn a_transient_timeout_on_an_observation_step_does_not_fail_the_deploy() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![stopped_probe()],
+        recorded_intent: Some(desired_intent()),
+        probe_after_start: Some(started_probe_for_this_attempt()),
+        observe_failures: 2,
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    // Asserted as a CONSECUTIVE run, not a total: the loop re-observes on
+    // every iteration, so a count would grow with unrelated polling and
+    // stop saying anything about the ladder. Three in a row followed by the
+    // next step is the ladder spending its retries and then moving on.
+    let calls = fake.calls();
+    let first = calls
+        .iter()
+        .position(|c| c == "run:read-intent")
+        .expect("the loop never read the intent");
+    assert!(
+        calls[first..first + 3]
+            .iter()
+            .all(|c| c == "run:read-intent")
+            && calls[first + 3] == "run:uname",
+        "expected two retries then an answer: {calls:?}"
+    );
+    // Converged artifacts must still be left alone: a retry is not a reason
+    // to reprovision, and reprovisioning is what makes a wake slow.
+    assert!(
+        !fake
+            .mutating_calls()
+            .iter()
+            .any(|c| c.starts_with("run:provision")),
+        "a retried observation reprovisioned: {:?}",
+        fake.mutating_calls()
+    );
+}
+
+/// The retry is bounded: a substrate that never answers still fails, and
+/// says how many chances it was given. Without this the ladder would be
+/// indistinguishable from a hang to whoever reads the error.
+#[test]
+fn an_observation_step_that_never_answers_fails_after_its_attempts() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![stopped_probe()],
+        recorded_intent: Some(desired_intent()),
+        observe_failures: usize::MAX,
+        ..Default::default()
+    });
+    let error = run(&fake).unwrap_err();
+    assert!(
+        error.contains("read provision intent") && error.contains("failed after 3 attempt(s)"),
+        "{error}"
+    );
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| *c == "run:read-intent")
+            .count(),
+        3,
+        "the ladder did not stop at its bound: {:?}",
+        fake.calls()
+    );
 }

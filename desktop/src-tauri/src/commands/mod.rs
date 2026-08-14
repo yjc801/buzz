@@ -12,6 +12,10 @@ mod agent_providers;
 mod agent_settings;
 mod agent_update_rollback;
 mod agents;
+// A sibling of `agents::waker` rather than a child of it: `agents.rs` is over
+// the desktop file-size ratchet (`desktop/scripts/check-file-sizes.mjs`) and
+// may not grow, so even the `#[path]` declaration lives here.
+mod agents_waker_enrolment;
 mod canvas;
 mod channel_templates;
 mod channel_window;

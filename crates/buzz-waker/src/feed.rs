@@ -962,6 +962,31 @@ pub trait FeedTransport {
         &mut self,
     ) -> impl std::future::Future<Output = Result<Vec<Uuid>, Self::Error>>;
 
+    /// Which of `channel_ids` are archived, and so must not be subscribed to.
+    ///
+    /// Called once per connection, immediately after
+    /// [`discover_channels`](Self::discover_channels) and before any
+    /// subscribe. Membership (kind:39002) says which channels an agent
+    /// belongs to; it says nothing about whether those channels still accept
+    /// messages. Archived state lives on the channel's kind:39000 metadata
+    /// (`["archived", "true"]`), which discovery never reads.
+    ///
+    /// Skipping them is not an optimization on likelihood — the relay
+    /// *rejects* any event published into an archived channel
+    /// (`ingest.rs`: "invalid: channel is archived"), so a mention there
+    /// cannot exist. Every subscription to one spends rate-limit budget
+    /// watching for something the relay will not accept, and this daemon
+    /// subscribes per channel, so that budget is the scarce resource
+    /// (see [`crate::wake_loop`]'s park-and-drain).
+    ///
+    /// Callers must fail **open**: if this errors, subscribe to everything
+    /// discovered. A missed archived channel costs a wasted subscription; a
+    /// wrongly skipped live one costs every wake in it.
+    fn archived_channels(
+        &mut self,
+        channel_ids: &[Uuid],
+    ) -> impl std::future::Future<Output = Result<std::collections::HashSet<Uuid>, Self::Error>>;
+
     /// Open the membership-change watch under
     /// [`WAKE_MEMBERSHIP_SUBSCRIPTION_ID`]. Issue this once per connection,
     /// after [`discover_channels`](Self::discover_channels) and before any

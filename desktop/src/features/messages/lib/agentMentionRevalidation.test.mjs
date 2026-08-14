@@ -12,7 +12,7 @@ function options(refetchOwnerProfiles) {
   return {
     pubkeys: [HUMAN, AGENT],
     agentPubkeys: new Set([AGENT]),
-    memberPubkeys: new Set(),
+    refetchMembers: async () => ({ data: [], error: null }),
     activeCommunityRelayUrl: null,
     currentPubkey: CURRENT,
     eligibilityScope: { type: "channel", channelId: "general" },
@@ -39,7 +39,7 @@ test("revalidation preserves member admission for a member agent with no directo
   const result = await revalidateAgentMentionPubkeys({
     pubkeys: [HUMAN, AGENT],
     agentPubkeys: new Set([AGENT]),
-    memberPubkeys: new Set([AGENT]),
+    refetchMembers: async () => ({ data: [{ pubkey: AGENT }], error: null }),
     activeCommunityRelayUrl: null,
     currentPubkey: CURRENT,
     eligibilityScope: { type: "channel", channelId: "general" },
@@ -55,6 +55,59 @@ test("revalidation preserves member admission for a member agent with no directo
   });
 
   assert.deepEqual(result, [HUMAN, AGENT]);
+});
+
+test("revalidation denies a member agent removed from the channel since the picker loaded", async () => {
+  const result = await revalidateAgentMentionPubkeys({
+    pubkeys: [HUMAN, AGENT],
+    agentPubkeys: new Set([AGENT]),
+    // Stale picker state may still think AGENT is a member; the fresh
+    // roster fetched at send time no longer contains it.
+    refetchMembers: async () => ({ data: [], error: null }),
+    activeCommunityRelayUrl: null,
+    currentPubkey: CURRENT,
+    eligibilityScope: { type: "channel", channelId: "general" },
+    sharedChannelIds: new Set(["general"]),
+    ownerOnly: false,
+    ownerPolicyError: null,
+    refetchManagedAgents: async () => ({ data: [], error: null }),
+    refetchRelayAgents: async () => ({ data: [], error: null }),
+    refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
+  });
+
+  assert.deepEqual(result, [HUMAN]);
+});
+
+test("revalidation fails closed when the channel roster cannot be refreshed", async () => {
+  const result = await revalidateAgentMentionPubkeys({
+    pubkeys: [HUMAN, AGENT],
+    agentPubkeys: new Set([AGENT]),
+    refetchMembers: async () => ({
+      data: undefined,
+      error: new Error("relay unavailable"),
+    }),
+    activeCommunityRelayUrl: null,
+    currentPubkey: CURRENT,
+    eligibilityScope: { type: "channel", channelId: "general" },
+    sharedChannelIds: new Set(["general"]),
+    ownerOnly: false,
+    ownerPolicyError: null,
+    refetchManagedAgents: async () => ({ data: [], error: null }),
+    refetchRelayAgents: async () => ({
+      data: [
+        {
+          pubkey: AGENT,
+          respondTo: "anyone",
+          respondToAllowlist: [],
+          channelIds: ["general"],
+        },
+      ],
+      error: null,
+    }),
+    refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
+  });
+
+  assert.deepEqual(result, [HUMAN]);
 });
 
 test("owner-only revalidation admits an agent only from a fresh same-owner proof", async () => {

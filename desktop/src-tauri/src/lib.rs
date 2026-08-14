@@ -50,8 +50,11 @@ use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 use commands::*;
 use deep_link::{
-    acknowledge_pending_community_deep_link, handle_deep_link_url,
-    take_pending_community_deep_link, PendingCommunityDeepLinks,
+    acknowledge_pending_community_deep_link, acknowledge_pending_entity_deep_link,
+    acknowledge_pending_navigation_deep_link, clear_pending_navigation_deep_links,
+    handle_deep_link_url, take_pending_community_deep_link, take_pending_entity_deep_link,
+    take_pending_navigation_deep_link, PendingCommunityDeepLinks, PendingEntityDeepLinks,
+    PendingNavigationDeepLinks,
 };
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
@@ -78,8 +81,6 @@ use mesh_llm_stubs::*;
 use shutdown::{hard_exit_after_mesh_shutdown, relaunch_after_mesh_shutdown};
 use shutdown::{is_restart_request, shut_down_app};
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
-#[cfg(target_os = "macos")]
-use tauri::Listener;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
 #[cfg(target_os = "macos")]
@@ -136,61 +137,7 @@ pub fn run() {
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
                 .build(),
         )
-        .plugin(
-            tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
-                .on_webview_ready(|webview| {
-                    if webview.label() != "main" {
-                        return;
-                    }
-
-                    // Linux/WebKitGTK needs media-stream settings and a
-                    // permission-request handler for getUserMedia; no-op
-                    // on macOS/Windows.
-                    linux_media::enable_media_capture(&webview);
-
-                    // macOS applies the restored geometry asynchronously. Wait
-                    // for several identical outer bounds and for React to
-                    // commit the startup surface before revealing it.
-                    let window = webview.window();
-
-                    #[cfg(target_os = "macos")]
-                    {
-                        set_initial_window_backing(&window);
-
-                        let (initial_render_tx, initial_render_rx) = tokio::sync::oneshot::channel();
-                        window
-                            .app_handle()
-                            .once(INITIAL_RENDER_READY_EVENT, move |_| {
-                                let _ = initial_render_tx.send(());
-                            });
-
-                        tauri::async_runtime::spawn(async move {
-                            wait_for_stable_initial_window_geometry(&window).await;
-
-                            if tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                initial_render_rx,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                eprintln!(
-                                    "buzz-desktop: initial render did not commit before reveal timeout"
-                                );
-                            }
-
-                            reveal_initial_window(&window);
-                            clear_initial_window_backing(&window).await;
-                        });
-                    }
-
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        reveal_initial_window(&window);
-                    }
-                })
-                .build(),
-        )
+        .plugin(initial_window_reveal_plugin())
         .plugin(native_websocket::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init());
@@ -292,7 +239,6 @@ pub fn run() {
     } else {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     };
-
     let app = app_menu::install(builder)
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -304,6 +250,8 @@ pub fn run() {
         .manage(build_app_state())
         .manage(ClipboardState::new())
         .manage(PendingCommunityDeepLinks::default())
+        .manage(PendingNavigationDeepLinks::default())
+        .manage(PendingEntityDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
@@ -519,15 +467,7 @@ pub fn run() {
             // and on cold start. The single-instance plugin handles forwarding
             // from duplicate launches on Windows/Linux.
             #[cfg(desktop)]
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                let dl_handle = app.handle().clone();
-                app.deep_link().on_open_url(move |event| {
-                    for url in event.urls() {
-                        handle_deep_link_url(&dl_handle, url.as_str());
-                    }
-                });
-            }
+            deep_link::install_deep_link_handlers(app);
 
             // Defer launch-time agent restoration until `apply_workspace` has
             // installed the active workspace relay and identity. Starting here
@@ -618,6 +558,11 @@ pub fn run() {
             terminal_runtime::terminal_focus,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
+            take_pending_navigation_deep_link,
+            acknowledge_pending_navigation_deep_link,
+            clear_pending_navigation_deep_links,
+            take_pending_entity_deep_link,
+            acknowledge_pending_entity_deep_link,
             start_builderlab_login,
             cancel_builderlab_login,
             get_builderlab_auth,
@@ -658,8 +603,11 @@ pub fn run() {
             delete_project_remote_branch,
             push_project_local_repository,
             pull_project_local_repository,
+            publish_project_owner_announcement,
             sign_project_pull_request_status,
             sign_project_pull_request_review_request,
+            sign_project_issue_assignment,
+            sign_project_issue_unassignment,
             publish_project_pull_request_merged_status,
             merge_project_pull_request,
             open_project_terminal,
@@ -739,6 +687,7 @@ pub fn run() {
             upload_media_bytes,
             upload_media_bytes_raw,
             cancel_media_upload,
+            release_media_upload,
             download_image,
             save_png_data_url,
             download_file,

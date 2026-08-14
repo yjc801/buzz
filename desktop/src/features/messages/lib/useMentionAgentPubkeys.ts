@@ -11,14 +11,11 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 /**
  * The agent pubkey sets the mention picker and the send path behind it use.
  *
- * - `mentionableAgentPubkeys` — agents the user can invoke here (managed +
- *   relay agents admitted by `getMentionableAgentPubkeys`' scope rules).
+ * - `mentionableAgentPubkeys` — agents the user can invoke here.
  * - `memberAgentPubkeys` — channel members classified as agents, invocable or
  *   not; the picker's member branch.
- * - `knownAgentPubkeys` — what the send path treats as an agent: every member
- *   agent `getAdmittedMemberAgentPubkeys` admits (which folds channel
- *   membership itself into the mentionable set — see that function's doc
- *   comment), unioned with `mentionableAgentPubkeys`.
+ * - `knownAgentPubkeys` — what the send path treats as an agent: the invocable
+ *   set plus every member agent the picker admits.
  *
  * The last two matter because a member agent with no kind:10100 entry is
  * mentionable without being invocable. Classifying the send path on the
@@ -29,14 +26,11 @@ export function useMentionAgentPubkeys({
   activeCommunityRelayUrl,
   currentPubkey,
   isArchived,
-  managedAgentDirectoryReady,
   managedAgentNamesByPubkey,
   managedAgents,
   members,
   mentionChannelId,
-  ownerOnly,
   profiles,
-  relayAgentDirectoryReady,
   relayAgents,
   relayAgentNamesByPubkey,
   sharedChannelIds,
@@ -44,20 +38,18 @@ export function useMentionAgentPubkeys({
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
   isArchived: (pubkey: string) => boolean;
-  managedAgentDirectoryReady: boolean;
   managedAgentNamesByPubkey: ReadonlyMap<string, string>;
   managedAgents: readonly ManagedAgentScopeInput[] | undefined;
   members: readonly ChannelMember[] | undefined;
   mentionChannelId: string | null;
-  ownerOnly: boolean | undefined;
   profiles: UserProfileLookup | undefined;
-  relayAgentDirectoryReady: boolean;
   relayAgents: readonly RelayAgent[] | undefined;
   relayAgentNamesByPubkey: ReadonlyMap<string, string>;
   sharedChannelIds: ReadonlySet<string>;
 }): {
   mentionableAgentPubkeys: ReadonlySet<string>;
   memberAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys: ReadonlySet<string>;
   knownAgentPubkeys: ReadonlySet<string>;
 } {
   const mentionableAgentPubkeys = React.useMemo(
@@ -82,6 +74,14 @@ export function useMentionAgentPubkeys({
     ],
   );
 
+  const directoryAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (relayAgents ?? []).map((agent) => normalizePubkey(agent.pubkey)),
+      ),
+    [relayAgents],
+  );
+
   const memberAgentPubkeys = React.useMemo(() => {
     const pubkeys = new Set<string>();
     for (const member of members ?? []) {
@@ -104,11 +104,7 @@ export function useMentionAgentPubkeys({
       memberAgentPubkeys,
       isArchived,
       mentionableAgentPubkeys,
-      isManagedAgent: (pubkey) => managedAgentNamesByPubkey.has(pubkey),
-      getOwnerPubkey: (pubkey) => profiles?.[pubkey]?.ownerPubkey,
-      currentPubkey,
-      directoryReady: managedAgentDirectoryReady && relayAgentDirectoryReady,
-      ownerOnly,
+      directoryAgentPubkeys,
     });
     if (admitted.size === 0) {
       return mentionableAgentPubkeys;
@@ -118,16 +114,16 @@ export function useMentionAgentPubkeys({
     }
     return admitted;
   }, [
-    currentPubkey,
+    directoryAgentPubkeys,
     isArchived,
-    managedAgentDirectoryReady,
-    managedAgentNamesByPubkey,
     memberAgentPubkeys,
     mentionableAgentPubkeys,
-    ownerOnly,
-    profiles,
-    relayAgentDirectoryReady,
   ]);
 
-  return { mentionableAgentPubkeys, memberAgentPubkeys, knownAgentPubkeys };
+  return {
+    mentionableAgentPubkeys,
+    memberAgentPubkeys,
+    directoryAgentPubkeys,
+    knownAgentPubkeys,
+  };
 }

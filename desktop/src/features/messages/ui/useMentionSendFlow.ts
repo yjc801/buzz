@@ -41,6 +41,7 @@ import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import {
   getErrorMessage,
+  getNonMemberMentionPubkeys as computeNonMemberMentionPubkeys,
   isManagedAgentRunning,
   isProviderBackedAgent,
   MENTION_REFERENCE_TAG,
@@ -666,18 +667,13 @@ export function useMentionSendFlow({
   );
 
   const getNonMemberMentionPubkeys = React.useCallback(
-    (pubkeys: string[]) => {
-      if (
-        channelType === null ||
-        channelType === "dm" ||
-        !mentions.hasResolvedMembers
-      ) {
-        return [];
-      }
-      return uniqueNormalizedPubkeys(pubkeys).filter(
-        (pubkey) => !mentions.memberPubkeys.has(pubkey),
-      );
-    },
+    (pubkeys: string[]) =>
+      computeNonMemberMentionPubkeys({
+        pubkeys,
+        channelType,
+        hasResolvedMembers: mentions.hasResolvedMembers,
+        memberPubkeys: mentions.memberPubkeys,
+      }),
     [channelType, mentions.hasResolvedMembers, mentions.memberPubkeys],
   );
 
@@ -917,6 +913,7 @@ export function useMentionSendFlow({
           peoplePubkeys.push(pubkey);
         }
       }
+
       const errors: string[] = [];
       if (peoplePubkeys.length > 0) {
         const result = await addMembersMutation.mutateAsync({

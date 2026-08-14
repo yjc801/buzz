@@ -7,6 +7,7 @@ import {
 import { evictUsersBatchEntries } from "@/features/profile/hooks";
 import { getUsersBatch } from "@/shared/api/tauriProfiles";
 import type {
+  ChannelMember,
   ManagedAgent,
   RelayAgent,
   UsersBatchResponse,
@@ -23,6 +24,7 @@ type DirectoryResult<T> = {
 export async function revalidateAgentMentionPubkeys({
   pubkeys,
   agentPubkeys,
+  refetchMembers,
   activeCommunityRelayUrl,
   currentPubkey,
   eligibilityScope,
@@ -35,6 +37,7 @@ export async function revalidateAgentMentionPubkeys({
 }: {
   pubkeys: readonly string[];
   agentPubkeys: ReadonlySet<string>;
+  refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
   eligibilityScope: AgentEligibilityScope;
@@ -52,18 +55,31 @@ export async function revalidateAgentMentionPubkeys({
     return [...pubkeys];
   }
 
-  const [managedResult, relayResult, ownerProfiles] = await Promise.all([
-    refetchManagedAgents(),
-    refetchRelayAgents(),
-    ownerOnly
-      ? refetchOwnerProfiles([...requestedAgentPubkeys]).catch(() => null)
-      : Promise.resolve(null),
-  ]);
+  // Roster proof only matters to the lenient channel-member admission
+  // branch. A "managed-only"/"community" scope (e.g. a new-DM composer with
+  // no channel yet) has no roster to fetch — requiring one would fail-close
+  // a valid managed-agent mention before the channel even exists.
+  const [managedResult, relayResult, membersResult, ownerProfiles] =
+    await Promise.all([
+      refetchManagedAgents(),
+      refetchRelayAgents(),
+      eligibilityScope.type === "channel"
+        ? refetchMembers()
+        : Promise.resolve<DirectoryResult<ChannelMember[]>>({
+            data: [],
+            error: null,
+          }),
+      ownerOnly
+        ? refetchOwnerProfiles([...requestedAgentPubkeys]).catch(() => null)
+        : Promise.resolve(null),
+    ]);
   if (
     managedResult.error !== null ||
     relayResult.error !== null ||
+    membersResult.error !== null ||
     managedResult.data === undefined ||
     relayResult.data === undefined ||
+    membersResult.data === undefined ||
     ownerOnly === undefined ||
     ownerPolicyError !== null ||
     (ownerOnly && ownerProfiles === null)
@@ -73,6 +89,12 @@ export async function revalidateAgentMentionPubkeys({
 
   const managedPubkeys = new Set(
     managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
+  );
+  const directoryAgentPubkeys = new Set(
+    relayResult.data.map((agent) => normalizePubkey(agent.pubkey)),
+  );
+  const memberPubkeys = new Set(
+    membersResult.data.map((member) => normalizePubkey(member.pubkey)),
   );
   const mentionablePubkeys = getMentionableAgentPubkeys({
     activeCommunityRelayUrl,
@@ -88,10 +110,12 @@ export async function revalidateAgentMentionPubkeys({
         getAgentMentionAdmission({
           isAgent: true,
           isManagedAgent: managedPubkeys.has(pubkey),
+          isMember: memberPubkeys.has(pubkey),
           pubkey,
           ownerPubkey: ownerProfiles?.profiles[pubkey]?.ownerPubkey,
           currentPubkey,
           mentionableAgentPubkeys: mentionablePubkeys,
+          directoryAgentPubkeys,
           directoryReady: true,
           ownerOnly,
         }) === "allow",
@@ -102,6 +126,7 @@ export async function revalidateAgentMentionPubkeys({
 
 export function useAgentMentionRevalidation({
   agentPubkeys,
+  refetchMembers,
   getSelectedAgentPubkeys,
   activeCommunityRelayUrl,
   currentPubkey,
@@ -113,6 +138,7 @@ export function useAgentMentionRevalidation({
   refetchRelayAgents,
 }: {
   agentPubkeys: ReadonlySet<string>;
+  refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
   getSelectedAgentPubkeys: () => ReadonlySet<string>;
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
@@ -136,6 +162,7 @@ export function useAgentMentionRevalidation({
       revalidateAgentMentionPubkeys({
         pubkeys,
         agentPubkeys: new Set([...agentPubkeys, ...getSelectedAgentPubkeys()]),
+        refetchMembers,
         activeCommunityRelayUrl,
         currentPubkey,
         eligibilityScope,
@@ -147,11 +174,12 @@ export function useAgentMentionRevalidation({
         refetchOwnerProfiles,
       }),
     [
-      agentPubkeys,
       activeCommunityRelayUrl,
+      agentPubkeys,
       currentPubkey,
       eligibilityScope,
       getSelectedAgentPubkeys,
+      refetchMembers,
       ownerOnly,
       ownerPolicyError,
       refetchManagedAgents,

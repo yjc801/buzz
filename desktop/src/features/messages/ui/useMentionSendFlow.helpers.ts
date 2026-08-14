@@ -1,4 +1,4 @@
-import type { ManagedAgent } from "@/shared/api/types";
+import type { ChannelType, ManagedAgent } from "@/shared/api/types";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import type { QueuedMediaAttachment } from "@/features/messages/lib/backgroundMediaUploadStore";
 import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
@@ -74,4 +74,24 @@ export function isManagedAgentRunning(agent: ManagedAgent) {
 
 export function isProviderBackedAgent(agent: ManagedAgent) {
   return agent.backend.type === "provider";
+}
+
+export function getNonMemberMentionPubkeys({
+  pubkeys,
+  channelType,
+  hasResolvedMembers,
+  memberPubkeys,
+}: {
+  pubkeys: string[];
+  channelType: ChannelType | null;
+  hasResolvedMembers: boolean;
+  memberPubkeys: ReadonlySet<string>;
+}) {
+  if (channelType === null || channelType === "dm" || !hasResolvedMembers) {
+    return [];
+  }
+
+  return uniqueNormalizedPubkeys(pubkeys).filter(
+    (pubkey) => !memberPubkeys.has(pubkey),
+  );
 }

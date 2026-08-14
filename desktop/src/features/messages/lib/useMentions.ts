@@ -166,23 +166,31 @@ export function useMentions(
     }
     return lookup;
   }, [managedAgentsQuery.data, personasQuery.data]);
-  const { mentionableAgentPubkeys, memberAgentPubkeys, knownAgentPubkeys } =
-    useMentionAgentPubkeys({
-      activeCommunityRelayUrl,
-      currentPubkey,
-      isArchived: isArchivedDiscovery,
-      managedAgentDirectoryReady,
-      managedAgentNamesByPubkey,
-      managedAgents: managedAgentsQuery.data,
-      members,
-      mentionChannelId,
-      ownerOnly: agentAccessOwnerOnlyQuery.data,
-      profiles,
-      relayAgentDirectoryReady,
-      relayAgents: relayAgentsQuery.data,
-      relayAgentNamesByPubkey,
-      sharedChannelIds,
-    });
+  const {
+    mentionableAgentPubkeys,
+    memberAgentPubkeys,
+    directoryAgentPubkeys,
+    knownAgentPubkeys: admittedKnownAgentPubkeys,
+  } = useMentionAgentPubkeys({
+    activeCommunityRelayUrl,
+    currentPubkey,
+    isArchived: isArchivedDiscovery,
+    managedAgentNamesByPubkey,
+    managedAgents: managedAgentsQuery.data,
+    members,
+    mentionChannelId,
+    profiles,
+    relayAgents: relayAgentsQuery.data,
+    relayAgentNamesByPubkey,
+    sharedChannelIds,
+  });
+  // Every managed agent counts as "known" for send-path classification even
+  // when it falls outside the current community scope (still the user's own
+  // agent) — mentionableAgentPubkeys alone would drop it.
+  const knownAgentPubkeys = React.useMemo(
+    () => new Set([...admittedKnownAgentPubkeys, ...managedAgentPubkeys]),
+    [admittedKnownAgentPubkeys, managedAgentPubkeys],
+  );
   const activePersonas = React.useMemo(
     () => (personasQuery.data ?? []).filter((persona) => persona.isActive),
     [personasQuery.data],
@@ -211,32 +219,26 @@ export function useMentions(
     [managedAgentPubkeys, members, profiles, relayAgentsQuery.data],
   );
   const mentionCandidates = React.useMemo<MentionCandidate[]>(() => {
-    // Membership alone proves an agent mentionable even without a
-    // managed-agent record or kind:10100 directory entry — see
-    // `getAdmittedMemberAgentPubkeys`'s doc comment. The picker's own
-    // visibility gate below must fold that in the same way, or a
-    // channel-member agent with no directory entry is hidden from the
-    // dropdown even though the send path (via `useMentionAgentPubkeys`'s
-    // `knownAgentPubkeys`) would treat it as a known agent once picked.
-    const mentionableWithMemberAgents = new Set([
-      ...mentionableAgentPubkeys,
-      ...memberAgentPubkeys,
-    ]);
     const candidatesByPubkey = new Map<string, MentionCandidate>();
     const addCandidate = (candidate: MentionCandidate & { pubkey: string }) => {
       const pubkey = normalizePubkey(candidate.pubkey);
       if (isArchivedDiscovery(pubkey)) {
         return;
       }
-      // Agents are gated ONLY by shouldHideAgentFromMentions.
+      // Agents are gated ONLY by shouldHideAgentFromMentions. Adding
+      // `isAgentIdentityInAllowedList` here (as this once did) makes its
+      // member branch unreachable and hides every channel-member agent
+      // with no kind:10100 entry — see its disagreement test.
       if (
         shouldHideAgentFromMentions({
           isAgent: candidate.isAgent === true,
           isManagedAgent: candidate.isManagedAgent === true,
+          isMember: candidate.isMember === true,
           pubkey,
           ownerPubkey: candidate.ownerPubkey,
           currentPubkey,
-          mentionableAgentPubkeys: mentionableWithMemberAgents,
+          mentionableAgentPubkeys,
+          directoryAgentPubkeys,
           directoryReady:
             candidate.isManagedAgent === true
               ? managedAgentDirectoryReady
@@ -391,6 +393,7 @@ export function useMentions(
     userSearchResults,
     canSearchGlobalUsers,
     currentPubkey,
+    directoryAgentPubkeys,
     isArchivedDiscovery,
     managedAgentDirectoryReady,
     managedAgentNamesByPubkey,
@@ -790,6 +793,7 @@ export function useMentions(
   ).current;
   const revalidateMentionPubkeys = useAgentMentionRevalidation({
     agentPubkeys: agentIdentityPubkeys,
+    refetchMembers: membersQuery.refetch,
     getSelectedAgentPubkeys,
     activeCommunityRelayUrl,
     currentPubkey,

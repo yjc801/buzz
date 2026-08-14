@@ -434,20 +434,6 @@ test("shouldHideAgentFromMentions: hides member agents with an explicit not-invo
   );
 });
 
-test("shouldHideAgentFromMentions: hides member agents without an affirmative directory grant", () => {
-  assert.equal(
-    shouldHideAgentFromMentions({
-      ownerOnly: false,
-      isAgent: true,
-      isMember: true,
-      pubkey: PUB_A,
-      mentionableAgentPubkeys: new Set(),
-      directoryAgentPubkeys: new Set(),
-    }),
-    true,
-  );
-});
-
 test("shouldHideAgentFromMentions: hides unknown member agents while directories load", () => {
   assert.equal(
     shouldHideAgentFromMentions({
@@ -493,18 +479,97 @@ test("shouldHideAgentFromMentions: shows non-agent members while directories loa
   );
 });
 
-test("shouldHideAgentFromMentions: hides unknown member agents after empty directories settle", () => {
+test("member agents: the allowed-list predicate is STRICTER than the hide rule", () => {
+  // These two disagree on exactly one input: a channel-member agent with no
+  // kind:10100 directory entry. `shouldHideAgentFromMentions` deliberately
+  // SHOWS it ("unknown invocability => show"); `isAgentIdentityInAllowedList`
+  // rejects it.
+  //
+  // The mention picker must therefore gate on the hide rule ALONE. Running
+  // both in sequence (as it did) made the member branch unreachable and hid
+  // every other-owner agent whose kind:10100 profile was never published —
+  // which is all of them, since nothing in the repo writes that event.
+  const shared = {
+    isAgent: true,
+    isMember: true,
+    pubkey: PUB_A,
+    mentionableAgentPubkeys: new Set(),
+    directoryAgentPubkeys: new Set(),
+    ownerOnly: false,
+  };
+
   assert.equal(
-    shouldHideAgentFromMentions({
-      ownerOnly: false,
-      isAgent: true,
-      isMember: true,
-      pubkey: PUB_A,
-      mentionableAgentPubkeys: new Set(),
-      directoryAgentPubkeys: new Set(),
-      directoryReady: true,
-    }),
-    true,
+    shouldHideAgentFromMentions(shared),
+    false,
+    "a channel-member agent with no directory entry must be shown",
+  );
+  assert.equal(
+    isAgentIdentityInAllowedList({ isAgent: true, pubkey: PUB_A }, new Set()),
+    false,
+    "the stricter predicate rejects it — do not add it to the mention picker",
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: admits the member agent the picker shows", () => {
+  // The picker's member branch and the send path's agent classification must
+  // agree, or an agent the user just picked is treated as an ordinary person
+  // once the message sends (no audience promotion, no Huddle enrollment).
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [PUB_A],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set(),
+      }),
+    ],
+    [PUB_A],
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: drops what the hide rule and archive gate reject", () => {
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        // PUB_A: explicitly not invocable (directory entry excludes us).
+        // PUB_B: archived.
+        // PUB_C: invocable.
+        // PUB_D: member agent with unknown invocability.
+        memberAgentPubkeys: [PUB_A, PUB_B, PUB_C, PUB_D],
+        isArchived: (pubkey) => pubkey === PUB_B,
+        mentionableAgentPubkeys: new Set([PUB_C]),
+        directoryAgentPubkeys: new Set([PUB_A, PUB_C]),
+      }),
+    ],
+    [PUB_C, PUB_D],
+  );
+});
+
+test("getAdmittedMemberAgentPubkeys: normalizes before gating and emitting", () => {
+  const mixedCase = "Ab".repeat(32);
+  const normalized = mixedCase.toLowerCase();
+
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [mixedCase],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set(),
+      }),
+    ],
+    [normalized],
+  );
+  assert.deepEqual(
+    [
+      ...getAdmittedMemberAgentPubkeys({
+        memberAgentPubkeys: [mixedCase],
+        isArchived: () => false,
+        mentionableAgentPubkeys: new Set(),
+        directoryAgentPubkeys: new Set([normalized]),
+      }),
+    ],
+    [],
   );
 });
 
@@ -521,144 +586,6 @@ test("shouldHideAgentFromMentions: hides agents while owner policy loads", () =>
   );
 });
 
-test("member agents: shouldHideAgentFromMentions itself has no member bypass", () => {
-  // `shouldHideAgentFromMentions` requires membership in
-  // `mentionableAgentPubkeys` unconditionally — it takes no `isMember` input
-  // at all. The member bypass lives one layer up, in
-  // `getAdmittedMemberAgentPubkeys`, which folds live channel membership into
-  // the `mentionableAgentPubkeys` set it passes down before calling this
-  // function (see that function's doc comment) rather than teaching this
-  // lower-level gate about membership. So on a bare call like this one, a
-  // channel-member agent absent from `mentionableAgentPubkeys` is hidden,
-  // same as `isAgentIdentityInAllowedList` — do not reintroduce
-  // `isAgentIdentityInAllowedList` as a second gate in the mention picker
-  // (see the comment on its call site in useMentions.ts) on the assumption
-  // it is stricter; today it is not.
-  const shared = {
-    isAgent: true,
-    isMember: true,
-    pubkey: PUB_A,
-    mentionableAgentPubkeys: new Set(),
-    directoryAgentPubkeys: new Set(),
-    ownerOnly: false,
-  };
-
-  assert.equal(
-    shouldHideAgentFromMentions(shared),
-    true,
-    "a channel-member agent absent from mentionableAgentPubkeys is hidden",
-  );
-  assert.equal(
-    isAgentIdentityInAllowedList({ isAgent: true, pubkey: PUB_A }, new Set()),
-    false,
-    "isAgentIdentityInAllowedList rejects it too — the two now agree",
-  );
-});
-
-test("getAdmittedMemberAgentPubkeys: admits the member agent the picker shows", () => {
-  // The picker's member branch and the send path's agent classification must
-  // agree, or an agent the user just picked is treated as an ordinary person
-  // once the message sends (no audience promotion, no Huddle enrollment).
-  assert.deepEqual(
-    [
-      ...getAdmittedMemberAgentPubkeys({
-        memberAgentPubkeys: [PUB_A],
-        isArchived: () => false,
-        mentionableAgentPubkeys: new Set([PUB_A]),
-        isManagedAgent: () => false,
-        getOwnerPubkey: () => null,
-        currentPubkey: CURRENT_PUBKEY,
-        directoryReady: true,
-        ownerOnly: false,
-      }),
-    ],
-    [PUB_A],
-  );
-});
-
-test("getAdmittedMemberAgentPubkeys: admits a member with no directory/managed record when owner-only is off", () => {
-  // A member flagged as an agent but with no kind:10100 entry and no managed
-  // record is still mentionable — membership itself proves eligibility.
-  // Requiring directory presence here would hide every channel-member agent
-  // that hasn't published a full profile.
-  assert.deepEqual(
-    [
-      ...getAdmittedMemberAgentPubkeys({
-        memberAgentPubkeys: [PUB_B],
-        isArchived: () => false,
-        mentionableAgentPubkeys: new Set(),
-        isManagedAgent: () => false,
-        getOwnerPubkey: () => null,
-        currentPubkey: CURRENT_PUBKEY,
-        directoryReady: true,
-        ownerOnly: false,
-      }),
-    ],
-    [PUB_B],
-  );
-});
-
-test("getAdmittedMemberAgentPubkeys: drops what the hide rule and archive gate reject", () => {
-  assert.deepEqual(
-    [
-      ...getAdmittedMemberAgentPubkeys({
-        // PUB_A: archived.
-        // PUB_B: no managed/directory record, owner-only ON with no known
-        //   owner — the membership bypass still fails closed on unresolved
-        //   owner-only policy, same as any other agent.
-        // PUB_C: owner-only and owned by someone else.
-        // PUB_D: owner-only, but a managed agent — exempt from owner-only.
-        memberAgentPubkeys: [PUB_A, PUB_B, PUB_C, PUB_D],
-        isArchived: (pubkey) => pubkey === PUB_A,
-        mentionableAgentPubkeys: new Set([PUB_C, PUB_D]),
-        isManagedAgent: (pubkey) => pubkey === PUB_D,
-        getOwnerPubkey: (pubkey) =>
-          pubkey === PUB_C ? OTHER_OWNER_PUBKEY : null,
-        currentPubkey: CURRENT_PUBKEY,
-        directoryReady: true,
-        ownerOnly: true,
-      }),
-    ],
-    [PUB_D],
-  );
-});
-
-test("getAdmittedMemberAgentPubkeys: normalizes before gating and emitting", () => {
-  const mixedCase = "Ab".repeat(32);
-  const normalized = mixedCase.toLowerCase();
-
-  assert.deepEqual(
-    [
-      ...getAdmittedMemberAgentPubkeys({
-        memberAgentPubkeys: [mixedCase],
-        isArchived: () => false,
-        mentionableAgentPubkeys: new Set([normalized]),
-        isManagedAgent: () => false,
-        getOwnerPubkey: () => null,
-        currentPubkey: CURRENT_PUBKEY,
-        directoryReady: true,
-        ownerOnly: false,
-      }),
-    ],
-    [normalized],
-  );
-  assert.deepEqual(
-    [
-      ...getAdmittedMemberAgentPubkeys({
-        memberAgentPubkeys: [mixedCase],
-        isArchived: () => true,
-        mentionableAgentPubkeys: new Set(),
-        isManagedAgent: () => false,
-        getOwnerPubkey: () => null,
-        currentPubkey: CURRENT_PUBKEY,
-        directoryReady: true,
-        ownerOnly: false,
-      }),
-    ],
-    [],
-  );
-});
-
 test("shouldHideAgentFromMentions: normalizes the pubkey before lookup", () => {
   const mixedCase = "Ab".repeat(32);
   const normalized = mixedCase.toLowerCase();
@@ -667,10 +594,12 @@ test("shouldHideAgentFromMentions: normalizes the pubkey before lookup", () => {
     shouldHideAgentFromMentions({
       ownerOnly: false,
       isAgent: true,
+      isMember: true,
       pubkey: mixedCase,
-      mentionableAgentPubkeys: new Set([normalized]),
+      mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set([normalized]),
     }),
-    false,
+    true,
   );
 });
 

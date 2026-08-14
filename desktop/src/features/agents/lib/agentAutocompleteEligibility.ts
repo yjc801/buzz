@@ -173,19 +173,23 @@ export type AgentMentionAdmission = "allow" | "deny" | "unknown";
 export function getAgentMentionAdmission({
   isAgent,
   isManagedAgent,
+  isMember = false,
   pubkey,
   ownerPubkey,
   currentPubkey,
   mentionableAgentPubkeys,
+  directoryAgentPubkeys = new Set(),
   directoryReady,
   ownerOnly,
 }: {
   isAgent: boolean;
   isManagedAgent: boolean;
+  isMember?: boolean;
   pubkey: string;
   ownerPubkey?: string | null;
   currentPubkey?: string | null;
   mentionableAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys?: ReadonlySet<string>;
   directoryReady: boolean;
   ownerOnly: boolean | undefined;
 }): AgentMentionAdmission {
@@ -193,7 +197,17 @@ export function getAgentMentionAdmission({
   if (!directoryReady || ownerOnly === undefined) return "unknown";
 
   const normalized = normalizePubkey(pubkey);
-  if (!mentionableAgentPubkeys.has(normalized)) return "deny";
+  // Member (Option B): a channel-member agent with no relay directory
+  // (kind:10100) entry has unknown invocability rather than an explicit
+  // exclusion — treat it as mentionable rather than hiding every
+  // other-owner agent whose profile was never published.
+  const isLenientMember =
+    isMember &&
+    !mentionableAgentPubkeys.has(normalized) &&
+    !directoryAgentPubkeys.has(normalized);
+  if (!mentionableAgentPubkeys.has(normalized) && !isLenientMember) {
+    return "deny";
+  }
   if (!ownerOnly || isManagedAgent) return "allow";
   if (!ownerPubkey || !currentPubkey) return "unknown";
 
@@ -205,19 +219,23 @@ export function getAgentMentionAdmission({
 export function shouldHideAgentFromMentions({
   isAgent,
   isManagedAgent = false,
+  isMember = false,
   pubkey,
   ownerPubkey,
   currentPubkey,
   mentionableAgentPubkeys,
+  directoryAgentPubkeys,
   directoryReady = true,
   ownerOnly,
 }: {
   isAgent: boolean;
   isManagedAgent?: boolean;
+  isMember?: boolean;
   pubkey: string;
   ownerPubkey?: string | null;
   currentPubkey?: string | null;
   mentionableAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys?: ReadonlySet<string>;
   directoryReady?: boolean;
   ownerOnly: boolean | undefined;
 }) {
@@ -225,10 +243,12 @@ export function shouldHideAgentFromMentions({
     getAgentMentionAdmission({
       isAgent,
       isManagedAgent,
+      isMember,
       pubkey,
       ownerPubkey,
       currentPubkey,
       mentionableAgentPubkeys,
+      directoryAgentPubkeys,
       directoryReady,
       ownerOnly,
     }) !== "allow"
@@ -305,64 +325,42 @@ export function filterAdmittedMentionPubkeys(
 /**
  * The channel-member agents the mention picker admits.
  *
- * A member already visible in the channel roster is mentionable even without
- * a managed-agent record or kind:10100 directory entry — requiring directory
- * presence here would hide every channel-member agent that hasn't published a
- * full profile (see `shouldHideAgentFromMentions`'s doc comment on why that
- * regressed once before). So membership itself is folded into the
- * `mentionableAgentPubkeys` this function passes to the shared gate, which
- * still applies owner-only policy identically to managed/relay agents: with
- * `ownerOnly` on and no known owner for a directory-absent member, the gate
- * fails closed like it does everywhere else in this file, rather than using
- * membership as a second bypass past owner-only.
- *
- * Downstream agent classification (persistent audience promotion, Huddle
- * enrollment) must use this SAME gate, or an agent the user just picked is
- * treated as an ordinary person once the message sends.
+ * The picker gates member agents on `shouldHideAgentFromMentions` alone, so a
+ * member agent with no kind:10100 entry is mentionable even though it is not in
+ * `mentionableAgentPubkeys`. Downstream agent classification (persistent
+ * audience promotion, Huddle enrollment) must use the SAME gate, or an agent
+ * the user just picked is treated as an ordinary person once the message sends.
  */
 export function getAdmittedMemberAgentPubkeys({
   memberAgentPubkeys,
   isArchived,
   mentionableAgentPubkeys,
-  isManagedAgent,
-  getOwnerPubkey,
-  currentPubkey,
-  directoryReady,
-  ownerOnly,
+  directoryAgentPubkeys,
 }: {
   memberAgentPubkeys: Iterable<string>;
   isArchived: (pubkey: string) => boolean;
   mentionableAgentPubkeys: ReadonlySet<string>;
-  isManagedAgent: (pubkey: string) => boolean;
-  getOwnerPubkey: (pubkey: string) => string | null | undefined;
-  currentPubkey?: string | null;
-  directoryReady: boolean;
-  ownerOnly: boolean | undefined;
+  directoryAgentPubkeys: ReadonlySet<string>;
 }) {
   const admitted = new Set<string>();
-  const liveMemberAgentPubkeys = new Set<string>();
+
   for (const pubkey of memberAgentPubkeys) {
     const normalized = normalizePubkey(pubkey);
-    if (!isArchived(normalized)) {
-      liveMemberAgentPubkeys.add(normalized);
+    if (isArchived(normalized)) {
+      continue;
     }
-  }
-  const mentionableWithMembers = new Set([
-    ...mentionableAgentPubkeys,
-    ...liveMemberAgentPubkeys,
-  ]);
-
-  for (const normalized of liveMemberAgentPubkeys) {
     if (
       shouldHideAgentFromMentions({
         isAgent: true,
-        isManagedAgent: isManagedAgent(normalized),
+        isMember: true,
         pubkey: normalized,
-        ownerPubkey: getOwnerPubkey(normalized),
-        currentPubkey,
-        mentionableAgentPubkeys: mentionableWithMembers,
-        directoryReady,
-        ownerOnly,
+        mentionableAgentPubkeys,
+        directoryAgentPubkeys,
+        // This helper only answers the invocability/membership question the
+        // picker's member branch depends on — owner-only visibility is
+        // already enforced by the picker itself before a pubkey ever
+        // reaches here.
+        ownerOnly: false,
       })
     ) {
       continue;

@@ -674,7 +674,6 @@ export function useMentionSendFlow({
       ) {
         return [];
       }
-
       return uniqueNormalizedPubkeys(pubkeys).filter(
         (pubkey) => !mentions.memberPubkeys.has(pubkey),
       );
@@ -918,7 +917,6 @@ export function useMentionSendFlow({
           peoplePubkeys.push(pubkey);
         }
       }
-
       const errors: string[] = [];
       if (peoplePubkeys.length > 0) {
         const result = await addMembersMutation.mutateAsync({

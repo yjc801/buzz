@@ -11,16 +11,17 @@ export function useCanonicalManagedAgentProfile(input: {
   currentPubkey: string | undefined;
   managedAgents: readonly ManagedAgent[] | undefined;
   personaId: string | undefined;
-  preserveRequestedInstance?: boolean;
   pubkey: string | undefined;
 }) {
-  const {
-    currentPubkey,
-    managedAgents,
-    personaId,
-    preserveRequestedInstance = false,
-    pubkey,
-  } = input;
+  const { currentPubkey, managedAgents, personaId, pubkey } = input;
+  const [requestedInstancePubkey, requestInstance] = React.useState<
+    string | null
+  >(null);
+  const preserveRequestedInstance = Boolean(
+    pubkey &&
+      requestedInstancePubkey &&
+      normalizePubkey(pubkey) === normalizePubkey(requestedInstancePubkey),
+  );
   const directManagedAgent = React.useMemo(() => {
     if (!pubkey) return undefined;
     const target = normalizePubkey(pubkey);
@@ -56,5 +57,11 @@ export function useCanonicalManagedAgentProfile(input: {
     [directManagedAgent, personaInstances, preserveRequestedInstance],
   );
 
-  return { linkedPersonaId, managedAgent, personaInstances };
+  return {
+    linkedPersonaId,
+    managedAgent,
+    personaInstances,
+    preserveRequestedInstance,
+    requestInstance,
+  };
 }

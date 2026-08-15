@@ -1,4 +1,6 @@
 {
+  "productName": "Waggle",
+  "identifier": "xyz.waggle.app",
   "bundle": {
     "externalBin": [
       "binaries/buzz-acp",

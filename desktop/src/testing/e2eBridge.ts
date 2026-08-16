@@ -4010,19 +4010,26 @@ function buildReplyMessageTags(
 // that started within the largest backdate window (120s) after UTC midnight
 // split the seeds across "Yesterday"/"Today", rendering two dividers and
 // failing those specs with a strict-mode violation (see messaging.spec.ts
-// "day divider appears in timeline"). Nudge the anchor forward so every
-// offset below still lands on today.
+// "day divider appears in timeline").
+//
+// Advancing the anchor forward past midnight (an earlier version of this
+// fix) put seeds up to GENERAL_SEED_MAX_BACKDATE_SECONDS - 30 in the future
+// relative to `now`, which broke the many specs that locate the just-sent
+// row with `.last()` — sortMessages ranks by created_at, so a future seed
+// sorts after a live send. Instead, anchor at the final second of the
+// *previous* UTC day: every offset below (anchor - 120 .. anchor) then
+// stays within that one earlier day, and anchor is always strictly less
+// than `now`, so seeds still sort before anything sent live.
 const GENERAL_SEED_MAX_BACKDATE_SECONDS = 120;
 
-function generalChannelSeedAnchorSeconds(): number {
+export function generalChannelSeedAnchorSeconds(): number {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const secondsSinceUtcMidnight = nowSeconds % 86_400;
   if (secondsSinceUtcMidnight >= GENERAL_SEED_MAX_BACKDATE_SECONDS) {
     return nowSeconds;
   }
-  return (
-    nowSeconds + (GENERAL_SEED_MAX_BACKDATE_SECONDS - secondsSinceUtcMidnight)
-  );
+  const utcMidnightToday = nowSeconds - secondsSinceUtcMidnight;
+  return utcMidnightToday - 1;
 }
 
 function getMockMessageStore(channelId: string): RelayEvent[] {

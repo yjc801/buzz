@@ -573,6 +573,53 @@ jobs:
             done
           }
 
+          coder_already_mentioned() {
+            # Prints "yes" or "no": whether THIS CI identity has ever put a
+            # p-tag on the coder in this channel before now — on the seed
+            # card if the PR opened inside his scope, or on a prior
+            # synchronize notice from this fix's own mention below. Answers
+            # "has he already been woken for this PR", not "is he in scope
+            # right now" — those diverge exactly when scope was added on a
+            # later push, which is the case this exists to catch.
+            #
+            # Same full-history walk as channel_seed_state and for the same
+            # reason: the mention is most likely on the seed card, which is
+            # the OLDEST message once the channel has been live a while, so
+            # a bounded newest-page probe would eventually false-negative.
+            # Only an empty page ends the walk; a stalled full page (every
+            # message landing in one second) steps the cursor back one
+            # second rather than terminating.
+            local CH="$1" BEFORE="" PAGE OLDEST MATCH COUNT
+            while :; do
+              if [ -z "$BEFORE" ]; then
+                PAGE=$(buzz messages get --channel "$CH" --limit 100) || return 1
+              else
+                PAGE=$(buzz messages get --channel "$CH" --limit 100 --before "$BEFORE") || return 1
+              fi
+              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
+              if [ "$COUNT" -eq 0 ]; then
+                echo no; return 0   # walked past the start of history
+              fi
+              MATCH=0
+              printf '%s' "$PAGE" | jq -e --arg ci "$CI_PUB" --arg p "$CODER_PUBKEY" \
+                '[(.messages? // .)[]? | select(.pubkey == $ci) |
+                  select((.tags // [])[]? | select(.[0] == "p" and .[1] == $p))] | length > 0' \
+                >/dev/null || MATCH=$?
+              case "$MATCH" in
+                0) echo yes; return 0 ;;
+                1) ;;             # valid page without a matching p-tag — keep paging
+                *) return 1 ;;    # page unparseable — lookup failure, not absence
+              esac
+              OLDEST=$(printf '%s' "$PAGE" \
+                | jq -r '[(.messages? // .)[]?.created_at] | min') || return 1
+              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
+                BEFORE=$((OLDEST - 1))
+              else
+                BEFORE="$OLDEST"
+              fi
+            done
+          }
+
           ensure_provisioned() {
             # Runs on EVERY action that finds an existing channel, not just
             # opened reruns: with cancel-in-progress, a successor
@@ -739,11 +786,32 @@ jobs:
                 create_and_seed || exit 1
               else
                 ensure_provisioned "$CH" || exit 1
+                # ensure_provisioned only calls route_scope on an unseeded
+                # channel (the recovery path) and returns immediately once
+                # seeded — the ordinary case for a second push. Scope can
+                # still have changed since the last time it ran: a PR that
+                # opened touching only unowned paths can grow coder-owned
+                # ones on any later push, and without recomputing here the
+                # update notice below would carry no mention at all, so the
+                # one non-agent author who CAN wake the coder
+                # (crates/buzz-waker/src/decide.rs — no agent-authored event
+                # ever wakes anything) never does.
+                route_scope
+                NEWLY_OWNED=no
+                if [ -n "$SCOPE_NAMES" ]; then
+                  ALREADY=$(coder_already_mentioned "$CH") || exit 1
+                  [ "$ALREADY" = no ] && NEWLY_OWNED=yes
+                fi
+                SYNC_MENTIONS=()
+                [ "$NEWLY_OWNED" = yes ] && SYNC_MENTIONS+=(--mention "$CODER_PUBKEY")
                 {
                   printf 'Updated to `%s` — %s\n' \
                     "$(git rev-parse --short HEAD)" "$(git diff --shortstat "$RANGE")"
                   printf '```\n%s\n```\n' "$(diff_files)"
-                } | buzz messages send --channel "$CH" --content -
+                  if [ "$NEWLY_OWNED" = yes ]; then
+                    printf '\n%s— this update brought coder-owned paths into scope.\n' "$SCOPE_NAMES"
+                  fi
+                } | buzz messages send --channel "$CH" --content - "${SYNC_MENTIONS[@]}"
               fi
               ;;
             reopened)

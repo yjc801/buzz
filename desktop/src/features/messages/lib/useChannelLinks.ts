@@ -115,14 +115,6 @@ export function useChannelLinks() {
       // hijacked by handleChannelKeyDown and inserts the stale suggestion
       // instead of submitting. See empty-edit-delete.spec.ts "a non-empty
       // edit still edits and never deletes".
-      //
-      // detectPrefixQuery's single-word fast path matches ANY boundary-prefixed
-      // token, whether or not it matches a known channel — so a mismatching
-      // replacement (e.g. "#general" retyped as "#zzzz") still returns a
-      // truthy `immediate` and would otherwise leave the stale "general"
-      // suggestions open until the debounce runs. Validate the immediate
-      // query against known channel names ourselves and close synchronously
-      // when it can't support any suggestion.
       const immediate = detectPrefixQuery(
         "#",
         value,
@@ -134,13 +126,30 @@ export function useChannelLinks() {
         return;
       }
 
+      // A truthy `immediate` only proves detectPrefixQuery's fast path found
+      // SOME boundary-prefixed token — it matches any single word regardless
+      // of whether it names a known channel, and even a validated match
+      // doesn't prove the suggestions currently ON SCREEN (rendered from the
+      // old, still-stale `channelQuery` state) are still correct for it. A
+      // select-all-and-retype that swaps one valid channel query for another
+      // (e.g. "#general" -> "#random") hits exactly this: both are valid
+      // queries, but the rendered popup is still showing "general"'s
+      // suggestion until the debounce catches up. Close synchronously unless
+      // the new query is a mutual-prefix continuation of the currently open
+      // one (typing further into, or backspacing out of, the same match) —
+      // that's the only case where the currently rendered suggestions are
+      // still guaranteed to apply.
       const immediateLower = immediate.query.toLowerCase();
-      const immediateHasSuggestion = knownNamesLowerRef.current.some((name) =>
-        name.includes(immediateLower),
-      );
-      if (!immediateHasSuggestion) {
-        setChannelQuery((current) => (current === null ? current : null));
-      }
+      setChannelQuery((current) => {
+        if (current === null) {
+          return current;
+        }
+        const currentLower = current.toLowerCase();
+        const isContinuingSameQuery =
+          immediateLower.startsWith(currentLower) ||
+          currentLower.startsWith(immediateLower);
+        return isContinuingSameQuery ? current : null;
+      });
 
       debounceTimerRef.current = setTimeout(() => {
         debounceTimerRef.current = null;

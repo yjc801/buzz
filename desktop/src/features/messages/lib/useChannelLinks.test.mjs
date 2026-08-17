@@ -12,6 +12,14 @@ import { JSDOM } from "jsdom";
 // suggestions open for the full CHANNEL_QUERY_DEBOUNCE_MS window — long enough
 // for a fast Enter to be swallowed by handleChannelKeyDown and insert the
 // stale suggestion instead of submitting. (PR #73 review, Alex.)
+//
+// A follow-up review round found the first fix incomplete: validating the new
+// query against the global channel list proves it matches SOME channel, but
+// not that it matches the suggestions currently rendered from the old,
+// still-stale `channelQuery` state. Replacing "#general" with another valid
+// channel query ("#random") hit the same swallowed-Enter race, just with both
+// ends of the replacement being individually valid. (PR #73 review round 2,
+// Alex.)
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -94,6 +102,64 @@ test("replacing an open #general query with a non-matching #zzzz closes the popu
         "new query cannot match any known channel, or a fast Enter in the " +
         "debounce window gets swallowed and inserts the stale suggestion",
     );
+  } finally {
+    cleanup();
+  }
+});
+
+test("replacing an open #general query with a different valid #random query closes the popup synchronously", async () => {
+  const React = await import("react");
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { ChannelNavigationProvider } = await import(
+    "@/shared/context/ChannelNavigationContext.tsx"
+  );
+  const { useChannelLinks } = await import("./useChannelLinks.ts");
+
+  const channels = [channel(), channel({ id: "ch-random", name: "random" })];
+  const wrapper = ({ children }) =>
+    React.createElement(ChannelNavigationProvider, { channels }, children);
+
+  try {
+    const { result } = renderHook(() => useChannelLinks(), { wrapper });
+
+    act(() => {
+      result.current.updateChannelQuery("hi #general", 11);
+    });
+    await act(async () => {
+      await new Promise((resolve) =>
+        setTimeout(resolve, CHANNEL_QUERY_DEBOUNCE_MS + 20),
+      );
+    });
+    assert.equal(result.current.isChannelOpen, true);
+    assert.equal(result.current.channelQuery, "general");
+
+    // Select-all + retype: "#general" is replaced with "#random" in one
+    // keystroke. Both are individually valid channel queries, so a guard that
+    // only checks "does the new query match some known channel" stays open —
+    // but the rendered suggestion is still "general" until the debounce runs.
+    act(() => {
+      result.current.updateChannelQuery("hi #random", 10);
+    });
+
+    assert.equal(
+      result.current.isChannelOpen,
+      false,
+      "popup must close synchronously when switching from one valid channel " +
+        "query to a different one — leaving the stale suggestion open lets a " +
+        "fast Enter insert the wrong channel",
+    );
+
+    await act(async () => {
+      await new Promise((resolve) =>
+        setTimeout(resolve, CHANNEL_QUERY_DEBOUNCE_MS + 20),
+      );
+    });
+    assert.equal(
+      result.current.isChannelOpen,
+      true,
+      "the debounce still reopens the popup for the new, correct query",
+    );
+    assert.equal(result.current.channelQuery, "random");
   } finally {
     cleanup();
   }

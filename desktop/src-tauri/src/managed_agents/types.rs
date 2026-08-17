@@ -95,6 +95,8 @@ pub struct AgentDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
+    #[serde(default)]
+    pub owner_pubkey: Option<String>,
     pub name: String,
     pub agent_type: String,
     pub channels: Vec<String>,
@@ -161,13 +163,9 @@ pub struct ManagedAgentRecord {
     pub avatar_url: Option<String>,
     pub acp_command: String,
     pub agent_command: String,
-    /// Explicit per-instance harness pin. `None` (the default) means inherit
-    /// the harness from the linked persona's `runtime`, so persona harness
-    /// edits propagate on the next spawn — mirroring the opt-in `model`
-    /// override. `Some` is set only when the user deliberately picks a harness
-    /// that diverges from the persona. Resolved via `effective_agent_command`;
-    /// `agent_command` above is the create-time snapshot kept for avatar/legacy
-    /// derivations and is not authoritative for spawn.
+    /// Explicit per-instance harness pin; `None` inherits the persona runtime.
+    /// The effective command is resolved at spawn; `agent_command` is a legacy
+    /// create-time snapshot.
     #[serde(default)]
     pub agent_command_override: Option<String>,
     pub agent_args: Vec<String>,
@@ -250,6 +248,8 @@ pub struct ManagedAgentRecord {
     /// during a backend migration. Empty for every agent that has never moved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub residual_deployments: Vec<ResidualDeployment>,
+    #[serde(default)]
+    pub provider_policy_pending: bool,
     #[serde(default)]
     pub provider_binary_path: Option<String>,
     /// Opt-in: publish a signed launch bundle so `buzz-waker`

@@ -36,6 +36,7 @@ fn bare_agent_record(
         backend: BackendKind::Local,
         backend_agent_id: None,
         residual_deployments: Vec::new(),
+        provider_policy_pending: false,
         provider_binary_path: None,
         waker_enabled: false,
         team_id: None,
@@ -625,6 +626,11 @@ fn provider_upgrade_reconciliation_targets_existing_deployments_only_in_marked_b
     assert_eq!(payload["respond_to"], "owner-only");
     assert_eq!(payload["respond_to_allowlist"], serde_json::json!([]));
     assert!(!provider_access::needs_reconciliation_with_policy(
+        &record, false
+    ));
+
+    record.provider_policy_pending = true;
+    assert!(provider_access::needs_reconciliation_with_policy(
         &record, false
     ));
 

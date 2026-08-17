@@ -3,6 +3,7 @@
 //! policy helpers as local spawn so remote execution does not reimplement them.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use tauri::AppHandle;
 
@@ -57,7 +58,15 @@ pub struct StartManagedAgentOutcome {
 /// is held is refused and can be retried. Only the provider *id* is compared —
 /// a same-provider config change is an ordinary re-deploy that the deploy
 /// itself reconciles.
-pub(super) async fn deploy_to_provider(
+///
+/// # Serialized per agent
+///
+/// Two deploys for the same agent would otherwise race their record writes,
+/// and the loser's `backend_agent_id` would overwrite the winner's. The
+/// per-agent deploy lock is taken *before* the transition fence so a deploy
+/// that queued behind another re-reads the backend below rather than acting on
+/// what was true when it queued.
+pub(crate) async fn deploy_to_provider(
     app: &AppHandle,
     state: &AppState,
     pubkey: &str,
@@ -66,6 +75,19 @@ pub(super) async fn deploy_to_provider(
     agent_json: serde_json::Value,
     cached_binary_path: Option<&str>,
 ) -> Result<Option<bool>, String> {
+    let deploy_lock = {
+        let mut locks = state
+            .provider_deploy_locks
+            .lock()
+            .map_err(|e| e.to_string())?;
+        Arc::clone(
+            locks
+                .entry(pubkey.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _deploy_guard = deploy_lock.lock().await;
+
     let _transition = crate::managed_agents::begin_backend_transition(pubkey)?;
     {
         let _store_guard = state
@@ -102,6 +124,7 @@ pub(super) async fn deploy_to_provider(
         })
         .map_or_else(|| resolve_provider_binary(provider_id), Ok)?;
 
+    let deployed_agent_json = agent_json.clone();
     let config_clone = config.clone();
     let deploy_result =
         tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
@@ -130,6 +153,7 @@ pub(super) async fn deploy_to_provider(
             // this deployment costs a duplicate warning; dropping one that is
             // not loses the last pointer to a pod holding the private key.
             rec.backend_agent_id = Some(outcome.agent_id);
+            acknowledge_policy(rec, &deployed_agent_json);
             rec.last_started_at = Some(now_iso());
             rec.updated_at = now_iso();
             rec.last_error = None;
@@ -144,6 +168,34 @@ pub(super) async fn deploy_to_provider(
     };
     save_managed_agents(app, &records)?;
     Ok(fresh_generation)
+}
+
+/// Whether the access policy the provider actually received still matches the
+/// record's current policy.
+fn policy_matches_payload(
+    record: &ManagedAgentRecord,
+    deployed_agent_json: &serde_json::Value,
+) -> bool {
+    deployed_agent_json
+        .get("respond_to")
+        .and_then(serde_json::Value::as_str)
+        == Some(record.respond_to.as_str())
+        && deployed_agent_json.get("respond_to_allowlist")
+            == Some(&serde_json::json!(record.respond_to_allowlist))
+}
+
+/// Clear `provider_policy_pending` only when this deploy actually carried the
+/// record's current policy.
+///
+/// A deploy that queued behind another (or behind a policy edit made while it
+/// was in flight) lands with a stale payload. Clearing unconditionally on
+/// success would mark that older policy as acknowledged and drop the retry that
+/// `provider_access::needs_reconciliation_with_policy` depends on, leaving the
+/// provider running the superseded access rules.
+fn acknowledge_policy(record: &mut ManagedAgentRecord, deployed_agent_json: &serde_json::Value) {
+    if policy_matches_payload(record, deployed_agent_json) {
+        record.provider_policy_pending = false;
+    }
 }
 
 /// Effective projection fields for the deploy payload — all derived from the
@@ -280,7 +332,7 @@ pub(super) fn apply_wake_replay_floor(
 ///
 /// `wake_replay_floor` is set only when this deploy is a wake-on-mention —
 /// see [`apply_wake_replay_floor`].
-pub(super) fn build_deploy_payload(
+pub(crate) fn build_deploy_payload(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
@@ -376,6 +428,59 @@ pub(super) fn deploy_payload_json(
         "env_vars": merged_env,
         "launch": launch,
     })
+}
+
+#[cfg(test)]
+mod policy_acknowledgement_tests {
+    use super::*;
+    use crate::managed_agents::RespondTo;
+
+    fn pending_record() -> ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": "agent", "name": "Agent", "relay_url": "", "acp_command": "",
+            "agent_command": "", "agent_args": [], "mcp_command": "",
+            "turn_timeout_seconds": 0, "system_prompt": null, "created_at": "",
+            "updated_at": "", "last_started_at": null, "last_stopped_at": null,
+            "last_exit_code": null, "last_error": null,
+            "provider_policy_pending": true
+        }))
+        .unwrap()
+    }
+
+    fn policy_payload(respond_to: &str) -> serde_json::Value {
+        serde_json::json!({"respond_to": respond_to, "respond_to_allowlist": []})
+    }
+
+    #[test]
+    fn successful_deploy_acknowledges_pending_policy() {
+        let mut record = pending_record();
+
+        acknowledge_policy(&mut record, &policy_payload("owner-only"));
+
+        assert!(!record.provider_policy_pending);
+    }
+
+    /// A deploy carrying a policy the record has since moved off must leave the
+    /// pending flag up so the reconcile retries with the current one.
+    #[test]
+    fn successful_stale_deploy_preserves_newer_pending_policy() {
+        let mut record = pending_record();
+        record.respond_to = RespondTo::Anyone;
+
+        acknowledge_policy(&mut record, &policy_payload("owner-only"));
+
+        assert!(record.provider_policy_pending);
+    }
+
+    #[test]
+    fn allowlist_drift_preserves_pending_policy() {
+        let mut record = pending_record();
+        record.respond_to_allowlist = vec!["someone".to_string()];
+
+        acknowledge_policy(&mut record, &policy_payload("owner-only"));
+
+        assert!(record.provider_policy_pending);
+    }
 }
 
 #[cfg(test)]

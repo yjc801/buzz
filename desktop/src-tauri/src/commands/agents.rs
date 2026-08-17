@@ -746,6 +746,7 @@ pub async fn create_managed_agent(
             backend: input.backend.clone(),
             backend_agent_id: None,
             residual_deployments: Vec::new(),
+            provider_policy_pending: false,
             provider_binary_path,
             waker_enabled: false,
             persona_team_dir: None,
@@ -856,7 +857,7 @@ pub async fn create_managed_agent(
         &resolved_relay_url,
         &relay_ws_url_with_override(&state),
     );
-    let profile_sync_error = (sync_managed_agent_profile(
+    let mut profile_sync_error = (sync_managed_agent_profile(
         &state,
         &profile_relay_url,
         &agent_keys,
@@ -866,12 +867,11 @@ pub async fn create_managed_agent(
     )
     .await)
         .err();
+    profile_sync_error =
+        super::agent_models::flush_managed_agent_policy(&app, &state, profile_sync_error).await;
 
-    // ── Phase 5: provider deploy (async, outside lock) ───────────────────────
     let spawn_error = if input.spawn_after_create && input.backend != BackendKind::Local {
         if let BackendKind::Provider { ref id, ref config } = input.backend {
-            // Read the saved record to build the deploy payload (record has the
-            // canonical field values after Phase 3 normalization).
             let agent_json = {
                 let _g = state
                     .managed_agents_store_lock
@@ -977,19 +977,7 @@ pub async fn start_managed_agent(
         // profile reconcile (the create-time snapshot may be empty or stale for
         // a persona-inherited harness).
         let reconcile_personas = load_personas(&app).unwrap_or_default();
-        let reconcile_effective_command =
-            crate::managed_agents::record_agent_command(record, &reconcile_personas);
-
-        let reconcile = ProfileReconcileData {
-            private_key_nsec: record.private_key_nsec.clone(),
-            name: record.name.clone(),
-            relay_url: record.relay_url.clone(),
-            avatar_url: record.avatar_url.clone(),
-            auth_tag: record.auth_tag.clone(),
-            pubkey: record.pubkey.clone(),
-            agent_command: reconcile_effective_command,
-            persona_id: record.persona_id.clone(),
-        };
+        let reconcile = profile_reconcile_data(record, &reconcile_personas);
 
         let target = if record.backend == BackendKind::Local {
             StartTarget::Local
@@ -1237,8 +1225,8 @@ pub async fn delete_managed_agent(
 #[path = "agents_deploy.rs"]
 mod deploy;
 pub(super) mod provider_access;
-use deploy::build_deploy_payload;
-use deploy::deploy_to_provider;
+pub(super) use deploy::build_deploy_payload;
+pub(super) use deploy::deploy_to_provider;
 #[cfg(test)]
 use deploy::{deploy_payload_json, DeployProjections};
 #[cfg(test)]
@@ -1248,9 +1236,9 @@ pub(crate) use deploy::StartManagedAgentOutcome;
 
 #[path = "agents_profile.rs"]
 mod profile;
+pub(crate) use profile::*;
 #[cfg(test)]
 use profile::{profile_needs_sync, resolve_legacy_avatar};
-pub(crate) use profile::{reconcile_agent_profile, ProfileReconcileData};
 
 #[path = "agents_waker.rs"]
 pub(crate) mod waker;

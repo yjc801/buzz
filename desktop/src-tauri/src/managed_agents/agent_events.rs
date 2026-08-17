@@ -195,6 +195,7 @@ mod tests {
             },
             backend_agent_id: Some("remote-id".to_string()),
             residual_deployments: Vec::new(),
+            provider_policy_pending: false,
             provider_binary_path: Some("/path/to/binary".to_string()),
             waker_enabled: false,
             team_id: None,

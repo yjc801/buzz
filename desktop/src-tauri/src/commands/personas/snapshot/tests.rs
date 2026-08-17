@@ -50,6 +50,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         backend: BackendKind::Local,
         backend_agent_id: None,
         residual_deployments: Vec::new(),
+        provider_policy_pending: false,
         provider_binary_path: None,
         waker_enabled: false,
         team_id: None,

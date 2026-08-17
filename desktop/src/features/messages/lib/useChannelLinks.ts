@@ -115,6 +115,14 @@ export function useChannelLinks() {
       // hijacked by handleChannelKeyDown and inserts the stale suggestion
       // instead of submitting. See empty-edit-delete.spec.ts "a non-empty
       // edit still edits and never deletes".
+      //
+      // detectPrefixQuery's single-word fast path matches ANY boundary-prefixed
+      // token, whether or not it matches a known channel — so a mismatching
+      // replacement (e.g. "#general" retyped as "#zzzz") still returns a
+      // truthy `immediate` and would otherwise leave the stale "general"
+      // suggestions open until the debounce runs. Validate the immediate
+      // query against known channel names ourselves and close synchronously
+      // when it can't support any suggestion.
       const immediate = detectPrefixQuery(
         "#",
         value,
@@ -124,6 +132,14 @@ export function useChannelLinks() {
       if (!immediate) {
         setChannelQuery((current) => (current === null ? current : null));
         return;
+      }
+
+      const immediateLower = immediate.query.toLowerCase();
+      const immediateHasSuggestion = knownNamesLowerRef.current.some((name) =>
+        name.includes(immediateLower),
+      );
+      if (!immediateHasSuggestion) {
+        setChannelQuery((current) => (current === null ? current : null));
       }
 
       debounceTimerRef.current = setTimeout(() => {

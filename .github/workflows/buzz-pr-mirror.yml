@@ -181,6 +181,7 @@ jobs:
           # apps/api + packages/* and tell him to stop rather than work outside
           # them, so pointing him at a Rust workspace either gets a refusal or
           # gets work his own prompt disowns.
+          CODER_NAME: Will
           CODER_PUBKEY: 15e158a9408649cc82dbe8637d25a63f9cde38cfb1b4ca35f59a8075080b470b
           # Community owner — added to every new channel so it shows up in
           # their sidebar (open channels are joinable but not auto-joined).
@@ -422,6 +423,51 @@ jobs:
               | jq -r .channel_id
           }
 
+          # Name the coding agent who owns the changed paths, so the seed card
+          # mentions him alongside the reviewer.
+          #
+          # WHY CI DOES THIS AND NOT THE REVIEWER. Alex reads the diff and judges
+          # ownership better than a path glob can — but a mention from Alex can
+          # never WAKE anyone. buzz-waker refuses to start an agent on an
+          # agent-authored event ("No agent-authored event ever wakes anything",
+          # crates/buzz-waker/src/decide.rs), because two agents p-tagging each
+          # other would keep the pair alive with no human in the loop. That rule
+          # is deliberate and load-bearing; this does not work around it, it sits
+          # on the other side of it. CI's key is not a registered agent, so a CI
+          # mention DOES wake — the same reason `@Alex please review` reaches a
+          # cold Alex today.
+          #
+          # CAVEAT, and it is the whole reason this is only half a fix here:
+          # Will currently runs on a LOCAL backend, and decide.rs excludes local
+          # agents outright ("Local agents are never candidates: whoever owns
+          # their process already has a start path"). So this mention does not
+          # wake him either until he moves to a provider backend. It is correct
+          # and forward-compatible, not sufficient.
+          #
+          # The globs mirror the scope Will's own prompt declares. They must keep
+          # mirroring it: a mention outside that scope buys "say so in-thread and
+          # stop", not work. `web/` is deliberately absent — his prompt does not
+          # claim it — so a web-only PR routes to nobody and the card says so.
+          SCOPE_NAMES=""
+          SCOPE_MENTIONS=()
+          route_scope() {
+            local FILES
+            # Reset, not append: only one seeding path runs per job today, but a
+            # second call must not mention the same agent twice.
+            SCOPE_NAMES=""
+            SCOPE_MENTIONS=()
+            FILES=$(git diff --name-only "$RANGE")
+            if printf '%s\n' "$FILES" \
+              | grep -qE '^(crates/|desktop/|mobile/|migrations/|scripts/|\.github/workflows/)'; then
+              SCOPE_NAMES="${SCOPE_NAMES}@${CODER_NAME} "
+              SCOPE_MENTIONS+=(--mention "$CODER_PUBKEY")
+            fi
+            # Explicit: `grep -q` returning 1 is the ordinary "no match" answer,
+            # and the default `bash -e` shell would treat a trailing non-zero as
+            # a job failure.
+            return 0
+          }
+
           diff_files() {
             git diff --name-status "$RANGE" | head -25
             COUNT=$(git diff --name-only "$RANGE" | wc -l)
@@ -447,6 +493,12 @@ jobs:
               fi
             fi
             printf '\n@%s please review.\n' "$REVIEWER_NAME"
+            if [ -n "$SCOPE_NAMES" ]; then
+              printf '\n%s— you own the changed paths. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
+                "$SCOPE_NAMES" "$REVIEWER_NAME"
+            else
+              printf '\n_No coding agent owns the changed paths — route this one by hand._\n'
+            fi
           }
 
           provision_members() {
@@ -521,6 +573,53 @@ jobs:
             done
           }
 
+          coder_already_mentioned() {
+            # Prints "yes" or "no": whether THIS CI identity has ever put a
+            # p-tag on the coder in this channel before now — on the seed
+            # card if the PR opened inside his scope, or on a prior
+            # synchronize notice from this fix's own mention below. Answers
+            # "has he already been woken for this PR", not "is he in scope
+            # right now" — those diverge exactly when scope was added on a
+            # later push, which is the case this exists to catch.
+            #
+            # Same full-history walk as channel_seed_state and for the same
+            # reason: the mention is most likely on the seed card, which is
+            # the OLDEST message once the channel has been live a while, so
+            # a bounded newest-page probe would eventually false-negative.
+            # Only an empty page ends the walk; a stalled full page (every
+            # message landing in one second) steps the cursor back one
+            # second rather than terminating.
+            local CH="$1" BEFORE="" PAGE OLDEST MATCH COUNT
+            while :; do
+              if [ -z "$BEFORE" ]; then
+                PAGE=$(buzz messages get --channel "$CH" --limit 100) || return 1
+              else
+                PAGE=$(buzz messages get --channel "$CH" --limit 100 --before "$BEFORE") || return 1
+              fi
+              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
+              if [ "$COUNT" -eq 0 ]; then
+                echo no; return 0   # walked past the start of history
+              fi
+              MATCH=0
+              printf '%s' "$PAGE" | jq -e --arg ci "$CI_PUB" --arg p "$CODER_PUBKEY" \
+                '[(.messages? // .)[]? | select(.pubkey == $ci) |
+                  select((.tags // [])[]? | select(.[0] == "p" and .[1] == $p))] | length > 0' \
+                >/dev/null || MATCH=$?
+              case "$MATCH" in
+                0) echo yes; return 0 ;;
+                1) ;;             # valid page without a matching p-tag — keep paging
+                *) return 1 ;;    # page unparseable — lookup failure, not absence
+              esac
+              OLDEST=$(printf '%s' "$PAGE" \
+                | jq -r '[(.messages? // .)[]?.created_at] | min') || return 1
+              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
+                BEFORE=$((OLDEST - 1))
+              else
+                BEFORE="$OLDEST"
+              fi
+            done
+          }
+
           ensure_provisioned() {
             # Runs on EVERY action that finds an existing channel, not just
             # opened reruns: with cancel-in-progress, a successor
@@ -537,12 +636,15 @@ jobs:
               return 0
             fi
             echo "channel $NAME exists but is unseeded — resuming provisioning"
+            route_scope
             provision_members "$CH" || return 1
-            seed_card | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"
+            seed_card | buzz messages send --channel "$CH" --content - \
+              --mention "$REVIEWER_PUBKEY" "${SCOPE_MENTIONS[@]}"
           }
 
           create_and_seed() {
             local CH
+            route_scope
             CH=$(create_channel)
             printf '%s' "$CH" \
               | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || {
@@ -558,7 +660,8 @@ jobs:
             assert_ci_owner "$CH" || return 1
             write_binding "$CH" || return 1
             provision_members "$CH" || return 1
-            seed_card | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"
+            seed_card | buzz messages send --channel "$CH" --content - \
+              --mention "$REVIEWER_PUBKEY" "${SCOPE_MENTIONS[@]}"
           }
 
           archive_channel() {
@@ -683,11 +786,32 @@ jobs:
                 create_and_seed || exit 1
               else
                 ensure_provisioned "$CH" || exit 1
+                # ensure_provisioned only calls route_scope on an unseeded
+                # channel (the recovery path) and returns immediately once
+                # seeded — the ordinary case for a second push. Scope can
+                # still have changed since the last time it ran: a PR that
+                # opened touching only unowned paths can grow coder-owned
+                # ones on any later push, and without recomputing here the
+                # update notice below would carry no mention at all, so the
+                # one non-agent author who CAN wake the coder
+                # (crates/buzz-waker/src/decide.rs — no agent-authored event
+                # ever wakes anything) never does.
+                route_scope
+                NEWLY_OWNED=no
+                if [ -n "$SCOPE_NAMES" ]; then
+                  ALREADY=$(coder_already_mentioned "$CH") || exit 1
+                  [ "$ALREADY" = no ] && NEWLY_OWNED=yes
+                fi
+                SYNC_MENTIONS=()
+                [ "$NEWLY_OWNED" = yes ] && SYNC_MENTIONS+=(--mention "$CODER_PUBKEY")
                 {
                   printf 'Updated to `%s` — %s\n' \
                     "$(git rev-parse --short HEAD)" "$(git diff --shortstat "$RANGE")"
                   printf '```\n%s\n```\n' "$(diff_files)"
-                } | buzz messages send --channel "$CH" --content -
+                  if [ "$NEWLY_OWNED" = yes ]; then
+                    printf '\n%s— this update brought coder-owned paths into scope.\n' "$SCOPE_NAMES"
+                  fi
+                } | buzz messages send --channel "$CH" --content - "${SYNC_MENTIONS[@]}"
               fi
               ;;
             reopened)

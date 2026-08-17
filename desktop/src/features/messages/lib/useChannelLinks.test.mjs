@@ -20,6 +20,14 @@ import { JSDOM } from "jsdom";
 // channel query ("#random") hit the same swallowed-Enter race, just with both
 // ends of the replacement being individually valid. (PR #73 review round 2,
 // Alex.)
+//
+// A third round found the "mutual-prefix continuation" fix (query ancestry)
+// still wrong: channel matching is substring-based (`includes`), so an
+// extension of the open query is not guaranteed to still match. With only
+// "general" known, "#gen" -> "#genz" is a valid extension but matches no
+// channel. With "agenda" and "general" both known, "#gen" -> "#gene" is a
+// valid extension too, but drops "agenda" from the match set. Both reproduce
+// the same swallowed-Enter race. (PR #73 review round 3, Alex.)
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -160,6 +168,101 @@ test("replacing an open #general query with a different valid #random query clos
       "the debounce still reopens the popup for the new, correct query",
     );
     assert.equal(result.current.channelQuery, "random");
+  } finally {
+    cleanup();
+  }
+});
+
+test("extending an open #gen query to a non-matching #genz closes the popup synchronously", async () => {
+  const React = await import("react");
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { ChannelNavigationProvider } = await import(
+    "@/shared/context/ChannelNavigationContext.tsx"
+  );
+  const { useChannelLinks } = await import("./useChannelLinks.ts");
+
+  const channels = [channel()];
+  const wrapper = ({ children }) =>
+    React.createElement(ChannelNavigationProvider, { channels }, children);
+
+  try {
+    const { result } = renderHook(() => useChannelLinks(), { wrapper });
+
+    act(() => {
+      result.current.updateChannelQuery("hi #gen", 7);
+    });
+    await act(async () => {
+      await new Promise((resolve) =>
+        setTimeout(resolve, CHANNEL_QUERY_DEBOUNCE_MS + 20),
+      );
+    });
+    assert.equal(result.current.isChannelOpen, true);
+    assert.equal(result.current.channelQuery, "gen");
+
+    // "#genz" is a textual extension of "#gen" (still starts with it), but no
+    // known channel matches it — query ancestry alone is not sufficient.
+    act(() => {
+      result.current.updateChannelQuery("hi #genz", 8);
+    });
+
+    assert.equal(
+      result.current.isChannelOpen,
+      false,
+      "an extension of the open query must still close synchronously when " +
+        "the extended text matches no known channel",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("extending an open #gen query to #gene closes the popup when it drops a currently-matching channel", async () => {
+  const React = await import("react");
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { ChannelNavigationProvider } = await import(
+    "@/shared/context/ChannelNavigationContext.tsx"
+  );
+  const { useChannelLinks } = await import("./useChannelLinks.ts");
+
+  const channels = [
+    channel({ id: "ch-agenda", name: "agenda" }),
+    channel({ id: "ch-general", name: "general" }),
+  ];
+  const wrapper = ({ children }) =>
+    React.createElement(ChannelNavigationProvider, { channels }, children);
+
+  try {
+    const { result } = renderHook(() => useChannelLinks(), { wrapper });
+
+    act(() => {
+      result.current.updateChannelQuery("hi #gen", 7);
+    });
+    await act(async () => {
+      await new Promise((resolve) =>
+        setTimeout(resolve, CHANNEL_QUERY_DEBOUNCE_MS + 20),
+      );
+    });
+    assert.equal(result.current.isChannelOpen, true);
+    assert.deepEqual(
+      result.current.channelSuggestions.map((s) => s.name).sort(),
+      ["agenda", "general"],
+      "both agenda and general substring-match the open #gen query",
+    );
+
+    // "#gene" is a textual extension of "#gen" and still matches "general",
+    // but "agenda" — one of the currently rendered suggestions — no longer
+    // matches. The stale list (and whatever it shows at the selected index)
+    // can no longer be trusted.
+    act(() => {
+      result.current.updateChannelQuery("hi #gene", 8);
+    });
+
+    assert.equal(
+      result.current.isChannelOpen,
+      false,
+      "the popup must close synchronously when extending the query drops any " +
+        "channel that was part of the currently rendered suggestion set",
+    );
   } finally {
     cleanup();
   }

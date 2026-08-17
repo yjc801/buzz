@@ -130,25 +130,30 @@ export function useChannelLinks() {
       // SOME boundary-prefixed token — it matches any single word regardless
       // of whether it names a known channel, and even a validated match
       // doesn't prove the suggestions currently ON SCREEN (rendered from the
-      // old, still-stale `channelQuery` state) are still correct for it. A
-      // select-all-and-retype that swaps one valid channel query for another
-      // (e.g. "#general" -> "#random") hits exactly this: both are valid
-      // queries, but the rendered popup is still showing "general"'s
-      // suggestion until the debounce catches up. Close synchronously unless
-      // the new query is a mutual-prefix continuation of the currently open
-      // one (typing further into, or backspacing out of, the same match) —
-      // that's the only case where the currently rendered suggestions are
-      // still guaranteed to apply.
+      // old, still-stale `channelQuery` state) are still correct for it.
+      // Query *ancestry* (is the new text an extension/reduction of the old
+      // query?) isn't sufficient either: channel matching is substring-based
+      // (`includes`), so "#gen" -> "#genz" is a valid extension but matches
+      // no channel, and with both "agenda" and "general" known, "#gen" ->
+      // "#gene" drops "agenda" even though it's an extension too. The only
+      // safe check is whether every channel name currently rendered for the
+      // old query would still match the new one — if even one drops out, the
+      // stale list (and whatever it's showing at the selected index) can no
+      // longer be trusted, so close synchronously and let the debounce
+      // rebuild the suggestion list from scratch.
       const immediateLower = immediate.query.toLowerCase();
       setChannelQuery((current) => {
         if (current === null) {
           return current;
         }
         const currentLower = current.toLowerCase();
-        const isContinuingSameQuery =
-          immediateLower.startsWith(currentLower) ||
-          currentLower.startsWith(immediateLower);
-        return isContinuingSameQuery ? current : null;
+        const currentlyMatchingNames = knownNamesLowerRef.current.filter(
+          (name) => name.includes(currentLower),
+        );
+        const allStillMatch =
+          currentlyMatchingNames.length > 0 &&
+          currentlyMatchingNames.every((name) => name.includes(immediateLower));
+        return allStillMatch ? current : null;
       });
 
       debounceTimerRef.current = setTimeout(() => {

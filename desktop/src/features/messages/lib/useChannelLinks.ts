@@ -102,6 +102,28 @@ export function useChannelLinks() {
 
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+
+      // Detecting a still-open query is debounced below (cheap enough per
+      // keystroke, but avoids flashing the popup while typing through a
+      // partial match). Detecting that the query is now GONE must happen
+      // synchronously: a debounced close leaves `isChannelOpen` stale for up
+      // to CHANNEL_QUERY_DEBOUNCE_MS after the cursor moves off a match — an
+      // Enter pressed in that window (e.g. selecting all of an edit target
+      // that ended in "#channel" and immediately retyping + submitting) gets
+      // hijacked by handleChannelKeyDown and inserts the stale suggestion
+      // instead of submitting. See empty-edit-delete.spec.ts "a non-empty
+      // edit still edits and never deletes".
+      const immediate = detectPrefixQuery(
+        "#",
+        value,
+        cursorPosition,
+        knownNamesLowerRef.current,
+      );
+      if (!immediate) {
+        setChannelQuery((current) => (current === null ? current : null));
+        return;
       }
 
       debounceTimerRef.current = setTimeout(() => {

@@ -396,10 +396,7 @@ pub async fn handle_req(
                     subs.remove(&sub_id);
                 }
                 if let Some(removed) = state.sub_registry.remove_subscription(conn_id, &sub_id) {
-                    state
-                        .pubsub
-                        .release_topic(&conn.tenant, topic_for_subscription(removed.channel_id))
-                        .await;
+                    release_subscription_topics(&state, &conn.tenant, &removed.scope).await;
                 }
                 conn.send(RelayMessage::closed(&sub_id, "error: database error"));
                 return;

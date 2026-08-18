@@ -4,11 +4,10 @@ use tauri::{AppHandle, Manager, State};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        begin_backend_transition, build_managed_agent_summary, current_instance_id,
-        find_managed_agent_mut, load_managed_agents, load_personas, resolve_provider_binary,
-        retire_deployment_pointer, save_managed_agents, sync_managed_agent_processes,
-        validate_backend_migration, validate_provider_config, BackendKind, ManagedAgentSummary,
-        MigrationPreconditions,
+        begin_backend_transition, current_instance_id, find_managed_agent_mut, load_managed_agents,
+        load_personas, resolve_provider_binary, retire_deployment_pointer, save_managed_agents,
+        sync_managed_agent_processes, validate_backend_migration, validate_provider_config,
+        BackendKind, ManagedAgentSummary, MigrationPreconditions,
     },
     util::now_iso,
 };
@@ -63,14 +62,7 @@ pub async fn set_managed_agent_start_on_app_launch(
         // "change any setting to reissue" recovery copy in `wakerBundleHealth.ts` would be
         // false for this specific setting.
         super::agents::retain_managed_agent_pending(&app, &state, record);
-        let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        super::agents::summarize_from_disk(&app, record, &runtimes)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -100,7 +92,7 @@ pub async fn set_managed_agent_start_on_app_launch(
 ///   — `sync_managed_agent_processes` clears it as legacy bookkeeping on every
 ///   record it touches, which is exactly what made the first version of this
 ///   guard read false for a healthy running agent.
-/// - **Provider**: [`build_managed_agent_summary`] reports `deployed` /
+/// - **Provider**: [`crate::managed_agents::build_managed_agent_summary`] reports `deployed` /
 ///   `not_deployed` from `backend_agent_id` — that is *infrastructure
 ///   existence*, not liveness. A sprite stays "deployed" after `!shutdown`, and
 ///   relay presence (the real signal) is polled by the frontend and never
@@ -282,7 +274,7 @@ pub async fn set_managed_agent_backend(
         // this is the path that picks up the new `provider_binary_path` a same-provider
         // config change or a re-migration onto `Provider` just wrote.
         super::agents::retain_managed_agent_pending(&app, &state, record);
-        build_managed_agent_summary(&app, record, &runtimes, &personas, &global)
+        super::agents::summarize_from_disk(&app, record, &runtimes)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -360,14 +352,7 @@ pub async fn set_managed_agent_community(
         // this is a user-facing settings mutator, so the "change any setting to reissue"
         // copy in `wakerBundleHealth.ts` must hold here too.
         super::agents::retain_managed_agent_pending(&app, &state, record);
-        let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        super::agents::summarize_from_disk(&app, record, &runtimes)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -497,14 +482,7 @@ pub async fn set_managed_agent_waker_enabled(
             .iter()
             .find(|record| record.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
-        let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        super::agents::summarize_from_disk(&app, record, &runtimes)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -550,14 +528,7 @@ pub async fn set_managed_agent_auto_restart(
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
         // See the matching reissue call in `set_managed_agent_start_on_app_launch` above.
         super::agents::retain_managed_agent_pending(&app, &state, record);
-        let personas = load_personas(&app).unwrap_or_default();
-        build_managed_agent_summary(
-            &app,
-            record,
-            &runtimes,
-            &personas,
-            &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-        )
+        super::agents::summarize_from_disk(&app, record, &runtimes)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

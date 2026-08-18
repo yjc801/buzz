@@ -21,17 +21,14 @@ function options(refetchOwnerProfiles) {
     ownerOnly: true,
     ownerPolicyError: null,
     refetchManagedAgents: async () => ({ data: [], error: null }),
-    refetchRelayAgents: async () => ({
-      data: [
-        {
-          pubkey: AGENT,
-          respondTo: "anyone",
-          respondToAllowlist: [],
-          channelIds: ["general"],
-        },
-      ],
-      error: null,
-    }),
+    fetchRelayAgents: async () => [
+      {
+        pubkey: AGENT,
+        respondTo: "anyone",
+        respondToAllowlist: [],
+        channelIds: ["general"],
+      },
+    ],
     refetchOwnerProfiles,
   };
 }
@@ -51,7 +48,7 @@ test("revalidation preserves member admission for a member agent with no directo
     // No relay directory entry for AGENT — mirrors the picker's admitted
     // member-agent case (getAdmittedMemberAgentPubkeys), which revalidation
     // must not silently strip.
-    refetchRelayAgents: async () => ({ data: [], error: null }),
+    fetchRelayAgents: async () => [],
     refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
   });
 
@@ -72,7 +69,7 @@ test("revalidation denies a member agent removed from the channel since the pick
     ownerOnly: false,
     ownerPolicyError: null,
     refetchManagedAgents: async () => ({ data: [], error: null }),
-    refetchRelayAgents: async () => ({ data: [], error: null }),
+    fetchRelayAgents: async () => [],
     refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
   });
 
@@ -94,17 +91,14 @@ test("revalidation fails closed when the channel roster cannot be refreshed", as
     ownerOnly: false,
     ownerPolicyError: null,
     refetchManagedAgents: async () => ({ data: [], error: null }),
-    refetchRelayAgents: async () => ({
-      data: [
-        {
-          pubkey: AGENT,
-          respondTo: "anyone",
-          respondToAllowlist: [],
-          channelIds: ["general"],
-        },
-      ],
-      error: null,
-    }),
+    fetchRelayAgents: async () => [
+      {
+        pubkey: AGENT,
+        respondTo: "anyone",
+        respondToAllowlist: [],
+        channelIds: ["general"],
+      },
+    ],
     refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
   });
 
@@ -130,7 +124,7 @@ test("revalidation admits a managed agent when no channel exists yet (managed-on
       data: [{ pubkey: AGENT, communityRelayUrl: null }],
       error: null,
     }),
-    refetchRelayAgents: async () => ({ data: [], error: null }),
+    fetchRelayAgents: async () => [],
     refetchOwnerProfiles: async () => ({ profiles: {}, missing: [] }),
   });
 
@@ -164,10 +158,9 @@ test("fresh managed evidence survives unrelated relay authorization errors", asy
       data: [{ pubkey: LOCAL_AGENT }],
       error: null,
     }),
-    refetchRelayAgents: async () => ({
-      data: undefined,
-      error: new Error("relay directory unavailable"),
-    }),
+    fetchRelayAgents: async () => {
+      throw new Error("relay directory unavailable");
+    },
   });
 
   assert.deepEqual(result, [HUMAN, LOCAL_AGENT]);
@@ -179,10 +172,9 @@ test("relay-only agents still fail closed when relay discovery fails", async () 
       profiles: { [AGENT]: { ownerPubkey: CURRENT } },
       missing: [],
     })),
-    refetchRelayAgents: async () => ({
-      data: undefined,
-      error: new Error("relay directory unavailable"),
-    }),
+    fetchRelayAgents: async () => {
+      throw new Error("relay directory unavailable");
+    },
   });
 
   assert.deepEqual(result, [HUMAN]);
@@ -200,10 +192,9 @@ test("mixed evidence preserves only fresh managed agents and humans", async () =
       data: [{ pubkey: LOCAL_AGENT }],
       error: null,
     }),
-    refetchRelayAgents: async () => ({
-      data: undefined,
-      error: new Error("relay directory unavailable"),
-    }),
+    fetchRelayAgents: async () => {
+      throw new Error("relay directory unavailable");
+    },
   });
 
   assert.deepEqual(result, [HUMAN, LOCAL_AGENT]);

@@ -6,6 +6,7 @@ import {
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { evictUsersBatchEntries } from "@/features/profile/hooks";
 import { getUsersBatch } from "@/shared/api/tauriProfiles";
+import { revalidateRelayAgents } from "@/shared/api/tauriRelayAgents";
 import type {
   ChannelMember,
   ManagedAgent,
@@ -32,7 +33,7 @@ export async function revalidateAgentMentionPubkeys({
   ownerOnly,
   ownerPolicyError,
   refetchManagedAgents,
-  refetchRelayAgents,
+  fetchRelayAgents,
   refetchOwnerProfiles,
 }: {
   pubkeys: readonly string[];
@@ -45,7 +46,7 @@ export async function revalidateAgentMentionPubkeys({
   ownerOnly: boolean | undefined;
   ownerPolicyError: Error | null;
   refetchManagedAgents: () => Promise<DirectoryResult<ManagedAgent[]>>;
-  refetchRelayAgents: () => Promise<DirectoryResult<RelayAgent[]>>;
+  fetchRelayAgents: (pubkeys: string[]) => Promise<RelayAgent[]>;
   refetchOwnerProfiles: (pubkeys: string[]) => Promise<UsersBatchResponse>;
 }) {
   const requestedAgentPubkeys = new Set(
@@ -59,10 +60,10 @@ export async function revalidateAgentMentionPubkeys({
   // branch. A "managed-only"/"community" scope (e.g. a new-DM composer with
   // no channel yet) has no roster to fetch — requiring one would fail-close
   // a valid managed-agent mention before the channel even exists.
-  const [managedResult, relayResult, membersResult, ownerProfiles] =
+  const [managedResult, relayAgents, membersResult, ownerProfiles] =
     await Promise.all([
       refetchManagedAgents(),
-      refetchRelayAgents(),
+      fetchRelayAgents([...requestedAgentPubkeys]).catch(() => null),
       eligibilityScope.type === "channel"
         ? refetchMembers()
         : Promise.resolve<DirectoryResult<ChannelMember[]>>({
@@ -73,8 +74,7 @@ export async function revalidateAgentMentionPubkeys({
         ? refetchOwnerProfiles([...requestedAgentPubkeys]).catch(() => null)
         : Promise.resolve(null),
     ]);
-  const relayDirectoryReady =
-    relayResult.error === null && relayResult.data !== undefined;
+  const relayDirectoryReady = relayAgents !== null;
   if (
     ownerOnly === undefined ||
     ownerPolicyError !== null ||
@@ -89,8 +89,7 @@ export async function revalidateAgentMentionPubkeys({
   const managedPubkeys = new Set(
     managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
   );
-  const relayDirectoryAgents =
-    (relayDirectoryReady ? relayResult.data : []) ?? [];
+  const relayDirectoryAgents = relayAgents ?? [];
   const directoryAgentPubkeys = new Set(
     relayDirectoryAgents.map((agent) => normalizePubkey(agent.pubkey)),
   );
@@ -102,7 +101,7 @@ export async function revalidateAgentMentionPubkeys({
     currentPubkey,
     eligibilityScope,
     managedAgents: managedResult.data,
-    relayAgents: relayDirectoryReady ? relayResult.data : [],
+    relayAgents: relayDirectoryAgents,
     sharedChannelIds,
   });
   const admittedPubkeys = new Set(
@@ -142,7 +141,6 @@ export function useAgentMentionRevalidation({
   ownerOnly,
   ownerPolicyError,
   refetchManagedAgents,
-  refetchRelayAgents,
 }: {
   agentPubkeys: ReadonlySet<string>;
   refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
@@ -154,7 +152,6 @@ export function useAgentMentionRevalidation({
   ownerOnly: boolean | undefined;
   ownerPolicyError: Error | null;
   refetchManagedAgents: () => Promise<DirectoryResult<ManagedAgent[]>>;
-  refetchRelayAgents: () => Promise<DirectoryResult<RelayAgent[]>>;
 }) {
   const queryClient = useQueryClient();
   const refetchOwnerProfiles = React.useCallback(
@@ -177,7 +174,13 @@ export function useAgentMentionRevalidation({
         ownerOnly,
         ownerPolicyError,
         refetchManagedAgents,
-        refetchRelayAgents,
+        fetchRelayAgents: (requestedPubkeys) =>
+          revalidateRelayAgents(
+            requestedPubkeys,
+            eligibilityScope.type === "channel"
+              ? eligibilityScope.channelId
+              : undefined,
+          ),
         refetchOwnerProfiles,
       }),
     [
@@ -191,7 +194,6 @@ export function useAgentMentionRevalidation({
       ownerPolicyError,
       refetchManagedAgents,
       refetchOwnerProfiles,
-      refetchRelayAgents,
       sharedChannelIds,
     ],
   );

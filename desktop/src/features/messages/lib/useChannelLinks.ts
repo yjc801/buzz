@@ -102,7 +102,59 @@ export function useChannelLinks() {
 
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
       }
+
+      // Detecting a still-open query is debounced below (cheap enough per
+      // keystroke, but avoids flashing the popup while typing through a
+      // partial match). Detecting that the query is now GONE must happen
+      // synchronously: a debounced close leaves `isChannelOpen` stale for up
+      // to CHANNEL_QUERY_DEBOUNCE_MS after the cursor moves off a match — an
+      // Enter pressed in that window (e.g. selecting all of an edit target
+      // that ended in "#channel" and immediately retyping + submitting) gets
+      // hijacked by handleChannelKeyDown and inserts the stale suggestion
+      // instead of submitting. See empty-edit-delete.spec.ts "a non-empty
+      // edit still edits and never deletes".
+      const immediate = detectPrefixQuery(
+        "#",
+        value,
+        cursorPosition,
+        knownNamesLowerRef.current,
+      );
+      if (!immediate) {
+        setChannelQuery((current) => (current === null ? current : null));
+        return;
+      }
+
+      // A truthy `immediate` only proves detectPrefixQuery's fast path found
+      // SOME boundary-prefixed token — it matches any single word regardless
+      // of whether it names a known channel, and even a validated match
+      // doesn't prove the suggestions currently ON SCREEN (rendered from the
+      // old, still-stale `channelQuery` state) are still correct for it.
+      // Query *ancestry* (is the new text an extension/reduction of the old
+      // query?) isn't sufficient either: channel matching is substring-based
+      // (`includes`), so "#gen" -> "#genz" is a valid extension but matches
+      // no channel, and with both "agenda" and "general" known, "#gen" ->
+      // "#gene" drops "agenda" even though it's an extension too. The only
+      // safe check is whether every channel name currently rendered for the
+      // old query would still match the new one — if even one drops out, the
+      // stale list (and whatever it's showing at the selected index) can no
+      // longer be trusted, so close synchronously and let the debounce
+      // rebuild the suggestion list from scratch.
+      const immediateLower = immediate.query.toLowerCase();
+      setChannelQuery((current) => {
+        if (current === null) {
+          return current;
+        }
+        const currentLower = current.toLowerCase();
+        const currentlyMatchingNames = knownNamesLowerRef.current.filter(
+          (name) => name.includes(currentLower),
+        );
+        const allStillMatch =
+          currentlyMatchingNames.length > 0 &&
+          currentlyMatchingNames.every((name) => name.includes(immediateLower));
+        return allStillMatch ? current : null;
+      });
 
       debounceTimerRef.current = setTimeout(() => {
         debounceTimerRef.current = null;

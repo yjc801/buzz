@@ -68,11 +68,13 @@ test("relayAgentIsSharedWithUser: accepts shared anyone agents and rejects unsha
   assert.equal(
     relayAgentIsSharedWithUser(
       {
+        ownerPubkey: OTHER_OWNER_PUBKEY,
         respondTo: "owner-only",
         respondToAllowlist: [],
         channelIds: ["general"],
       },
       sharedChannelIds,
+      CURRENT_PUBKEY,
     ),
     false,
   );
@@ -82,6 +84,22 @@ test("relayAgentIsSharedWithUser: accepts shared anyone agents and rejects unsha
       sharedChannelIds,
     ),
     false,
+  );
+});
+
+test("relayAgentIsSharedWithUser: accepts verified same-owner agents across machines", () => {
+  assert.equal(
+    relayAgentIsSharedWithUser(
+      {
+        ownerPubkey: CURRENT_PUBKEY.toUpperCase(),
+        respondTo: "owner-only",
+        respondToAllowlist: [],
+        channelIds: ["general"],
+      },
+      new Set(["general"]),
+      CURRENT_PUBKEY,
+    ),
+    true,
   );
 });
 

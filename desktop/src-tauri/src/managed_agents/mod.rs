@@ -12,6 +12,7 @@ pub(crate) use agent_env::{
 };
 mod backend;
 mod backend_migration;
+pub(crate) mod claude_config;
 mod community_scope;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;

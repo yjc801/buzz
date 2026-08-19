@@ -119,6 +119,7 @@ fn test_record() -> ManagedAgentRecord {
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
@@ -171,7 +172,7 @@ fn persona_and_global_env_tiers(
 fn pre_spawn_surface_reports_pending_acp_tiers() {
     let record = test_record();
     let runtime = test_runtime();
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     assert!(surface.is_pre_spawn);
     assert_eq!(surface.sources.acp_native, ConfigTierStatus::Pending);
@@ -187,7 +188,7 @@ fn surface_reports_mcp_specific_config_path() {
     let record = test_record();
     let runtime = test_runtime();
     let surface = with_goose_path_root(None, || {
-        read_config_surface(&record, Some(runtime), None, &no_tiers())
+        read_config_surface(&record, Some(runtime), None, &no_tiers(), None)
     });
 
     let path = surface
@@ -206,7 +207,7 @@ fn goose_mcp_config_path_follows_path_root_override() {
     let record = test_record();
     let runtime = test_runtime();
     let surface = with_goose_path_root(Some("/tmp/buzz-goose-root"), || {
-        read_config_surface(&record, Some(runtime), None, &no_tiers())
+        read_config_surface(&record, Some(runtime), None, &no_tiers(), None)
     });
 
     let expected_path = Path::new("/tmp/buzz-goose-root")
@@ -230,7 +231,7 @@ fn claude_surface_uses_mcp_config_path_not_settings_path() {
         config_file_path: Some("~/.claude/settings.json"),
         ..*test_runtime()
     };
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     assert!(surface
         .sources
@@ -250,7 +251,7 @@ fn record_model_overrides_file_model() {
     record.model = Some("explicit-model".to_string());
     let runtime = test_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("explicit-model"));
     assert_eq!(model.origin, ConfigOrigin::BuzzExplicit);
@@ -263,7 +264,7 @@ fn provider_locked_shows_locked() {
         provider_locked: true,
         ..*test_runtime()
     };
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
     let provider = surface.normalized.provider.unwrap();
     assert_eq!(provider.value.as_deref(), Some("Anthropic (locked)"));
     assert_eq!(provider.origin, ConfigOrigin::HarnessConstraint);
@@ -289,7 +290,7 @@ fn post_spawn_with_model_config_option_uses_acp() {
         captured_at: "".to_string(),
     };
 
-    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers(), None);
     assert!(!surface.is_pre_spawn);
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("claude-opus-4"));
@@ -313,7 +314,7 @@ fn acp_model_overrides_file_model_with_override_tracking() {
         captured_at: "".to_string(),
     };
 
-    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &no_tiers(), None);
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("acp-model"));
     assert_eq!(model.origin, ConfigOrigin::AcpConfigOption);
@@ -334,7 +335,7 @@ fn persona_model_tier_produces_persona_default_origin() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("persona-model"));
@@ -350,7 +351,7 @@ fn global_model_tier_produces_global_default_origin() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("global-model"));
@@ -366,7 +367,7 @@ fn persona_provider_tier_produces_persona_default_origin() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let provider = surface.normalized.provider.unwrap();
     assert_eq!(provider.value.as_deref(), Some("anthropic"));
@@ -382,7 +383,7 @@ fn persona_prompt_tier_produces_persona_default_origin() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let prompt = surface.normalized.system_prompt.unwrap();
     assert_eq!(
@@ -419,7 +420,7 @@ fn runtime_override_wins_display_when_model_overridden_is_true() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers);
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers, None);
     let model = surface.normalized.model.unwrap();
 
     // Override wins the display value with a runtime-override origin.
@@ -451,7 +452,7 @@ fn no_runtime_override_when_model_overridden_is_false() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers);
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers, None);
     let model = surface.normalized.model.unwrap();
 
     // model_overridden is false => the override branch is not taken.
@@ -483,7 +484,7 @@ fn no_false_positive_override_when_persona_edited_mid_life() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers);
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers, None);
     let model = surface.normalized.model.unwrap();
 
     // model_overridden is false => no RuntimeOverride, even though
@@ -542,7 +543,7 @@ fn explicit_record_model_not_retagged_when_already_present() {
     record.model = Some("explicit-model".to_string());
     let runtime = test_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("explicit-model"));
@@ -565,7 +566,7 @@ fn extra_env_vars_appear_in_advanced_as_buzz_explicit() {
         .insert("SPROUT_ACP_MEMORY".to_string(), "mem-value".to_string());
     let runtime = test_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let advanced_keys: Vec<&str> = surface.advanced.iter().map(|f| f.key.as_str()).collect();
     assert!(
@@ -604,7 +605,7 @@ fn extra_env_var_skipped_when_already_in_file_config_extra() {
         .insert("GOOSE_THINKING_EFFORT".to_string(), "high".to_string());
     let runtime = test_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let advanced_keys: Vec<&str> = surface.advanced.iter().map(|f| f.key.as_str()).collect();
     assert!(
@@ -665,7 +666,7 @@ fn buzz_agent_max_output_tokens_from_env_is_buzz_explicit() {
     );
     let runtime = buzz_agent_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let field = surface.normalized.max_output_tokens.unwrap();
     assert_eq!(field.value.as_deref(), Some("8192"));
@@ -686,7 +687,7 @@ fn buzz_agent_context_limit_from_env_is_buzz_explicit() {
     );
     let runtime = buzz_agent_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let field = surface.normalized.context_limit.unwrap();
     assert_eq!(field.value.as_deref(), Some("100000"));
@@ -704,7 +705,7 @@ fn buzz_agent_max_tokens_absent_when_no_env_var_or_file() {
     let record = test_record();
     let runtime = buzz_agent_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     assert!(
         surface.normalized.max_output_tokens.is_none(),
@@ -729,7 +730,7 @@ fn buzz_agent_max_tokens_env_var_not_double_surfaced_in_advanced() {
     );
     let runtime = buzz_agent_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let advanced_keys: Vec<&str> = surface.advanced.iter().map(|f| f.key.as_str()).collect();
     assert!(
@@ -750,7 +751,7 @@ fn buzz_agent_thinking_effort_from_env_is_buzz_explicit() {
         .insert("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string());
     let runtime = buzz_agent_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let field = surface.normalized.thinking_effort.unwrap();
     assert_eq!(field.value.as_deref(), Some("high"));
@@ -771,7 +772,7 @@ fn buzz_agent_thinking_effort_env_var_not_double_surfaced_in_advanced() {
     );
     let runtime = buzz_agent_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let advanced_keys: Vec<&str> = surface.advanced.iter().map(|f| f.key.as_str()).collect();
     assert!(
@@ -833,7 +834,7 @@ fn global_effort_surfaces_as_global_default_when_record_has_none() {
     let runtime = buzz_agent_rt();
     let tiers = global_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "high");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let effort = surface
         .normalized
@@ -850,7 +851,7 @@ fn persona_effort_shadows_global_and_tags_persona_default() {
     let runtime = buzz_agent_rt();
     let tiers = persona_and_global_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "medium", "high");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let effort = surface
         .normalized
@@ -874,7 +875,7 @@ fn record_effort_outranks_persona_and_global_keeps_buzz_explicit() {
     let runtime = buzz_agent_rt();
     let tiers = persona_and_global_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "medium", "high");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let effort = surface
         .normalized
@@ -890,7 +891,7 @@ fn no_effort_anywhere_yields_no_thinking_effort_field() {
     let record = test_record();
     let runtime = buzz_agent_rt();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     assert!(
         surface.normalized.thinking_effort.is_none(),
@@ -900,6 +901,9 @@ fn no_effort_anywhere_yields_no_thinking_effort_field() {
 
 /// AC-5 (conflicting-ACP): inherited effort set (global=high) + live ACP effort=low
 /// → ACP wins as primary (AcpConfigOption), global is the overridden secondary.
+///
+/// The ACP entry uses the real adapter shape: category `thought_level` with an
+/// adapter-defined config id (`effort`), NOT category `effort`.
 #[test]
 fn acp_effort_wins_over_inherited_global_effort_as_secondary() {
     let record = test_record();
@@ -907,7 +911,7 @@ fn acp_effort_wins_over_inherited_global_effort_as_secondary() {
     let cache = SessionConfigCache {
         config_options: vec![AcpConfigOptionEntry {
             config_id: "effort".to_string(),
-            category: Some("effort".to_string()),
+            category: Some("thought_level".to_string()),
             display_name: Some("Effort".to_string()),
             current_value: Some("low".to_string()),
             options: vec![],
@@ -921,7 +925,7 @@ fn acp_effort_wins_over_inherited_global_effort_as_secondary() {
     };
     let tiers = global_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "high");
 
-    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers);
+    let surface = read_config_surface(&record, Some(runtime), Some(&cache), &tiers, None);
 
     let effort = surface
         .normalized
@@ -945,7 +949,7 @@ fn numeric_max_tokens_inherits_from_global_env() {
     let runtime = buzz_agent_runtime();
     let tiers = global_env_tiers("BUZZ_AGENT_MAX_OUTPUT_TOKENS", "16384");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let field = surface.normalized.max_output_tokens.unwrap();
     assert_eq!(field.value.as_deref(), Some("16384"));

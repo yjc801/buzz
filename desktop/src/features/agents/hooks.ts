@@ -529,14 +529,28 @@ export function useStartManagedAgentMutation() {
 
   return useMutation({
     // A bare pubkey keeps the `(pubkey) => Promise` plumbing through the
-    // control actions working; the wake path passes an object to carry the
-    // replay floor of the mention that triggered the deploy.
+    // control actions working; callers that need more pass an object — the
+    // wake path carries the replay floor of the mention that triggered the
+    // deploy, and a long-lived callback carries the tenant scope it captured
+    // before its first await (the backend fails closed on a mid-flight
+    // community/identity switch).
     mutationFn: (
-      input: string | { pubkey: string; wakeReplayFloorTs?: number },
+      input:
+        | string
+        | {
+            pubkey: string;
+            wakeReplayFloorTs?: number;
+            expectedRelayUrl?: string;
+            expectedSignerPubkey?: string;
+          },
     ) =>
       typeof input === "string"
         ? startManagedAgent(input)
-        : startManagedAgent(input.pubkey, input.wakeReplayFloorTs),
+        : startManagedAgent(input.pubkey, {
+            wakeReplayFloorTs: input.wakeReplayFloorTs,
+            expectedRelayUrl: input.expectedRelayUrl,
+            expectedSignerPubkey: input.expectedSignerPubkey,
+          }),
     onSuccess: ({ agent: updated }) => {
       queryClient.setQueryData<ManagedAgent[]>(
         managedAgentsQueryKey,

@@ -3,7 +3,9 @@ import { test } from "node:test";
 
 import {
   isProjectAccessibleToViewer,
+  isProjectMine,
   isRepositoryAccessibleToViewer,
+  nextRepositoryEntryLimit,
   relativeTime,
 } from "./projectsViewHelpers.ts";
 
@@ -43,6 +45,50 @@ function makeAccessInput(overrides = {}) {
     ...overrides,
   };
 }
+
+function makeProject(overrides = {}) {
+  return {
+    createdAt: 0,
+    description: "",
+    dtag: "sprout",
+    id: "30621:owner:sprout",
+    name: "sprout",
+    owner: REPO_OWNER,
+    primaryRepositoryAddress: null,
+    projectAddress: "30621:owner:sprout",
+    projectChannelId: null,
+    repositories: [],
+    repositoryAddresses: [],
+    status: "open",
+    ...overrides,
+  };
+}
+
+test("isProjectMine is true for projects the viewer owns or contributes to", () => {
+  assert.equal(isProjectMine(makeProject(), undefined), false);
+  assert.equal(isProjectMine(makeProject(), VIEWER), false);
+  assert.equal(isProjectMine(makeProject(), REPO_OWNER), true);
+  assert.equal(
+    isProjectMine(
+      makeProject({
+        owner: "c".repeat(64),
+        repositories: [makeRepository({ owner: VIEWER })],
+      }),
+      VIEWER,
+    ),
+    true,
+  );
+  assert.equal(
+    isProjectMine(
+      makeProject({
+        owner: "c".repeat(64),
+        repositories: [makeRepository({ contributors: [VIEWER] })],
+      }),
+      VIEWER,
+    ),
+    true,
+  );
+});
 
 test("a channel-bound repository is accessible only to channel members", () => {
   const repository = makeRepository();
@@ -173,4 +219,10 @@ test("relativeTime includes the year only across a year boundary", () => {
     relativeTime(crossYearCreatedAt, crossYearNow),
     crossYearExpected,
   );
+});
+
+test("repository entry pagination advances and clamps to the total", () => {
+  assert.equal(nextRepositoryEntryLimit(200, 450), 400);
+  assert.equal(nextRepositoryEntryLimit(400, 450), 450);
+  assert.equal(nextRepositoryEntryLimit(450, 450), 450);
 });

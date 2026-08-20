@@ -22,17 +22,28 @@ export type StartManagedAgentOutcome = {
 
 export async function startManagedAgent(
   pubkey: string,
-  /** Unix seconds of the mention that triggered a wake deploy. Carried into
-   * the new harness as its startup replay floor so cold-start latency cannot
-   * drop the very message that woke it. Omitted for ordinary starts. */
-  wakeReplayFloorTs?: number,
+  options?: {
+    /** Unix seconds of the mention that triggered a wake deploy. Carried into
+     * the new harness as its startup replay floor so cold-start latency cannot
+     * drop the very message that woke it. Omitted for ordinary starts. */
+    wakeReplayFloorTs?: number;
+    /** Tenant scope captured by the caller before its first await; the
+     * backend fails closed before any spawn/deploy side effect when the
+     * active community no longer matches. */
+    expectedRelayUrl?: string;
+    /** Signer identity captured with the relay scope; the backend fails
+     * closed when the active workspace identity no longer matches. */
+    expectedSignerPubkey?: string;
+  },
 ): Promise<StartManagedAgentOutcome> {
   const response = await invokeTauri<{
     agent: RawManagedAgent;
     fresh_generation: boolean | null;
   }>("start_managed_agent", {
     pubkey,
-    wakeReplayFloor: wakeReplayFloorTs ?? null,
+    wakeReplayFloor: options?.wakeReplayFloorTs ?? null,
+    expectedRelayUrl: options?.expectedRelayUrl ?? null,
+    expectedSignerPubkey: options?.expectedSignerPubkey ?? null,
   });
   return {
     agent: fromRawManagedAgent(response.agent),

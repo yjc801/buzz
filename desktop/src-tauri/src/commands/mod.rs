@@ -17,6 +17,7 @@ mod agents;
 // may not grow, so even the `#[path]` declaration lives here.
 mod agents_waker_enrolment;
 mod canvas;
+mod channel_reconnect_repair;
 mod channel_templates;
 mod channel_window;
 mod channels;
@@ -86,6 +87,7 @@ pub use agent_providers::*;
 pub use agent_settings::*;
 pub use agents::*;
 pub use canvas::*;
+pub use channel_reconnect_repair::*;
 pub use channel_templates::*;
 pub use channel_window::*;
 pub use channels::*;

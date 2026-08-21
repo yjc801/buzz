@@ -186,29 +186,21 @@ export type AgentMentionAdmission = "allow" | "deny" | "unknown";
 
 export function getAgentMentionAdmission({
   isAgent,
-  isManagedAgent,
   isMember = false,
   pubkey,
-  ownerPubkey,
-  currentPubkey,
   mentionableAgentPubkeys,
   directoryAgentPubkeys = new Set(),
   directoryReady,
-  ownerOnly,
 }: {
   isAgent: boolean;
-  isManagedAgent: boolean;
   isMember?: boolean;
   pubkey: string;
-  ownerPubkey?: string | null;
-  currentPubkey?: string | null;
   mentionableAgentPubkeys: ReadonlySet<string>;
   directoryAgentPubkeys?: ReadonlySet<string>;
   directoryReady: boolean;
-  ownerOnly: boolean | undefined;
 }): AgentMentionAdmission {
   if (!isAgent) return "allow";
-  if (!directoryReady || ownerOnly === undefined) return "unknown";
+  if (!directoryReady) return "unknown";
 
   const normalized = normalizePubkey(pubkey);
   // Member (Option B): a channel-member agent with no relay directory
@@ -219,52 +211,35 @@ export function getAgentMentionAdmission({
     isMember &&
     !mentionableAgentPubkeys.has(normalized) &&
     !directoryAgentPubkeys.has(normalized);
-  if (!mentionableAgentPubkeys.has(normalized) && !isLenientMember) {
-    return "deny";
-  }
-  if (!ownerOnly || isManagedAgent) return "allow";
-  if (!ownerPubkey || !currentPubkey) return "unknown";
 
-  return normalizePubkey(ownerPubkey) === normalizePubkey(currentPubkey)
+  return mentionableAgentPubkeys.has(normalized) || isLenientMember
     ? "allow"
     : "deny";
 }
 
 export function shouldHideAgentFromMentions({
   isAgent,
-  isManagedAgent = false,
   isMember = false,
   pubkey,
-  ownerPubkey,
-  currentPubkey,
   mentionableAgentPubkeys,
   directoryAgentPubkeys,
   directoryReady = true,
-  ownerOnly,
 }: {
   isAgent: boolean;
-  isManagedAgent?: boolean;
   isMember?: boolean;
   pubkey: string;
-  ownerPubkey?: string | null;
-  currentPubkey?: string | null;
   mentionableAgentPubkeys: ReadonlySet<string>;
   directoryAgentPubkeys?: ReadonlySet<string>;
   directoryReady?: boolean;
-  ownerOnly: boolean | undefined;
 }) {
   return (
     getAgentMentionAdmission({
       isAgent,
-      isManagedAgent,
       isMember,
       pubkey,
-      ownerPubkey,
-      currentPubkey,
       mentionableAgentPubkeys,
       directoryAgentPubkeys,
       directoryReady,
-      ownerOnly,
     }) !== "allow"
   );
 }
@@ -370,11 +345,6 @@ export function getAdmittedMemberAgentPubkeys({
         pubkey: normalized,
         mentionableAgentPubkeys,
         directoryAgentPubkeys,
-        // This helper only answers the invocability/membership question the
-        // picker's member branch depends on — owner-only visibility is
-        // already enforced by the picker itself before a pubkey ever
-        // reaches here.
-        ownerOnly: false,
       })
     ) {
       continue;

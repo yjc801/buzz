@@ -108,6 +108,11 @@ struct AttemptReport {
     /// A re-driven attempt's settlement is terminal whatever it reports —
     /// see [`Settlement`].
     retried: bool,
+    /// For [`WakeOutcome::InFlight`] only: the `created_at` of the trigger
+    /// whose attempt refused this one. Carried through so
+    /// [`leaves_mention_unacted`] can check the collapse for real instead of
+    /// assuming it — see [`in_flight_owner_covers`].
+    in_flight_owner_created_at: Option<u64>,
 }
 
 /// Debounce-refused (and otherwise unresolved) triggers retained per agent for
@@ -115,8 +120,9 @@ struct AttemptReport {
 ///
 /// Matches the desktop's `WAKE_COLLAPSED_TRIGGER_LIMIT`. One wake loop watches
 /// exactly one agent, so this is already the per-agent bound the desktop
-/// computes per key. Beyond it the OLDEST is dropped — newest mentions are the
-/// most actionable — and dropping is not silent: the evicted trigger's cursor
+/// computes per key. Beyond it the OLDEST — by the mention's own `created_at`,
+/// not by arrival order; see [`retain_stranded`] — is dropped, because newest
+/// mentions are the most actionable, and dropping is not silent: the cursor
 /// claim is completed with an explicit warning, because a claim left held
 /// would pin the checkpoint forever.
 const STRANDED_TRIGGER_LIMIT: usize = 16;
@@ -721,7 +727,7 @@ async fn join_next_or_pending(
     }
 }
 
-/// Does this outcome leave the mention unacted-on, such that dropping it now
+/// Does this report leave its mention unacted-on, such that dropping it now
 /// would lose it?
 ///
 /// True exactly when the attempt neither proved liveness nor made a policy
@@ -741,20 +747,57 @@ async fn join_next_or_pending(
 /// - `Woken` / `AlreadyLive` — liveness was proven. (The desktop retains these
 ///   too, to grade an unverifiable per-channel REQ delivery; the daemon
 ///   already logs that case as an error and does not re-deploy for it.)
-/// - `InFlight` — an attempt for this same agent owns the decision, and its
-///   replay floor is derived from an *earlier* `created_at` than this
-///   follower's, so the wake it produces covers this mention.
 /// - `AuthorRejected` / `AuthorUnverified` — fail-closed policy verdicts.
 ///   Re-driving would re-litigate a veto that will not change.
 /// - `Cancelled` — handled separately: abandoned, not completed.
-fn leaves_mention_unacted(outcome: WakeOutcome) -> bool {
-    matches!(
-        outcome,
+///
+/// [`WakeOutcome::InFlight`] is the one arm that is terminal only
+/// *conditionally* — see [`in_flight_owner_covers`].
+fn leaves_mention_unacted(report: &AttemptReport) -> bool {
+    match report.outcome {
         WakeOutcome::Debounced
-            | WakeOutcome::DeployFailed
-            | WakeOutcome::WakeUnconfirmed
-            | WakeOutcome::PresenceUnavailable
-    )
+        | WakeOutcome::DeployFailed
+        | WakeOutcome::WakeUnconfirmed
+        | WakeOutcome::PresenceUnavailable => true,
+        WakeOutcome::InFlight => !in_flight_owner_covers(report),
+        WakeOutcome::Woken
+        | WakeOutcome::AlreadyLive
+        | WakeOutcome::AuthorRejected
+        | WakeOutcome::AuthorUnverified
+        | WakeOutcome::Cancelled => false,
+    }
+}
+
+/// Would the attempt that took the in-flight claim reach this follower's
+/// mention?
+///
+/// The collapse that [`WakeOutcome::InFlight`] performs is only sound in one
+/// direction. A deploy's replay floor is its own trigger's `created_at`
+/// ([`crate::effects::RealWakeEffects`]), so an owner reaches back to a
+/// follower only when the owner is the *older* of the two (within
+/// [`crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS`]).
+///
+/// Live traffic mostly arrives oldest-first and makes that true by accident,
+/// which is why the assumption survived. A backlog drain does not: the relay
+/// serves stored rows **newest-first** (see [`CursorStore`]'s module doc), and
+/// every admitted row is spawned onto its own task, so which one wins the
+/// claim is a lock race, not delivery order. The newest row winning leaves
+/// every older sibling holding an `InFlight` the owner's floor cannot cover —
+/// and completing those cursor claims is exactly the mention loss the
+/// stranded-trigger path exists to prevent.
+///
+/// A `None` owner timestamp — which `claim` never produces for this outcome —
+/// is treated as *not* covered, because an unproven collapse must not be the
+/// thing that authorizes dropping a mention.
+///
+/// This proves reach, not delivery: it says the owner's floor would span this
+/// mention, not that the owner's deploy succeeds. When the owner fails it is
+/// stranded and re-driven on its own (older) floor, which spans this mention
+/// too, so the follower stays covered by the same chain.
+fn in_flight_owner_covers(report: &AttemptReport) -> bool {
+    report.in_flight_owner_created_at.is_some_and(|owner| {
+        crate::decide::is_covered_by_replay_floor(report.event.created_at, owner)
+    })
 }
 
 /// Fold a finished attempt's outcome into the durable cursor.
@@ -775,12 +818,12 @@ fn apply_report(cursor: &mut CursorStore, agent_pubkey: &str, report: AttemptRep
         cursor.abandon(&report.event.id);
         return Settlement::Settled;
     }
-    if leaves_mention_unacted(report.outcome) && !report.retried {
+    if leaves_mention_unacted(&report) && !report.retried {
         // The claim stays in flight — see `StrandedTrigger` for why that is
         // the right cursor state for a held trigger.
         return Settlement::Strand(report.event);
     }
-    if report.retried && leaves_mention_unacted(report.outcome) {
+    if report.retried && leaves_mention_unacted(&report) {
         // Deliberately says only what is knowable. A batch of stranded
         // triggers re-drives oldest first, and a deploy's replay floor is the
         // triggering event's own `created_at` (`effects::RealWakeEffects`), so
@@ -814,6 +857,16 @@ fn apply_report(cursor: &mut CursorStore, agent_pubkey: &str, report: AttemptRep
 /// `pushBoundedPendingTrigger` does: the same event can reach this loop twice
 /// (reconnect replay overlapping the live window), and a duplicate would spend
 /// a second re-drive on one mention.
+///
+/// Eviction is by the trigger's own `created_at`, and this is where the
+/// daemon's copy of the rule has to diverge from the desktop's. The desktop
+/// drops the front of the queue, which is the oldest mention *because its tap
+/// has no history replay* — its own doc says so, and every event it sees is
+/// live and in order. This loop drains history, and the relay serves stored
+/// rows newest-first, so a front-drop here would discard the **newest**
+/// mentions and keep the stalest ones — precisely inverting "newest mentions
+/// are the most actionable". Insertion order breaks ties so a drop is still
+/// reproducible in the logs.
 fn retain_stranded(
     stranded: &mut Vec<StrandedTrigger>,
     cursor: &mut CursorStore,
@@ -828,7 +881,15 @@ fn retain_stranded(
         due_at: tokio::time::Instant::now() + Duration::from_millis(WAKE_STRANDED_RETRY_DELAY_MS),
     });
     while stranded.len() > STRANDED_TRIGGER_LIMIT {
-        let evicted = stranded.remove(0);
+        let Some(oldest) = stranded
+            .iter()
+            .enumerate()
+            .min_by_key(|(index, held)| (held.event.created_at, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let evicted = stranded.remove(oldest);
         // Never silent, and never left claimed: an evicted trigger's claim
         // would otherwise pin the checkpoint for the life of the process.
         tracing::warn!(
@@ -897,7 +958,8 @@ fn spawn_attempt(
             },
         );
 
-        let result = run_wake_attempt(&agent_pubkey, &attempt_state, &effects).await;
+        let result =
+            run_wake_attempt(&agent_pubkey, event.created_at, &attempt_state, &effects).await;
 
         if undeliverable && result.outcome == WakeOutcome::Woken {
             // The event was already older than a woken harness's replay
@@ -959,6 +1021,7 @@ fn spawn_attempt(
             event,
             outcome: result.outcome,
             retried,
+            in_flight_owner_created_at: result.in_flight_owner_created_at,
         }
     });
 }
@@ -975,12 +1038,16 @@ mod tests {
     }
 
     fn trigger(id: &str) -> TriggerEvent {
+        trigger_at(id, NOW)
+    }
+
+    fn trigger_at(id: &str, created_at: u64) -> TriggerEvent {
         TriggerEvent {
             id: id.to_string(),
             author: "a".repeat(64),
             kind: 9,
             p_tags: vec!["b".repeat(64)],
-            created_at: NOW,
+            created_at,
         }
     }
 
@@ -989,6 +1056,22 @@ mod tests {
             event: trigger(id),
             outcome,
             retried,
+            in_flight_owner_created_at: None,
+        }
+    }
+
+    /// A follower collapsed behind a concurrent attempt, with both triggers'
+    /// timestamps spelled out — the ordering is the whole point.
+    fn in_flight_report(
+        id: &str,
+        follower_created_at: u64,
+        owner_created_at: u64,
+    ) -> AttemptReport {
+        AttemptReport {
+            event: trigger_at(id, follower_created_at),
+            outcome: WakeOutcome::InFlight,
+            retried: false,
+            in_flight_owner_created_at: Some(owner_created_at),
         }
     }
 
@@ -1058,7 +1141,6 @@ mod tests {
         for outcome in [
             WakeOutcome::Woken,
             WakeOutcome::AlreadyLive,
-            WakeOutcome::InFlight,
             WakeOutcome::AuthorRejected,
             WakeOutcome::AuthorUnverified,
         ] {
@@ -1078,6 +1160,131 @@ mod tests {
                 "{outcome} must release its claim"
             );
         }
+    }
+
+    /// The ordering-neutral half of the collapse, and the reason `InFlight`
+    /// is terminal at all: a follower no older than the owner sits inside the
+    /// floor the owner's deploy will commit, so re-driving it would spend a
+    /// second deploy for a mention the first one already reaches.
+    #[test]
+    fn a_follower_covered_by_the_owning_attempt_settles_terminally() {
+        for (label, follower_at, owner_at) in [
+            ("owner is older", NOW, NOW - 600),
+            ("same instant", NOW, NOW),
+            (
+                "owner newer, but inside the skew",
+                NOW,
+                NOW + crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut cursor = store(&dir);
+            cursor.admit("e1", NOW, NOW).expect("admit");
+
+            let settlement = apply_report(
+                &mut cursor,
+                "agent",
+                in_flight_report("e1", follower_at, owner_at),
+            );
+
+            assert!(
+                matches!(settlement, Settlement::Settled),
+                "{label}: the owner's replay floor reaches this mention"
+            );
+            assert_eq!(cursor.in_flight_len(), 0, "{label}: claim must be released");
+        }
+    }
+
+    /// The bug this exists for. A backlog drain is served newest-first and
+    /// every admitted row is spawned concurrently, so the *newest* row can win
+    /// the in-flight claim. Its replay floor is its own `created_at`, which
+    /// cannot reach back to an older sibling — and completing that sibling's
+    /// cursor claim is precisely the "dropping wake triggers" this loop is
+    /// meant to have stopped.
+    #[test]
+    fn an_older_follower_behind_a_newer_owner_is_stranded_not_completed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e-old", NOW, NOW).expect("admit");
+
+        let follower_at = NOW - 600;
+        let owner_at = NOW;
+        assert!(
+            !crate::decide::is_covered_by_replay_floor(follower_at, owner_at),
+            "the fixture must actually sit outside the owner's floor"
+        );
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            in_flight_report("e-old", follower_at, owner_at),
+        );
+
+        assert!(
+            matches!(settlement, Settlement::Strand(event) if event.id == "e-old"),
+            "an uncovered follower must be retained for its re-drive"
+        );
+        assert_eq!(
+            cursor.in_flight_len(),
+            1,
+            "nothing about this mention is finished, so its claim stays held"
+        );
+        assert_eq!(cursor.abandoned_len(), 0);
+    }
+
+    /// One second past the skew is still uncovered — the boundary is the
+    /// whole content of the predicate, so pin it rather than trusting a
+    /// comfortably-large fixture.
+    #[test]
+    fn the_collapse_boundary_is_exactly_the_replay_floor_skew() {
+        let owner_at = NOW;
+        let skew = crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS;
+
+        assert!(in_flight_owner_covers(&in_flight_report(
+            "e1",
+            owner_at - skew,
+            owner_at
+        )));
+        assert!(!in_flight_owner_covers(&in_flight_report(
+            "e1",
+            owner_at - skew - 1,
+            owner_at
+        )));
+    }
+
+    /// An unproven collapse must never be the thing that authorizes dropping
+    /// a mention: with no owner recorded, fail towards retention.
+    #[test]
+    fn an_in_flight_report_with_no_named_owner_is_stranded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            report("e1", WakeOutcome::InFlight, false),
+        );
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        assert_eq!(cursor.in_flight_len(), 1);
+    }
+
+    /// One-shot still means one shot. An uncovered follower gets its single
+    /// re-drive and no more, whatever that re-drive reports.
+    #[test]
+    fn a_re_driven_uncovered_follower_settles_terminally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let mut report = in_flight_report("e1", NOW - 600, NOW);
+        report.retried = true;
+
+        let settlement = apply_report(&mut cursor, "agent", report);
+
+        assert!(matches!(settlement, Settlement::Settled));
+        assert_eq!(cursor.in_flight_len(), 0);
     }
 
     /// Unchanged behaviour, asserted so the strand path cannot swallow it: a
@@ -1133,6 +1340,41 @@ mod tests {
         );
         // Every retained trigger still holds its claim; only the evicted one
         // released.
+        assert_eq!(cursor.in_flight_len(), STRANDED_TRIGGER_LIMIT);
+    }
+
+    /// A backlog drain arrives newest-first, so arrival order is the reverse
+    /// of mention age. Evicting the front of the queue there would keep the
+    /// stalest mentions and throw away the ones most worth waking for.
+    #[test]
+    fn eviction_drops_the_oldest_mention_not_the_first_to_arrive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        let mut stranded = Vec::new();
+
+        // Newest first, exactly as the relay serves stored rows.
+        for index in 0..=STRANDED_TRIGGER_LIMIT {
+            let id = format!("e{index}");
+            cursor.admit(&id, NOW, NOW).expect("admit");
+            let created_at = NOW - index as u64;
+            retain_stranded(
+                &mut stranded,
+                &mut cursor,
+                "agent",
+                trigger_at(&id, created_at),
+            );
+        }
+
+        assert_eq!(stranded.len(), STRANDED_TRIGGER_LIMIT);
+        let evicted = format!("e{STRANDED_TRIGGER_LIMIT}");
+        assert!(
+            !stranded.iter().any(|held| held.event.id == evicted),
+            "the oldest mention ({evicted}) is the one dropped, not the first to arrive"
+        );
+        assert!(
+            stranded.iter().any(|held| held.event.id == "e0"),
+            "the newest mention must survive the bound"
+        );
         assert_eq!(cursor.in_flight_len(), STRANDED_TRIGGER_LIMIT);
     }
 

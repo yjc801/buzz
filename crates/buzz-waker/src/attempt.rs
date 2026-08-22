@@ -234,21 +234,19 @@ pub struct WakeAttemptResult<E> {
     /// settlement — this field only tells a caller whether it may *also*
     /// presume the mention that caused it was delivered.
     pub floor_adopted: Option<bool>,
-    /// For [`WakeOutcome::InFlight`] only: the `created_at` of the trigger
-    /// whose attempt holds the claim this one was refused by. `None` on every
-    /// other outcome.
+    /// For [`WakeOutcome::InFlight`] only: the trigger whose attempt holds the
+    /// claim this one was refused by. `None` on every other outcome.
     ///
     /// Captured **at the moment of refusal**, under the claim lock, because
     /// the owner drops its claim the instant it settles — reading the book
     /// afterwards would race that release and find nothing.
     ///
-    /// The caller needs it because a follower is only collapsed into the
-    /// owner's wake when the owner's replay floor can actually reach back to
-    /// the follower's mention, and that floor is the owner's own trigger
-    /// `created_at` ([`crate::effects::RealWakeEffects`]). Which attempt wins
-    /// the claim is a lock race between concurrently spawned tasks, not
-    /// delivery order, so the owner is not necessarily the older trigger.
-    pub in_flight_owner_created_at: Option<u64>,
+    /// The caller needs it because a follower may only be collapsed into the
+    /// owner's wake when that owner is provably going to act for it too, and
+    /// nothing about the claim itself establishes that: which attempt wins is
+    /// a lock race between concurrently spawned tasks, not delivery order.
+    /// See [`ClaimingTrigger`] for what each field decides.
+    pub in_flight_owner: Option<ClaimingTrigger>,
 }
 
 impl<E> WakeAttemptResult<E> {
@@ -258,7 +256,7 @@ impl<E> WakeAttemptResult<E> {
             reconcile,
             error: None,
             floor_adopted: None,
-            in_flight_owner_created_at: None,
+            in_flight_owner: None,
         }
     }
 
@@ -268,7 +266,7 @@ impl<E> WakeAttemptResult<E> {
             reconcile,
             error: Some(error),
             floor_adopted: None,
-            in_flight_owner_created_at: None,
+            in_flight_owner: None,
         }
     }
 
@@ -278,7 +276,7 @@ impl<E> WakeAttemptResult<E> {
             reconcile,
             error: None,
             floor_adopted,
-            in_flight_owner_created_at: None,
+            in_flight_owner: None,
         }
     }
 
@@ -289,7 +287,7 @@ impl<E> WakeAttemptResult<E> {
             reconcile: false,
             error: None,
             floor_adopted: None,
-            in_flight_owner_created_at: refusal.in_flight_owner_created_at,
+            in_flight_owner: refusal.in_flight_owner,
         }
     }
 }
@@ -511,6 +509,39 @@ pub fn is_presumed_delivered_by_floor(
     }
 }
 
+/// The trigger an attempt claims on behalf of, described in the terms a
+/// *later* attempt refused by that claim needs to judge the collapse.
+///
+/// The claim is per **agent**; every decision an attempt makes is per
+/// **trigger**. Recording only the agent key — as the book once did — throws
+/// away exactly the facts a refused follower needs, and leaves it assuming the
+/// owner will act for it. Each field below answers one way that assumption can
+/// be false; [`crate::wake_loop`]'s `in_flight_owner_covers` requires all
+/// three, and treats an unrecorded owner as covering nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimingTrigger {
+    /// The trigger's `created_at`. A deploy's replay floor is derived from it
+    /// ([`crate::effects::RealWakeEffects`]), so it decides whether this
+    /// attempt's wake reaches back to a follower's older mention at all.
+    pub created_at: u64,
+    /// The trigger's author, hex.
+    ///
+    /// The author gate ([`WakeEffects::confirm_author_not_known_agent`]) is
+    /// per triggering author, but this claim is per agent and is taken
+    /// *before* that gate runs. So an owner can hold the claim and then exit
+    /// [`WakeOutcome::AuthorRejected`] without deploying — a verdict that says
+    /// nothing about a follower written by someone else. Only a follower with
+    /// the *same* author inherits it.
+    pub author: String,
+    /// Whether this attempt is the one re-drive a stranded trigger gets.
+    ///
+    /// A re-driven attempt settles terminally whatever it reports (one-shot
+    /// means one shot — see [`crate::wake_loop`]'s `apply_report`), so its
+    /// failure is not followed by another attempt. The re-drive chain that
+    /// makes collapsing behind a *failing* owner safe does not exist for one.
+    pub retried: bool,
+}
+
 /// Per-agent bookkeeping shared across attempts.
 ///
 /// Lives outside [`run_wake_attempt`] because its whole purpose is to be seen
@@ -526,12 +557,11 @@ pub struct WakeAttemptState {
 #[derive(Debug, Default)]
 struct AttemptBook {
     last_attempt_at: HashMap<String, u64>,
-    /// Agent key → the `created_at` of the trigger whose attempt holds the
-    /// claim. The value is what makes a refusal answerable: a set would record
-    /// only *that* someone is deciding, and a follower cannot tell whether the
-    /// owner's wake reaches its mention without knowing *which* trigger that
-    /// owner is running for.
-    in_flight: HashMap<String, u64>,
+    /// Agent key → the trigger whose attempt holds the claim. The value is
+    /// what makes a refusal answerable: a set would record only *that* someone
+    /// is deciding, and a follower cannot tell whether that owner will act on
+    /// its behalf without knowing *which* trigger the owner is running for.
+    in_flight: HashMap<String, ClaimingTrigger>,
 }
 
 /// Why [`WakeAttemptState::claim`] said no, plus the context the refused
@@ -539,22 +569,22 @@ struct AttemptBook {
 struct ClaimRefusal {
     outcome: WakeOutcome,
     /// Set only for [`WakeOutcome::InFlight`] — see
-    /// [`WakeAttemptResult::in_flight_owner_created_at`].
-    in_flight_owner_created_at: Option<u64>,
+    /// [`WakeAttemptResult::in_flight_owner`].
+    in_flight_owner: Option<ClaimingTrigger>,
 }
 
 impl ClaimRefusal {
     fn plain(outcome: WakeOutcome) -> Self {
         Self {
             outcome,
-            in_flight_owner_created_at: None,
+            in_flight_owner: None,
         }
     }
 
-    fn in_flight(owner_created_at: u64) -> Self {
+    fn in_flight(owner: ClaimingTrigger) -> Self {
         Self {
             outcome: WakeOutcome::InFlight,
-            in_flight_owner_created_at: Some(owner_created_at),
+            in_flight_owner: Some(owner),
         }
     }
 }
@@ -585,19 +615,19 @@ impl WakeAttemptState {
     /// ordering still matches the desktop's — in-flight, then debounce, then
     /// the generation fence — without the check escaping the lock.
     ///
-    /// `trigger_created_at` is recorded with the claim so the *next* attempt
-    /// refused by it learns which trigger owns the decision, and can judge for
-    /// itself whether that owner's wake reaches its own mention.
+    /// `trigger` is recorded with the claim so the *next* attempt refused by
+    /// it learns which trigger owns the decision, and can judge for itself
+    /// whether that owner will act on its behalf.
     fn claim<'a>(
         &'a self,
         key: &'a str,
-        trigger_created_at: u64,
+        trigger: &ClaimingTrigger,
         now_ms: u64,
         aborted: bool,
     ) -> Result<AttemptClaim<'a>, ClaimRefusal> {
         let mut book = self.book();
-        if let Some(&owner_created_at) = book.in_flight.get(key) {
-            return Err(ClaimRefusal::in_flight(owner_created_at));
+        if let Some(owner) = book.in_flight.get(key) {
+            return Err(ClaimRefusal::in_flight(owner.clone()));
         }
         if is_wake_attempt_debounced(book.last_attempt_at.get(key).copied(), now_ms) {
             return Err(ClaimRefusal::plain(WakeOutcome::Debounced));
@@ -605,7 +635,7 @@ impl WakeAttemptState {
         if aborted {
             return Err(ClaimRefusal::plain(WakeOutcome::Cancelled));
         }
-        book.in_flight.insert(key.to_string(), trigger_created_at);
+        book.in_flight.insert(key.to_string(), trigger.clone());
         drop(book);
         Ok(AttemptClaim { state: self, key })
     }
@@ -774,14 +804,20 @@ pub trait WakeEffects {
 ///    nothing appears, release our own stamp so the next mention retries
 ///    instead of being debounced against a dead agent.
 ///
-/// `trigger_created_at` is the `created_at` of the mention this attempt runs
-/// for — the same value that becomes the deploy's replay floor. It is recorded
-/// with the in-flight claim so a concurrent attempt refused by this one can
-/// tell whether this attempt's wake would reach *its* mention; see
-/// [`WakeAttemptResult::in_flight_owner_created_at`].
+/// `trigger` describes the mention this attempt runs for. It is recorded with
+/// the in-flight claim so a concurrent attempt refused by this one can tell
+/// whether this attempt will act on its behalf, rather than assuming it; see
+/// [`ClaimingTrigger`] and [`WakeAttemptResult::in_flight_owner`].
+///
+/// Note step 5 above: the author gate runs *after* the claim is taken. That
+/// ordering is deliberate — the gate is the last thing before spending money,
+/// and hoisting it above the claim would make every collapsed follower pay a
+/// relay round trip for a decision it is not going to make. The cost is that
+/// an owner can hold this claim and then refuse on grounds that are specific
+/// to its own author, which is precisely why the claim records that author.
 pub async fn run_wake_attempt<E: WakeEffects>(
     agent_pubkey: &str,
-    trigger_created_at: u64,
+    trigger: &ClaimingTrigger,
     state: &WakeAttemptState,
     effects: &E,
 ) -> WakeAttemptResult<E::Error> {
@@ -790,12 +826,7 @@ pub async fn run_wake_attempt<E: WakeEffects>(
 
     // Held for the rest of the function; dropping it releases the claim on
     // every exit path, including a panic.
-    let _claim = match state.claim(
-        &key,
-        trigger_created_at,
-        attempt_started_at,
-        effects.is_cancelled(),
-    ) {
+    let _claim = match state.claim(&key, trigger, attempt_started_at, effects.is_cancelled()) {
         Ok(claim) => claim,
         Err(refusal) => return WakeAttemptResult::refused(refusal),
     };
@@ -1186,11 +1217,24 @@ mod tests {
     /// the ordering-neutral case.
     const TRIGGER_AT: u64 = 1_700_000_000;
 
+    /// An author for tests that do not care about one. Attempts sharing it are
+    /// the author-neutral case: whatever verdict one reaches applies to both.
+    const AUTHOR: &str = "f00d";
+
+    /// A first-attempt trigger by [`AUTHOR`] at `created_at`.
+    fn claiming(created_at: u64) -> ClaimingTrigger {
+        ClaimingTrigger {
+            created_at,
+            author: AUTHOR.to_string(),
+            retried: false,
+        }
+    }
+
     async fn attempt(
         harness: &Harness,
         state: &WakeAttemptState,
     ) -> WakeAttemptResult<EffectError> {
-        run_wake_attempt(AGENT, TRIGGER_AT, state, harness).await
+        run_wake_attempt(AGENT, &claiming(TRIGGER_AT), state, harness).await
     }
 
     #[tokio::test]
@@ -1663,10 +1707,11 @@ mod tests {
 
         let newer = TRIGGER_AT + 600;
         let older = TRIGGER_AT;
+        let (newer_trigger, older_trigger) = (claiming(newer), claiming(older));
 
         let (first, second) = tokio::join!(
-            run_wake_attempt(AGENT, newer, &state, &harness),
-            run_wake_attempt(AGENT, older, &state, &harness),
+            run_wake_attempt(AGENT, &newer_trigger, &state, &harness),
+            run_wake_attempt(AGENT, &older_trigger, &state, &harness),
         );
 
         let ran = [(newer, &first), (older, &second)];
@@ -1682,11 +1727,85 @@ mod tests {
             .expect("the other must be collapsed into it");
 
         assert_eq!(
-            follower.in_flight_owner_created_at,
+            follower
+                .in_flight_owner
+                .as_ref()
+                .map(|owner| owner.created_at),
             Some(owner_created_at),
             "the follower must learn the owner's trigger timestamp"
         );
+        assert_eq!(
+            follower
+                .in_flight_owner
+                .as_ref()
+                .map(|owner| owner.author.as_str()),
+            Some(AUTHOR),
+            "and the owner's author, because the author gate is per trigger"
+        );
+        assert_eq!(
+            follower.in_flight_owner.as_ref().map(|owner| owner.retried),
+            Some(false),
+            "and whether the owner still has a re-drive left to inherit"
+        );
         assert_eq!(harness.deploys.get(), 1);
+    }
+
+    /// The claim is per **agent** and is taken before the author gate, which
+    /// is per **triggering author**. So an agent-authored trigger can win the
+    /// claim, refuse a concurrent human mention, and then exit
+    /// `AuthorRejected` — terminal, no deploy, not stranded — having vetoed a
+    /// mention it never judged. Nothing wakes, and without the author on the
+    /// claim the follower has no way to know that.
+    ///
+    /// Ordering is forced, not raced: `join!` polls the owner first, and the
+    /// owner reaches its teardown-fence `delay` (a real suspension point) with
+    /// the claim held, so the follower is guaranteed to ask for it while it is
+    /// taken. Two harnesses because the author verdict is a property of the
+    /// triggering author, and the real effects are built per attempt.
+    #[tokio::test]
+    async fn an_agent_authored_owner_does_not_speak_for_a_human_follower() {
+        let agent_author = "beef".repeat(16);
+        let human_author = "cafe".repeat(16);
+        let owner_effects = Harness {
+            author_is_agent: true,
+            ..Harness::default()
+        };
+        let follower_effects = Harness::default();
+        let state = WakeAttemptState::new();
+
+        // The owner is the older trigger, so it passes the reach check — the
+        // one condition that is satisfied here. It must still not be enough.
+        let owner_trigger = ClaimingTrigger {
+            created_at: TRIGGER_AT,
+            author: agent_author.clone(),
+            retried: false,
+        };
+        let follower_trigger = ClaimingTrigger {
+            created_at: TRIGGER_AT + 1,
+            author: human_author,
+            retried: false,
+        };
+
+        let (owner, follower) = tokio::join!(
+            run_wake_attempt(AGENT, &owner_trigger, &state, &owner_effects),
+            run_wake_attempt(AGENT, &follower_trigger, &state, &follower_effects),
+        );
+
+        assert_eq!(owner.outcome, WakeOutcome::AuthorRejected);
+        assert_eq!(follower.outcome, WakeOutcome::InFlight);
+        assert_eq!(
+            follower
+                .in_flight_owner
+                .as_ref()
+                .map(|owner| owner.author.as_str()),
+            Some(agent_author.as_str()),
+            "the follower must be able to see the veto was not about its own author"
+        );
+        assert_eq!(
+            (owner_effects.deploys.get(), follower_effects.deploys.get()),
+            (0, 0),
+            "no deploy happened, so nothing covers the human mention"
+        );
     }
 
     #[tokio::test]
@@ -1698,7 +1817,7 @@ mod tests {
 
         assert_eq!(result.outcome, WakeOutcome::Woken);
         assert_eq!(
-            result.in_flight_owner_created_at, None,
+            result.in_flight_owner, None,
             "an attempt refused by nobody has no owner to report"
         );
     }
@@ -1740,8 +1859,8 @@ mod tests {
         let harness = Harness::default();
         let state = WakeAttemptState::new();
 
-        let first = run_wake_attempt(AGENT, TRIGGER_AT, &state, &harness).await;
-        let second = run_wake_attempt("deadbeef", TRIGGER_AT, &state, &harness).await;
+        let first = run_wake_attempt(AGENT, &claiming(TRIGGER_AT), &state, &harness).await;
+        let second = run_wake_attempt("deadbeef", &claiming(TRIGGER_AT), &state, &harness).await;
 
         assert_eq!(first.outcome, WakeOutcome::Woken);
         assert_eq!(second.outcome, WakeOutcome::Woken);
@@ -1754,8 +1873,14 @@ mod tests {
         let harness = Harness::default();
         let state = WakeAttemptState::new();
 
-        let first = run_wake_attempt(AGENT, TRIGGER_AT, &state, &harness).await;
-        let second = run_wake_attempt(&AGENT.to_uppercase(), TRIGGER_AT, &state, &harness).await;
+        let first = run_wake_attempt(AGENT, &claiming(TRIGGER_AT), &state, &harness).await;
+        let second = run_wake_attempt(
+            &AGENT.to_uppercase(),
+            &claiming(TRIGGER_AT),
+            &state,
+            &harness,
+        )
+        .await;
 
         assert_eq!(first.outcome, WakeOutcome::Woken);
         assert_eq!(second.outcome, WakeOutcome::Debounced);

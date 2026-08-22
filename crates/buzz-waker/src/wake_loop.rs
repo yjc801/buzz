@@ -45,10 +45,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::attempt::{
-    run_wake_attempt, WakeAttemptState, WakeOutcome, WAKE_STRANDED_RETRY_DELAY_MS,
+    run_wake_attempt, ClaimingTrigger, WakeAttemptState, WakeOutcome, WAKE_STRANDED_RETRY_DELAY_MS,
 };
 use crate::cursor::{CursorStore, Resume, DEFAULT_COMPLETED_RING};
-use crate::decide::TriggerEvent;
+use crate::decide::{normalize_pubkey, TriggerEvent};
 use crate::effects::RealWakeEffects;
 use crate::feed::{
     is_rate_limited, parse_rate_limit_retry_secs, rate_limit_park_ms, reconnect_delay_ms, step,
@@ -108,11 +108,11 @@ struct AttemptReport {
     /// A re-driven attempt's settlement is terminal whatever it reports —
     /// see [`Settlement`].
     retried: bool,
-    /// For [`WakeOutcome::InFlight`] only: the `created_at` of the trigger
-    /// whose attempt refused this one. Carried through so
-    /// [`leaves_mention_unacted`] can check the collapse for real instead of
-    /// assuming it — see [`in_flight_owner_covers`].
-    in_flight_owner_created_at: Option<u64>,
+    /// For [`WakeOutcome::InFlight`] only: the trigger whose attempt refused
+    /// this one. Carried through so [`leaves_mention_unacted`] can check the
+    /// collapse for real instead of assuming it — see
+    /// [`in_flight_owner_covers`].
+    in_flight_owner: Option<ClaimingTrigger>,
 }
 
 /// Debounce-refused (and otherwise unresolved) triggers retained per agent for
@@ -768,35 +768,49 @@ fn leaves_mention_unacted(report: &AttemptReport) -> bool {
     }
 }
 
-/// Would the attempt that took the in-flight claim reach this follower's
-/// mention?
+/// Will the attempt that took the in-flight claim act on this follower's
+/// mention too?
 ///
-/// The collapse that [`WakeOutcome::InFlight`] performs is only sound in one
-/// direction. A deploy's replay floor is its own trigger's `created_at`
-/// ([`crate::effects::RealWakeEffects`]), so an owner reaches back to a
-/// follower only when the owner is the *older* of the two (within
-/// [`crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS`]).
+/// Completing a follower's cursor claim on the strength of someone else's
+/// in-flight attempt is a bet, and this is where the bet has to be made
+/// good. Three independent things have to hold, and every one of them was
+/// assumed rather than checked at some point in this file's history:
 ///
-/// Live traffic mostly arrives oldest-first and makes that true by accident,
-/// which is why the assumption survived. A backlog drain does not: the relay
-/// serves stored rows **newest-first** (see [`CursorStore`]'s module doc), and
-/// every admitted row is spawned onto its own task, so which one wins the
-/// claim is a lock race, not delivery order. The newest row winning leaves
-/// every older sibling holding an `InFlight` the owner's floor cannot cover —
-/// and completing those cursor claims is exactly the mention loss the
-/// stranded-trigger path exists to prevent.
+/// 1. **The owner's wake reaches back this far.** A deploy's replay floor is
+///    its own trigger's `created_at` ([`crate::effects::RealWakeEffects`]),
+///    so an owner spans a follower only when it is the *older* of the two
+///    (within [`crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS`]). Live traffic
+///    mostly arrives oldest-first and made that true by accident; a backlog
+///    drain does not, because the relay serves stored rows **newest-first**
+///    (see [`CursorStore`]'s module doc) and every admitted row is spawned
+///    onto its own task, so which one wins the claim is a lock race.
+/// 2. **The owner's author verdict, if it refuses on one, is this follower's
+///    too.** The claim is taken per agent *before*
+///    `confirm_author_not_known_agent` runs, and that gate is per triggering
+///    author. So an agent-authored trigger can own the claim, refuse a human
+///    follower, and then exit [`WakeOutcome::AuthorRejected`] — terminal, no
+///    deploy, not stranded — having vetoed a mention it never judged. Only a
+///    follower with the same author inherits that verdict.
+/// 3. **A failing owner will be re-driven.** Points 1 and 2 prove reach, not
+///    delivery: they say the owner's floor would span this mention, not that
+///    its deploy succeeds. That gap is closed by the owner being stranded and
+///    re-driven on its own (older) floor, which spans this mention too — but
+///    only for a *first* attempt. A re-driven owner settles terminally
+///    whatever it reports (one-shot means one shot, see [`apply_report`]), so
+///    there is no next attempt to inherit, and the chain does not exist.
 ///
-/// A `None` owner timestamp — which `claim` never produces for this outcome —
-/// is treated as *not* covered, because an unproven collapse must not be the
-/// thing that authorizes dropping a mention.
+/// A `None` owner — which `claim` never produces for this outcome — covers
+/// nothing, because an unproven collapse must not be the thing that
+/// authorizes dropping a mention.
 ///
-/// This proves reach, not delivery: it says the owner's floor would span this
-/// mention, not that the owner's deploy succeeds. When the owner fails it is
-/// stranded and re-driven on its own (older) floor, which spans this mention
-/// too, so the follower stays covered by the same chain.
+/// Every rejection here costs at most one extra re-driven attempt, which a
+/// live agent debounces or no-ops. That asymmetry is why all three checks are
+/// written to fail towards retention.
 fn in_flight_owner_covers(report: &AttemptReport) -> bool {
-    report.in_flight_owner_created_at.is_some_and(|owner| {
-        crate::decide::is_covered_by_replay_floor(report.event.created_at, owner)
+    report.in_flight_owner.as_ref().is_some_and(|owner| {
+        !owner.retried
+            && normalize_pubkey(&owner.author) == normalize_pubkey(&report.event.author)
+            && crate::decide::is_covered_by_replay_floor(report.event.created_at, owner.created_at)
     })
 }
 
@@ -958,8 +972,17 @@ fn spawn_attempt(
             },
         );
 
-        let result =
-            run_wake_attempt(&agent_pubkey, event.created_at, &attempt_state, &effects).await;
+        // The claim this attempt is about to take records the trigger it runs
+        // for, not just this agent — see `in_flight_owner_covers` for the three
+        // things a follower refused by it has to check before letting itself be
+        // collapsed into it.
+        let claiming = ClaimingTrigger {
+            created_at: event.created_at,
+            author: event.author.clone(),
+            retried,
+        };
+
+        let result = run_wake_attempt(&agent_pubkey, &claiming, &attempt_state, &effects).await;
 
         if undeliverable && result.outcome == WakeOutcome::Woken {
             // The event was already older than a woken harness's replay
@@ -1021,7 +1044,7 @@ fn spawn_attempt(
             event,
             outcome: result.outcome,
             retried,
-            in_flight_owner_created_at: result.in_flight_owner_created_at,
+            in_flight_owner: result.in_flight_owner,
         }
     });
 }
@@ -1042,13 +1065,28 @@ mod tests {
     }
 
     fn trigger_at(id: &str, created_at: u64) -> TriggerEvent {
+        trigger_by(id, created_at, &author_a())
+    }
+
+    fn trigger_by(id: &str, created_at: u64, author: &str) -> TriggerEvent {
         TriggerEvent {
             id: id.to_string(),
-            author: "a".repeat(64),
+            author: author.to_string(),
             kind: 9,
             p_tags: vec!["b".repeat(64)],
             created_at,
         }
+    }
+
+    /// The author every trigger carries unless a test is specifically about
+    /// two of them — the author gate is per triggering author, so a follower
+    /// only inherits its owner's verdict when they match.
+    fn author_a() -> String {
+        "a".repeat(64)
+    }
+
+    fn author_b() -> String {
+        "b".repeat(64)
     }
 
     fn report(id: &str, outcome: WakeOutcome, retried: bool) -> AttemptReport {
@@ -1056,12 +1094,16 @@ mod tests {
             event: trigger(id),
             outcome,
             retried,
-            in_flight_owner_created_at: None,
+            in_flight_owner: None,
         }
     }
 
     /// A follower collapsed behind a concurrent attempt, with both triggers'
     /// timestamps spelled out — the ordering is the whole point.
+    ///
+    /// Owner and follower share an author and the owner is a first attempt, so
+    /// this isolates the reach question; tests about the other two conditions
+    /// override `in_flight_owner` on the report they get back.
     fn in_flight_report(
         id: &str,
         follower_created_at: u64,
@@ -1071,7 +1113,11 @@ mod tests {
             event: trigger_at(id, follower_created_at),
             outcome: WakeOutcome::InFlight,
             retried: false,
-            in_flight_owner_created_at: Some(owner_created_at),
+            in_flight_owner: Some(ClaimingTrigger {
+                created_at: owner_created_at,
+                author: author_a(),
+                retried: false,
+            }),
         }
     }
 
@@ -1250,6 +1296,78 @@ mod tests {
             owner_at - skew - 1,
             owner_at
         )));
+    }
+
+    /// The two-author ordering. An agent-authored trigger takes the per-agent
+    /// claim *before* the per-author gate runs, refuses a concurrent human
+    /// mention, then exits `AuthorRejected` without deploying and without
+    /// being stranded (see `attempt`'s
+    /// `an_agent_authored_owner_does_not_speak_for_a_human_follower` for the
+    /// interleaving that produces it). The owner is the older trigger here, so
+    /// reach alone would authorize the collapse — and completing the
+    /// follower's claim on a veto that was never about it loses the mention.
+    #[test]
+    fn a_follower_authored_by_someone_else_is_not_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let mut report = in_flight_report("e1", NOW, NOW - 1);
+        report.event = trigger_by("e1", NOW, &author_b());
+
+        let settlement = apply_report(&mut cursor, "agent", report);
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        assert_eq!(cursor.in_flight_len(), 1);
+    }
+
+    /// The same ordering with one author: whatever verdict the owner reaches
+    /// is this follower's verdict too, so the collapse stands. Asserted so the
+    /// author check cannot quietly become "never collapse anything".
+    #[test]
+    fn a_follower_sharing_its_owners_author_is_still_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(&mut cursor, "agent", in_flight_report("e1", NOW, NOW - 1));
+
+        assert!(matches!(settlement, Settlement::Settled));
+        assert_eq!(cursor.in_flight_len(), 0);
+    }
+
+    /// Authors are compared as keys, not as strings: a relay is free to hand
+    /// back either hex case, and a case-driven mismatch would strand every
+    /// follower forever rather than only the ones that need it.
+    #[test]
+    fn the_author_comparison_is_case_insensitive() {
+        let mut report = in_flight_report("e1", NOW, NOW - 1);
+        report.event = trigger_by("e1", NOW, &author_a().to_uppercase());
+
+        assert!(in_flight_owner_covers(&report));
+    }
+
+    /// The collapse's last leg is that a *failing* owner comes back for its
+    /// one re-drive on the same older floor. A re-driven owner has already
+    /// spent that shot — it settles terminally whatever it reports — so there
+    /// is no next attempt for this follower to be carried by.
+    #[test]
+    fn a_follower_behind_a_re_driven_owner_is_not_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let mut report = in_flight_report("e1", NOW, NOW - 1);
+        report
+            .in_flight_owner
+            .as_mut()
+            .expect("owner recorded")
+            .retried = true;
+
+        let settlement = apply_report(&mut cursor, "agent", report);
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        assert_eq!(cursor.in_flight_len(), 1);
     }
 
     /// An unproven collapse must never be the thing that authorizes dropping

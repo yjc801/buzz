@@ -1,11 +1,21 @@
 # Remote wake cannot deploy: the provider digest pin has no matching artifact
 
-## Status
+## Status: CLOSED (2026-08-13), verified in production 2026-08-22
 
-Everything up to the deploy step works end to end and is verified against the
-live relay. This is the last blocker, and it is not a bug in the pin — the pin
-is doing its job. It is that nothing produces the artifact the pin would have
-to name.
+All four sequencing steps below landed. Remote wake deploys for real: the
+hosted daemon woke three different agents on 2026-08-22 (`outcome=woken` at
+05:58Z, 07:30Z and 07:57Z), with no digest refusal anywhere in the log.
+
+Kept because the reasoning still constrains every provider bump. Bumping
+`PROVIDER_SPRITES_TAG` in `Dockerfile.waker` and `release` +
+`targets` in `desktop/src-tauri/provider-digests.json` must happen **in the
+same change** — a test
+(`waker_bundle::tests::the_manifest_release_matches_the_image_the_daemon_runs`)
+enforces it, because a one-sided bump reproduces exactly the failure below.
+Bundles issued under the old digest need reissuing (toggle Remote wake off and
+on, or make any config change).
+
+## The original failure
 
 Observed 2026-08-12, agent `1b60fb4a…`, bundle v7:
 
@@ -64,23 +74,41 @@ break on routine rebuilds rather than only on genuine mismatch.
 Note the macOS side has the same defect: the local binary is a hand-built
 `cargo build` output, not a released artifact either.
 
-## Required sequencing
+## Required sequencing — all four landed
 
-Step 4 is the code change. Steps 1–3 are supply-chain work, and step 4 alone
+Step 4 was the code change. Steps 1–3 are supply-chain work, and step 4 alone
 accomplishes nothing without them.
 
-1. **Build `buzz-backend-sprites` for `linux-musl` (and macOS) in CI** and
+1. ✅ **Build `buzz-backend-sprites` for `linux-musl` (and macOS) in CI** and
    publish it as a versioned artifact alongside the providers already
-   released.
-2. **Have `Dockerfile.waker` install that artifact** rather than compiling
+   released. — `.github/workflows/provider-sprites.yml`
+2. ✅ **Have `Dockerfile.waker` install that artifact** rather than compiling
    from source. This is the load-bearing step: it is what makes the digest
    stable and knowable ahead of time. Without it the pin has no fixed target.
-3. **Publish the digests** in a form desktop can read at issuance — a manifest
-   keyed by target triple.
-4. **Carry per-target digests in the launch bundle**, and have the daemon
+3. ✅ **Publish the digests** in a form desktop can read at issuance — a
+   manifest keyed by target triple. — `desktop/src-tauri/provider-digests.json`
+4. ✅ **Carry per-target digests in the launch bundle**, and have the daemon
    match its own platform. The bundle already carries a provider config block,
    so there is a natural home. The pin stays exact; the owner is simply
-   authorizing the right file for the right target.
+   authorizing the right file for the right target. — #44
+
+## The cost of pinning a release, learned the hard way
+
+Pinning made the digest a fact rather than a moving target, which is what made
+remote wake work at all. It also means **a provider fix does not reach
+production until someone deliberately cuts a release and bumps both pins.**
+
+On 2026-08-22 the deployed daemon was still running
+`buzz-backend-sprites-v0.1.0`, published 2026-08-12 21:05Z. #55 — which
+retries read-only provision probes instead of failing the deploy on a single
+30s exec timeout — merged 2026-08-13 18:42Z, a day after that artifact was
+built. Two real wakes of agent `143bd5c0…` failed on exactly the error #55
+exists to absorb, nine days after the fix was on `main`. Confirmed by
+inspecting the published binaries directly: the v0.1.0 asset contains no
+`failed after` format string (the retry path's), the v0.1.1 asset does.
+
+So: when a change lands in `crates/buzz-backend-sprites`, it is not deployed
+until a `buzz-backend-sprites-v*` tag is cut and both pins move with it.
 
 ## Explicitly not the cause
 
@@ -93,7 +121,8 @@ accomplishes nothing without them.
 ## Prior art
 
 `Dockerfile.waker`'s header documented this gap from the start, when bundle
-issuance had no production callers. It now has one, so it is reachable.
+issuance had no production callers. It gained one (the desktop's Remote wake
+toggle), which is how the gap became reachable — and then closed.
 
 ## Everything else in the chain is verified
 

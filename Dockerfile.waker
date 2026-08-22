@@ -18,35 +18,25 @@
 # manifest-list digests so either architecture resolves to immutable source
 # bytes.
 #
-# KNOWN GAP, not yet closed: this image can run the waker's listener/state
-# machinery end-to-end (relay connection, presence tap, bundle admission),
-# but provider *deployment* through it will always fail today.
-# buzz-provider-deploy rejects a provider whose staged bytes don't exactly
-# match the SHA-256 a launch bundle pins (crates/buzz-waker/src/effects.rs,
-# provider_deploy_pinned). That digest is computed by desktop from whatever
-# provider binary is on the issuing machine's local disk
-# (desktop/src-tauri/src/managed_agents/waker_bundle.rs,
-# provider_binary_sha256) — a macOS Tauri sidecar, not the Linux/musl
-# buzz-backend-sprites this image builds and strips below. No build-flag
-# change here closes that gap; the two binaries come from different
-# toolchains for different platforms and were never going to byte-match.
-# This is no longer theoretical. When this note was written, bundle issuance
-# had zero production callers, so nothing reached the deploy step. It has one
-# now (the desktop's Remote wake toggle), and a real mention has produced a
-# real attempt that reached this step with an admitted bundle and failed
-# exactly here — `refusing to run an unauthorized binary`, which is G1 working
-# rather than misbehaving.
+# The provider digest gap this file used to carry a KNOWN GAP note about is
+# CLOSED, in both halves, and remote wake deploys for real. Kept as history
+# because the shape of the fix is what constrains every future bump below:
 #
-# Half of it is now closed. buzz-backend-sprites is built and published by
-# .github/workflows/provider-sprites.yml, and this image installs that
-# artifact after verifying its checksum rather than compiling its own — so the
-# Linux digest exists, and it no longer drifts on every rebuild.
+#   1. buzz-provider-deploy refuses any staged provider whose bytes do not
+#      match the SHA-256 a launch bundle pins (crates/buzz-waker/src/
+#      effects.rs, provider_deploy_pinned — G1). That refusal is correct and
+#      must not be relaxed.
+#   2. The Linux artifact now exists and is stable:
+#      .github/workflows/provider-sprites.yml publishes it, and this image
+#      installs the published binary after verifying its checksum rather than
+#      compiling its own (whose bytes drifted on every rebuild).
+#   3. Desktop stopped hashing whatever sat on the issuing Mac. A bundle now
+#      carries a digest per target (#44), read from
+#      desktop/src-tauri/provider-digests.json, and the daemon matches the
+#      entry for the platform it runs on.
 #
-# What remains is desktop's issuance path: it still hashes whatever provider
-# binary sits on the issuing machine, which on a Mac is a Mach-O arm64 build
-# that can never equal the musl one running here. Until a bundle carries a
-# digest per target and the daemon matches its own, a real wake still ends at
-# `deploy-failed`. See docs/waker-provider-digest-gap.md for the sequencing.
+# See docs/waker-provider-digest-gap.md for the full account.
+#
 # The published provider release this image installs. Pinned to a version tag
 # on purpose: the rolling `buzz-backend-sprites-latest` asset is republished on
 # every push to main, so its digest moves for reasons that have nothing to do
@@ -55,7 +45,7 @@
 # target. Bump this deliberately, and expect issued bundles to need reissuing
 # when you do.
 ARG PROVIDER_SPRITES_REPO=yjc801/buzz
-ARG PROVIDER_SPRITES_TAG=buzz-backend-sprites-v0.1.0
+ARG PROVIDER_SPRITES_TAG=buzz-backend-sprites-v0.1.1
 
 # Fetched, not compiled. Building it here made its bytes a function of the
 # source revision and toolchain at image build time, so the digest drifted on

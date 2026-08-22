@@ -77,9 +77,9 @@ pub mod watch_list;
 
 pub use attempt::{
     is_managed_agent_live, is_presumed_delivered_by_floor, is_wake_attempt_debounced,
-    push_bounded_pending_trigger, run_wake_attempt, should_retry_collapsed_triggers, HasEventId,
-    HeartbeatObservation, LiveEvidenceTracker, WakeAttemptResult, WakeAttemptState, WakeEffects,
-    WakeOutcome, WakeSettlement,
+    push_bounded_pending_trigger, run_wake_attempt, should_retry_collapsed_triggers,
+    ClaimingTrigger, HasEventId, HeartbeatObservation, LiveEvidenceTracker, WakeAttemptResult,
+    WakeAttemptState, WakeEffects, WakeOutcome, WakeSettlement,
 };
 pub use bundle::{BundleError, LaunchBundleBody, ProviderEnvelope, SignedLaunchBundle};
 pub use cursor::{Admission, Cursor, CursorError, CursorStore, Resume};

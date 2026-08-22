@@ -44,9 +44,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::attempt::{run_wake_attempt, WakeAttemptState, WakeOutcome};
+use crate::attempt::{
+    run_wake_attempt, ClaimingTrigger, WakeAttemptState, WakeOutcome, WAKE_STRANDED_RETRY_DELAY_MS,
+};
 use crate::cursor::{CursorStore, Resume, DEFAULT_COMPLETED_RING};
-use crate::decide::TriggerEvent;
+use crate::decide::{normalize_pubkey, TriggerEvent};
 use crate::effects::RealWakeEffects;
 use crate::feed::{
     is_rate_limited, parse_rate_limit_retry_secs, rate_limit_park_ms, reconnect_delay_ms, step,
@@ -98,8 +100,57 @@ fn now_secs() -> u64 {
 
 /// What a finished wake attempt reports back to the loop that spawned it.
 struct AttemptReport {
-    event_id: String,
+    /// The trigger this attempt ran for, returned so the loop can re-drive it
+    /// without having kept a parallel copy keyed by id.
+    event: TriggerEvent,
     outcome: WakeOutcome,
+    /// Whether this attempt *was* the one re-drive a stranded trigger gets.
+    /// A re-driven attempt's settlement is terminal whatever it reports —
+    /// see [`Settlement`].
+    retried: bool,
+    /// For [`WakeOutcome::InFlight`] only: the trigger whose attempt refused
+    /// this one. Carried through so [`leaves_mention_unacted`] can check the
+    /// collapse for real instead of assuming it — see
+    /// [`in_flight_owner_covers`].
+    in_flight_owner: Option<ClaimingTrigger>,
+}
+
+/// Debounce-refused (and otherwise unresolved) triggers retained per agent for
+/// their one re-drive, at most.
+///
+/// Matches the desktop's `WAKE_COLLAPSED_TRIGGER_LIMIT`. One wake loop watches
+/// exactly one agent, so this is already the per-agent bound the desktop
+/// computes per key. Beyond it the OLDEST — by the mention's own `created_at`,
+/// not by arrival order; see [`retain_stranded`] — is dropped, because newest
+/// mentions are the most actionable, and dropping is not silent: the cursor
+/// claim is completed with an explicit warning, because a claim left held
+/// would pin the checkpoint forever.
+const STRANDED_TRIGGER_LIMIT: usize = 16;
+
+/// A trigger whose attempt reached no decision, held for exactly one re-drive.
+///
+/// The cursor claim stays **in flight** for the whole hold rather than being
+/// abandoned and re-admitted: in-flight is the honest state (the daemon has
+/// not finished with this event), it pins the checkpoint identically, and
+/// re-admitting would advance [`crate::cursor::Cursor::covered_through_secs`]
+/// off a retained event — which is not evidence the feed is current and would
+/// under-report a real outage.
+struct StrandedTrigger {
+    event: TriggerEvent,
+    /// When the re-drive may run. Past the deploy debounce, so an attempt
+    /// whose predecessor stamped it is not refused for that same reason again.
+    due_at: tokio::time::Instant,
+}
+
+/// What the loop must do with a finished attempt.
+enum Settlement {
+    /// The cursor was settled here; nothing further is owed.
+    Settled,
+    /// The attempt neither proved liveness nor made a policy decision, so the
+    /// mention it was for has not been acted on. The cursor claim is
+    /// deliberately left held and the caller must retain this trigger for one
+    /// re-drive past the deploy debounce.
+    Strand(TriggerEvent),
 }
 
 /// Gap left between re-subscribes when draining parked channels.
@@ -176,6 +227,11 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
 
     let attempt_state = Arc::new(WakeAttemptState::new());
     let mut attempts: JoinSet<AttemptReport> = JoinSet::new();
+    // Outside the reconnect loop on purpose: a debounce window outlives a
+    // reconnect, so a trigger held across one must survive it. Its cursor
+    // claim survives regardless — that is on disk — but re-driving it depends
+    // on this buffer.
+    let mut stranded: Vec<StrandedTrigger> = Vec::new();
     let mut consecutive_failures = 0u32;
 
     'reconnect: while !cancel.is_cancelled() {
@@ -309,13 +365,69 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
 
                 joined = join_next_or_pending(&mut attempts) => {
                     match joined {
-                        Ok(report) => apply_report(&mut cursor, &agent_pubkey, report),
+                        Ok(report) => {
+                            if let Settlement::Strand(event) =
+                                apply_report(&mut cursor, &agent_pubkey, report)
+                            {
+                                retain_stranded(
+                                    &mut stranded,
+                                    &mut cursor,
+                                    &agent_pubkey,
+                                    event,
+                                );
+                            }
+                        }
                         Err(join_error) => tracing::error!(
                             agent = %agent_pubkey,
                             %join_error,
                             "buzz-waker: a wake attempt task panicked; its cursor claim \
                              stays held until the next restart retries it"
                         ),
+                    }
+                }
+
+                () = next_stranded_due(&stranded) => {
+                    // Exactly one re-drive per firing, for the same reason the
+                    // park drain above takes one per firing: spawning a batch
+                    // here would stop this loop calling `next_frame` for as
+                    // long as the spawn burst takes, and every re-drive that
+                    // is due is already 125s late — one more turn of the
+                    // select! costs it nothing.
+                    let now = tokio::time::Instant::now();
+                    let due = stranded
+                        .iter()
+                        .position(|held| held.due_at <= now);
+                    if let Some(index) = due {
+                        let held = stranded.remove(index);
+                        // Recomputed, never carried from admission: the
+                        // trigger has aged by at least the debounce window
+                        // while held, so a mention that was inside a woken
+                        // harness's replay reach when it arrived can have
+                        // fallen outside it by now. This is the same test
+                        // `CursorStore::admit` applies, applied to the age the
+                        // re-drive actually starts at.
+                        let undeliverable = now_secs().saturating_sub(held.event.created_at)
+                            > crate::WAKE_DELIVERABLE_AGE_SECS;
+                        tracing::info!(
+                            agent = %agent_pubkey,
+                            event_id = %held.event.id,
+                            undeliverable,
+                            "buzz-waker: re-driving a wake trigger its first attempt left \
+                             unresolved"
+                        );
+                        spawn_attempt(
+                            &mut attempts,
+                            held.event,
+                            undeliverable,
+                            true,
+                            agent_pubkey.clone(),
+                            Arc::clone(&attempt_state),
+                            Arc::clone(&config.presence_state),
+                            config.watch_list.clone(),
+                            config.bundle_state.current(),
+                            config.provider_env.clone(),
+                            cancel.clone(),
+                        );
                     }
                 }
 
@@ -374,6 +486,7 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                                         &mut attempts,
                                         *event,
                                         undeliverable,
+                                        false,
                                         agent_pubkey.clone(),
                                         Arc::clone(&attempt_state),
                                         Arc::clone(&config.presence_state),
@@ -576,7 +689,24 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
         tokio::select! {
             joined = join_next_or_pending(&mut attempts) => {
                 match joined {
-                    Ok(report) => apply_report(&mut cursor, &agent_pubkey, report),
+                    Ok(report) => {
+                        // A strand here is not retained: this loop is exiting,
+                        // so nothing would ever re-drive it. Leaving the claim
+                        // in flight — which is what `Settlement::Strand`
+                        // already did — is exactly right: it stays held on
+                        // disk and the next restart replays it, per the
+                        // cursor's crash-safety contract.
+                        if let Settlement::Strand(event) =
+                            apply_report(&mut cursor, &agent_pubkey, report)
+                        {
+                            tracing::info!(
+                                agent = %agent_pubkey,
+                                event_id = %event.id,
+                                "buzz-waker: shutting down with a wake trigger unresolved; \
+                                 its claim stays held for the next restart to retry"
+                            );
+                        }
+                    }
                     Err(join_error) => tracing::error!(agent = %agent_pubkey, %join_error, "buzz-waker: a wake attempt task panicked during shutdown"),
                 }
             }
@@ -597,29 +727,212 @@ async fn join_next_or_pending(
     }
 }
 
+/// Does this report leave its mention unacted-on, such that dropping it now
+/// would lose it?
+///
+/// True exactly when the attempt neither proved liveness nor made a policy
+/// decision:
+///
+/// - [`WakeOutcome::Debounced`] — a recent attempt stamped the window, so this
+///   trigger was never evaluated at all. The stamping attempt's own deploy may
+///   have *failed*, in which case nothing woke and nothing ever will.
+/// - [`WakeOutcome::DeployFailed`] — a wake was asked for and did not happen.
+/// - [`WakeOutcome::WakeUnconfirmed`] — the deploy landed but no heartbeat
+///   followed. Its doc says "the next mention can retry"; without this,
+///   nothing retries when no next mention comes.
+/// - [`WakeOutcome::PresenceUnavailable`] — a relay hiccup, not a decision.
+///
+/// Everything else is terminal on purpose:
+///
+/// - `Woken` / `AlreadyLive` — liveness was proven. (The desktop retains these
+///   too, to grade an unverifiable per-channel REQ delivery; the daemon
+///   already logs that case as an error and does not re-deploy for it.)
+/// - `AuthorRejected` / `AuthorUnverified` — fail-closed policy verdicts.
+///   Re-driving would re-litigate a veto that will not change.
+/// - `Cancelled` — handled separately: abandoned, not completed.
+///
+/// [`WakeOutcome::InFlight`] is the one arm that is terminal only
+/// *conditionally* — see [`in_flight_owner_covers`].
+fn leaves_mention_unacted(report: &AttemptReport) -> bool {
+    match report.outcome {
+        WakeOutcome::Debounced
+        | WakeOutcome::DeployFailed
+        | WakeOutcome::WakeUnconfirmed
+        | WakeOutcome::PresenceUnavailable => true,
+        WakeOutcome::InFlight => !in_flight_owner_covers(report),
+        WakeOutcome::Woken
+        | WakeOutcome::AlreadyLive
+        | WakeOutcome::AuthorRejected
+        | WakeOutcome::AuthorUnverified
+        | WakeOutcome::Cancelled => false,
+    }
+}
+
+/// Will the attempt that took the in-flight claim act on this follower's
+/// mention too?
+///
+/// Completing a follower's cursor claim on the strength of someone else's
+/// in-flight attempt is a bet, and this is where the bet has to be made
+/// good. Three independent things have to hold, and every one of them was
+/// assumed rather than checked at some point in this file's history:
+///
+/// 1. **The owner's wake reaches back this far.** A deploy's replay floor is
+///    its own trigger's `created_at` ([`crate::effects::RealWakeEffects`]),
+///    so an owner spans a follower only when it is the *older* of the two
+///    (within [`crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS`]). Live traffic
+///    mostly arrives oldest-first and made that true by accident; a backlog
+///    drain does not, because the relay serves stored rows **newest-first**
+///    (see [`CursorStore`]'s module doc) and every admitted row is spawned
+///    onto its own task, so which one wins the claim is a lock race.
+/// 2. **The owner's author verdict, if it refuses on one, is this follower's
+///    too.** The claim is taken per agent *before*
+///    `confirm_author_not_known_agent` runs, and that gate is per triggering
+///    author. So an agent-authored trigger can own the claim, refuse a human
+///    follower, and then exit [`WakeOutcome::AuthorRejected`] — terminal, no
+///    deploy, not stranded — having vetoed a mention it never judged. Only a
+///    follower with the same author inherits that verdict.
+/// 3. **A failing owner will be re-driven.** Points 1 and 2 prove reach, not
+///    delivery: they say the owner's floor would span this mention, not that
+///    its deploy succeeds. That gap is closed by the owner being stranded and
+///    re-driven on its own (older) floor, which spans this mention too — but
+///    only for a *first* attempt. A re-driven owner settles terminally
+///    whatever it reports (one-shot means one shot, see [`apply_report`]), so
+///    there is no next attempt to inherit, and the chain does not exist.
+///
+/// A `None` owner — which `claim` never produces for this outcome — covers
+/// nothing, because an unproven collapse must not be the thing that
+/// authorizes dropping a mention.
+///
+/// Every rejection here costs at most one extra re-driven attempt, which a
+/// live agent debounces or no-ops. That asymmetry is why all three checks are
+/// written to fail towards retention.
+fn in_flight_owner_covers(report: &AttemptReport) -> bool {
+    report.in_flight_owner.as_ref().is_some_and(|owner| {
+        !owner.retried
+            && normalize_pubkey(&owner.author) == normalize_pubkey(&report.event.author)
+            && crate::decide::is_covered_by_replay_floor(report.event.created_at, owner.created_at)
+    })
+}
+
 /// Fold a finished attempt's outcome into the durable cursor.
 ///
 /// [`WakeOutcome::Cancelled`] is abandoned, not completed: the attempt fired
 /// its generation fence before reaching any real decision, so the mention is
 /// exactly as unprocessed as it was on admission and must be retried once
-/// this daemon is not shutting down. Every other outcome — including
-/// [`WakeOutcome::DeployFailed`] — is a genuine terminal decision and is
-/// completed, per [`crate::attempt::run_wake_attempt`]'s own contract that it
-/// always reaches one.
-fn apply_report(cursor: &mut CursorStore, agent_pubkey: &str, report: AttemptReport) {
+/// this daemon is not shutting down.
+///
+/// An outcome that [`leaves_mention_unacted`] returns
+/// [`Settlement::Strand`] for — but only on a first attempt. A re-driven
+/// attempt's settlement is terminal whatever it reports: one-shot means one
+/// shot, and re-stranding would arm timer after timer for as long as the
+/// condition persists (a provider that is down stays down), which is exactly
+/// the unbounded cycle the desktop's one-shot policy exists to prevent.
+fn apply_report(cursor: &mut CursorStore, agent_pubkey: &str, report: AttemptReport) -> Settlement {
     if report.outcome == WakeOutcome::Cancelled {
-        cursor.abandon(&report.event_id);
-        return;
+        cursor.abandon(&report.event.id);
+        return Settlement::Settled;
     }
-    if let Err(error) = cursor.complete(&report.event_id) {
+    if leaves_mention_unacted(&report) && !report.retried {
+        // The claim stays in flight — see `StrandedTrigger` for why that is
+        // the right cursor state for a held trigger.
+        return Settlement::Strand(report.event);
+    }
+    if report.retried && leaves_mention_unacted(&report) {
+        // Deliberately says only what is knowable. A batch of stranded
+        // triggers re-drives oldest first, and a deploy's replay floor is the
+        // triggering event's own `created_at` (`effects::RealWakeEffects`), so
+        // a later sibling debounced behind that deploy is very likely inside
+        // its floor — but per-channel delivery is observable only on the
+        // harness side, so this cannot claim either way.
+        tracing::warn!(
+            agent = %agent_pubkey,
+            event_id = %report.event.id,
+            outcome = %report.outcome,
+            "buzz-waker: wake trigger reached no resolution on its one re-drive and will \
+             not be re-driven again; a new mention starts fresh"
+        );
+    }
+    if let Err(error) = cursor.complete(&report.event.id) {
         tracing::error!(
             agent = %agent_pubkey,
-            event_id = %report.event_id,
+            event_id = %report.event.id,
             outcome = %report.outcome,
             %error,
             "buzz-waker: could not durably complete a wake attempt's cursor claim; \
              it stays held and will be retried"
         );
+    }
+    Settlement::Settled
+}
+
+/// Retain a trigger for its one re-drive, evicting the oldest past the bound.
+///
+/// Dedupes by event id for the same reason the desktop's
+/// `pushBoundedPendingTrigger` does: the same event can reach this loop twice
+/// (reconnect replay overlapping the live window), and a duplicate would spend
+/// a second re-drive on one mention.
+///
+/// Eviction is by the trigger's own `created_at`, and this is where the
+/// daemon's copy of the rule has to diverge from the desktop's. The desktop
+/// drops the front of the queue, which is the oldest mention *because its tap
+/// has no history replay* — its own doc says so, and every event it sees is
+/// live and in order. This loop drains history, and the relay serves stored
+/// rows newest-first, so a front-drop here would discard the **newest**
+/// mentions and keep the stalest ones — precisely inverting "newest mentions
+/// are the most actionable". Insertion order breaks ties so a drop is still
+/// reproducible in the logs.
+fn retain_stranded(
+    stranded: &mut Vec<StrandedTrigger>,
+    cursor: &mut CursorStore,
+    agent_pubkey: &str,
+    event: TriggerEvent,
+) {
+    if stranded.iter().any(|held| held.event.id == event.id) {
+        return;
+    }
+    stranded.push(StrandedTrigger {
+        event,
+        due_at: tokio::time::Instant::now() + Duration::from_millis(WAKE_STRANDED_RETRY_DELAY_MS),
+    });
+    while stranded.len() > STRANDED_TRIGGER_LIMIT {
+        let Some(oldest) = stranded
+            .iter()
+            .enumerate()
+            .min_by_key(|(index, held)| (held.event.created_at, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let evicted = stranded.remove(oldest);
+        // Never silent, and never left claimed: an evicted trigger's claim
+        // would otherwise pin the checkpoint for the life of the process.
+        tracing::warn!(
+            agent = %agent_pubkey,
+            event_id = %evicted.event.id,
+            limit = STRANDED_TRIGGER_LIMIT,
+            "buzz-waker: dropping the oldest unresolved wake trigger to stay inside the \
+             retention bound; it will not be re-driven"
+        );
+        if let Err(error) = cursor.complete(&evicted.event.id) {
+            tracing::error!(
+                agent = %agent_pubkey,
+                event_id = %evicted.event.id,
+                %error,
+                "buzz-waker: could not durably complete an evicted wake trigger's cursor claim"
+            );
+        }
+    }
+}
+
+/// Wait until the earliest stranded trigger is due for its re-drive, or
+/// forever if none is held.
+///
+/// The `pending` arm is what makes this safe to leave in the `select!`
+/// permanently: with nothing stranded the branch simply never fires.
+async fn next_stranded_due(stranded: &[StrandedTrigger]) {
+    match stranded.iter().map(|held| held.due_at).min() {
+        Some(due_at) => tokio::time::sleep_until(due_at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -628,6 +941,7 @@ fn spawn_attempt(
     attempts: &mut JoinSet<AttemptReport>,
     event: TriggerEvent,
     undeliverable: bool,
+    retried: bool,
     agent_pubkey: String,
     attempt_state: Arc<WakeAttemptState>,
     presence_state: Arc<PresenceState>,
@@ -658,7 +972,17 @@ fn spawn_attempt(
             },
         );
 
-        let result = run_wake_attempt(&agent_pubkey, &attempt_state, &effects).await;
+        // The claim this attempt is about to take records the trigger it runs
+        // for, not just this agent — see `in_flight_owner_covers` for the three
+        // things a follower refused by it has to check before letting itself be
+        // collapsed into it.
+        let claiming = ClaimingTrigger {
+            created_at: event.created_at,
+            author: event.author.clone(),
+            retried,
+        };
+
+        let result = run_wake_attempt(&agent_pubkey, &claiming, &attempt_state, &effects).await;
 
         if undeliverable && result.outcome == WakeOutcome::Woken {
             // The event was already older than a woken harness's replay
@@ -717,8 +1041,476 @@ fn spawn_attempt(
         }
 
         AttemptReport {
-            event_id,
+            event,
             outcome: result.outcome,
+            retried,
+            in_flight_owner: result.in_flight_owner,
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_000_000;
+
+    fn store(dir: &tempfile::TempDir) -> CursorStore {
+        CursorStore::open_or_start(dir.path().join("cursor.json"), NOW, DEFAULT_COMPLETED_RING)
+            .expect("open")
+    }
+
+    fn trigger(id: &str) -> TriggerEvent {
+        trigger_at(id, NOW)
+    }
+
+    fn trigger_at(id: &str, created_at: u64) -> TriggerEvent {
+        trigger_by(id, created_at, &author_a())
+    }
+
+    fn trigger_by(id: &str, created_at: u64, author: &str) -> TriggerEvent {
+        TriggerEvent {
+            id: id.to_string(),
+            author: author.to_string(),
+            kind: 9,
+            p_tags: vec!["b".repeat(64)],
+            created_at,
+        }
+    }
+
+    /// The author every trigger carries unless a test is specifically about
+    /// two of them — the author gate is per triggering author, so a follower
+    /// only inherits its owner's verdict when they match.
+    fn author_a() -> String {
+        "a".repeat(64)
+    }
+
+    fn author_b() -> String {
+        "b".repeat(64)
+    }
+
+    fn report(id: &str, outcome: WakeOutcome, retried: bool) -> AttemptReport {
+        AttemptReport {
+            event: trigger(id),
+            outcome,
+            retried,
+            in_flight_owner: None,
+        }
+    }
+
+    /// A follower collapsed behind a concurrent attempt, with both triggers'
+    /// timestamps spelled out — the ordering is the whole point.
+    ///
+    /// Owner and follower share an author and the owner is a first attempt, so
+    /// this isolates the reach question; tests about the other two conditions
+    /// override `in_flight_owner` on the report they get back.
+    fn in_flight_report(
+        id: &str,
+        follower_created_at: u64,
+        owner_created_at: u64,
+    ) -> AttemptReport {
+        AttemptReport {
+            event: trigger_at(id, follower_created_at),
+            outcome: WakeOutcome::InFlight,
+            retried: false,
+            in_flight_owner: Some(ClaimingTrigger {
+                created_at: owner_created_at,
+                author: author_a(),
+                retried: false,
+            }),
+        }
+    }
+
+    /// The bug this exists for. A deploy that failed stamps the debounce, so
+    /// the mentions that follow it are refused without being looked at — and
+    /// completing them there is what silently loses them.
+    #[test]
+    fn a_debounced_trigger_is_stranded_rather_than_completed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            report("e1", WakeOutcome::Debounced, false),
+        );
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        // The claim is still held: nothing about this mention is finished.
+        assert_eq!(cursor.in_flight_len(), 1);
+        assert_eq!(cursor.abandoned_len(), 0);
+    }
+
+    /// The failure JC hit: the deploy itself failed, and nothing re-drove it.
+    #[test]
+    fn a_failed_deploy_is_stranded_for_one_re_drive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            report("e1", WakeOutcome::DeployFailed, false),
+        );
+
+        assert!(matches!(settlement, Settlement::Strand(_)));
+        assert_eq!(cursor.in_flight_len(), 1);
+    }
+
+    /// One-shot means one shot: a re-driven attempt settles terminally
+    /// whatever it reports, or a provider that stays down arms timer after
+    /// timer forever.
+    #[test]
+    fn a_re_driven_trigger_settles_terminally_even_when_unresolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            report("e1", WakeOutcome::Debounced, true),
+        );
+
+        assert!(matches!(settlement, Settlement::Settled));
+        assert_eq!(cursor.in_flight_len(), 0);
+        assert_eq!(cursor.abandoned_len(), 0);
+    }
+
+    /// A proven wake, and the two fail-closed policy verdicts, must not be
+    /// re-driven — re-litigating a veto spends a deploy on an answer that
+    /// will not change.
+    #[test]
+    fn proven_and_vetoed_outcomes_stay_terminal() {
+        for outcome in [
+            WakeOutcome::Woken,
+            WakeOutcome::AlreadyLive,
+            WakeOutcome::AuthorRejected,
+            WakeOutcome::AuthorUnverified,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut cursor = store(&dir);
+            cursor.admit("e1", NOW, NOW).expect("admit");
+
+            let settlement = apply_report(&mut cursor, "agent", report("e1", outcome, false));
+
+            assert!(
+                matches!(settlement, Settlement::Settled),
+                "{outcome} must settle terminally"
+            );
+            assert_eq!(
+                cursor.in_flight_len(),
+                0,
+                "{outcome} must release its claim"
+            );
+        }
+    }
+
+    /// The ordering-neutral half of the collapse, and the reason `InFlight`
+    /// is terminal at all: a follower no older than the owner sits inside the
+    /// floor the owner's deploy will commit, so re-driving it would spend a
+    /// second deploy for a mention the first one already reaches.
+    #[test]
+    fn a_follower_covered_by_the_owning_attempt_settles_terminally() {
+        for (label, follower_at, owner_at) in [
+            ("owner is older", NOW, NOW - 600),
+            ("same instant", NOW, NOW),
+            (
+                "owner newer, but inside the skew",
+                NOW,
+                NOW + crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut cursor = store(&dir);
+            cursor.admit("e1", NOW, NOW).expect("admit");
+
+            let settlement = apply_report(
+                &mut cursor,
+                "agent",
+                in_flight_report("e1", follower_at, owner_at),
+            );
+
+            assert!(
+                matches!(settlement, Settlement::Settled),
+                "{label}: the owner's replay floor reaches this mention"
+            );
+            assert_eq!(cursor.in_flight_len(), 0, "{label}: claim must be released");
+        }
+    }
+
+    /// The bug this exists for. A backlog drain is served newest-first and
+    /// every admitted row is spawned concurrently, so the *newest* row can win
+    /// the in-flight claim. Its replay floor is its own `created_at`, which
+    /// cannot reach back to an older sibling — and completing that sibling's
+    /// cursor claim is precisely the "dropping wake triggers" this loop is
+    /// meant to have stopped.
+    #[test]
+    fn an_older_follower_behind_a_newer_owner_is_stranded_not_completed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e-old", NOW, NOW).expect("admit");
+
+        let follower_at = NOW - 600;
+        let owner_at = NOW;
+        assert!(
+            !crate::decide::is_covered_by_replay_floor(follower_at, owner_at),
+            "the fixture must actually sit outside the owner's floor"
+        );
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            in_flight_report("e-old", follower_at, owner_at),
+        );
+
+        assert!(
+            matches!(settlement, Settlement::Strand(event) if event.id == "e-old"),
+            "an uncovered follower must be retained for its re-drive"
+        );
+        assert_eq!(
+            cursor.in_flight_len(),
+            1,
+            "nothing about this mention is finished, so its claim stays held"
+        );
+        assert_eq!(cursor.abandoned_len(), 0);
+    }
+
+    /// One second past the skew is still uncovered — the boundary is the
+    /// whole content of the predicate, so pin it rather than trusting a
+    /// comfortably-large fixture.
+    #[test]
+    fn the_collapse_boundary_is_exactly_the_replay_floor_skew() {
+        let owner_at = NOW;
+        let skew = crate::decide::WAKE_REPLAY_FLOOR_SKEW_SECS;
+
+        assert!(in_flight_owner_covers(&in_flight_report(
+            "e1",
+            owner_at - skew,
+            owner_at
+        )));
+        assert!(!in_flight_owner_covers(&in_flight_report(
+            "e1",
+            owner_at - skew - 1,
+            owner_at
+        )));
+    }
+
+    /// The two-author ordering. An agent-authored trigger takes the per-agent
+    /// claim *before* the per-author gate runs, refuses a concurrent human
+    /// mention, then exits `AuthorRejected` without deploying and without
+    /// being stranded (see `attempt`'s
+    /// `an_agent_authored_owner_does_not_speak_for_a_human_follower` for the
+    /// interleaving that produces it). The owner is the older trigger here, so
+    /// reach alone would authorize the collapse — and completing the
+    /// follower's claim on a veto that was never about it loses the mention.
+    #[test]
+    fn a_follower_authored_by_someone_else_is_not_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let mut report = in_flight_report("e1", NOW, NOW - 1);
+        report.event = trigger_by("e1", NOW, &author_b());
+
+        let settlement = apply_report(&mut cursor, "agent", report);
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        assert_eq!(cursor.in_flight_len(), 1);
+    }
+
+    /// The same ordering with one author: whatever verdict the owner reaches
+    /// is this follower's verdict too, so the collapse stands. Asserted so the
+    /// author check cannot quietly become "never collapse anything".
+    #[test]
+    fn a_follower_sharing_its_owners_author_is_still_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(&mut cursor, "agent", in_flight_report("e1", NOW, NOW - 1));
+
+        assert!(matches!(settlement, Settlement::Settled));
+        assert_eq!(cursor.in_flight_len(), 0);
+    }
+
+    /// Authors are compared as keys, not as strings: a relay is free to hand
+    /// back either hex case, and a case-driven mismatch would strand every
+    /// follower forever rather than only the ones that need it.
+    #[test]
+    fn the_author_comparison_is_case_insensitive() {
+        let mut report = in_flight_report("e1", NOW, NOW - 1);
+        report.event = trigger_by("e1", NOW, &author_a().to_uppercase());
+
+        assert!(in_flight_owner_covers(&report));
+    }
+
+    /// The collapse's last leg is that a *failing* owner comes back for its
+    /// one re-drive on the same older floor. A re-driven owner has already
+    /// spent that shot — it settles terminally whatever it reports — so there
+    /// is no next attempt for this follower to be carried by.
+    #[test]
+    fn a_follower_behind_a_re_driven_owner_is_not_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let mut report = in_flight_report("e1", NOW, NOW - 1);
+        report
+            .in_flight_owner
+            .as_mut()
+            .expect("owner recorded")
+            .retried = true;
+
+        let settlement = apply_report(&mut cursor, "agent", report);
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        assert_eq!(cursor.in_flight_len(), 1);
+    }
+
+    /// An unproven collapse must never be the thing that authorizes dropping
+    /// a mention: with no owner recorded, fail towards retention.
+    #[test]
+    fn an_in_flight_report_with_no_named_owner_is_stranded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            report("e1", WakeOutcome::InFlight, false),
+        );
+
+        assert!(matches!(settlement, Settlement::Strand(event) if event.id == "e1"));
+        assert_eq!(cursor.in_flight_len(), 1);
+    }
+
+    /// One-shot still means one shot. An uncovered follower gets its single
+    /// re-drive and no more, whatever that re-drive reports.
+    #[test]
+    fn a_re_driven_uncovered_follower_settles_terminally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let mut report = in_flight_report("e1", NOW - 600, NOW);
+        report.retried = true;
+
+        let settlement = apply_report(&mut cursor, "agent", report);
+
+        assert!(matches!(settlement, Settlement::Settled));
+        assert_eq!(cursor.in_flight_len(), 0);
+    }
+
+    /// Unchanged behaviour, asserted so the strand path cannot swallow it: a
+    /// fenced attempt reached no decision at all and must stay replayable.
+    #[test]
+    fn a_cancelled_attempt_is_still_abandoned_not_stranded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        cursor.admit("e1", NOW, NOW).expect("admit");
+
+        let settlement = apply_report(
+            &mut cursor,
+            "agent",
+            report("e1", WakeOutcome::Cancelled, false),
+        );
+
+        assert!(matches!(settlement, Settlement::Settled));
+        assert_eq!(cursor.abandoned_len(), 1);
+    }
+
+    #[test]
+    fn retention_dedupes_by_event_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        let mut stranded = Vec::new();
+
+        retain_stranded(&mut stranded, &mut cursor, "agent", trigger("e1"));
+        retain_stranded(&mut stranded, &mut cursor, "agent", trigger("e1"));
+
+        assert_eq!(stranded.len(), 1);
+    }
+
+    /// Past the bound the oldest is dropped — and its cursor claim is
+    /// completed, not left held. A claim held for an event nothing will ever
+    /// re-drive pins the checkpoint for the life of the process.
+    #[test]
+    fn eviction_past_the_bound_releases_the_evicted_claim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        let mut stranded = Vec::new();
+
+        for index in 0..=STRANDED_TRIGGER_LIMIT {
+            let id = format!("e{index}");
+            cursor.admit(&id, NOW, NOW).expect("admit");
+            retain_stranded(&mut stranded, &mut cursor, "agent", trigger(&id));
+        }
+
+        assert_eq!(stranded.len(), STRANDED_TRIGGER_LIMIT);
+        assert_eq!(stranded[0].event.id, "e1", "the oldest is the one dropped");
+        assert!(
+            !stranded.iter().any(|held| held.event.id == "e0"),
+            "e0 was evicted"
+        );
+        // Every retained trigger still holds its claim; only the evicted one
+        // released.
+        assert_eq!(cursor.in_flight_len(), STRANDED_TRIGGER_LIMIT);
+    }
+
+    /// A backlog drain arrives newest-first, so arrival order is the reverse
+    /// of mention age. Evicting the front of the queue there would keep the
+    /// stalest mentions and throw away the ones most worth waking for.
+    #[test]
+    fn eviction_drops_the_oldest_mention_not_the_first_to_arrive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        let mut stranded = Vec::new();
+
+        // Newest first, exactly as the relay serves stored rows.
+        for index in 0..=STRANDED_TRIGGER_LIMIT {
+            let id = format!("e{index}");
+            cursor.admit(&id, NOW, NOW).expect("admit");
+            let created_at = NOW - index as u64;
+            retain_stranded(
+                &mut stranded,
+                &mut cursor,
+                "agent",
+                trigger_at(&id, created_at),
+            );
+        }
+
+        assert_eq!(stranded.len(), STRANDED_TRIGGER_LIMIT);
+        let evicted = format!("e{STRANDED_TRIGGER_LIMIT}");
+        assert!(
+            !stranded.iter().any(|held| held.event.id == evicted),
+            "the oldest mention ({evicted}) is the one dropped, not the first to arrive"
+        );
+        assert!(
+            stranded.iter().any(|held| held.event.id == "e0"),
+            "the newest mention must survive the bound"
+        );
+        assert_eq!(cursor.in_flight_len(), STRANDED_TRIGGER_LIMIT);
+    }
+
+    /// The retry must land past the window that refused it, or the re-drive is
+    /// refused for the very same reason and the one shot is wasted.
+    #[test]
+    fn the_re_drive_is_scheduled_past_the_deploy_debounce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cursor = store(&dir);
+        let mut stranded = Vec::new();
+        let before = tokio::time::Instant::now();
+
+        retain_stranded(&mut stranded, &mut cursor, "agent", trigger("e1"));
+
+        let held_for = stranded[0].due_at.saturating_duration_since(before);
+        assert!(
+            held_for.as_millis() as u64 >= crate::attempt::WAKE_ATTEMPT_DEBOUNCE_MS,
+            "a re-drive at {held_for:?} lands inside the debounce window"
+        );
+    }
 }

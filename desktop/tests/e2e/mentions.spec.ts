@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { waitForAnimations } from "../helpers/animations";
+
 import {
   installMockBridge,
   openChannelBrowser,
@@ -845,6 +847,9 @@ test("mention autocomplete caps global people search at 50 results", async ({
 test("selecting a person mention inserts @Name into input", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz-theme", "buzz-dark");
+  });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -873,6 +878,114 @@ test("selecting a person mention inserts @Name into input", async ({
     ),
   );
   expect(iconMask).toContain("data:image/svg+xml");
+  await expect(mentionChip).toHaveCSS("line-height", "18px");
+  const scrollViewport = page.getByTestId("message-input-scroll");
+  const paintedBounds = await mentionChip.evaluate((element) => {
+    const chip = element.getBoundingClientRect();
+    const viewport = element
+      .closest("[data-testid='message-input-scroll']")
+      ?.getBoundingClientRect();
+    if (!viewport)
+      throw new Error("Mention chip is missing its scroll viewport");
+    return {
+      chipTop: chip.top,
+      chipBottom: chip.bottom,
+      viewportTop: viewport.top,
+      viewportBottom: viewport.bottom,
+    };
+  });
+  expect(paintedBounds.chipTop).toBeGreaterThanOrEqual(
+    paintedBounds.viewportTop,
+  );
+  expect(paintedBounds.chipBottom).toBeLessThanOrEqual(
+    paintedBounds.viewportBottom,
+  );
+  const humanIconTranslateY = await mentionChip.evaluate(
+    (element) =>
+      new DOMMatrix(getComputedStyle(element, "::before").transform).m42,
+  );
+  const channelIconTranslateY = await input.evaluate((composer) => {
+    const probe = document.createElement("span");
+    probe.className =
+      "mention-chip inline-chip-with-icon inline-chip-icon-channel";
+    composer.append(probe);
+    const translateY = new DOMMatrix(
+      getComputedStyle(probe, "::before").transform,
+    ).m42;
+    probe.remove();
+    return translateY;
+  });
+  expect(humanIconTranslateY - channelIconTranslateY).toBeCloseTo(1);
+
+  await input.fill("@bo");
+  await dropdown.getByText("bob").click();
+  await input.press("Shift+Enter");
+  await page.keyboard.type("@bo");
+  await dropdown.getByText("bob").click();
+  await input.press("Shift+Enter");
+  await page.keyboard.type("@bo");
+  await dropdown.getByText("bob").click();
+  const multilineChips = input.locator(".human-mention-highlight");
+  await expect(multilineChips).toHaveCount(3);
+  const multilinePaintBounds = await multilineChips.evaluateAll((elements) => {
+    const viewport = elements[0]
+      ?.closest("[data-testid='message-input-scroll']")
+      ?.getBoundingClientRect();
+    if (!viewport) {
+      throw new Error("Mention chips are missing their scroll viewport");
+    }
+    return elements.map((element) => {
+      const chip = element.getBoundingClientRect();
+      return {
+        chipTop: chip.top,
+        chipBottom: chip.bottom,
+        viewportTop: viewport.top,
+        viewportBottom: viewport.bottom,
+      };
+    });
+  });
+  for (const bounds of multilinePaintBounds) {
+    expect(bounds.chipTop).toBeGreaterThanOrEqual(bounds.viewportTop);
+    expect(bounds.chipBottom).toBeLessThanOrEqual(bounds.viewportBottom);
+  }
+
+  await scrollViewport.evaluate((element) => {
+    element.style.width = "8rem";
+  });
+  await input.fill("A deliberately long prefix that forces @bo");
+  await dropdown.getByText("bob").click();
+  const wrappedChip = input.locator(".human-mention-highlight", {
+    hasText: "bob",
+  });
+  const wrappedPaintBounds = await wrappedChip.evaluate((element) => {
+    const chip = element.getBoundingClientRect();
+    const viewport = element
+      .closest("[data-testid='message-input-scroll']")
+      ?.getBoundingClientRect();
+    if (!viewport)
+      throw new Error("Mention chip is missing its scroll viewport");
+    return {
+      chipTop: chip.top,
+      chipBottom: chip.bottom,
+      viewportTop: viewport.top,
+      viewportBottom: viewport.bottom,
+    };
+  });
+  expect(wrappedPaintBounds.chipTop).toBeGreaterThanOrEqual(
+    wrappedPaintBounds.viewportTop,
+  );
+  expect(wrappedPaintBounds.chipBottom).toBeLessThanOrEqual(
+    wrappedPaintBounds.viewportBottom,
+  );
+  await expect(input).toHaveCSS("height", /^(?!20px$)/);
+  await scrollViewport.evaluate((element) => {
+    element.style.removeProperty("width");
+  });
+
+  await waitForAnimations(page);
+  await page.getByTestId("message-composer").screenshot({
+    path: "test-results/inline-chip-polish/composer-after.png",
+  });
 });
 
 test("immediate ArrowLeft after a person mention is not bounced past the trailing space", async ({

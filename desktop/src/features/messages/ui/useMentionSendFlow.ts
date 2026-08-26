@@ -54,9 +54,9 @@ export function useMentionSendFlow({
   emojiAutocomplete,
   mentions,
   onPrepareSendChannel,
-  onAddressedAgentsSendStarted,
+  onAddressedAgentsComposerCleared,
   onAddressedAgentsSendFailed,
-  onInlineAgentMentionsSent,
+  onAddressedAgentsSendSucceeded,
   onSendRef,
   richText,
   setContent,
@@ -363,6 +363,7 @@ export function useMentionSendFlow({
         );
       };
       let composerCleared = false;
+      let optimisticComposerContent = "";
       const restoreComposerAfterFailure = () => {
         if (!composerCleared) return;
         composerCleared = false;
@@ -379,7 +380,7 @@ export function useMentionSendFlow({
         }
         const canRestoreCurrentComposer =
           canAnimateCurrentComposer &&
-          contentRef.current.trim().length === 0 &&
+          contentRef.current.trim() === optimisticComposerContent.trim() &&
           !hasUnsavedMedia();
         if (!canRestoreCurrentComposer && draft.recoveryDraftKey) {
           saveQueuedAttachmentsForDraft(
@@ -404,10 +405,13 @@ export function useMentionSendFlow({
         draft.capturedChannelId === channelIdRef.current ||
         channelIdRef.current === null
       ) {
-        if (draft.addressedAgentPubkeys.length > 0) {
-          onAddressedAgentsSendStarted?.(draft.addressedAgentPubkeys);
-        }
         clearComposer();
+        if (draft.addressedAgentPubkeys.length > 0) {
+          optimisticComposerContent =
+            onAddressedAgentsComposerCleared?.(draft.addressedAgentPubkeys) ??
+            "";
+          contentRef.current = optimisticComposerContent;
+        }
         composerCleared = true;
       }
       let uploadStarted = false;
@@ -544,12 +548,23 @@ export function useMentionSendFlow({
           const sentMentionPubkeys = new Set(
             revalidatedMentionPubkeys.map(normalizePubkey),
           );
-          onInlineAgentMentionsSent?.({
-            expectedRevision: draft.audienceRevision,
-            pubkeys: draft.inlineAgentMentionPubkeys.filter((pubkey) =>
-              sentMentionPubkeys.has(normalizePubkey(pubkey)),
-            ),
-          });
+          const newlyPinnedPubkeys = draft.inlineAgentMentionPubkeys.filter(
+            (pubkey) => sentMentionPubkeys.has(normalizePubkey(pubkey)),
+          );
+          if (
+            draft.capturedChannelId === channelIdRef.current ||
+            channelIdRef.current === null
+          ) {
+            onAddressedAgentsSendSucceeded?.(
+              [
+                ...new Set([
+                  ...draft.addressedAgentPubkeys,
+                  ...newlyPinnedPubkeys,
+                ]),
+              ],
+              newlyPinnedPubkeys,
+            );
+          }
           if (draft.sentDraftKey) {
             drafts.markDraftSent(
               draft.sentDraftKey,
@@ -561,12 +576,18 @@ export function useMentionSendFlow({
           }
         };
         if (preparedUpload) {
+          let settleUpload!: () => void;
+          const uploadSettled = new Promise<void>((resolve) => {
+            settleUpload = resolve;
+          });
           uploadStarted = preparedUpload.start({
             onComplete: async (uploaded, signal) => {
               try {
                 await finishSend(uploaded, signal);
               } catch {
                 restoreComposerAfterFailure();
+              } finally {
+                settleUpload();
               }
             },
             onError: (error) => {
@@ -574,14 +595,18 @@ export function useMentionSendFlow({
               toast.error(
                 `Upload failed: ${getErrorMessage(error, "Unknown error")}`,
               );
+              settleUpload();
             },
             onCancel: () => {
               restoreComposerAfterFailure();
+              settleUpload();
             },
           });
           if (!uploadStarted) {
+            settleUpload();
             return restoreComposerAfterFailure();
           }
+          await uploadSettled;
         }
         if (!preparedUpload) {
           try {
@@ -613,9 +638,9 @@ export function useMentionSendFlow({
       getManagedAgentsByPubkey,
       mentions.isAgentPubkey,
       mentions.revalidateMentionPubkeys,
-      onAddressedAgentsSendStarted,
+      onAddressedAgentsComposerCleared,
       onAddressedAgentsSendFailed,
-      onInlineAgentMentionsSent,
+      onAddressedAgentsSendSucceeded,
       onPrepareSendChannel,
       onSendRef,
       richText.setContent,
@@ -631,7 +656,6 @@ export function useMentionSendFlow({
   const sendMessageWithMentionFlow = React.useCallback(
     async ({
       addressedAgentPubkeys = [],
-      audienceRevision = 0,
       capturedChannelId,
       capturedThreadContext = null,
       pendingImeta,
@@ -738,7 +762,6 @@ export function useMentionSendFlow({
         const savedMentionRefs = mentions.getDraftMentionRefs(trimmed);
         const pendingDraft: PendingNonMemberMentionSend = {
           addressedAgentPubkeys: uniqueNormalizedPubkeys(addressedAgentPubkeys),
-          audienceRevision,
           inlineAgentMentionPubkeys: uniqueNormalizedPubkeys(
             savedMentionRefs
               .filter((ref) => ref.isAgent)

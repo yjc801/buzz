@@ -30,12 +30,12 @@ export type UseMentionSendFlowOptions = {
   emojiAutocomplete: Pick<UseEmojiAutocompleteResult, "clearEmojis">;
   mentions: UseMentionsResult;
   onPrepareSendChannel?: (pubkeys?: string[]) => Promise<string | null>;
-  onAddressedAgentsSendStarted?: (pubkeys: readonly string[]) => void;
+  onAddressedAgentsComposerCleared?: (pubkeys: readonly string[]) => string;
   onAddressedAgentsSendFailed?: (pubkeys: readonly string[]) => void;
-  onInlineAgentMentionsSent?: (promotion: {
-    expectedRevision: number;
-    pubkeys: readonly string[];
-  }) => void;
+  onAddressedAgentsSendSucceeded?: (
+    pubkeys: readonly string[],
+    newlyPinnedPubkeys: readonly string[],
+  ) => void;
   onSendRef: React.MutableRefObject<
     (
       content: string,
@@ -62,18 +62,10 @@ export type UseMentionSendFlowOptions = {
   setSpoileredAttachmentUrls?: React.Dispatch<
     React.SetStateAction<Set<string>>
   >;
-  onSuccessfulExplicitAgentAudience?: (audience: {
-    channelId: string;
-    expectedGeneration: number;
-    expectedRevision: number | null;
-    explicitAgentPubkeys: string[];
-  }) => void;
-  resolvePostSendContent?: (effectiveExplicitAgentPubkeys: string[]) => string;
 };
 
 export type PendingNonMemberMentionSend = {
   addressedAgentPubkeys: string[];
-  audienceRevision: number;
   inlineAgentMentionPubkeys: string[];
   capturedChannelId: string | null;
   capturedThreadContext: {
@@ -98,7 +90,6 @@ export type PendingNonMemberMentionSend = {
 
 export type SendMessageWithMentionFlowInput = {
   addressedAgentPubkeys?: readonly string[];
-  audienceRevision?: number;
   capturedChannelId: string | null;
   capturedThreadContext?: PendingNonMemberMentionSend["capturedThreadContext"];
   pendingImeta: ImetaMedia[];

@@ -22,6 +22,7 @@ import {
   invokeTauri,
   listManagedAgents,
 } from "@/shared/api/tauri";
+import { listPersonas } from "@/shared/api/tauriPersonas";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type {
   AttachManagedAgentToChannelInput,
@@ -179,12 +180,16 @@ export function useProvisionChannelManagedAgentMutation(
         throw new Error("No channel selected.");
       }
 
-      const [managedAgents, members] = await Promise.all([
+      const [managedAgents, members, personas] = await Promise.all([
         listManagedAgents(),
         getChannelMembers(effectiveChannelId),
+        rest.personaId && rest.respondTo === undefined
+          ? listPersonas()
+          : Promise.resolve([]),
       ]);
       return provisionChannelManagedAgent(rest, {
         managedAgents,
+        personas,
         channelMemberPubkeys: new Set(
           members.map((member) => normalizePubkey(member.pubkey)),
         ),

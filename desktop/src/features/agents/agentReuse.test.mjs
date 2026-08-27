@@ -8,6 +8,7 @@ import {
   findReusablePersonaAgent,
   findReusableGenericAgent,
   findReusableAgent,
+  resolveReusableAgentAccessPolicy,
 } from "./agentReuse.ts";
 
 const PUB_A = "a".repeat(64);
@@ -470,5 +471,28 @@ test("findReusableAgent: carries the community through both routes", () => {
       RELAY_A,
     ),
     persona,
+  );
+});
+
+test("resolveReusableAgentAccessPolicy uses explicit, persona, then safe defaults", () => {
+  const persona = {
+    respondTo: "allowlist",
+    respondToAllowlist: [PUB_B],
+  };
+
+  assert.deepEqual(resolveReusableAgentAccessPolicy({}, persona), {
+    respondTo: "allowlist",
+    respondToAllowlist: [PUB_B],
+  });
+  assert.deepEqual(resolveReusableAgentAccessPolicy({}), {
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+  });
+  assert.deepEqual(
+    resolveReusableAgentAccessPolicy(
+      { respondTo: "owner-only", respondToAllowlist: [] },
+      persona,
+    ),
+    { respondTo: "owner-only", respondToAllowlist: [] },
   );
 });

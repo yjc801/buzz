@@ -1,5 +1,9 @@
 import { managedAgentIsReusableInCommunity } from "@/features/agents/lib/communityScope";
-import type { ManagedAgent } from "@/shared/api/types";
+import type {
+  AgentPersona,
+  CreateManagedAgentInput,
+  ManagedAgent,
+} from "@/shared/api/types";
 
 /** Inline normalization — avoids runtime dependency on @/shared/lib/pubkey. */
 function normalizePubkey(pubkey: string): string {
@@ -110,4 +114,31 @@ export function findReusableAgent(
     );
   }
   return undefined;
+}
+
+export function resolveReusableAgentAccessPolicy(
+  request: Pick<CreateManagedAgentInput, "respondTo" | "respondToAllowlist">,
+  persona?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
+) {
+  const requestedAllowlist = request.respondToAllowlist ?? [];
+  if (request.respondTo !== undefined) {
+    return {
+      respondTo: request.respondTo,
+      respondToAllowlist: [...requestedAllowlist],
+    };
+  }
+  if (persona?.respondTo != null) {
+    return {
+      respondTo: persona.respondTo,
+      respondToAllowlist: [
+        ...(requestedAllowlist.length > 0
+          ? requestedAllowlist
+          : persona.respondToAllowlist),
+      ],
+    };
+  }
+  return {
+    respondTo: "owner-only" as const,
+    respondToAllowlist: [...requestedAllowlist],
+  };
 }

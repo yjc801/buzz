@@ -175,7 +175,7 @@ jobs:
           # Alex — the reviewer agent (mention by pubkey so notification doesn't
           # depend on display-name resolution)
           REVIEWER_NAME: Alex
-          REVIEWER_PUBKEY: 143bd5c0ffcfb82856dc3a9264269e719acc98ba7d5dc3cf07a51f9511162c4d
+          REVIEWER_PUBKEY: 276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd
           # Will — the buzz platform coding agent; member of every task room.
           # NOT Chris (velvet's coder): his instructions scope him to velvet's
           # apps/api + packages/* and tell him to stop rather than work outside

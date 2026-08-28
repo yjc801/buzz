@@ -434,8 +434,8 @@ pub(super) fn apply_wake_replay_floor(
 ///
 /// `wake_replay_floor` is set only when this deploy is a wake-on-mention —
 /// see [`apply_wake_replay_floor`].
-pub(crate) fn build_deploy_payload(
-    app: &AppHandle,
+pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     record: &ManagedAgentRecord,
     wake_replay_floor: Option<u64>,

@@ -483,6 +483,7 @@ description. See [PR #803](https://github.com/block/buzz/pull/803).
    `productName`/`identifier` live in the `tauri.<platform>.conf.json`
    overlays, which Tauri merges automatically. See
    [docs/fork-branding.md](docs/fork-branding.md) before changing either.
+8. **`pgschema` omits seed DML and some storage parameters** — Fresh desired-state bootstraps use `./bin/pgschema apply`, which does not execute `INSERT` statements or preserve every table storage parameter from `schema/schema.sql`. Put each unsupported invariant in `scripts/reconcile-schema-after-pgschema.sql` as an idempotent convergence statement plus a live catalog or data assertion. Every `pgschema apply` caller must run that script. A string assertion against `schema.sql` alone does not prove the pgschema-created database has the intended state.
 
 ---
 

@@ -71,6 +71,12 @@ pub struct AgentDefinition {
     /// a new local id, so the only link back to the publication is this pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source: Option<CatalogSource>,
+    /// Provenance of a persona copied out of another owner's shared TEAM
+    /// publication, as opposed to their persona catalog. Distinct from
+    /// `catalog_source` because a 30178 member is not addressable as a 30175
+    /// coordinate — see [`TeamMemberCatalogSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_catalog_source: Option<TeamMemberCatalogSource>,
     /// Harness-level configuration passed to the agent subprocess as environment variables.
     /// Opaque to Buzz — keys and values are runtime-specific.
     ///
@@ -349,6 +355,10 @@ pub struct ManagedAgentRecord {
     /// definition was copied from, when it came from another owner's catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source: Option<CatalogSource>,
+    /// Absorbed from `AgentDefinition.team_catalog_source` — the team
+    /// publication and member this definition was copied out of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_catalog_source: Option<TeamMemberCatalogSource>,
     /// NIP-AP definition-level behavioral defaults, absorbed from
     /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/
@@ -743,54 +753,6 @@ pub struct AgentModelInfo {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamRecord {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    /// Runtime-layered instructions shared by every member deployment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    pub persona_ids: Vec<String>,
-    #[serde(default)]
-    pub is_builtin: bool,
-    /// Absolute path to the team's backing directory (if directory-backed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_dir: Option<PathBuf>,
-    /// Whether `source_dir` is a symlink to an external directory.
-    #[serde(default)]
-    pub is_symlink: bool,
-    /// Resolved symlink target path (for display). Only set when `is_symlink` is true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symlink_target: Option<String>,
-    /// Version from the team's `plugin.json` manifest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTeamRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub instructions: Option<String>,
-    #[serde(default)]
-    pub persona_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateTeamRequest {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub instructions: Option<String>,
-    #[serde(default)]
-    pub persona_ids: Vec<String>,
-}
-
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 /// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
@@ -979,6 +941,10 @@ mod relay_mesh;
 pub use relay_mesh::RelayMeshConfig;
 mod requests;
 pub use requests::*;
+mod team_catalog_source;
+pub use team_catalog_source::{TeamCatalogSource, TeamMemberCatalogSource};
+mod teams;
+pub use teams::{CreateTeamRequest, TeamRecord, UpdateTeamRequest};
 
 #[cfg(test)]
 mod tests;

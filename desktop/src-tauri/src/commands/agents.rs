@@ -35,7 +35,10 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
 mod pending;
 #[cfg(test)]
 use pending::build_agent_archive_request;
-pub(crate) use pending::{archive_managed_agent_pending, tombstone_managed_agent_pending};
+// Upstream folded the standalone `archive_managed_agent_pending` into
+// `tombstone_managed_agent_pending`, which now enqueues the kind:5 tombstone
+// and the kind:9035 archive request in one transaction.
+pub(crate) use pending::tombstone_managed_agent_pending;
 
 // `retain_managed_agent_pending` stays in `waker::*` (`agents_waker.rs`): the
 // fork's copy also issues the waker launch bundle and enrolment alongside the
@@ -689,6 +692,7 @@ pub async fn create_managed_agent(
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
@@ -1116,10 +1120,6 @@ pub async fn delete_managed_agent(
                 }
             }
 
-            let persona_id = records
-                .iter()
-                .find(|record| record.pubkey == pubkey)
-                .and_then(|record| record.persona_id.clone());
             if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
                 stop_managed_agent_process(&app, record, &mut runtimes)?;
             }
@@ -1131,12 +1131,12 @@ pub async fn delete_managed_agent(
             }
             save_managed_agents(&app, &records)?;
             crate::managed_agents::delete_agent_key(&pubkey);
-            // Tombstone after confirmed removal (inside lock; every published agent tombstones).
+            // Tombstone after confirmed removal (inside lock; every published
+            // agent tombstones). The NIP-IA kind:9035 archive request — which
+            // stops the identity appearing in member pickers and autocomplete —
+            // is enqueued in the SAME transaction, its `persona_id` derived from
+            // the retained 30177 head.
             tombstone_managed_agent_pending(&app, &state, &pubkey);
-            // NIP-IA: archive the deleted agent's identity on the relay so it
-            // stops appearing in member pickers and autocomplete. Same
-            // best-effort, inside-the-lock contract as the tombstone above.
-            archive_managed_agent_pending(&app, &state, &pubkey, persona_id.as_deref());
         }
         try_regenerate_nest(&app);
         Ok(())

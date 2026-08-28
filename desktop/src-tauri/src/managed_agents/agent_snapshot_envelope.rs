@@ -424,6 +424,7 @@ mod tests {
             agent_command_override: None,
             persona_source_version: None,
             provider: None,
+            team_catalog_source: None,
         }
     }
 

@@ -184,6 +184,7 @@ fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agent
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: std::collections::BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -1716,7 +1717,6 @@ fn harness_def(
         install_hint: String::new(),
     }
 }
-
 /// A `save_and_warm` landing mid-discovery (after the scan, before the
 /// publish) must survive discovery's registry publish — through the real
 /// `discover_acp_runtimes_from` path.
@@ -1750,7 +1750,6 @@ fn discovery_publish_path_survives_mid_flight_save() {
          publish clobbers a save that landed mid-discovery"
     );
 }
-
 /// A `delete_and_warm` landing mid-discovery must stay gone after discovery's
 /// publish — a stale snapshot (taken while the file existed) would resurrect it.
 #[test]

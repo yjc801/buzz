@@ -107,3 +107,23 @@ async fn databricks_interactive_auth_timeout_records_cooldown_and_returns_timeou
     assert_eq!(error, databricks_sign_in_timed_out_error());
     assert!(cooldowns.is_active(host, Instant::now()));
 }
+
+#[test]
+fn databricks_static_token_error_redacts_echoed_token() {
+    use std::collections::BTreeMap;
+
+    let token = "secret-databricks-token";
+    let redaction_env = BTreeMap::from([("DATABRICKS_TOKEN".to_string(), token.to_string())]);
+
+    let error = databricks_static_token_error(
+        &format!("Databricks rejected bearer {token}"),
+        &redaction_env,
+    );
+
+    assert!(error.contains("[REDACTED]"), "got: {error}");
+    assert!(!error.contains(token), "token leaked in error: {error}");
+    assert!(
+        error.contains("update it in agent settings"),
+        "error lost its remediation: {error}"
+    );
+}

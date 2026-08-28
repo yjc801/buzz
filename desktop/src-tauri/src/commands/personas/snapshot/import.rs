@@ -589,6 +589,7 @@ pub async fn confirm_agent_snapshot_import(
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             env_vars: std::collections::BTreeMap::new(),
             respond_to: respond_to_wire.clone(),
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
@@ -663,6 +664,7 @@ pub async fn confirm_agent_snapshot_import(
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: minted.respond_to_allowlist.clone(),
             definition_parallelism: minted_parallelism,
@@ -905,6 +907,9 @@ mod egress_guard_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "import_avatar_tests.rs"]
+mod import_avatar_tests;
 #[cfg(test)]
 #[path = "import_tests.rs"]
 mod tests;

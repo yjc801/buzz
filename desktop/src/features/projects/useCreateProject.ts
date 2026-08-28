@@ -20,6 +20,7 @@ import {
   applyProjectHomeCanvas,
   PROJECT_HOME_TEMPLATE_ID,
 } from "@/features/projects/lib/projectHomeTemplate";
+import { markProjectDataAuthoritative } from "@/features/projects/projectSnapshot";
 import type { Channel } from "@/shared/api/types";
 import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 
@@ -39,6 +40,7 @@ export function useCreateProjectMutation() {
     mutationFn: (input: CreateProjectInput) =>
       createProject(input, resumeRef.current, { activeCommunityRelayUrl }),
     onSuccess: async ({ channel, project }, input) => {
+      markProjectDataAuthoritative(project, "local-write");
       addProjectToSidebar(
         project.projectAddress,
         getCachedRelayOrigin(),

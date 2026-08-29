@@ -108,7 +108,7 @@ test("channel replay lookback stays coupled to relay and DB source constants", a
   const [ingest, relayConstants, fence] = await Promise.all([
     readFile("../crates/buzz-relay/src/handlers/ingest.rs", "utf8"),
     readFile("../crates/buzz-core/src/relay.rs", "utf8"),
-    readFile("../crates/buzz-db/src/replica_fence.rs", "utf8"),
+    readFile("../crates/buzz-db/src/runtime/replica_fence.rs", "utf8"),
   ]);
   // This fork hoists the drift tolerance into buzz-core so buzz-waker can
   // share it; ingest.rs derives its own constant from that one rather than

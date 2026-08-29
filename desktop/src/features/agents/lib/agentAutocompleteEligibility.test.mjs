@@ -9,6 +9,7 @@ import {
   getAgentMentionAdmission,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
+  isAgentDirectoryReady,
   isAgentIdentityInAllowedList,
   isAgentMentionChannelType,
   managedAgentBelongsToCommunity,
@@ -43,6 +44,15 @@ function makeAgent(overrides = {}) {
     ...overrides,
   };
 }
+
+test("isAgentDirectoryReady: requires successful cached directory evidence", () => {
+  assert.equal(isAgentDirectoryReady({ data: [], error: null }), true);
+  assert.equal(isAgentDirectoryReady({ data: undefined, error: null }), false);
+  assert.equal(
+    isAgentDirectoryReady({ data: [], error: new Error("offline") }),
+    false,
+  );
+});
 
 test("getSharedChannelIds: includes only active joined channels", () => {
   assert.deepEqual(

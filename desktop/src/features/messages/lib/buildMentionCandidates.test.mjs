@@ -25,6 +25,7 @@ function input(overrides = {}) {
     memberAgentPubkeys: new Set(),
     memberPubkeys: new Set(),
     members: [],
+    mentionChannelId: null,
     mentionableAgentPubkeys: new Set(),
     personaNameByPubkey: new Map(),
     profiles: undefined,

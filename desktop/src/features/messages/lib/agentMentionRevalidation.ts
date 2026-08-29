@@ -27,7 +27,7 @@ type DirectoryResult<T> = {
  */
 export function rememberDirectoryAgentPubkeys(
   remembered: Set<string>,
-  directoryAgentPubkeys: ReadonlySet<string>,
+  directoryAgentPubkeys: Iterable<string>,
 ): Set<string> {
   for (const pubkey of directoryAgentPubkeys) {
     remembered.add(normalizePubkey(pubkey));
@@ -190,13 +190,32 @@ export function useAgentMentionRevalidation({
         eligibilityScope,
         sharedChannelIds,
         refetchManagedAgents,
-        fetchRelayAgents: (requestedPubkeys) =>
-          revalidateRelayAgents(
+        fetchRelayAgents: async (requestedPubkeys) => {
+          const relayAgents = await revalidateRelayAgents(
             requestedPubkeys,
             eligibilityScope.type === "channel"
               ? eligibilityScope.channelId
               : undefined,
-          ),
+          );
+          // A targeted revalidation can be the first directory view to observe
+          // an agent, while the full polled cache is still empty or up to a
+          // poll interval stale. Without remembering it, the next revalidation
+          // coming back empty reads as never-listed instead of revoked — and
+          // that next call is reachable within a single send, which revalidates
+          // once before the media upload and again after it.
+          //
+          // Only a resolved result is evidence: a rejection means the directory
+          // was unreachable and proves nothing either way, and the caller
+          // already fails those closed via `relayDirectoryReady`. Folding here
+          // cannot change the outcome of the call in flight, which unions this
+          // same result into its own directory view regardless; it only gives
+          // later calls the memory they otherwise lack.
+          rememberDirectoryAgentPubkeys(
+            rememberedDirectoryAgentPubkeys,
+            relayAgents.map((agent) => agent.pubkey),
+          );
+          return relayAgents;
+        },
       }),
     [
       activeCommunityRelayUrl,

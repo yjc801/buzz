@@ -15,6 +15,21 @@ const HUMAN = "c".repeat(64);
 // identical to what an agent the directory never listed looks like.
 let relayAgentsResponse = [];
 
+// The raw kind:10100 row `revalidate_relay_agents` returns, in the snake_case
+// shape tauriRelayAgents maps from. Answering in #general to anyone is what
+// makes AGENT mentionable rather than merely present.
+const LISTED_AGENT = {
+  pubkey: AGENT,
+  name: "agent",
+  agent_type: "managed",
+  channels: ["general"],
+  channel_ids: ["general"],
+  capabilities: [],
+  status: "running",
+  respond_to: "anyone",
+  respond_to_allowlist: [],
+};
+
 before(() => {
   Object.assign(globalThis, {
     document: dom.window.document,
@@ -81,4 +96,22 @@ test("send still admits a member agent the directory never listed", async () => 
   rerender({ directoryAgentPubkeys: new Set() });
 
   assert.deepEqual(await result.current([HUMAN, AGENT]), [HUMAN, AGENT]);
+});
+
+test("a targeted revalidation's evidence survives into the next revalidation", async () => {
+  // The full polled directory cache stays empty throughout: AGENT's kind:10100
+  // record is published too recently for the five-minute poll to have picked it
+  // up, so a targeted send-time revalidation is the only view that ever sees
+  // it. Both calls below happen on one send — the composer revalidates once
+  // before the media upload and again after it.
+  const { result } = await renderRevalidator(new Set());
+
+  relayAgentsResponse = [LISTED_AGENT];
+  assert.deepEqual(await result.current([HUMAN, AGENT]), [HUMAN, AGENT]);
+
+  // The record is revoked during the upload window, so the second revalidation
+  // returns empty. That is a revocation, not a never-listed member, and only
+  // the first call's result proves the difference.
+  relayAgentsResponse = [];
+  assert.deepEqual(await result.current([HUMAN, AGENT]), [HUMAN]);
 });

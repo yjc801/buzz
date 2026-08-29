@@ -18,6 +18,23 @@ type DirectoryResult<T> = {
   error: Error | null;
 };
 
+/**
+ * Fold the directory's current view into `remembered`, which only ever grows.
+ *
+ * Directory provenance has to outlive any single view of the directory. See
+ * `knownDirectoryAgentPubkeys` below for why forgetting that an agent was once
+ * listed re-opens the revocation hole.
+ */
+export function rememberDirectoryAgentPubkeys(
+  remembered: Set<string>,
+  directoryAgentPubkeys: ReadonlySet<string>,
+): Set<string> {
+  for (const pubkey of directoryAgentPubkeys) {
+    remembered.add(normalizePubkey(pubkey));
+  }
+  return remembered;
+}
+
 export async function revalidateAgentMentionPubkeys({
   pubkeys,
   agentPubkeys,
@@ -42,6 +59,9 @@ export async function revalidateAgentMentionPubkeys({
    * like an agent that was never listed. Deciding leniency on that result
    * alone would re-admit the agent the revalidation just revoked. Carrying
    * the known directory separately keeps the two apart.
+   *
+   * This must be provenance accumulated across the compose/send lifetime, not
+   * a live view of the directory — see `useAgentMentionRevalidation`.
    */
   knownDirectoryAgentPubkeys: ReadonlySet<string>;
   refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
@@ -143,12 +163,27 @@ export function useAgentMentionRevalidation({
   sharedChannelIds: ReadonlySet<string>;
   refetchManagedAgents: () => Promise<DirectoryResult<ManagedAgent[]>>;
 }) {
+  // Callers pass a live view of the polled relay-agent query, which shrinks the
+  // moment a refetch observes a revocation. Send reads it later than the picker
+  // did, so a refresh landing in between would erase the only evidence that the
+  // selected agent was ever directory-listed — leaving it indistinguishable
+  // from a never-listed member and re-admitting it through the lenient branch.
+  // Accumulating here rather than at the call site keeps that impossible to get
+  // wrong. The ref is component state, so App.tsx's `communityKey` remount
+  // clears it on a community switch; it needs no resetCommunityState() wiring.
+  const rememberedDirectoryAgentPubkeys = React.useRef<Set<string>>(
+    new Set(),
+  ).current;
+  rememberDirectoryAgentPubkeys(
+    rememberedDirectoryAgentPubkeys,
+    knownDirectoryAgentPubkeys,
+  );
   return React.useCallback(
     (pubkeys: readonly string[]) =>
       revalidateAgentMentionPubkeys({
         pubkeys,
         agentPubkeys: new Set([...agentPubkeys, ...getSelectedAgentPubkeys()]),
-        knownDirectoryAgentPubkeys,
+        knownDirectoryAgentPubkeys: rememberedDirectoryAgentPubkeys,
         refetchMembers,
         activeCommunityRelayUrl,
         currentPubkey,
@@ -169,7 +204,7 @@ export function useAgentMentionRevalidation({
       currentPubkey,
       eligibilityScope,
       getSelectedAgentPubkeys,
-      knownDirectoryAgentPubkeys,
+      rememberedDirectoryAgentPubkeys,
       refetchMembers,
       refetchManagedAgents,
       sharedChannelIds,

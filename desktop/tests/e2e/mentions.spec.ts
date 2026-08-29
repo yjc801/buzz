@@ -1495,7 +1495,10 @@ test("channel-member agents absent from the directories stay agents through the 
   // ordinary person: dropped from the thread's persistent audience and from
   // Huddle enrollment.
   await page.addInitScript(() => {
-    window.localStorage.setItem("buzz:keep-addressed-agents-active", "1");
+    window.localStorage.setItem(
+      "buzz.messages.keepMentionedAgentsPinned",
+      "true",
+    );
   });
   await installMockBridge(page, { userSearchDelayMs: 1_000 });
   await page.goto(
@@ -1525,24 +1528,10 @@ test("channel-member agents absent from the directories stay agents through the 
   // Stays addressed for the next reply instead of vanishing after the send.
   await expect(input).toHaveText("@mira ");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
-  // Promoted into the thread's stored audience.
-  await expect
-    .poll(() =>
-      page.evaluate(
-        ({ owner, channelId, rootId }) => {
-          const stored = JSON.parse(
-            localStorage.getItem("buzz:persistent-agent-audiences:v2") ?? "{}",
-          );
-          return stored[`${owner}:${channelId}:thread:${rootId}`] ?? null;
-        },
-        {
-          owner: MOCK_VIEWER_PUBKEY,
-          channelId: GENERAL_CHANNEL_ID,
-          rootId: GENERAL_THREAD_ROOT_ID,
-        },
-      ),
-    )
-    .toEqual([PROFILE_ONLY_AGENT_PUBKEY]);
+  // Promoted into this thread composer's persistent audience.
+  await expect(
+    composer.getByTestId(`composer-address-lock-${PROFILE_ONLY_AGENT_PUBKEY}`),
+  ).toBeVisible();
   // Enrolled in the Huddle like any other mentioned agent.
   await expect
     .poll(async () =>

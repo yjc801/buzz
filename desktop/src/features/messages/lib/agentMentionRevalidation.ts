@@ -21,6 +21,7 @@ type DirectoryResult<T> = {
 export async function revalidateAgentMentionPubkeys({
   pubkeys,
   agentPubkeys,
+  knownDirectoryAgentPubkeys,
   refetchMembers,
   activeCommunityRelayUrl,
   currentPubkey,
@@ -31,6 +32,18 @@ export async function revalidateAgentMentionPubkeys({
 }: {
   pubkeys: readonly string[];
   agentPubkeys: ReadonlySet<string>;
+  /**
+   * Agents the relay's kind:10100 directory is already known to list — the
+   * picker's cached `list_relay_agents` view.
+   *
+   * The lenient member branch exists for an agent the directory has NO record
+   * of. `fetchRelayAgents` here is a *revalidation*: it answers "may this
+   * agent still be invoked", and a revoked agent comes back missing, exactly
+   * like an agent that was never listed. Deciding leniency on that result
+   * alone would re-admit the agent the revalidation just revoked. Carrying
+   * the known directory separately keeps the two apart.
+   */
+  knownDirectoryAgentPubkeys: ReadonlySet<string>;
   refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
@@ -74,9 +87,10 @@ export async function revalidateAgentMentionPubkeys({
     managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
   );
   const relayDirectoryAgents = relayAgents ?? [];
-  const directoryAgentPubkeys = new Set(
-    relayDirectoryAgents.map((agent) => normalizePubkey(agent.pubkey)),
-  );
+  const directoryAgentPubkeys = new Set([
+    ...[...knownDirectoryAgentPubkeys].map(normalizePubkey),
+    ...relayDirectoryAgents.map((agent) => normalizePubkey(agent.pubkey)),
+  ]);
   const memberPubkeys = new Set(
     membersResult.data.map((member) => normalizePubkey(member.pubkey)),
   );
@@ -110,6 +124,7 @@ export async function revalidateAgentMentionPubkeys({
 
 export function useAgentMentionRevalidation({
   agentPubkeys,
+  knownDirectoryAgentPubkeys,
   refetchMembers,
   getSelectedAgentPubkeys,
   activeCommunityRelayUrl,
@@ -119,6 +134,7 @@ export function useAgentMentionRevalidation({
   refetchManagedAgents,
 }: {
   agentPubkeys: ReadonlySet<string>;
+  knownDirectoryAgentPubkeys: ReadonlySet<string>;
   refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
   getSelectedAgentPubkeys: () => ReadonlySet<string>;
   activeCommunityRelayUrl: string | null;
@@ -132,6 +148,7 @@ export function useAgentMentionRevalidation({
       revalidateAgentMentionPubkeys({
         pubkeys,
         agentPubkeys: new Set([...agentPubkeys, ...getSelectedAgentPubkeys()]),
+        knownDirectoryAgentPubkeys,
         refetchMembers,
         activeCommunityRelayUrl,
         currentPubkey,
@@ -152,6 +169,7 @@ export function useAgentMentionRevalidation({
       currentPubkey,
       eligibilityScope,
       getSelectedAgentPubkeys,
+      knownDirectoryAgentPubkeys,
       refetchMembers,
       refetchManagedAgents,
       sharedChannelIds,

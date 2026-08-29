@@ -12,6 +12,7 @@ function options() {
   return {
     pubkeys: [HUMAN, AGENT],
     agentPubkeys: new Set([AGENT]),
+    knownDirectoryAgentPubkeys: new Set(),
     refetchMembers: async () => ({ data: [], error: null }),
     activeCommunityRelayUrl: null,
     currentPubkey: CURRENT,
@@ -40,6 +41,20 @@ test("revalidation preserves member admission for a member agent with no directo
   });
 
   assert.deepEqual(result, [HUMAN, AGENT]);
+});
+
+test("revalidation denies a member agent the relay revoked at send time", async () => {
+  const result = await revalidateAgentMentionPubkeys({
+    ...options(),
+    // AGENT is a channel member AND has a directory record the picker
+    // already saw. Revalidation coming back empty is a revocation, not the
+    // "never listed" case the member branch is lenient about.
+    knownDirectoryAgentPubkeys: new Set([AGENT]),
+    refetchMembers: async () => ({ data: [{ pubkey: AGENT }], error: null }),
+    fetchRelayAgents: async () => [],
+  });
+
+  assert.deepEqual(result, [HUMAN]);
 });
 
 test("revalidation denies a member agent removed from the channel since the picker loaded", async () => {

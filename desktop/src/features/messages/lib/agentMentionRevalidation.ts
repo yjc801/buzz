@@ -18,9 +18,27 @@ type DirectoryResult<T> = {
   error: Error | null;
 };
 
+/**
+ * Fold the directory's current view into `remembered`, which only ever grows.
+ *
+ * Directory provenance has to outlive any single view of the directory. See
+ * `knownDirectoryAgentPubkeys` below for why forgetting that an agent was once
+ * listed re-opens the revocation hole.
+ */
+export function rememberDirectoryAgentPubkeys(
+  remembered: Set<string>,
+  directoryAgentPubkeys: Iterable<string>,
+): Set<string> {
+  for (const pubkey of directoryAgentPubkeys) {
+    remembered.add(normalizePubkey(pubkey));
+  }
+  return remembered;
+}
+
 export async function revalidateAgentMentionPubkeys({
   pubkeys,
   agentPubkeys,
+  knownDirectoryAgentPubkeys,
   refetchMembers,
   activeCommunityRelayUrl,
   currentPubkey,
@@ -31,6 +49,21 @@ export async function revalidateAgentMentionPubkeys({
 }: {
   pubkeys: readonly string[];
   agentPubkeys: ReadonlySet<string>;
+  /**
+   * Agents the relay's kind:10100 directory is already known to list — the
+   * picker's cached `list_relay_agents` view.
+   *
+   * The lenient member branch exists for an agent the directory has NO record
+   * of. `fetchRelayAgents` here is a *revalidation*: it answers "may this
+   * agent still be invoked", and a revoked agent comes back missing, exactly
+   * like an agent that was never listed. Deciding leniency on that result
+   * alone would re-admit the agent the revalidation just revoked. Carrying
+   * the known directory separately keeps the two apart.
+   *
+   * This must be provenance accumulated across the compose/send lifetime, not
+   * a live view of the directory — see `useAgentMentionRevalidation`.
+   */
+  knownDirectoryAgentPubkeys: ReadonlySet<string>;
   refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
   activeCommunityRelayUrl: string | null;
   currentPubkey: string | null;
@@ -74,9 +107,10 @@ export async function revalidateAgentMentionPubkeys({
     managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
   );
   const relayDirectoryAgents = relayAgents ?? [];
-  const directoryAgentPubkeys = new Set(
-    relayDirectoryAgents.map((agent) => normalizePubkey(agent.pubkey)),
-  );
+  const directoryAgentPubkeys = new Set([
+    ...[...knownDirectoryAgentPubkeys].map(normalizePubkey),
+    ...relayDirectoryAgents.map((agent) => normalizePubkey(agent.pubkey)),
+  ]);
   const memberPubkeys = new Set(
     membersResult.data.map((member) => normalizePubkey(member.pubkey)),
   );
@@ -110,6 +144,7 @@ export async function revalidateAgentMentionPubkeys({
 
 export function useAgentMentionRevalidation({
   agentPubkeys,
+  knownDirectoryAgentPubkeys,
   refetchMembers,
   getSelectedAgentPubkeys,
   activeCommunityRelayUrl,
@@ -119,6 +154,7 @@ export function useAgentMentionRevalidation({
   refetchManagedAgents,
 }: {
   agentPubkeys: ReadonlySet<string>;
+  knownDirectoryAgentPubkeys: ReadonlySet<string>;
   refetchMembers: () => Promise<DirectoryResult<ChannelMember[]>>;
   getSelectedAgentPubkeys: () => ReadonlySet<string>;
   activeCommunityRelayUrl: string | null;
@@ -127,24 +163,59 @@ export function useAgentMentionRevalidation({
   sharedChannelIds: ReadonlySet<string>;
   refetchManagedAgents: () => Promise<DirectoryResult<ManagedAgent[]>>;
 }) {
+  // Callers pass a live view of the polled relay-agent query, which shrinks the
+  // moment a refetch observes a revocation. Send reads it later than the picker
+  // did, so a refresh landing in between would erase the only evidence that the
+  // selected agent was ever directory-listed — leaving it indistinguishable
+  // from a never-listed member and re-admitting it through the lenient branch.
+  // Accumulating here rather than at the call site keeps that impossible to get
+  // wrong. The ref is component state, so App.tsx's `communityKey` remount
+  // clears it on a community switch; it needs no resetCommunityState() wiring.
+  const rememberedDirectoryAgentPubkeys = React.useRef<Set<string>>(
+    new Set(),
+  ).current;
+  rememberDirectoryAgentPubkeys(
+    rememberedDirectoryAgentPubkeys,
+    knownDirectoryAgentPubkeys,
+  );
   return React.useCallback(
     (pubkeys: readonly string[]) =>
       revalidateAgentMentionPubkeys({
         pubkeys,
         agentPubkeys: new Set([...agentPubkeys, ...getSelectedAgentPubkeys()]),
+        knownDirectoryAgentPubkeys: rememberedDirectoryAgentPubkeys,
         refetchMembers,
         activeCommunityRelayUrl,
         currentPubkey,
         eligibilityScope,
         sharedChannelIds,
         refetchManagedAgents,
-        fetchRelayAgents: (requestedPubkeys) =>
-          revalidateRelayAgents(
+        fetchRelayAgents: async (requestedPubkeys) => {
+          const relayAgents = await revalidateRelayAgents(
             requestedPubkeys,
             eligibilityScope.type === "channel"
               ? eligibilityScope.channelId
               : undefined,
-          ),
+          );
+          // A targeted revalidation can be the first directory view to observe
+          // an agent, while the full polled cache is still empty or up to a
+          // poll interval stale. Without remembering it, the next revalidation
+          // coming back empty reads as never-listed instead of revoked — and
+          // that next call is reachable within a single send, which revalidates
+          // once before the media upload and again after it.
+          //
+          // Only a resolved result is evidence: a rejection means the directory
+          // was unreachable and proves nothing either way, and the caller
+          // already fails those closed via `relayDirectoryReady`. Folding here
+          // cannot change the outcome of the call in flight, which unions this
+          // same result into its own directory view regardless; it only gives
+          // later calls the memory they otherwise lack.
+          rememberDirectoryAgentPubkeys(
+            rememberedDirectoryAgentPubkeys,
+            relayAgents.map((agent) => agent.pubkey),
+          );
+          return relayAgents;
+        },
       }),
     [
       activeCommunityRelayUrl,
@@ -152,6 +223,7 @@ export function useAgentMentionRevalidation({
       currentPubkey,
       eligibilityScope,
       getSelectedAgentPubkeys,
+      rememberedDirectoryAgentPubkeys,
       refetchMembers,
       refetchManagedAgents,
       sharedChannelIds,

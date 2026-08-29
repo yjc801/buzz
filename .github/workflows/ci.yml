@@ -958,7 +958,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.mobile == 'true'
+    # Fork divergence: this fork ships the mac desktop app only, so the mobile
+    # lane is upstream-only here.
+    if: github.repository == 'block/buzz' && (github.event_name == 'push' || needs.changes.outputs.mobile == 'true')
     permissions:
       contents: read
     steps:
@@ -1017,7 +1019,8 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 10
     needs: [changes]
-    if: needs.changes.outputs.mobile == 'true'
+    # Fork divergence: mobile lanes are upstream-only (mac desktop fork).
+    if: github.repository == 'block/buzz' && needs.changes.outputs.mobile == 'true'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Build
@@ -1107,7 +1110,9 @@ jobs:
     # cold across four steps; budget generously.
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
+    # Fork divergence: this fork ships the mac desktop app only, so the
+    # Windows lane is upstream-only here.
+    if: github.repository == 'block/buzz' && (github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true')
     permissions:
       contents: read
     env:

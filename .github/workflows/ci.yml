@@ -73,17 +73,25 @@ jobs:
               - 'scripts/test-mobile-worktree-overrides.sh'
               - '.github/workflows/mobile-release-candidate.yml'
               - '.github/workflows/ci.yml'
+      # Fork divergence: the next four contract steps validate upstream's
+      # release/canary/mobile workflow files, which are deleted on this fork
+      # (releases go through fork-desktop-release.yml instead), so they are
+      # upstream-only here.
       - name: Release workflow source contract
+        if: github.repository == 'block/buzz'
         run: scripts/test-release-ref-contract.sh
       - name: Relay image eligibility contract
+        if: github.repository == 'block/buzz'
         run: scripts/test-relay-image-eligibility-workflow.sh
       - name: Desktop release candidate contract
         run: scripts/test-desktop-release-candidate.sh
       - name: OSS desktop promotion contract
+        if: github.repository == 'block/buzz'
         run: |
           scripts/test-oss-desktop-promotion.sh
           scripts/test-oss-desktop-promotion-behavior.sh
       - name: Mobile release contract
+        if: github.repository == 'block/buzz'
         run: |
           scripts/test-mobile-release-contract.sh
           scripts/test-mobile-release-candidate-publisher.sh

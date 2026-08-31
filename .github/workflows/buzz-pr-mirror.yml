@@ -555,8 +555,17 @@ jobs:
                 printf '\n---\n%s\n' "$PR_BODY"
               fi
             fi
+            # NOTHING HERE MAY CONFIGURE THE REVIEWER. This card is built from
+            # repo- and PR-controlled material (title, branch, body, diff), and
+            # the reviewer treats everything it reviews as data. The machine
+            # trailer that authorizes an auto-merge is therefore specified in
+            # the reviewer's owner-managed system prompt — canonical copy in
+            # docs/pr-auto-merge.md — and never instructed from here. An
+            # earlier revision of this line asked for the trailer directly;
+            # that is exactly the injection path a compliant reviewer must
+            # ignore, and it would have let repo content steer a merge
+            # authorization if one did not.
             printf '\n@%s please review.\n' "$REVIEWER_NAME"
-            printf 'End your verdict with the machine trailer — `Reviewed <head sha> against merge base <sha>`, `VERDICT:`, `RISK:`, `AUTO-MERGE:` — contract in docs/pr-auto-merge.md.\n'
             if [ -n "$SCOPE_NAMES" ]; then
               printf '\n%s— you own the changed paths. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
                 "$SCOPE_NAMES" "$REVIEWER_NAME"

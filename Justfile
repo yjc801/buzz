@@ -101,11 +101,14 @@ security-review-check:
     node --test .github/scripts/codex-security-review.test.js
     actionlint .github/workflows/codex-security-review.yml
 
-# Validate the PR auto-merge risk classifier and verdict parser contracts.
+# Validate the PR auto-merge risk classifier, verdict parser, event
+# verification, and the merge job's revalidation fence.
 auto-merge-check:
     node --check .github/scripts/pr-auto-merge-risk.js
     node --check .github/scripts/pr-auto-merge-verdict.js
     node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js
+    python3 scripts/buzz-mint-auth-tag.py selftest
+    bash .github/scripts/pr-auto-merge-revalidate.test.sh
 
 # Run the repository-wide differential file-size ratchet and its policy tests.
 # The ratchet inspects only files changed from the merge base, so this stays

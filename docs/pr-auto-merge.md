@@ -21,7 +21,7 @@ reader that trusts neither the relay client nor the network.
 A signature proves *authorship*, though, not that the message is still the
 reviewer's **standing** verdict — an omitted correction leaves no trace in the
 event it corrected. Establishing which verdict stands is a separate job with
-its own trusted read of the relay; see [Three jobs, and why](#three-jobs-and-why).
+its own trusted read of the relay; see [No unreviewed code, and two jobs](#no-unreviewed-code-and-two-jobs).
 
 ## The verdict trailer (normative)
 
@@ -95,8 +95,8 @@ plus `workflow_dispatch`). Every gate must pass:
    `CI` workflow — "nothing ran" is not green.
 7. The base branch carries a GitHub ruleset that requires status checks
    **strictly** (`strict_required_status_checks_policy: true`) and whose
-   required contexts include every one of `REQUIRED_RULESET_CONTEXTS`, so the
-   platform — not our reads — fences the merge. A single rule must carry both
+   required contexts include every one of `REQUIRED_RULESET_CONTEXTS` — today
+   the single aggregate context `CI Complete`. A single rule must carry both
    properties: strictness from one rule and the contexts from another would
    still leave those contexts testable against a stale base.
 8. Every one of the above, re-read in the isolated merge job immediately
@@ -118,94 +118,100 @@ merge uses the `AUTO_MERGE_TOKEN` secret (owner PAT), never the default
 silently freezing Sprig / Provider / Waker image publishing that the
 remote-agent fleet installs its harness from.
 
-## Three jobs, and why
+## No unreviewed code, and two jobs
 
-Reading the relay through the CLI means running `buzz`, which comes from
-`block/buzz`'s rolling `sprig-latest` release: the asset is rebuilt on every
-push to that repo, and its published checksum moves with it. A checksum
-fetched from the same mutable release proves the download arrived intact, not
-that anyone reviewed what was published — and pinning a digest constant would
-fail red on every upstream push, so it is not on offer either.
+Earlier revisions reached the relay through `buzz`, from `block/buzz`'s rolling
+`sprig-latest` release, and tried to *contain* it: a job with no merge
+credential, plus a signature check on the verdict event afterwards. That was
+not enough, and the reason is worth writing down because it is not obvious.
 
-The response is to stop the binary from being load-bearing at all. Three jobs:
+**The CI identity owns every PR channel.** A channel owner may kind-9005 delete
+any message in it, not merely their own
+(`crates/buzz-relay/src/handlers/side_effects.rs`, "event author OR channel
+owner/admin"). The delete is soft (`deleted_at = NOW()`,
+`crates/buzz-db/src/store/event.rs`) and every query path appends
+`deleted_at IS NULL`. So unreviewed code holding that key never has to forge or
+withhold anything — it deletes the reviewer's newer `REQUEST-CHANGES`, and what
+is left is a genuine, correctly signed `APPROVE` above a history that looks
+complete. Signature verification cannot see it, because the surviving event is
+real. A completeness proof over the live view cannot see it either: the rows a
+reader never sees are exactly the ones somebody deleted.
 
-| Job | Holds | Runs `sprig` | Decides |
-|---|---|---|---|
-| `evaluate` | CI relay identity | yes | which PR to attempt, and announces it |
-| `authorize` | CI relay identity | no | the reviewer's standing verdict |
-| `merge` | `AUTO_MERGE_TOKEN` | no | every GitHub-side gate, then the write |
+The answer is not a better guard around the binary. Everything the workflow
+asked it to do is a relay read or a relay write, both reachable from
+`POST /query` and `POST /events` behind NIP-98 auth
+(`crates/buzz-relay/src/api/bridge.rs`), using the BIP-340 and NIP-01 code this
+repository already carries for auth tags (`scripts/buzz-mint-auth-tag.py`). So
+the binary is gone. `.github/scripts/pr-auto-merge-relay.py` is the entire
+relay client — pure stdlib, no pip installs, reviewed with the workflow — and
+every `uses:` is pinned to a full-length commit SHA. Nothing in this workflow
+executes code nobody reviewed.
 
-- **The binary cannot reach the merge credential.** `AUTO_MERGE_TOKEN` is
-  exposed to exactly one step, in a job on a fresh runner that never downloads
-  or executes `sprig` and never contacts the relay. A separate job means a
-  separate VM, so nothing the binary wrote to disk or onto `PATH` survives to
-  meet the token. On that runner every `uses:` is pinned to a full-length
-  commit SHA, because a mutable action tag resolving there is third-party code
-  sharing a VM with the credential.
-- **It cannot forge the authorization.** Each message of the standing verdict
-  set is proved in the merge job — NIP-01 id recomputed from the event's own
-  fields, BIP-340 signature checked against the pinned `REVIEWER_PUBKEY` — via
-  `scripts/buzz-mint-auth-tag.py verify-event`, pure stdlib Python selftested
-  against the BIP-340 and NIP-OA spec vectors.
-- **It cannot withhold a revocation.** See below.
-- **It cannot manufacture a gate.** Every GitHub-side fact — state, draft,
-  labels, head, base, mergeability, the file list, the risk floor, the check
-  rollup, the branch ruleset — is re-read and recomputed in the merge job from
-  the API and the in-repo scripts. Nothing is inherited on trust.
-- **It cannot widen the scope.** The head repository and the base branch are
-  compared against `EXPECTED_HEAD_REPO` and `PROTECTED_BASE`, reviewed
-  constants at the top of the workflow. Comparing the live PR against what the
-  evaluate job *expected* would prove only that that job is self-consistent —
-  it chose the expectation.
+| Job | Holds | Decides |
+|---|---|---|
+| `evaluate` | CI relay identity, no merge credential | which PR, and the reviewer's standing verdict |
+| `merge` | `AUTO_MERGE_TOKEN`, no relay access | every GitHub-side gate, then the write |
 
-A disagreement between the jobs is red, not a skip: weather does not reverse a
-proof.
+The split that remains is the credential boundary: the job that can write to
+the repository holds no key that can alter the evidence, and the job that holds
+that key cannot write to the repository. (An earlier revision had a third job,
+to re-read the relay with trusted code while another job ran the binary. With
+no binary there is nothing for it to distrust, and a job whose stated reason
+has been removed is worse than no job at all, so it went with the binary.)
 
-### Why a signature is not enough, and what `authorize` adds
+### What the relay read proves
 
-A BIP-340 signature proves the reviewer authored an event. It cannot prove
-that event is still their **standing** verdict. An untrusted reader can hand
-over a genuine, correctly signed `APPROVE` while silently omitting the newer
-`REQUEST-CHANGES` that revoked it — and that omission is invisible from inside
-the replayed event, so no amount of checking *that event* closes it.
+Not merely that each event is authentic:
 
-The only fix is to do the read again with trusted code, and that turns out to
-need no binary. The relay exposes `POST /query` behind NIP-98 auth
-(`crates/buzz-relay/src/api/bridge.rs`), and `scripts/buzz-mint-auth-tag.py`
-already implements BIP-340 signing and NIP-01 ids in pure stdlib for the
-auth-tag work. `.github/scripts/pr-auto-merge-relay-read.py` joins those two
-facts. It:
+- **Authenticity** — NIP-01 id recomputed from the event's own fields, BIP-340
+  signature checked against the pinned `REVIEWER_PUBKEY`.
+- **Scope** — the `h` tag placing the message in *this* channel. It is inside
+  the signature, so this proves the reviewer published it here, rather than
+  proving the relay says so.
+- **Provenance** — the channel comes from the mirror's own signed kind-30023
+  binding note, never from a caller. There is no membership-scan fallback: a
+  signed note naming the channel is a stronger claim than "a room with the
+  right name that we happen to own".
+- **Completeness** — the relay clamps to NIP-11 `max_limit`, so a *short* page
+  is the relay saying "that is all of them". A full window means history may
+  continue past its edge, and refuses.
+- **Integrity** — no kind-9005 anywhere in the channel. Kind 5 is
+  self-deletion only (plus an agent's owning human), so 9005 is specifically
+  the foreign-redaction primitive; agents delete their own messages routinely,
+  while a moderation delete in a PR channel should never happen. A redaction
+  can hide a message but not the fact that one occurred: deleting the 9005
+  needs another 9005, so one is always visible.
 
-- resolves the PR's channel from the mirror's own signed kind-30023 binding
-  note — it does **not** accept a channel from the evaluate job, so a
-  substituted `sprig` cannot point it at a channel of its choosing;
-- fetches the reviewer's messages in that channel and proves each one:
-  signature, author, and the `h` tag that scopes it to this channel. All three
-  are inside the signature, so this proves the reviewer published the message
-  *here*, not merely that the relay says so;
-- proves **completeness** rather than assuming it. The relay advertises
-  `max_limit: 1000` (NIP-11) and clamps to it, so a *short* page is the relay
-  saying "that is all of them". A full window means history may continue past
-  the edge — which is exactly how an omission could reappear as an accident —
-  so the read refuses instead.
+The merge job then proves every message of that set again before acting, and
+requires the event `evaluate` announced in the channel to be among them.
 
-The merge job then evaluates that set, not one event of somebody else's
-choosing. It also requires the event `evaluate` announced in the PR channel to
-be in the set: if the reviewer posted a correction between the two jobs, the
-announcement no longer describes what would be merged, so the run refuses
-rather than keeping a promise it cannot keep.
-
-**What a substituted `sprig` can still do**, stated plainly: choose which PR is
-attempted. It cannot choose the verdict, the scope, or any GitHub-side fact.
-Attempting a PR the reviewer really has approved, on a head and base that
-really are current, which really does pass every gate, is not an attack — it
-is the feature.
-
-`.github/scripts/pr-auto-merge-revalidate.test.sh` is the contract test for
-the merge job's fence. It *extracts the step's script from the workflow YAML*
+`.github/scripts/pr-auto-merge-revalidate.test.sh` is the contract test for the
+merge job's fence. It *extracts the step's script from the workflow YAML*
 rather than reproducing it, stubs only GitHub, and asserts the outcome for
 every gate — so deleting a gate from the workflow fails the test instead of
 quietly passing it.
+
+## The required check has to be an aggregate
+
+Gate 7 requires the base branch's ruleset to require a status check. Which one
+is not a detail: every real test job in `ci.yml` is path-conditional, so none
+can be required directly — requiring `Rust Lint` would deadlock a docs-only PR
+where it correctly never runs. Naming the always-running jobs instead does not
+work either, because `Detect Changed Paths` finishes *before* the test lanes
+and aggregates nothing. A lane could go red after the merge job read its check
+rollup, and GitHub would still accept the write, because that lane was never
+required.
+
+So `ci.yml` carries one unconditional `CI Complete` job that `needs` every
+other job and fails unless each one succeeded or was legitimately skipped
+(a cancelled lane counts as a failure: "unknown" must not read as "fine").
+Requiring that single context makes every applicable lane required
+transitively.
+
+Two one-line edits could silently undo this — adding a CI job without adding it
+to `needs`, or renaming the job out of step with `REQUIRED_RULESET_CONTEXTS` —
+so `.github/scripts/pr-auto-merge-aggregate.test.py` asserts all three
+properties and runs in `just auto-merge-check`.
 
 ## The path-risk floor
 
@@ -278,12 +284,12 @@ the only honest record.
     an older base, which is exactly the hole gate 3 closes with a read and
     cannot close at the write.
   - required contexts covering every entry of `REQUIRED_RULESET_CONTEXTS` in
-    the workflow — today `Detect Changed Paths` and `Dead Token Reference
-    Guard`. These are the two `ci.yml` jobs that run on **every** PR; the rest
-    are path-conditional, and requiring a context that legitimately does not
-    run would deadlock unrelated PRs. `Detect Changed Paths` is also where the
-    `PR auto-merge contract` step lives, so requiring it puts this feature's
-    own tests behind GitHub's enforcement.
+    the workflow — today the single context `CI Complete`. Do not add the
+    individual lanes: they are path-conditional and requiring one would
+    deadlock any PR where it correctly does not run. `CI Complete` needs them
+    all and fails unless each succeeded or was skipped, so requiring it
+    requires them transitively. See "The required check has to be an
+    aggregate" above.
 
   Both must be on the same rule: strictness from one and the contexts from
   another would still leave those contexts testable against a stale base.

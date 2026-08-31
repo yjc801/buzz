@@ -1295,3 +1295,68 @@ jobs:
           LLAMA_STAGE_BACKEND: metal
           LLAMA_STAGE_BUILD_DIR: ${{ github.workspace }}/.cache/mesh-llama/build-stage-abi-metal
           SKIPPY_LLAMA_AUTO_BUILD: "0"
+
+  # ---------------------------------------------------------------------------
+  # The one context that speaks for all of CI.
+  #
+  # Every job above is path-conditional, so none of them can be a GitHub
+  # required status check: requiring `Rust Lint` would deadlock a docs-only PR
+  # where it legitimately never runs. That left branch protection able to
+  # require only jobs that always run — and the only always-running job,
+  # `Detect Changed Paths`, finishes BEFORE the test lanes and aggregates
+  # nothing. A lane could go red after a merge gate read its rollup and GitHub
+  # would still accept the write, because that lane was never required.
+  #
+  # This job closes that. It is unconditional (`if: always()`, no path filter),
+  # so it always reports; it needs every lane, so it cannot finish before them;
+  # and it fails unless each lane succeeded or was legitimately skipped. Make
+  # THIS the required context and every applicable lane becomes required
+  # transitively.
+  #
+  # `cancelled` is a failure here on purpose: a cancelled lane is a lane whose
+  # result nobody knows, and "unknown" must not read as "fine".
+  #
+  # Adding a job above? Add it to `needs` here too, or its failures stop being
+  # required. The check below is generic, so that list is the only edit.
+  # ---------------------------------------------------------------------------
+  ci-complete:
+    name: CI Complete
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    permissions:
+      contents: read
+    needs:
+      - changes
+      - rust-lint
+      - unit-tests
+      - desktop-core
+      - desktop-smoke-e2e
+      - desktop
+      - desktop-e2e-relay
+      - desktop-e2e-integration-shard
+      - desktop-e2e-integration
+      - backend-integration
+      - relay-e2e
+      - web
+      - mobile
+      - mobile-swift
+      - security
+      - dead-token-guard
+      - server-cross-compile
+      - windows-rust
+      - desktop-build-macos
+    steps:
+      - name: Every applicable lane succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort
+          BAD=$(echo "$RESULTS" | jq -r '
+            [to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key]
+            | join(", ")')
+          if [ -n "$BAD" ]; then
+            echo "::error::CI is not complete — not success/skipped: ${BAD}"
+            exit 1
+          fi
+          echo "All CI lanes succeeded or were skipped."

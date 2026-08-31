@@ -12,54 +12,62 @@ name: buzz-pr-auto-merge
 # max(floor, Alex's RISK) is at most medium, checks are green, and the verdict
 # names the PR's exact current head AND the base it was reviewed against.
 #
-# THREE JOBS, AND THE SPLIT IS THE SECURITY BOUNDARY.
+# NO UNREVIEWED CODE RUNS IN THIS WORKFLOW.
 #
-#   evaluate   Holds the CI relay identity and runs the `sprig` binary
-#              downloaded from block/buzz's rolling `sprig-latest` release.
-#              Holds NO merge credential. Picks a candidate PR, announces
-#              intent in its channel, and hands the number on. Nothing it
-#              concludes is trusted by either job below.
-#   authorize  Holds the CI relay identity. Runs NO downloaded binary and
-#              holds no merge credential. Establishes the reviewer's STANDING
-#              verdict by reading the relay itself, with code from this
-#              repository.
-#   merge      Fresh runner. No relay, no downloaded binary. Holds
-#              AUTO_MERGE_TOKEN, and re-derives every GitHub-side gate for
-#              itself from the API and the in-repo scripts.
+# Earlier revisions reached the relay through `buzz`, from block/buzz's rolling
+# `sprig-latest` release, and tried to contain it: put it in a job with no merge
+# credential, prove the verdict event's signature afterwards. That containment
+# was not enough, and the reason is worth stating because it is not obvious.
 #
-# WHY `authorize` EXISTS, SEPARATELY FROM THE SIGNATURE CHECK. A BIP-340
-# signature proves the reviewer authored an event. It cannot prove that event
-# is still their standing verdict, because an untrusted reader can simply omit
-# the newer REQUEST-CHANGES that revoked an approval and hand over the approval
-# it corrected. That omission is invisible from inside the replayed event, so
-# no amount of checking THAT event closes it. The only fix is to do the read
-# again with trusted code — which turns out to need no binary at all. The relay
-# exposes POST /query behind NIP-98 auth, and scripts/buzz-mint-auth-tag.py
-# already implements BIP-340 and NIP-01 ids in pure stdlib for the auth-tag
-# work. .github/scripts/pr-auto-merge-relay-read.py is those two facts joined:
-# it resolves the PR's channel from the mirror's own signed binding note (it
-# does NOT accept a channel from the evaluate job), fetches the reviewer's
-# messages, and proves each one — signature, author, and the `h` tag that puts
-# it in this channel, all of which are inside the signature. Completeness is
-# proved rather than assumed: the relay advertises max_limit 1000 and the read
-# refuses unless it gets a SHORT page back, because a full window might have
-# more history past its edge.
+# The CI identity OWNS every PR channel. A channel owner may kind-9005 delete
+# any message in it, not merely their own (side_effects.rs, "event author OR
+# channel owner/admin"); the delete is soft (`deleted_at = NOW()`) and every
+# query path appends `deleted_at IS NULL`. So unreviewed code holding that key
+# does not need to forge anything or withhold anything — it deletes the
+# reviewer's newer REQUEST-CHANGES, and what remains is a genuine, correctly
+# signed APPROVE and a history that looks complete. Signature verification
+# cannot see that, because the surviving event is real.
 #
-# So a substituted `sprig` can still choose WHICH PR is attempted. It cannot
-# choose the verdict: the standing verdict for that PR is selected by this
-# repository's own parser over this repository's own fresh read, and every
-# GitHub-side fact about that PR is re-derived in the merge job from reviewed
-# constants rather than from anything the evaluate job said. Choosing a PR that
-# the reviewer really has approved, on a head and base that really are current,
-# which really does pass every gate, is not an attack — it is the feature.
+# The answer is not a better guard around the binary. Everything the workflow
+# asked it to do is a relay read or a relay write, and both are reachable from
+# `POST /query` and `POST /events` behind NIP-98 auth, using BIP-340 code this
+# repository already has for auth tags. So the binary is gone:
+# .github/scripts/pr-auto-merge-relay.py is the whole relay client, pure
+# stdlib, reviewed with this workflow. Every `uses:` is likewise pinned to a
+# full-length commit SHA. Nothing here executes code nobody reviewed.
 #
-# `sprig-latest` is rebuilt on every push to block/buzz main, so its checksum
-# asset moves with it and pinning a reviewed digest would fail red on every
-# upstream push. That is why the binary is kept off the authorization path
-# entirely rather than pinned. Actions, by contrast, ARE pinned: every `uses:`
-# here names a full-length commit SHA, because a mutable tag on the runner that
-# later exports AUTO_MERGE_TOKEN is third-party code with access to the
-# credential.
+# TWO JOBS, AND THE SPLIT IS THE CREDENTIAL BOUNDARY.
+#
+#   evaluate  Holds the CI relay identity. Holds NO merge credential. Picks a
+#             candidate, establishes the reviewer's standing verdict, announces
+#             intent in the PR channel, hands the verdict set on.
+#   merge     Fresh runner, no relay access and no relay key. Holds
+#             AUTO_MERGE_TOKEN, and re-derives every GitHub-side gate for
+#             itself from the API, this repository's scripts, and the reviewed
+#             constants below — nothing is inherited on trust.
+#
+# (An earlier revision had a third job to re-read the relay with trusted code
+# while the first job ran the binary. With no binary there is nothing for it to
+# distrust, and a job whose stated reason has been removed is worse than no job
+# at all, so it is gone with the binary.)
+#
+# WHAT THE RELAY READ PROVES. Not just that each event is authentic:
+#
+#   authenticity  NIP-01 id recomputed from the event's own fields, BIP-340
+#                 signature checked against the pinned REVIEWER_PUBKEY.
+#   scope         the `h` tag putting the message in THIS channel — inside the
+#                 signature, so the reviewer published it here.
+#   provenance    the channel comes from the mirror's own signed binding note,
+#                 never from a caller. There is no membership-scan fallback.
+#   completeness  the relay clamps to NIP-11 max_limit, so a SHORT page is the
+#                 relay saying "that is all of them". A full window refuses.
+#   integrity     no kind-9005 in the channel. Completeness over the live view
+#                 is not completeness over the history — the rows a reader
+#                 never sees are exactly the ones somebody deleted. Kind 5 is
+#                 self-deletion, so 9005 is specifically the foreign-redaction
+#                 primitive and its presence is a refusal. A redaction can hide
+#                 a message but not that one happened: deleting the 9005 takes
+#                 another 9005, so one is always visible.
 #
 # THE MERGE USES AUTO_MERGE_TOKEN (owner fine-grained PAT), NEVER THE DEFAULT
 # GITHUB_TOKEN. A GITHUB_TOKEN-authored merge pushes to main without
@@ -77,7 +85,7 @@ name: buzz-pr-auto-merge
 # mergeable UNKNOWN) degrades to "don't merge this tick", which is already the
 # safe action, so those paths warn and stay green for the next tick to retry.
 # Red is reserved for faults a rerun cannot fix (bad secrets, identity-pin
-# mismatch, sprig checksum, classifier or parser crash), for content that
+# mismatch, classifier or parser crash), for content that
 # fails a PROOF rather than merely failing to arrive (an event signed by the
 # wrong key, scoped to the wrong channel, or duplicated on an addressable
 # coordinate), for a merge-job revalidation that CONTRADICTS the evaluate job,
@@ -124,18 +132,23 @@ env:
   # picked the expectation. The merge job compares the live PR against these.
   EXPECTED_HEAD_REPO: yjc801/buzz
   PROTECTED_BASE: main
-  # Check contexts the base branch's GitHub ruleset must require, so that the
+  # The check context the base branch's GitHub ruleset must require, so the
   # gates below are enforced by GitHub at the moment of the write rather than
-  # by a read of ours with a window after it. These two CI jobs are the ones
-  # that run on EVERY pull request — the rest of ci.yml is path-conditional,
-  # and requiring a context that legitimately does not run would deadlock
-  # unrelated PRs. "Detect Changed Paths" is also where the "PR auto-merge
-  # contract" step lives, so requiring it puts this feature's own tests behind
-  # GitHub's enforcement.
-  REQUIRED_RULESET_CONTEXTS: "Detect Changed Paths,Dead Token Reference Guard"
-  # One relay for both reading jobs. `buzz` accepts the https form and the
-  # authorize job's reader normalizes ws/wss to it, so a single constant serves
-  # the CLI and the NIP-98 HTTP bridge alike.
+  # by a read of ours with a window after it.
+  #
+  # Exactly one context, and it is an AGGREGATE. Every real test job in ci.yml
+  # is path-conditional, so none can be required directly — requiring `Rust
+  # Lint` would deadlock a docs-only PR where it correctly never runs. Naming
+  # the always-running jobs instead does not work either: `Detect Changed
+  # Paths` finishes BEFORE the test lanes and aggregates nothing, so a lane
+  # going red after our rollup read would leave both required contexts green
+  # and GitHub would accept the write. `CI Complete` needs every lane and
+  # fails unless each succeeded or was skipped, which makes them all required
+  # transitively. Kept in step with the job by
+  # .github/scripts/pr-auto-merge-aggregate.test.py.
+  REQUIRED_RULESET_CONTEXTS: "CI Complete"
+  # The relay's HTTP origin. The client normalizes ws/wss to https, so this
+  # may be written either way.
   BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
   # Same pinned CI identity as buzz-pr-mirror.yml, for the same reason: every
   # relay read is scoped to the key we hold, so a rotated key would see an
@@ -145,8 +158,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # evaluate — relay identity and the downloaded binary live here, and nothing
-  # that can write to the repository does.
+  # evaluate — the relay identity lives here, and nothing that can write to
+  # the repository does. Every line it runs is in this repository.
   # ---------------------------------------------------------------------------
   evaluate:
     if: github.repository == 'yjc801/buzz'
@@ -161,6 +174,7 @@ jobs:
       risk: ${{ steps.sweep.outputs.risk }}
       effective: ${{ steps.sweep.outputs.effective }}
       event_id: ${{ steps.sweep.outputs.event_id }}
+      verdict_events: ${{ steps.sweep.outputs.verdict_events }}
     steps:
       # Before checkout so a no-candidate tick costs a single API call.
       - name: List candidate PRs
@@ -187,20 +201,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # No secrets are in scope for this step, and none may be added to it:
-      # it is the step that fetches unreviewed third-party code.
-      - name: Install buzz CLI (sprig multicall)
-        if: steps.candidates.outputs.count != '0'
-        run: |
-          URL=https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz
-          curl -fsSL -o sprig.tar.gz "$URL"
-          curl -fsSL -o sprig.sha256 "$URL.sha256"
-          sed 's|  .*|  sprig.tar.gz|' sprig.sha256 | sha256sum -c -
-          echo "sprig sha256 (provenance): $(cut -c1-64 sprig.sha256)"
-          mkdir -p "$HOME/.sprig" && tar -xzf sprig.tar.gz -C "$HOME/.sprig"
-          ln -s "$HOME/.sprig/sprig" "$HOME/.sprig/buzz"
-          echo "$HOME/.sprig" >> "$GITHUB_PATH"
-
       - name: Evaluate
         id: sweep
         if: steps.candidates.outputs.count != '0'
@@ -214,7 +214,6 @@ jobs:
           R="$GITHUB_REPOSITORY"
           TMP="$RUNNER_TEMP"
           ERRFILE=$(mktemp)
-          MEMBER_SCAN_LIMIT=2000
 
           DRY="${DRY_RUN_INPUT:-false}"
           if [ "$DRY" != "true" ] && [ "$HAVE_MERGE_TOKEN" != "true" ]; then
@@ -242,129 +241,75 @@ jobs:
             decision "$1" "SKIP (unproven: $2)"
           }
 
-          # --- Channel resolution, ported from buzz-pr-mirror.yml (read-only
-          # subset: no create, no write_binding). Same status discipline: an
-          # empty result means PROVABLY absent; failure is non-zero, checked
-          # at every call site, never inferred from empty output.
+          # --- Relay access. Every call below goes through the repository's own
+          # client (.github/scripts/pr-auto-merge-relay.py) — pure stdlib over
+          # the relay's NIP-98 HTTP bridge, no downloaded binary anywhere in
+          # this workflow. That is not a style preference: this step holds the
+          # CI signing key, the CI identity OWNS every PR channel, and a
+          # channel owner can kind-9005 delete any message in one. Unreviewed
+          # code with that key could redact the reviewer's newer
+          # REQUEST-CHANGES and leave a genuine, correctly signed APPROVE as
+          # the apparent standing verdict. So there is no unreviewed code.
+          #
+          # Exit codes are the same everywhere: 0 ok, 1 a proof failed (fault,
+          # red), 2 caller bug, 3 provably absent, 4 unprovable (weather).
 
-          read_binding() {
-            local SLUG="$1" OUT STATUS=0
-            OUT=$(buzz notes get --name "$SLUG" --author me --content-only 2>"$ERRFILE") \
-              || STATUS=$?
-            if [ "$STATUS" -eq 0 ]; then
-              printf '%s' "$OUT" | tr -d '[:space:]'
+          relay() {
+            python3 .github/scripts/pr-auto-merge-relay.py "$@"
+          }
+
+          # Exit 4 is weather: no verdict this tick, retry the next one. Exit 1
+          # is content that ARRIVED and failed a proof — a forged binding note,
+          # a message scoped to another channel, or a kind-9005 redaction of
+          # this PR's history. A rerun cannot fix any of those, and a warning
+          # on a cron run reaches nobody, so they go red. Called after every
+          # relay read that can fail; the caller has already skipped by then.
+          relay_status() {
+            local N="$1" STATUS="$2" WHAT="$3"
+            if [ "$STATUS" -eq 4 ]; then
+              warn_skip "$N" "$WHAT (relay unprovable this tick)"
               return 0
             fi
-            if [ "$STATUS" -eq 1 ] && grep -q '"error":"not_found"' "$ERRFILE"; then
-              return 0
-            fi
-            echo "binding lookup failed (exit $STATUS): $(cat "$ERRFILE")" >&2
+            echo "::error::PR #$N: $WHAT — the relay returned content that failed a proof (exit $STATUS). See the step log; this is a bug or an attack, not weather."
             return 1
           }
 
-          channel_roster() {
-            buzz channels members --channel "$1"
-          }
-
-          ci_owns() {
-            local ROSTER
-            ROSTER=$(channel_roster "$1") || return 2
-            printf '%s' "$ROSTER" | jq -e --arg ci "$CI_PUB" \
-              'any(.[]?; .pubkey == $ci and .role == "owner")' >/dev/null || return 1
-            return 0
-          }
-
-          resolve_by_membership() {
-            local NAME="$1" LIST N COUNT I CH
-            LIST=$(buzz channels list --member --limit "$MEMBER_SCAN_LIMIT") || {
-              echo "membership listing failed" >&2
-              return 1
-            }
-            N=$(printf '%s' "$LIST" | jq 'length') || return 1
-            if [ "$N" -ge "$MEMBER_SCAN_LIMIT" ]; then
-              echo "membership listing filled its window ($N) — absence unproven" >&2
-              return 1
-            fi
-            COUNT=$(printf '%s' "$LIST" | jq --arg n "$NAME" '[.[] | select(.name == $n)] | length') || return 1
-            I=0
-            while [ "$I" -lt "$COUNT" ]; do
-              CH=$(printf '%s' "$LIST" | jq -r --arg n "$NAME" --argjson i "$I" \
-                '[.[] | select(.name == $n)][$i].channel_id') || return 1
-              ci_owns "$CH"
-              case "$?" in
-                0) printf '%s' "$CH"; return 0 ;;
-                1) echo "ignoring #${NAME} room $CH — not owned by this CI identity" >&2 ;;
-                *) echo "roster read failed for $CH" >&2; return 1 ;;
-              esac
-              I=$((I + 1))
-            done
-          }
-
+          # The channel, from the mirror's own signed binding note. There is
+          # deliberately no membership-scan fallback any more: the note is
+          # signed by the CI identity and names the channel, which is a
+          # stronger claim than "a room with the right name that we own".
           resolve_channel() {
-            local N="$1" SLUG BOUND
-            SLUG=$(printf 'pr-mirror-%s-%s' "$R" "$N" | tr '[:upper:]' '[:lower:]' | tr '/' '-')
-            BOUND=$(read_binding "$SLUG") || return 1
-            if [ -z "$BOUND" ]; then
-              resolve_by_membership "buzz-pr-${N}"
-              return $?
-            fi
-            printf '%s' "$BOUND" \
-              | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || {
-              echo "binding note holds '${BOUND}', not a channel UUID" >&2
-              return 1
-            }
-            printf '%s' "$BOUND"
+            local N="$1" OUT STATUS=0
+            OUT=$(relay channel --repo "$R" --pr "$N" --ci-pubkey "$EXPECTED_CI_PUBKEY" 2>"$ERRFILE") \
+              || STATUS=$?
+            case "$STATUS" in
+              0) printf '%s' "$OUT"; return 0 ;;
+              3) return 0 ;;
+              *) cat "$ERRFILE" >&2; return "$STATUS" ;;
+            esac
           }
 
-          # Newest-first history walk, accumulated into one JSON array. Stops
-          # as soon as a reviewer VERDICT-bearing message is in hand (page 1
-          # in practice — pages are time-ordered, so the newest such message
-          # cannot be on a later page), on an empty page, or at 5 pages.
-          # Same stall-guard as the mirror: a full page of one timestamp
-          # steps the cursor back one second rather than terminating. That
-          # guard re-reads a second of history, so the accumulated array can
-          # repeat events; the parser deduplicates by id.
+          # The reviewer's history in that channel: every event signature-
+          # verified, proved to carry the channel's h tag, proved complete
+          # (a short page), and proved un-redacted (no kind-9005 present).
           fetch_verdict_events() {
-            local CH="$1" BEFORE="" PAGE COUNT OLDEST ALL="[]" PAGES=0
-            while [ "$PAGES" -lt 5 ]; do
-              if [ -z "$BEFORE" ]; then
-                PAGE=$(buzz messages get --channel "$CH" --limit 200) || return 1
-              else
-                PAGE=$(buzz messages get --channel "$CH" --limit 200 --before "$BEFORE") || return 1
-              fi
-              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
-              ALL=$(printf '%s' "$PAGE" | jq --argjson acc "$ALL" '$acc + [(.messages? // .)[]?]') || return 1
-              [ "$COUNT" -eq 0 ] && break
-              if printf '%s' "$ALL" | jq -e --arg r "$REVIEWER_PUBKEY" \
-                '[.[] | select(.pubkey == $r and (.content | test("(^|\\n)VERDICT:")))] | length > 0' >/dev/null; then
-                break
-              fi
-              OLDEST=$(printf '%s' "$ALL" | jq -r '[.[].created_at] | min') || return 1
-              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
-                BEFORE=$((OLDEST - 1))
-              else
-                BEFORE="$OLDEST"
-              fi
-              PAGES=$((PAGES + 1))
-            done
-            printf '%s' "$ALL"
+            relay events --channel "$1" --author "$REVIEWER_PUBKEY"
           }
 
-          # One notice per (PR, head): dedup by scanning recent CI-authored
-          # messages for the marker. A failed dedup read skips the post
+          # One notice per (PR, head): dedup by scanning this identity's own
+          # recent messages for the marker. A failed dedup read skips the post
           # (warn) — a missing notice is recoverable, a spammed channel is
           # noise forever.
           post_blocked_notice() {
-            local CH="$1" HEAD="$2" REASONS="$3" URL="$4" PAGE MARKER
+            local CH="$1" HEAD="$2" REASONS="$3" URL="$4" MINE MARKER
             MARKER="⛔ auto-merge blocked at ${HEAD}"
-            PAGE=$(buzz messages get --channel "$CH" --limit 200) || return 1
-            if printf '%s' "$PAGE" | jq -e --arg ci "$CI_PUB" --arg m "$MARKER" \
-              '[(.messages? // .)[]? | select(.pubkey == $ci and (.content | contains($m)))] | length > 0' \
-              >/dev/null; then
+            MINE=$(relay events --channel "$CH" --author "$CI_PUB") || return 1
+            if printf '%s' "$MINE" | jq -e --arg m "$MARKER" \
+              '[.[] | select(.content | contains($m))] | length > 0' >/dev/null; then
               return 0
             fi
             printf '%s\n%s\n%s\n' "$MARKER" "$REASONS" "$URL" \
-              | buzz messages send --channel "$CH" --content -
+              | relay send --channel "$CH" >/dev/null
           }
 
           for N in $(jq -r 'sort | .[]' "$TMP/candidates.json"); do
@@ -434,18 +379,22 @@ jobs:
               FLOOR_NOTE=$(printf '%s\n' "$RISK_OUT" | awk -F'\t' -v t="$FLOOR" 'NR>1 && $1==t {print $3 " (" $2 ")"; exit}')
             fi
 
-            CH=$(resolve_channel "$N") || {
-              warn_skip "$N" "channel resolution failed"
+            CH_STATUS=0
+            CH=$(resolve_channel "$N") || CH_STATUS=$?
+            if [ "$CH_STATUS" -ne 0 ]; then
+              relay_status "$N" "$CH_STATUS" "channel resolution failed" || exit 1
               continue
-            }
+            fi
             if [ -z "$CH" ]; then
               decision "$N" "SKIP (no PR channel — mirror has not run yet)"
               continue
             fi
-            EVENTS=$(fetch_verdict_events "$CH") || {
-              warn_skip "$N" "relay history read failed"
+            EV_STATUS=0
+            EVENTS=$(fetch_verdict_events "$CH") || EV_STATUS=$?
+            if [ "$EV_STATUS" -ne 0 ]; then
+              relay_status "$N" "$EV_STATUS" "reviewer history could not be proved" || exit 1
               continue
-            }
+            fi
             if ! VERDICT_JSON=$(printf '%s' "$EVENTS" \
               | node .github/scripts/pr-auto-merge-verdict.js \
                   --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" \
@@ -521,9 +470,30 @@ jobs:
             # what this job knows — the merge job re-checks every gate and may
             # still refuse, and a message claiming a merge that did not happen
             # is worse than one that says "if they still hold".
+            # The standing verdict set, narrowed by the same selection the
+            # parser uses, is what crosses into the merge job — that job
+            # re-proves every signature rather than taking this one's word.
+            # A tie is carried across intact so the merge job composes it
+            # exactly as decide() does, rather than receiving a winner.
+            VERDICT_EVENTS=$(printf '%s' "$EVENTS" \
+              | node .github/scripts/pr-auto-merge-verdict.js \
+                  --reviewer "$REVIEWER_PUBKEY" --select) || {
+              echo "::error::verdict selection failed for PR #$N — this is a bug, not weather"
+              exit 1
+            }
+            # A job output is capped at 1 MB and the relay accepts messages up
+            # to 512 KB, so a tie of two long ones could overrun it. A
+            # truncated array would fail the merge job's proof as a parse
+            # error rather than for the real reason, so say the real reason.
+            BYTES=$(printf '%s' "$VERDICT_EVENTS" | wc -c | tr -d ' ')
+            if [ "$BYTES" -gt 524288 ]; then
+              warn_skip "$N" "standing verdict set is ${BYTES} bytes, too large to hand over"
+              continue
+            fi
+
             printf '⏩ auto-merge authorized for %s — verdict event %s: VERDICT APPROVE, RISK %s, floor %s, effective %s. Merging now if the final gates still hold.\n%s\n' \
               "$HEAD_SHA" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$PR_URL" \
-              | buzz messages send --channel "$CH" --content - || {
+              | relay send --channel "$CH" >/dev/null || {
               warn_skip "$N" "intent message send failed"
               continue
             }
@@ -537,98 +507,13 @@ jobs:
               echo "risk=$RISK"
               echo "effective=$EFFECTIVE"
               echo "event_id=$EVENT_ID"
+              echo "verdict_events=$VERDICT_EVENTS"
             } >> "$GITHUB_OUTPUT"
             decision "$N" "AUTHORIZED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR}) — handing to the merge job"
             # One merge per run: everything evaluated after a merge would be
             # judged against a main no gate observed. The next tick re-sweeps.
             break
           done
-
-  # ---------------------------------------------------------------------------
-  # authorize — establishes the reviewer's STANDING verdict, using only code
-  # that lives in this repository. Holds the relay identity; holds no merge
-  # credential and performs no GitHub write of any kind.
-  #
-  # This job is the answer to "a signature proves authorship, not standing".
-  # It does not take the channel, the events, or the decision from the evaluate
-  # job — only the PR number, which it turns into a channel itself via the
-  # mirror's signed binding note. If the evaluate job's binary were substituted,
-  # everything it produced except that number would be ignored here.
-  # ---------------------------------------------------------------------------
-  authorize:
-    needs: evaluate
-    if: needs.evaluate.outputs.pr != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      verdict_events: ${{ steps.standing.outputs.verdict_events }}
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-
-      - name: Read the standing verdict
-        id: standing
-        env:
-          PR: ${{ needs.evaluate.outputs.pr }}
-          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
-          BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
-        run: |
-          STATUS=0
-          READ=$(python3 .github/scripts/pr-auto-merge-relay-read.py standing-verdict \
-            --repo "$GITHUB_REPOSITORY" --pr "$PR" \
-            --ci-pubkey "$EXPECTED_CI_PUBKEY" --reviewer "$REVIEWER_PUBKEY") || STATUS=$?
-
-          # 3 = the mirror has not written a binding note yet; 4 = the relay did
-          # not answer, or answered with a window too full to prove complete.
-          # Both mean "no verdict established this tick", which is already the
-          # safe outcome, so they warn and stay green for the next tick.
-          case "$STATUS" in
-            0) ;;
-            3|4)
-              echo "::warning::PR #$PR: no standing verdict established this tick (exit $STATUS) — not merging"
-              echo "- PR #$PR: SKIP (standing verdict not established)" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-              ;;
-            *)
-              # Not weather: an event that arrived and failed a proof. Signed by
-              # the wrong key, scoped to another channel, or a duplicate on an
-              # addressable coordinate. A rerun cannot fix any of those.
-              echo "::error::PR #$PR: the relay read produced content that failed a proof (exit $STATUS)"
-              exit 1
-              ;;
-          esac
-
-          CHANNEL=$(jq -r .channel <<<"$READ")
-          echo "resolved #buzz-pr-${PR} to ${CHANNEL} from the mirror's binding note"
-
-          # Narrow the proved history to the messages that could be the standing
-          # verdict, with the same selection decide() uses. Head, base and floor
-          # are deliberately not applied here — those are GitHub facts, and the
-          # merge job derives them itself.
-          EVENTS=$(jq -c .events <<<"$READ" \
-            | node .github/scripts/pr-auto-merge-verdict.js --reviewer "$REVIEWER_PUBKEY" --select) || {
-            echo "::error::verdict selection failed for PR #$PR — this is a bug, not weather"
-            exit 1
-          }
-          COUNT=$(jq 'length' <<<"$EVENTS")
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::warning::PR #$PR: the reviewer has published no verdict trailer in ${CHANNEL} — not merging"
-            echo "- PR #$PR: SKIP (no verdict trailer in the channel)" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          # A job output is capped (1 MB), and the relay accepts messages up
-          # to 512 KB, so a tie of two long ones could overrun it. A truncated
-          # JSON array would fail the merge job's proof — but as a parse error
-          # rather than as the real reason — so say the real reason here.
-          BYTES=$(printf '%s' "$EVENTS" | wc -c | tr -d ' ')
-          if [ "$BYTES" -gt 524288 ]; then
-            echo "::warning::PR #$PR: the standing verdict set is ${BYTES} bytes, too large to hand over — not merging"
-            echo "- PR #$PR: SKIP (standing verdict set too large: ${BYTES} bytes)" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          echo "standing verdict: ${COUNT} message(s) at the newest created_at, ${BYTES} bytes"
-          echo "verdict_events=$EVENTS" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # merge — holds the owner PAT. Fresh runner, no relay, no downloaded binary,
@@ -643,8 +528,8 @@ jobs:
   # job, and is proved again here rather than taken on that job's word.
   # ---------------------------------------------------------------------------
   merge:
-    needs: [evaluate, authorize]
-    if: needs.evaluate.outputs.pr != '' && needs.authorize.outputs.verdict_events != ''
+    needs: evaluate
+    if: needs.evaluate.outputs.pr != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -664,7 +549,7 @@ jobs:
           EXPECTED_BASE_TIP: ${{ needs.evaluate.outputs.base_tip }}
           EXPECTED_FLOOR: ${{ needs.evaluate.outputs.floor }}
           EXPECTED_EVENT_ID: ${{ needs.evaluate.outputs.event_id }}
-          VERDICT_EVENTS: ${{ needs.authorize.outputs.verdict_events }}
+          VERDICT_EVENTS: ${{ needs.evaluate.outputs.verdict_events }}
         run: |
           R="$GITHUB_REPOSITORY"
           TMP="$RUNNER_TEMP"

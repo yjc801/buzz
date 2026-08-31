@@ -157,8 +157,7 @@ JSON
   {"type": "deletion"},
   {"type": "required_status_checks",
    "parameters": {"strict_required_status_checks_policy": true,
-                  "required_status_checks": [{"context": "Detect Changed Paths"},
-                                             {"context": "Dead Token Reference Guard"},
+                  "required_status_checks": [{"context": "CI Complete"},
                                              {"context": "DCO"}]}}
 ]
 JSON
@@ -192,7 +191,7 @@ run_fence() {
   EXPECTED_EVENT_ID="${ANNOUNCED_ID:-$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')}" \
   EXPECTED_HEAD_REPO=yjc801/buzz \
   PROTECTED_BASE=main \
-  REQUIRED_RULESET_CONTEXTS="Detect Changed Paths,Dead Token Reference Guard" \
+  REQUIRED_RULESET_CONTEXTS="CI Complete" \
   VERDICT_EVENTS="${VERDICT_EVENTS:-$(verdict_set "$VERDICT_EVENT")}" \
     bash -e "$WORK/revalidate.sh" > "$WORK/stdout" 2>&1
   echo "$?"
@@ -322,7 +321,7 @@ r = json.load(open(sys.argv[1]))
 r[1]["parameters"]["required_status_checks"] = [{"context": "Detect Changed Paths"}]
 json.dump(r, open(sys.argv[1], "w"))
 ' "$FIXTURES/rules.json"
-expect "strict rule covers only some of the required contexts" refuse
+expect "strict rule requires a real context that is not the aggregate" refuse
 
 # One rule may not supply strictness while a different one supplies the
 # contexts: the contexts would still be testable against a stale base.
@@ -334,8 +333,7 @@ r[1]["parameters"] = {"strict_required_status_checks_policy": True,
                       "required_status_checks": [{"context": "DCO"}]}
 r.append({"type": "required_status_checks",
           "parameters": {"strict_required_status_checks_policy": False,
-                         "required_status_checks": [{"context": "Detect Changed Paths"},
-                                                    {"context": "Dead Token Reference Guard"}]}})
+                         "required_status_checks": [{"context": "CI Complete"}]}})
 json.dump(r, open(sys.argv[1], "w"))
 ' "$FIXTURES/rules.json"
 expect "strictness and contexts split across two rules" refuse

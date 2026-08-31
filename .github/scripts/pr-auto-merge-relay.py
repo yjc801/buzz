@@ -50,6 +50,13 @@ Commands:
       `channel` then `events` for the reviewer, as {"channel":…, "events":[…]}.
   send --channel <uuid>
       Publish a kind-9 message with the content on stdin. Prints the event id.
+      Top-level and unthreaded, with no `p` tags — which is right for the
+      workflow's own channel notices ("blocked at <sha>", "merging now") and
+      wrong for anything conversational. A reply needs an `e` tag and a
+      mention needs a `p` tag; neither is modelled here, because this client
+      exists to serve one workflow rather than to be a second CLI. Use
+      `buzz messages send --reply-to --mention` for anything a human reads
+      as part of a conversation.
   selftest
       Verify the parsing/proof/signing helpers against fixtures. No network.
 

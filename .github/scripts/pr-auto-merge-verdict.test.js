@@ -138,7 +138,7 @@ test("parseArgs validates its inputs", () => {
   assert.throws(() => parseArgs(argv({ "--base": "nope" })), /--base/);
   assert.throws(() => parseArgs(["--reviewer", REVIEWER, "--head", HEAD, "--floor", "medium"]), /--base/);
   assert.throws(() => parseArgs(argv({ "--floor": "extreme" })), /--floor/);
-  assert.deepEqual(parseArgs(argv()), { reviewer: REVIEWER, head: HEAD, base: BASE, floor: "medium" });
+  assert.deepEqual(parseArgs(argv()), { reviewer: REVIEWER, head: HEAD, base: BASE, floor: "medium", select: false });
 });
 
 // --- Same-second corrections -------------------------------------------
@@ -250,4 +250,62 @@ test("an unrelated merge-base value does not authorize", () => {
 test("the head check still runs before the base check", () => {
   const result = decide([verdictMessage({ head: OLD_HEAD, base: OLD_BASE })], opts());
   assert.match(result.reason, /^stale: reviewed 2+/);
+});
+
+// --- --select: what the authorize job hands the merge job ---------------
+// The authorize job reads the relay with trusted in-repo code and narrows the
+// channel's reviewer history to the standing verdict. It deliberately does NOT
+// evaluate: head, base and floor are GitHub facts the merge job derives for
+// itself, so parseArgs must not demand them here.
+
+test("--select parses without head, base or floor", () => {
+  const parsed = parseArgs(["--reviewer", REVIEWER, "--select"]);
+  assert.deepEqual(parsed, { reviewer: REVIEWER, select: true });
+});
+
+test("--select still requires a well-formed reviewer pubkey", () => {
+  assert.throws(() => parseArgs(["--reviewer", "nope", "--select"]), /64-hex pubkey/);
+});
+
+test("the evaluating form still requires head, base and floor", () => {
+  assert.throws(() => parseArgs(["--reviewer", REVIEWER, "--head", HEAD, "--base", BASE]), /--floor/);
+  const parsed = parseArgs(["--reviewer", REVIEWER, "--head", HEAD, "--base", BASE, "--floor", "low"]);
+  assert.equal(parsed.select, false);
+});
+
+test("selection hands over the newest verdict, not an older approval", () => {
+  // The Round 2 attack, at the layer that stops it: whatever an untrusted
+  // reader would rather hand over, selection over the full history returns the
+  // correction, and the merge job refuses on it.
+  const approval = verdictMessage({ createdAt: 1000, id: "f".repeat(64) });
+  const correction = verdictMessage({
+    createdAt: 1001,
+    id: "0".repeat(64),
+    verdict: "REQUEST-CHANGES",
+    autoMerge: "no",
+  });
+  for (const order of [[approval, correction], [correction, approval]]) {
+    const selected = selectVerdictMessages(order, REVIEWER);
+    assert.deepEqual(selected.map((e) => e.id), ["0".repeat(64)]);
+    assert.equal(decide(selected, opts()).authorized, false);
+  }
+});
+
+test("selection keeps every message of a tie, so the merge job sees the disagreement", () => {
+  const approval = verdictMessage({ createdAt: 1000, id: "f".repeat(64) });
+  const correction = verdictMessage({
+    createdAt: 1000,
+    id: "0".repeat(64),
+    verdict: "REQUEST-CHANGES",
+    autoMerge: "no",
+  });
+  const selected = selectVerdictMessages([approval, correction], REVIEWER);
+  assert.equal(selected.length, 2);
+  assert.equal(decide(selected, opts()).authorized, false);
+});
+
+test("selection drops messages that are not the reviewer's", () => {
+  const mine = verdictMessage({ createdAt: 1000 });
+  const theirs = verdictMessage({ createdAt: 2000, pubkey: OTHER });
+  assert.deepEqual(selectVerdictMessages([mine, theirs], REVIEWER).map((e) => e.content), [mine.content]);
 });

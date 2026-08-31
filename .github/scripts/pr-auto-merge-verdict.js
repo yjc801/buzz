@@ -10,9 +10,19 @@
 //         caller's paging stall-guard re-reads a second of history).
 // args:   --reviewer <64-hex pubkey> --head <40-hex sha>
 //         --base <40-hex sha> --floor low|medium|high
-// stdout: one JSON object (see shape below).
+//   or:   --reviewer <64-hex pubkey> --select
+// stdout: one JSON object (see shape below), or with --select the JSON array
+//         of the reviewer's newest-tied verdict messages and nothing else.
 // exit:   0 whenever a decision was produced (including "no"); 2 on bad
 //         usage or unparseable input — a caller bug, never a quiet "no".
+//
+// --select exists for the authorize job (docs/pr-auto-merge.md): that job
+// reads the relay with trusted in-repo code and must hand the merge job the
+// STANDING verdict rather than a verdict of somebody else's choosing. It
+// narrows a channel's reviewer history to the messages that could be the
+// standing verdict, using exactly the selection decide() would use, without
+// evaluating them — head, base and floor are the merge job's to supply, from
+// GitHub, and are deliberately not knowable here.
 //
 // Selection is BROAD, evaluation is STRICT — and selection never continues
 // past the newest verdict-bearing message. The newest reviewer-authored
@@ -199,10 +209,18 @@ function decide(events, { reviewer, head, base, floor }) {
 
 function parseArgs(argv) {
   const args = {};
-  for (let i = 0; i < argv.length; i += 2) {
-    args[argv[i]] = argv[i + 1];
+  const select = argv.includes("--select");
+  const positional = argv.filter((a) => a !== "--select");
+  for (let i = 0; i < positional.length; i += 2) {
+    args[positional[i]] = positional[i + 1];
   }
   const reviewer = args["--reviewer"];
+  if (select) {
+    if (!/^[0-9a-f]{64}$/.test(reviewer ?? "")) {
+      throw new Error("--reviewer must be a 64-hex pubkey");
+    }
+    return { reviewer, select: true };
+  }
   const head = args["--head"];
   const base = args["--base"];
   const floor = args["--floor"];
@@ -218,7 +236,7 @@ function parseArgs(argv) {
   if (!TIERS.includes(floor ?? "")) {
     throw new Error("--floor must be low|medium|high");
   }
-  return { reviewer, head, base, floor };
+  return { reviewer, head, base, floor, select: false };
 }
 
 function readEvents(raw) {
@@ -233,7 +251,8 @@ function readEvents(raw) {
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const events = readEvents(require("node:fs").readFileSync(0, "utf8"));
-  process.stdout.write(`${JSON.stringify(decide(events, opts))}\n`);
+  const result = opts.select ? selectVerdictMessages(events, opts.reviewer) : decide(events, opts);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
 if (require.main === module) {

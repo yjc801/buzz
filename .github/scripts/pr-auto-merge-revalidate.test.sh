@@ -126,6 +126,10 @@ FIXTURES="$WORK/fixtures"
 export FIXTURES
 
 reset_fixtures() {
+  # Clear per-scenario overrides first. Without this a scenario that sets
+  # VERDICT_EVENTS or ANNOUNCED_ID would silently keep applying to every
+  # scenario after it, and those would pass for the wrong reason.
+  unset VERDICT_EVENTS ANNOUNCED_ID
   rm -rf "$FIXTURES"
   mkdir -p "$FIXTURES"
   cat > "$FIXTURES/pr_view.json" <<JSON
@@ -135,6 +139,8 @@ reset_fixtures() {
   "labels": [{"name": "enhancement"}],
   "headRefOid": "$HEAD_SHA",
   "baseRefName": "main",
+  "headRepositoryOwner": {"login": "yjc801"},
+  "headRepository": {"name": "buzz"},
   "mergeable": "MERGEABLE",
   "changedFiles": 2,
   "statusCheckRollup": [
@@ -150,7 +156,10 @@ JSON
 [
   {"type": "deletion"},
   {"type": "required_status_checks",
-   "parameters": {"required_status_checks": [{"context": "CI / build"}, {"context": "DCO"}]}}
+   "parameters": {"strict_required_status_checks_policy": true,
+                  "required_status_checks": [{"context": "Detect Changed Paths"},
+                                             {"context": "Dead Token Reference Guard"},
+                                             {"context": "DCO"}]}}
 ]
 JSON
   printf 'Round 1 — clean.\n\nReviewed %s against merge base %s\nVERDICT: APPROVE\nRISK: medium — product code\nAUTO-MERGE: yes\n' \
@@ -158,6 +167,11 @@ JSON
   VERDICT_EVENT=$(sign_event "$REVIEWER_SECRET" "$WORK/verdict.txt")
   EXPECTED_FLOOR=medium
 }
+
+# The fence receives the STANDING verdict set from the authorize job, not one
+# event chosen by the evaluate job. Most scenarios have a set of one; the tie
+# and revocation scenarios are the reason it is a set at all.
+verdict_set() { printf '[%s]' "$(printf '%s' "$1")"; }
 
 run_fence() {
   : > "$WORK/output"
@@ -175,8 +189,11 @@ run_fence() {
   EXPECTED_BASE_REF=main \
   EXPECTED_BASE_TIP="$BASE_TIP" \
   EXPECTED_FLOOR="$EXPECTED_FLOOR" \
-  EXPECTED_EVENT_ID="$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" \
-  VERDICT_EVENT="$VERDICT_EVENT" \
+  EXPECTED_EVENT_ID="${ANNOUNCED_ID:-$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')}" \
+  EXPECTED_HEAD_REPO=yjc801/buzz \
+  PROTECTED_BASE=main \
+  REQUIRED_RULESET_CONTEXTS="Detect Changed Paths,Dead Token Reference Guard" \
+  VERDICT_EVENTS="${VERDICT_EVENTS:-$(verdict_set "$VERDICT_EVENT")}" \
     bash -e "$WORK/revalidate.sh" > "$WORK/stdout" 2>&1
   echo "$?"
 }
@@ -265,6 +282,107 @@ expect "base branch has no required-status-check rule" refuse
 reset_fixtures
 printf '[{"type": "deletion"}]\n' > "$FIXTURES/rules.json"
 expect "base branch rules exist but none require checks" refuse
+
+# --- the ruleset has to fence the gates, not merely exist ------------------
+# Without strict mode GitHub accepts checks that ran against an older base,
+# which is exactly the window gate 3 closes with a read and cannot close at
+# the write.
+
+reset_fixtures
+python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+r[1]["parameters"]["strict_required_status_checks_policy"] = False
+json.dump(r, open(sys.argv[1], "w"))
+' "$FIXTURES/rules.json"
+expect "required checks are not strict about the latest base" refuse
+
+reset_fixtures
+python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+del r[1]["parameters"]["strict_required_status_checks_policy"]
+json.dump(r, open(sys.argv[1], "w"))
+' "$FIXTURES/rules.json"
+expect "required-checks rule omits strict mode entirely" refuse
+
+reset_fixtures
+python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+r[1]["parameters"]["required_status_checks"] = [{"context": "DCO"}]
+json.dump(r, open(sys.argv[1], "w"))
+' "$FIXTURES/rules.json"
+expect "strict rule requires only an unrelated context" refuse
+
+reset_fixtures
+python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+r[1]["parameters"]["required_status_checks"] = [{"context": "Detect Changed Paths"}]
+json.dump(r, open(sys.argv[1], "w"))
+' "$FIXTURES/rules.json"
+expect "strict rule covers only some of the required contexts" refuse
+
+# One rule may not supply strictness while a different one supplies the
+# contexts: the contexts would still be testable against a stale base.
+reset_fixtures
+python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+r[1]["parameters"] = {"strict_required_status_checks_policy": True,
+                      "required_status_checks": [{"context": "DCO"}]}
+r.append({"type": "required_status_checks",
+          "parameters": {"strict_required_status_checks_policy": False,
+                         "required_status_checks": [{"context": "Detect Changed Paths"},
+                                                    {"context": "Dead Token Reference Guard"}]}})
+json.dump(r, open(sys.argv[1], "w"))
+' "$FIXTURES/rules.json"
+expect "strictness and contexts split across two rules" refuse
+
+# --- scope is re-derived from reviewed constants, never inherited ----------
+# The evaluate job runs an untrusted binary and chooses which PR crosses, so
+# comparing the live PR against that job's own expectation proves nothing.
+
+reset_fixtures
+edit_view 'd["headRepositoryOwner"] = {"login": "attacker"}'
+expect "head branch lives in a fork" refuse
+
+reset_fixtures
+edit_view 'd["headRepository"] = {"name": "buzz-fork"}'
+expect "head branch lives in a different repository" refuse
+
+reset_fixtures
+edit_view 'd["baseRefName"] = "release"'
+expect "PR targets a branch other than main" refuse
+
+# --- the standing verdict comes from the authorize job --------------------
+# A substituted sprig can name whichever event it likes in the channel; what
+# it cannot do is change which event the authorize job read.
+
+reset_fixtures
+ANNOUNCED_ID=$(python3 -c 'print("a" * 64)')
+expect "announced verdict is not the standing verdict" refuse
+
+reset_fixtures
+printf 'Round 2 — revoked.\n\nReviewed %s against merge base %s\nVERDICT: REQUEST-CHANGES\nRISK: medium — product code\nAUTO-MERGE: no\n' \
+  "$HEAD_SHA" "$BASE_TIP" > "$WORK/revoked.txt"
+REVOKED=$(sign_event "$REVIEWER_SECRET" "$WORK/revoked.txt")
+ANNOUNCED_ID=$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+VERDICT_EVENTS=$(printf '[%s]' "$REVOKED")
+expect "approval replayed after the reviewer revoked it" refuse
+
+reset_fixtures
+VERDICT_EVENTS='[]'
+expect "empty standing verdict set" contradiction
+
+reset_fixtures
+VERDICT_EVENTS=$(printf '[%s,%s]' "$VERDICT_EVENT" "$(sign_event "$IMPOSTOR_SECRET" "$WORK/verdict.txt")")
+expect "one member of the standing set is not the reviewer's" contradiction
+
+reset_fixtures
+VERDICT_EVENTS="$VERDICT_EVENT"
+expect "standing verdict handed over as a bare object, not a set" contradiction
 
 # --- the artifact the merge job cannot re-read, and therefore must prove ----
 

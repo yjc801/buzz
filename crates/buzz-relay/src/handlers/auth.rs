@@ -113,6 +113,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
     // The tag is integrity-protected by the event's Schnorr signature — if
     // tampered, NIP-42 verification will fail before we ever inspect it.
     let auth_tag_json = extract_auth_tag_json(&event);
+    let signed_auth_created_at = event.created_at.as_secs();
 
     // Same reasoning for the connection class: read it here, but do not apply
     // it until the signature has verified. Requesting a class can only remove
@@ -180,6 +181,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     if let Some(owner) = crate::api::relay_members::extract_nip_oa_owner(
                         pubkey.as_bytes(),
                         auth_tag_json.as_deref(),
+                        Some(signed_auth_created_at),
                     ) {
                         outcome = match state
                             .db
@@ -262,6 +264,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 conn.tenant.community(),
                 pubkey.as_bytes(),
                 auth_tag_json.as_deref(),
+                Some(signed_auth_created_at),
             )
             .await
             {
@@ -289,6 +292,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     crate::api::relay_members::extract_nip_oa_owner(
                         pubkey.as_bytes(),
                         auth_tag_json.as_deref(),
+                        Some(signed_auth_created_at),
                     )
                 } else {
                     None

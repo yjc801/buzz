@@ -1004,6 +1004,7 @@ type RawPersona = {
   id: string;
   display_name: string;
   avatar_url: string | null;
+  description?: string | null;
   system_prompt: string;
   runtime?: string | null;
   model?: string | null;
@@ -3411,6 +3412,7 @@ function mockPersonaCatalogPublications() {
         );
       });
     };
+    const rawDescription = content.description;
     if (
       typeof displayName !== "string" ||
       !displayName.trim() ||
@@ -3418,7 +3420,13 @@ function mockPersonaCatalogPublications() {
       typeof systemPrompt !== "string" ||
       new TextEncoder().encode(systemPrompt).length > 64 * 1024 ||
       !hasValidVisibleText(displayName, false) ||
-      !hasValidVisibleText(systemPrompt, true)
+      !hasValidVisibleText(systemPrompt, true) ||
+      (rawDescription !== undefined &&
+        rawDescription !== null &&
+        typeof rawDescription !== "string") ||
+      (typeof rawDescription === "string" &&
+        ([...rawDescription].length > 280 ||
+          !hasValidVisibleText(rawDescription, false)))
     )
       continue;
     publications.push({
@@ -3429,6 +3437,7 @@ function mockPersonaCatalogPublications() {
       agent: {
         displayName,
         avatarUrl: optionalString(content.avatar_url),
+        description: optionalString(rawDescription),
         systemPrompt,
         runtime: optionalString(content.runtime),
         model: optionalString(content.model),
@@ -8697,6 +8706,7 @@ async function handleCreatePersona(args: {
   input: {
     displayName: string;
     avatarUrl?: string;
+    description?: string | null;
     systemPrompt: string;
     runtime?: string;
     model?: string;
@@ -8711,6 +8721,7 @@ async function handleCreatePersona(args: {
     id: crypto.randomUUID(),
     display_name: args.input.displayName.trim(),
     avatar_url: args.input.avatarUrl?.trim() || null,
+    description: args.input.description?.trim() || null,
     system_prompt: args.input.systemPrompt.trim(),
     runtime: args.input.runtime?.trim() || null,
     model: args.input.model?.trim() || null,
@@ -8743,6 +8754,7 @@ type MockUpdatePersonaInput = {
   id: string;
   displayName: string;
   avatarUrl?: string;
+  description?: string | null;
   systemPrompt: string;
   runtime?: string;
   model?: string;
@@ -8776,6 +8788,7 @@ async function applyMockPersonaUpdate(
   }
   persona.display_name = input.displayName.trim();
   persona.avatar_url = input.avatarUrl?.trim() || null;
+  persona.description = input.description?.trim() || null;
   persona.system_prompt = input.systemPrompt.trim();
   persona.runtime = input.runtime?.trim() || null;
   persona.model = input.model?.trim() || null;
@@ -8881,6 +8894,7 @@ function upsertMockPersonaEvent(
       display_name: persona.display_name,
       system_prompt: persona.system_prompt,
       avatar_url: persona.avatar_url,
+      description: persona.description ?? null,
       runtime: persona.runtime ?? null,
       model: persona.model ?? null,
       provider: persona.provider ?? null,

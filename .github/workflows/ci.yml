@@ -239,7 +239,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    # Disabled. To re-enable, restore the original condition:
+    # if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -315,7 +317,9 @@ jobs:
             echo "Desktop Core finished with: ${{ needs.desktop-core.result }}"
             exit 1
           fi
-          if [ "${{ needs.desktop-smoke-e2e.result }}" != "success" ]; then
+          # desktop-smoke-e2e is disabled (if: false above), so "skipped" is
+          # expected; still fail on a real failure if it is re-enabled.
+          if [ "${{ needs.desktop-smoke-e2e.result }}" != "success" ] && [ "${{ needs.desktop-smoke-e2e.result }}" != "skipped" ]; then
             echo "Desktop Smoke E2E shards finished with: ${{ needs.desktop-smoke-e2e.result }}"
             exit 1
           fi

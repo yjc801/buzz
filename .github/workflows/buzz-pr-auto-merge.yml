@@ -1,0 +1,439 @@
+name: buzz-pr-auto-merge
+
+# Squash-merges a PR when the reviewer agent (Alex) has authorized it from
+# its Buzz channel and every deterministic gate agrees. Full contract:
+# docs/pr-auto-merge.md. Fork-only; upstream has no counterpart.
+#
+# Alex performs no GitHub writes. His signed Buzz verdict message — ending in
+# the machine trailer (Reviewed <sha> …, VERDICT:, RISK:, AUTO-MERGE:) — is
+# the authorization artifact; authorship is trustworthy because the relay
+# enforces event.pubkey == the authenticated publisher. This workflow reads
+# that message with the same CI relay identity the PR mirror uses, computes a
+# deterministic path-risk floor (fail-closed: unmatched paths are high), and
+# merges only when max(floor, Alex's RISK) is at most medium, checks are
+# green, and the verdict names the PR's exact current head.
+#
+# THE MERGE USES AUTO_MERGE_TOKEN (owner fine-grained PAT), NEVER THE DEFAULT
+# GITHUB_TOKEN. A GITHUB_TOKEN-authored merge pushes to main without
+# triggering push workflows — which would silently freeze Sprig, Provider,
+# and Waker image publishing, the artifacts the remote-agent fleet installs
+# its harness from. If the secret is absent the workflow degrades to dry-run
+# (evaluate and log, touch nothing) instead of failing red every tick, so it
+# can land before the secret exists.
+#
+# Failure philosophy (differs from the mirror deliberately): the mirror's
+# absence-driven action is CREATION, so an unproven read there must fail red
+# or it mints duplicate state. This workflow's absence-driven action is
+# NOTHING — every unproven read (relay blip, indeterminate channel
+# resolution, verdict-walk give-up, mergeable UNKNOWN) degrades to "don't
+# merge this tick", which is already the safe action, so those paths warn and
+# stay green for the next tick to retry. Red is reserved for faults a rerun
+# cannot fix (bad secrets, identity-pin mismatch, sprig checksum, classifier
+# or parser crash) and for anything after state changed (merge failed after
+# the intent message was posted; audit comment failed after a merge), where a
+# red run is the only honest record.
+#
+# One merge per run: after a successful merge the sweep stops, so every merge
+# was evaluated against a main that all of its gates actually observed.
+#
+# Scheduled runs execute this file from main, so a PR editing it cannot gate
+# itself — and .github/** floors high regardless, so such a PR can never
+# auto-merge.
+
+on:
+  schedule:
+    - cron: "4-59/10 * * * *" # off :00 — those queue behind everyone's cron
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Evaluate all gates and log decisions, but never merge or post"
+        type: boolean
+        default: true
+
+concurrency:
+  group: buzz-pr-auto-merge
+  cancel-in-progress: false # never cancel a run that may be mid-merge
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+jobs:
+  sweep:
+    if: github.repository == 'yjc801/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Before checkout so a no-candidate tick costs a single API call.
+      - name: List candidate PRs
+        id: candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --base main --limit 100 \
+            --json number,isDraft,labels,headRepositoryOwner,headRepository \
+            > "$RUNNER_TEMP/prs.json"
+          jq '[.[]
+                | select(
+                    (.isDraft | not)
+                    and (((.labels // []) | map(.name) | index("no-auto-merge")) == null)
+                    and (.headRepositoryOwner.login == "yjc801")
+                    and (.headRepository.name == "buzz"))
+                | .number]' "$RUNNER_TEMP/prs.json" > "$RUNNER_TEMP/candidates.json"
+          COUNT=$(jq 'length' "$RUNNER_TEMP/candidates.json")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "eligible PRs: $(jq -c . "$RUNNER_TEMP/candidates.json")"
+
+      - uses: actions/checkout@v4
+        if: steps.candidates.outputs.count != '0'
+        with:
+          persist-credentials: false
+
+      - name: Install buzz CLI (sprig multicall)
+        if: steps.candidates.outputs.count != '0'
+        run: |
+          URL=https://github.com/block/buzz/releases/download/sprig-latest/sprig-x86_64-unknown-linux-musl.tar.gz
+          curl -fsSL -o sprig.tar.gz "$URL"
+          curl -fsSL -o sprig.sha256 "$URL.sha256"
+          sed 's|  .*|  sprig.tar.gz|' sprig.sha256 | sha256sum -c -
+          echo "sprig sha256 (provenance): $(cut -c1-64 sprig.sha256)"
+          mkdir -p "$HOME/.sprig" && tar -xzf sprig.tar.gz -C "$HOME/.sprig"
+          ln -s "$HOME/.sprig/sprig" "$HOME/.sprig/buzz"
+          echo "$HOME/.sprig" >> "$GITHUB_PATH"
+
+      - name: Evaluate and merge
+        if: steps.candidates.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+          BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
+          BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
+          # Alex — the reviewer whose signed verdict authorizes a merge.
+          # A reviewed constant like EXPECTED_CI_PUBKEY: rotating the
+          # reviewer identity is a code change, not a variable flip.
+          REVIEWER_NAME: Alex
+          REVIEWER_PUBKEY: 276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd
+          # Same pinned CI identity as buzz-pr-mirror.yml, for the same
+          # reason: every relay read below is scoped to the key we hold, so a
+          # rotated key would see an empty world. Here that fails SAFE (no
+          # verdict → no merge), but the pin turns a silent permanent no-op
+          # into a red run with an explanation.
+          EXPECTED_CI_PUBKEY: fbc33a2cf3637867fa90e9e3e334304701e1fdf3c57eae4283cea60134f604af
+        run: |
+          R="$GITHUB_REPOSITORY"
+          TMP="$RUNNER_TEMP"
+          ERRFILE=$(mktemp)
+          MEMBER_SCAN_LIMIT=2000
+
+          DRY="${DRY_RUN_INPUT:-false}"
+          if [ "$DRY" != "true" ] && [ -z "$AUTO_MERGE_TOKEN" ]; then
+            echo "::warning::AUTO_MERGE_TOKEN is not set — evaluating in dry-run mode (no merges, no messages)"
+            DRY=true
+          fi
+
+          CI_PUB=$(NOSTR_SECRET="$BUZZ_PRIVATE_KEY" python3 scripts/buzz-mint-auth-tag.py pubkey)
+          printf '%s' "$CI_PUB" | grep -qE '^[0-9a-f]{64}$' || {
+            echo "::error::CI pubkey derivation failed"
+            exit 1
+          }
+          if [ "$CI_PUB" != "$EXPECTED_CI_PUBKEY" ]; then
+            echo "::error::BUZZ_CI_PRIVATE_KEY derives to ${CI_PUB}, not the pinned ${EXPECTED_CI_PUBKEY}. A rotated key sees none of the PR channels or binding notes, so every read below would report an empty world. See buzz-pr-mirror.yml for the rotation procedure."
+            exit 1
+          fi
+
+          decision() {
+            echo "PR #$1: $2"
+            echo "- PR #$1: $2" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          warn_skip() {
+            echo "::warning::PR #$1: $2 — skipped this tick"
+            decision "$1" "SKIP (unproven: $2)"
+          }
+
+          # --- Channel resolution, ported from buzz-pr-mirror.yml (read-only
+          # subset: no create, no write_binding). Same status discipline: an
+          # empty result means PROVABLY absent; failure is non-zero, checked
+          # at every call site, never inferred from empty output.
+
+          read_binding() {
+            local SLUG="$1" OUT STATUS=0
+            OUT=$(buzz notes get --name "$SLUG" --author me --content-only 2>"$ERRFILE") \
+              || STATUS=$?
+            if [ "$STATUS" -eq 0 ]; then
+              printf '%s' "$OUT" | tr -d '[:space:]'
+              return 0
+            fi
+            if [ "$STATUS" -eq 1 ] && grep -q '"error":"not_found"' "$ERRFILE"; then
+              return 0
+            fi
+            echo "binding lookup failed (exit $STATUS): $(cat "$ERRFILE")" >&2
+            return 1
+          }
+
+          channel_roster() {
+            buzz channels members --channel "$1"
+          }
+
+          ci_owns() {
+            local ROSTER
+            ROSTER=$(channel_roster "$1") || return 2
+            printf '%s' "$ROSTER" | jq -e --arg ci "$CI_PUB" \
+              'any(.[]?; .pubkey == $ci and .role == "owner")' >/dev/null || return 1
+            return 0
+          }
+
+          resolve_by_membership() {
+            local NAME="$1" LIST N COUNT I CH
+            LIST=$(buzz channels list --member --limit "$MEMBER_SCAN_LIMIT") || {
+              echo "membership listing failed" >&2
+              return 1
+            }
+            N=$(printf '%s' "$LIST" | jq 'length') || return 1
+            if [ "$N" -ge "$MEMBER_SCAN_LIMIT" ]; then
+              echo "membership listing filled its window ($N) — absence unproven" >&2
+              return 1
+            fi
+            COUNT=$(printf '%s' "$LIST" | jq --arg n "$NAME" '[.[] | select(.name == $n)] | length') || return 1
+            I=0
+            while [ "$I" -lt "$COUNT" ]; do
+              CH=$(printf '%s' "$LIST" | jq -r --arg n "$NAME" --argjson i "$I" \
+                '[.[] | select(.name == $n)][$i].channel_id') || return 1
+              ci_owns "$CH"
+              case "$?" in
+                0) printf '%s' "$CH"; return 0 ;;
+                1) echo "ignoring #${NAME} room $CH — not owned by this CI identity" >&2 ;;
+                *) echo "roster read failed for $CH" >&2; return 1 ;;
+              esac
+              I=$((I + 1))
+            done
+          }
+
+          resolve_channel() {
+            local N="$1" SLUG BOUND
+            SLUG=$(printf 'pr-mirror-%s-%s' "$R" "$N" | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+            BOUND=$(read_binding "$SLUG") || return 1
+            if [ -z "$BOUND" ]; then
+              resolve_by_membership "buzz-pr-${N}"
+              return $?
+            fi
+            printf '%s' "$BOUND" \
+              | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || {
+              echo "binding note holds '${BOUND}', not a channel UUID" >&2
+              return 1
+            }
+            printf '%s' "$BOUND"
+          }
+
+          # Newest-first history walk, accumulated into one JSON array. Stops
+          # as soon as a reviewer VERDICT-bearing message is in hand (page 1
+          # in practice — pages are time-ordered, so the newest such message
+          # cannot be on a later page), on an empty page, or at 5 pages.
+          # Same stall-guard as the mirror: a full page of one timestamp
+          # steps the cursor back one second rather than terminating.
+          fetch_verdict_events() {
+            local CH="$1" BEFORE="" PAGE COUNT OLDEST ALL="[]" PAGES=0
+            while [ "$PAGES" -lt 5 ]; do
+              if [ -z "$BEFORE" ]; then
+                PAGE=$(buzz messages get --channel "$CH" --limit 200) || return 1
+              else
+                PAGE=$(buzz messages get --channel "$CH" --limit 200 --before "$BEFORE") || return 1
+              fi
+              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
+              ALL=$(printf '%s' "$PAGE" | jq --argjson acc "$ALL" '$acc + [(.messages? // .)[]?]') || return 1
+              [ "$COUNT" -eq 0 ] && break
+              if printf '%s' "$ALL" | jq -e --arg r "$REVIEWER_PUBKEY" \
+                '[.[] | select(.pubkey == $r and (.content | test("(^|\\n)VERDICT:")))] | length > 0' >/dev/null; then
+                break
+              fi
+              OLDEST=$(printf '%s' "$ALL" | jq -r '[.[].created_at] | min') || return 1
+              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
+                BEFORE=$((OLDEST - 1))
+              else
+                BEFORE="$OLDEST"
+              fi
+              PAGES=$((PAGES + 1))
+            done
+            printf '%s' "$ALL"
+          }
+
+          # One notice per (PR, head): dedup by scanning recent CI-authored
+          # messages for the marker. A failed dedup read skips the post
+          # (warn) — a missing notice is recoverable, a spammed channel is
+          # noise forever.
+          post_blocked_notice() {
+            local CH="$1" HEAD="$2" REASONS="$3" URL="$4" PAGE MARKER
+            MARKER="⛔ auto-merge blocked at ${HEAD}"
+            PAGE=$(buzz messages get --channel "$CH" --limit 200) || return 1
+            if printf '%s' "$PAGE" | jq -e --arg ci "$CI_PUB" --arg m "$MARKER" \
+              '[(.messages? // .)[]? | select(.pubkey == $ci and (.content | contains($m)))] | length > 0' \
+              >/dev/null; then
+              return 0
+            fi
+            printf '%s\n%s\n%s\n' "$MARKER" "$REASONS" "$URL" \
+              | buzz messages send --channel "$CH" --content -
+          }
+
+          for N in $(jq -r 'sort | .[]' "$TMP/candidates.json"); do
+            VIEW=$(gh pr view "$N" -R "$R" --json state,headRefOid,mergeable,changedFiles,url,statusCheckRollup) || {
+              warn_skip "$N" "PR read failed"
+              continue
+            }
+            STATE=$(jq -r .state <<<"$VIEW")
+            HEAD_SHA=$(jq -r .headRefOid <<<"$VIEW")
+            MERGEABLE=$(jq -r .mergeable <<<"$VIEW")
+            CHANGED=$(jq -r .changedFiles <<<"$VIEW")
+            PR_URL=$(jq -r .url <<<"$VIEW")
+            if [ "$STATE" != "OPEN" ]; then
+              decision "$N" "SKIP (state $STATE)"
+              continue
+            fi
+            if [ "$MERGEABLE" = "UNKNOWN" ]; then
+              warn_skip "$N" "mergeability still computing"
+              continue
+            fi
+            if [ "$CHANGED" -eq 0 ]; then
+              warn_skip "$N" "no changed files reported"
+              continue
+            fi
+
+            # Deterministic path-risk floor. previous_filename rides along so
+            # both sides of a rename are classified; a fetched-vs-reported
+            # count mismatch (API caps at 3000 files) floors high.
+            if ! gh api "repos/$R/pulls/$N/files" --paginate \
+              --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > "$TMP/files.tsv"; then
+              warn_skip "$N" "file listing failed"
+              continue
+            fi
+            FETCHED=$(wc -l < "$TMP/files.tsv" | tr -d ' ')
+            if [ "$FETCHED" -ne "$CHANGED" ]; then
+              FLOOR=high
+              FLOOR_NOTE="file listing incomplete (${FETCHED} of ${CHANGED})"
+            else
+              { cut -f1 "$TMP/files.tsv"; cut -f2 "$TMP/files.tsv"; } | sed '/^$/d' > "$TMP/paths.txt"
+              if ! RISK_OUT=$(node .github/scripts/pr-auto-merge-risk.js < "$TMP/paths.txt"); then
+                echo "::error::risk classifier failed for PR #$N — this is a bug, not weather"
+                exit 1
+              fi
+              FLOOR=$(printf '%s\n' "$RISK_OUT" | head -1)
+              FLOOR_NOTE=$(printf '%s\n' "$RISK_OUT" | awk -F'\t' -v t="$FLOOR" 'NR>1 && $1==t {print $3 " (" $2 ")"; exit}')
+            fi
+
+            CH=$(resolve_channel "$N") || {
+              warn_skip "$N" "channel resolution failed"
+              continue
+            }
+            if [ -z "$CH" ]; then
+              decision "$N" "SKIP (no PR channel — mirror has not run yet)"
+              continue
+            fi
+            EVENTS=$(fetch_verdict_events "$CH") || {
+              warn_skip "$N" "relay history read failed"
+              continue
+            }
+            if ! VERDICT_JSON=$(printf '%s' "$EVENTS" \
+              | node .github/scripts/pr-auto-merge-verdict.js \
+                  --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" --floor "$FLOOR"); then
+              echo "::error::verdict parser failed for PR #$N — this is a bug, not weather"
+              exit 1
+            fi
+            FOUND=$(jq -r .found <<<"$VERDICT_JSON")
+            REQUESTED=$(jq -r .requested <<<"$VERDICT_JSON")
+            AUTHORIZED=$(jq -r .authorized <<<"$VERDICT_JSON")
+            REASON=$(jq -r .reason <<<"$VERDICT_JSON")
+            EVENT_ID=$(jq -r '.eventId // "-"' <<<"$VERDICT_JSON")
+            RISK=$(jq -r '.risk // "-"' <<<"$VERDICT_JSON")
+            EFFECTIVE=$(jq -r '.effectiveRisk // "-"' <<<"$VERDICT_JSON")
+
+            if [ "$FOUND" != "true" ] || [ "$REQUESTED" != "true" ]; then
+              decision "$N" "SKIP (${REASON}; floor ${FLOOR})"
+              continue
+            fi
+
+            # Alex requested this merge on the current head. Collect every
+            # remaining refusal so the blocked notice names all of them.
+            BLOCKED=""
+            if [ "$AUTHORIZED" != "true" ]; then
+              BLOCKED="${BLOCKED}- ${REASON}${FLOOR_NOTE:+ — ${FLOOR_NOTE}}\n"
+            fi
+            if [ "$MERGEABLE" = "CONFLICTING" ]; then
+              BLOCKED="${BLOCKED}- conflicts with main\n"
+            fi
+            ROLLUP=$(jq '.statusCheckRollup // []' <<<"$VIEW")
+            PENDING=$(jq '[.[] | select((.__typename == "CheckRun" and .status != "COMPLETED")
+              or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$ROLLUP")
+            FAILING=$(jq -r '[.[] | select((.__typename == "CheckRun" and .status == "COMPLETED"
+                and ((.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED")) | not))
+              or (.__typename == "StatusContext" and (.state | IN("FAILURE","ERROR"))))
+              | (.name // .context)] | join(", ")' <<<"$ROLLUP")
+            ANCHOR=$(jq '[.[] | select(.__typename == "CheckRun" and .workflowName == "CI"
+              and .conclusion == "SUCCESS")] | length' <<<"$ROLLUP")
+            if [ "$PENDING" -gt 0 ]; then
+              # Transient by construction — checks resolve on their own, and a
+              # "blocked: still running" notice would be pure noise.
+              decision "$N" "SKIP (checks still running; will re-evaluate)"
+              continue
+            fi
+            if [ -n "$FAILING" ]; then
+              BLOCKED="${BLOCKED}- failing checks: ${FAILING}\n"
+            fi
+            if [ "$ANCHOR" -eq 0 ]; then
+              BLOCKED="${BLOCKED}- no successful CI check on this head (nothing ran is not green)\n"
+            fi
+
+            if [ -n "$BLOCKED" ]; then
+              REASONS=$(printf '%b' "$BLOCKED")
+              decision "$N" "BLOCKED: $(printf '%s' "$REASONS" | tr '\n' '; ')"
+              if [ "$DRY" != "true" ]; then
+                post_blocked_notice "$CH" "$HEAD_SHA" "$REASONS" "$PR_URL" \
+                  || echo "::warning::PR #$N: blocked notice not posted (dedup read or send failed)"
+              fi
+              continue
+            fi
+
+            if [ "$DRY" = "true" ]; then
+              decision "$N" "WOULD MERGE (RISK ${RISK}, floor ${FLOOR}, effective ${EFFECTIVE}, verdict ${EVENT_ID})"
+              continue
+            fi
+
+            # Announce, then act: the intent message must land BEFORE the
+            # merge, because the mirror's closed handler archives this
+            # channel right after the merge event. If the announcement cannot
+            # be published we do not merge this tick.
+            printf '⏩ auto-merging %s — verdict event %s: VERDICT APPROVE, RISK %s, floor %s, effective %s.\n%s\n' \
+              "$HEAD_SHA" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$PR_URL" \
+              | buzz messages send --channel "$CH" --content - || {
+              warn_skip "$N" "intent message send failed"
+              continue
+            }
+            FRESH=$(gh pr view "$N" -R "$R" --json state,headRefOid --jq '[.state, .headRefOid] | @tsv') || {
+              warn_skip "$N" "freshness re-read failed after intent"
+              continue
+            }
+            if [ "$FRESH" != "$(printf 'OPEN\t%s' "$HEAD_SHA")" ]; then
+              warn_skip "$N" "PR moved between evaluation and merge (${FRESH})"
+              continue
+            fi
+            # --match-head-commit makes the merge itself the conditional
+            # write: a push racing this run is rejected by GitHub, not by our
+            # earlier read. Failing after the announcement is red — the
+            # channel now claims a merge that did not happen.
+            if ! GH_TOKEN="$AUTO_MERGE_TOKEN" gh pr merge "$N" -R "$R" --squash --match-head-commit "$HEAD_SHA"; then
+              echo "::error::merge failed for PR #$N after the intent message was posted — reconcile the channel by hand"
+              exit 1
+            fi
+            if ! GH_TOKEN="$AUTO_MERGE_TOKEN" gh pr comment "$N" -R "$R" --body "$(printf '🤖 Auto-merged on the reviewer'\''s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
+              "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
+              "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")"; then
+              echo "::error::PR #$N merged but the audit comment failed — the record is incomplete"
+              exit 1
+            fi
+            decision "$N" "MERGED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR})"
+            # One merge per run: everything evaluated after a merge would be
+            # judged against a main no gate observed. The next tick re-sweeps.
+            break
+          done

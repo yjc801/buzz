@@ -78,6 +78,16 @@ name: buzz-pr-mirror
 # identity works here unchanged — copying those two secret values across is
 # enough, and minting a second identity is optional.
 #
+# THE CI IDENTITY ALSO NEEDS A kind:0 PROFILE CARRYING THAT SAME AUTH TAG.
+# The relay's membership gate reads the tag from each event, but an agent
+# harness deciding whether a non-owner author may fire a turn under
+# respond_to: owner-only reads it from the author's PROFILE (buzz-acp's
+# check_sibling_via_profile, fail closed). Without the profile, every card
+# and mention this workflow posts is stored and delivered — and silently
+# dropped by every owner-only agent it names. The sync step self-heals this
+# by publishing the profile whenever the relay has none; see
+# ensure_ci_profile below.
+#
 # THE CI IDENTITY IS PART OF EVERY CHANNEL'S STATE, so BUZZ_CI_PRIVATE_KEY is
 # not freely rotatable. Channels are owned by the key that created them, the
 # binding notes are addressed under that key, and the seed marker is only
@@ -232,6 +242,59 @@ jobs:
             echo "each binding note, and update EXPECTED_CI_PUBKEY in the same PR." >&2
             exit 1
           fi
+
+          # THE PINNED IDENTITY'S PROFILE, NOT JUST ITS KEY, IS LOAD-BEARING.
+          # Two consumers read the NIP-OA auth tag through two different
+          # doors: the relay's membership gate reads it from every EVENT (the
+          # CLI injects BUZZ_AUTH_TAG into everything it signs), but an agent
+          # harness deciding whether a non-owner author may fire a turn under
+          # respond_to: owner-only reads it from the author's kind:0 PROFILE
+          # (buzz-acp's check_sibling_via_profile), and fails closed. With no
+          # profile, every mention below is stored and delivered — and
+          # silently dropped, at debug level, by every owner-only agent it
+          # names. Found live 2026-08-31: buzz-pr-101's seed card fired a
+          # wake and prompted nobody, and the gap had sat invisible for the
+          # mirror's whole history because the previous reviewer ran
+          # respond_to: anyone and never consulted the check.
+          #
+          # Publishing is conditional on ABSENCE: kind:0 is replaceable, so
+          # an unconditional republish would stomp out-of-band profile edits.
+          # An empty read is the only state that publishes; a failed read
+          # fails the job rather than publishing on a guess. The read-back
+          # checks existence only — `users get` projects tags away — but that
+          # is still a sufficient postcondition for the TAG, because
+          # sign_event refuses to emit an event whose auth-tag count doesn't
+          # match the BUZZ_AUTH_TAG it was handed: a set-profile that
+          # succeeded under this env cannot have stored an untagged profile.
+          # Healing is forward-looking only: a harness that has already
+          # cached "not a sibling" for this key keeps dropping until that
+          # agent process restarts (the sibling-verdict cache has no TTL).
+          ensure_ci_profile() {
+            local PROFILES N
+            PROFILES=$(buzz users get --pubkey "$CI_PUB") || {
+              echo "CI profile lookup failed — failing so the rerun re-probes" >&2
+              return 1
+            }
+            N=$(printf '%s' "$PROFILES" | jq 'length') || return 1
+            if [ "$N" -gt 0 ]; then
+              return 0
+            fi
+            echo "CI identity has no kind:0 profile — publishing one so owner-only agents accept its mentions"
+            buzz users set-profile --name "Buzz CI" || {
+              echo "CI profile publish failed — failing so the rerun retries" >&2
+              return 1
+            }
+            PROFILES=$(buzz users get --pubkey "$CI_PUB") || {
+              echo "CI profile read-back failed — failing so the rerun re-probes" >&2
+              return 1
+            }
+            N=$(printf '%s' "$PROFILES" | jq 'length') || return 1
+            if [ "$N" -eq 0 ]; then
+              echo "CI profile publish was accepted but is not readable back — failing so the rerun retries" >&2
+              return 1
+            fi
+          }
+          ensure_ci_profile || exit 1
 
           # Slug of this PR's binding note. Lowercased and slash-free to stay
           # inside the note-slug charset; asserted rather than assumed, because

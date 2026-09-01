@@ -12,62 +12,72 @@ name: buzz-pr-auto-merge
 # max(floor, Alex's RISK) is at most medium, checks are green, and the verdict
 # names the PR's exact current head AND the base it was reviewed against.
 #
-# NO UNREVIEWED CODE RUNS IN THIS WORKFLOW.
+# THE AUTHORIZATION COMES FROM SOMEWHERE THIS WORKFLOW CANNOT REWRITE.
+#
+# Three revisions of this file tried to read the reviewer's standing verdict
+# out of the PR channel's message history, and review found a defect in each:
+# an event-hash tiebreak that could prefer a revoked approval; a completeness
+# proof that held over the live view but not over the history; and a redaction
+# tripwire that the redactor could itself erase with an ordinary self-delete.
+# They were not three unrelated bugs. The CI identity OWNS every PR channel, a
+# channel owner may kind-9005 delete anyone's message there, deletes are soft
+# and every query appends `deleted_at IS NULL` — so each attempt was a detector
+# placed inside the blast radius of the thing it was detecting.
+#
+# So the verdict is not read from a channel. The reviewer publishes it to the
+# NIP-33 addressable coordinate
+#
+#     (kind 30023, REVIEWER_PUBKEY, d = pr-verdict-<owner>-<repo>-<pr>)
+#
+# which no channel authority can touch: kind-9005 authority comes from channel
+# ownership, and the relay refuses a 9005 whose target has no channel at all
+# (`moderation_delete_target_allowed`, side_effects.rs — pinned by a unit test
+# there, because this workflow now depends on it). Kind 30023 is global-only,
+# so its channel_id is always NULL even with a stray `h` tag. Only the
+# reviewer's own key can delete that note (kind 5 is self-authored) or rewrite
+# it (NIP-33 replacement is keyed by `(kind, pubkey, d)`).
+#
+# Being REPLACEABLE is the other half. The standing verdict is simply the
+# coordinate's current value — a correction overwrites the verdict it corrects.
+# There is no newest-of-many to select, no tie to break, no page to prove
+# complete, and no redaction to detect. The bug class is gone rather than
+# guarded, and so is the machinery that used to guard it.
+#
+# NO UNREVIEWED CODE RUNS IN THIS WORKFLOW EITHER.
 #
 # Earlier revisions reached the relay through `buzz`, from block/buzz's rolling
-# `sprig-latest` release, and tried to contain it: put it in a job with no merge
-# credential, prove the verdict event's signature afterwards. That containment
-# was not enough, and the reason is worth stating because it is not obvious.
-#
-# The CI identity OWNS every PR channel. A channel owner may kind-9005 delete
-# any message in it, not merely their own (side_effects.rs, "event author OR
-# channel owner/admin"); the delete is soft (`deleted_at = NOW()`) and every
-# query path appends `deleted_at IS NULL`. So unreviewed code holding that key
-# does not need to forge anything or withhold anything — it deletes the
-# reviewer's newer REQUEST-CHANGES, and what remains is a genuine, correctly
-# signed APPROVE and a history that looks complete. Signature verification
-# cannot see that, because the surviving event is real.
-#
-# The answer is not a better guard around the binary. Everything the workflow
-# asked it to do is a relay read or a relay write, and both are reachable from
-# `POST /query` and `POST /events` behind NIP-98 auth, using BIP-340 code this
-# repository already has for auth tags. So the binary is gone:
+# `sprig-latest` release. Everything they asked it to do is a relay read or a
+# relay write, both reachable from `POST /query` and `POST /events` behind
+# NIP-98 auth, using BIP-340 code this repository already has for auth tags. So
 # .github/scripts/pr-auto-merge-relay.py is the whole relay client, pure
-# stdlib, reviewed with this workflow. Every `uses:` is likewise pinned to a
-# full-length commit SHA. Nothing here executes code nobody reviewed.
+# stdlib, reviewed with this workflow, and every `uses:` is pinned to a
+# full-length commit SHA.
+#
+# That is defence in depth, not the load-bearing argument. The load-bearing
+# argument is the paragraph above: the CI key still reaches unreviewed binaries
+# in buzz-pr-mirror.yml and buzz-issue-mirror.yml, and the design no longer
+# cares, because that key cannot alter what authorizes a merge.
 #
 # TWO JOBS, AND THE SPLIT IS THE CREDENTIAL BOUNDARY.
 #
 #   evaluate  Holds the CI relay identity. Holds NO merge credential. Picks a
-#             candidate, establishes the reviewer's standing verdict, announces
-#             intent in the PR channel, hands the verdict set on.
+#             candidate, reads the reviewer's verdict coordinate, announces
+#             intent in the PR channel, hands the signed note on.
 #   merge     Fresh runner, no relay access and no relay key. Holds
 #             AUTO_MERGE_TOKEN, and re-derives every GitHub-side gate for
 #             itself from the API, this repository's scripts, and the reviewed
 #             constants below — nothing is inherited on trust.
 #
-# (An earlier revision had a third job to re-read the relay with trusted code
-# while the first job ran the binary. With no binary there is nothing for it to
-# distrust, and a job whose stated reason has been removed is worse than no job
-# at all, so it is gone with the binary.)
+# WHAT THE VERDICT READ PROVES:
 #
-# WHAT THE RELAY READ PROVES. Not just that each event is authentic:
-#
-#   authenticity  NIP-01 id recomputed from the event's own fields, BIP-340
+#   authenticity  NIP-01 id recomputed from the note's own fields, BIP-340
 #                 signature checked against the pinned REVIEWER_PUBKEY.
-#   scope         the `h` tag putting the message in THIS channel — inside the
-#                 signature, so the reviewer published it here.
-#   provenance    the channel comes from the mirror's own signed binding note,
-#                 never from a caller. There is no membership-scan fallback.
-#   completeness  the relay clamps to NIP-11 max_limit, so a SHORT page is the
-#                 relay saying "that is all of them". A full window refuses.
-#   integrity     no kind-9005 in the channel. Completeness over the live view
-#                 is not completeness over the history — the rows a reader
-#                 never sees are exactly the ones somebody deleted. Kind 5 is
-#                 self-deletion, so 9005 is specifically the foreign-redaction
-#                 primitive and its presence is a refusal. A redaction can hide
-#                 a message but not that one happened: deleting the 9005 takes
-#                 another 9005, so one is always visible.
+#   coordinate    the `d` tag is the one this PR's verdict belongs at, and the
+#                 author is the reviewer — both inside the signature.
+#   currency      the coordinate is replaceable, so its value IS the standing
+#                 verdict. More than one event there means replacement is not
+#                 being enforced, which refuses rather than picks.
+#   integrity     no channel authority can delete or rewrite it. See above.
 #
 # THE MERGE USES AUTO_MERGE_TOKEN (owner fine-grained PAT), NEVER THE DEFAULT
 # GITHUB_TOKEN. A GITHUB_TOKEN-authored merge pushes to main without
@@ -121,8 +131,8 @@ permissions:
 env:
   # Alex — the reviewer whose signed verdict authorizes a merge. A reviewed
   # constant like EXPECTED_CI_PUBKEY: rotating the reviewer identity is a code
-  # change, not a variable flip. All three jobs pin the same value; the merge
-  # job verifies signatures against it without trusting either job above.
+  # change, not a variable flip. Both jobs pin the same value; the merge job
+  # verifies signatures against it without trusting the job above.
   REVIEWER_NAME: Alex
   REVIEWER_PUBKEY: 276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd
   # The only head repository and the only base branch this workflow will ever
@@ -289,11 +299,24 @@ jobs:
             esac
           }
 
-          # The reviewer's history in that channel: every event signature-
-          # verified, proved to carry the channel's h tag, proved complete
-          # (a short page), and proved un-redacted (no kind-9005 present).
-          fetch_verdict_events() {
-            relay events --channel "$1" --author "$REVIEWER_PUBKEY"
+          # The reviewer's standing verdict, from an addressable coordinate
+          # rather than from channel history. This is the whole security
+          # argument, so it is worth stating here and not only in the docs:
+          # kind-9005 authority comes from channel ownership, and the relay
+          # refuses a 9005 whose target has no channel at all. Kind 30023 is
+          # global-only, so its channel_id is always NULL. The note is
+          # therefore out of reach of every channel owner and admin —
+          # including this identity, which owns every PR channel and whose key
+          # is still handed to unreviewed binaries in the mirror workflows.
+          # Only the reviewer can rewrite the coordinate.
+          #
+          # And because it is REPLACEABLE, the standing verdict is just its
+          # current value: a correction replaces what it corrects. Nothing here
+          # selects a newest, breaks a tie, proves a page complete, or looks
+          # for a redaction — those were all ways of reconstructing "which is
+          # current" from a log that a channel admin could rewrite.
+          fetch_verdict() {
+            relay standing-verdict --repo "$R" --pr "$1" --reviewer "$REVIEWER_PUBKEY"
           }
 
           # One notice per (PR, head): dedup by scanning this identity's own
@@ -390,11 +413,16 @@ jobs:
               continue
             fi
             EV_STATUS=0
-            EVENTS=$(fetch_verdict_events "$CH") || EV_STATUS=$?
-            if [ "$EV_STATUS" -ne 0 ]; then
-              relay_status "$N" "$EV_STATUS" "reviewer history could not be proved" || exit 1
+            NOTE=$(fetch_verdict "$N") || EV_STATUS=$?
+            if [ "$EV_STATUS" -eq 3 ]; then
+              decision "$N" "SKIP (the reviewer has published no verdict for this PR)"
               continue
             fi
+            if [ "$EV_STATUS" -ne 0 ]; then
+              relay_status "$N" "$EV_STATUS" "the verdict coordinate could not be read" || exit 1
+              continue
+            fi
+            EVENTS=$(jq -c '[.]' <<<"$NOTE")
             if ! VERDICT_JSON=$(printf '%s' "$EVENTS" \
               | node .github/scripts/pr-auto-merge-verdict.js \
                   --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" \
@@ -470,21 +498,13 @@ jobs:
             # what this job knows — the merge job re-checks every gate and may
             # still refuse, and a message claiming a merge that did not happen
             # is worse than one that says "if they still hold".
-            # The standing verdict set, narrowed by the same selection the
-            # parser uses, is what crosses into the merge job — that job
-            # re-proves every signature rather than taking this one's word.
-            # A tie is carried across intact so the merge job composes it
-            # exactly as decide() does, rather than receiving a winner.
-            VERDICT_EVENTS=$(printf '%s' "$EVENTS" \
-              | node .github/scripts/pr-auto-merge-verdict.js \
-                  --reviewer "$REVIEWER_PUBKEY" --select) || {
-              echo "::error::verdict selection failed for PR #$N — this is a bug, not weather"
-              exit 1
-            }
-            # A job output is capped at 1 MB and the relay accepts messages up
-            # to 512 KB, so a tie of two long ones could overrun it. A
-            # truncated array would fail the merge job's proof as a parse
-            # error rather than for the real reason, so say the real reason.
+            # The signed note itself crosses into the merge job, which
+            # re-proves it rather than taking this job's word. There is nothing
+            # to select: the coordinate holds one value.
+            VERDICT_EVENTS="$EVENTS"
+            # A job output is capped at 1 MB and the relay accepts events up to
+            # 512 KB. A truncated array would fail the merge job's proof as a
+            # parse error rather than for the real reason, so say the real one.
             BYTES=$(printf '%s' "$VERDICT_EVENTS" | wc -c | tr -d ' ')
             if [ "$BYTES" -gt 524288 ]; then
               warn_skip "$N" "standing verdict set is ${BYTES} bytes, too large to hand over"
@@ -573,6 +593,13 @@ jobs:
           #    Every message in the standing set is verified, not just the one
           #    that happens to decide the outcome: a set is only as trustworthy
           #    as its weakest member, and a tie is resolved by ALL of them.
+          #    Being signed by the reviewer is not enough. The security
+          #    argument is that the verdict lives at an addressable coordinate
+          #    no channel authority can rewrite — so this job checks the event
+          #    IS that, rather than inheriting the fact from the job that read
+          #    the relay. A kind-9 channel message signed by the reviewer is a
+          #    perfectly valid signature over a perfectly redactable artifact.
+          VERDICT_SLUG=$(printf 'pr-verdict-%s-%s' "$R" "$PR" | tr '[:upper:]' '[:lower:]' | tr '/' '-')
           printf '%s' "$VERDICT_EVENTS" > "$TMP/verdicts.json"
           COUNT=$(jq 'if type == "array" then length else error("not an array") end' "$TMP/verdicts.json") \
             || contradiction "the standing verdict set is not a JSON array"
@@ -584,6 +611,11 @@ jobs:
             VERIFIED_ID=$(python3 scripts/buzz-mint-auth-tag.py verify-event \
               --pubkey "$REVIEWER_PUBKEY" < "$TMP/verdict.json") \
               || contradiction "standing verdict #${I} does not verify against the pinned reviewer pubkey"
+            jq -e --argjson want 30023 '.kind == $want' "$TMP/verdict.json" >/dev/null \
+              || contradiction "standing verdict #${I} is kind $(jq -r .kind "$TMP/verdict.json"), not the addressable 30023 — a channel-scoped event can be redacted by a channel admin"
+            jq -e --arg d "$VERDICT_SLUG" '[.tags[] | select(.[0] == "d") | .[1]] == [$d]' \
+              "$TMP/verdict.json" >/dev/null \
+              || contradiction "standing verdict #${I} is at coordinate $(jq -c '[.tags[] | select(.[0] == "d") | .[1]]' "$TMP/verdict.json"), not ${VERDICT_SLUG}"
             VERIFIED_IDS="${VERIFIED_IDS} ${VERIFIED_ID}"
             I=$((I + 1))
           done

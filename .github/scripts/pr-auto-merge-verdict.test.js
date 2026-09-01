@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { decide, parseArgs, readEvents, selectVerdictMessages } = require("./pr-auto-merge-verdict.js");
+const { decide, parseArgs, readEvents } = require("./pr-auto-merge-verdict.js");
 
 const REVIEWER = "a".repeat(64);
 const OTHER = "b".repeat(64);
@@ -40,9 +40,16 @@ test("clean approve at or below the floor authorizes", () => {
   assert.match(result.eventId, /^event-/);
 });
 
-test("no reviewer verdict message → not found", () => {
+test("an empty coordinate is 'not found'; a populated one is never silently empty", () => {
+  // The distinction matters for the caller: "nothing published yet" is a quiet
+  // skip, while "something is there and it does not parse" is a refusal that
+  // should be visible. The coordinate is dedicated to the verdict, so content
+  // without a trailer is a malformed verdict, not an absent one.
   assert.equal(decide([], opts()).found, false);
-  assert.equal(decide([message({ content: "just chatting" })], opts()).found, false);
+  const junk = decide([message({ content: "just chatting" })], opts());
+  assert.equal(junk.found, true);
+  assert.equal(junk.authorized, false);
+  assert.match(junk.reason, /trailer/);
 });
 
 test("another author's verdict is ignored", () => {
@@ -50,31 +57,15 @@ test("another author's verdict is ignored", () => {
   assert.equal(result.found, false);
 });
 
-test("newest REQUEST-CHANGES blocks an older APPROVE", () => {
-  const events = [
-    verdictMessage({ createdAt: 1000 }),
-    verdictMessage({ createdAt: 2000, verdict: "REQUEST-CHANGES", autoMerge: "no" }),
-  ];
-  const result = decide(events, opts());
-  assert.equal(result.found, true);
-  assert.equal(result.requested, false);
-  assert.equal(result.reason, "verdict is REQUEST-CHANGES");
-});
-
-test("a malformed newest verdict blocks — an older APPROVE is never resurrected", () => {
-  const events = [
-    verdictMessage({ createdAt: 1000 }),
-    message({ createdAt: 2000, content: `${trailer()}\n\nP.S. text after the trailer` }),
-  ];
-  const result = decide(events, opts());
-  assert.equal(result.found, true);
-  assert.equal(result.requested, false);
-  assert.match(result.reason, /malformed trailer/);
-});
-
-test("a blockquoted trailer is not a verdict", () => {
+test("a quoted trailer does not authorize — only the final four lines count", () => {
+  // The security property is that it does not AUTHORIZE. Under the coordinate
+  // model it is also `found`, because something is published there — which is
+  // the more useful signal: the reviewer wrote to their verdict coordinate and
+  // it does not parse, rather than the coordinate being empty.
   const quoted = message({ content: `> VERDICT: APPROVE\nresending shortly` });
-  assert.equal(decide([quoted], opts()).found, false);
+  const result = decide([quoted], opts());
+  assert.equal(result.authorized, false);
+  assert.equal(result.requested, false);
 });
 
 test("APPROVE-WITH-NITS does not qualify", () => {
@@ -122,7 +113,7 @@ test("CRLF and trailing blank lines are tolerated", () => {
   assert.equal(result.authorized, true);
 });
 
-test("readEvents accepts both a bare array and a messages wrapper", () => {
+test("readEvents accepts a bare array and an events/messages wrapper", () => {
   assert.deepEqual(readEvents("[]"), []);
   assert.deepEqual(readEvents('{"messages": []}'), []);
   assert.throws(() => readEvents('{"other": 1}'), /neither/);
@@ -138,97 +129,62 @@ test("parseArgs validates its inputs", () => {
   assert.throws(() => parseArgs(argv({ "--base": "nope" })), /--base/);
   assert.throws(() => parseArgs(["--reviewer", REVIEWER, "--head", HEAD, "--floor", "medium"]), /--base/);
   assert.throws(() => parseArgs(argv({ "--floor": "extreme" })), /--floor/);
-  assert.deepEqual(parseArgs(argv()), { reviewer: REVIEWER, head: HEAD, base: BASE, floor: "medium", select: false });
+  assert.deepEqual(parseArgs(argv()), { reviewer: REVIEWER, head: HEAD, base: BASE, floor: "medium" });
 });
 
-// --- Same-second corrections -------------------------------------------
-//
-// `created_at` is second-resolution and nothing in a Nostr event orders two
-// events within one second. The old tiebreak compared event ids, which is a
-// hash comparison: an APPROVE whose id happened to sort above the
-// REQUEST-CHANGES that revoked it won, and the merge proceeded after the
-// reviewer had already taken it back.
+// --- One coordinate, one value ------------------------------------------
+// The reviewer publishes to a NIP-33 addressable coordinate, so a correction
+// REPLACES the verdict it corrects. The three defects review found in the old
+// channel-history reader — an event-hash tiebreak preferring a revoked
+// approval, a completeness proof valid only over the live view, and a
+// redaction tripwire the redactor could erase — were all attempts to
+// reconstruct "which is current" from a log. These tests pin the property that
+// replaced them: anything other than exactly one value is a refusal.
 
-test("a same-second correction is ambiguous and never authorizes — whichever id sorts higher", () => {
-  for (const [approveId, correctionId] of [
-    ["ff".repeat(32), "00".repeat(32)],
-    ["00".repeat(32), "ff".repeat(32)],
-  ]) {
-    const approve = verdictMessage({ createdAt: 1000, id: approveId });
-    const correction = verdictMessage({ createdAt: 1000, id: correctionId, verdict: "REQUEST-CHANGES", autoMerge: "no" });
-    for (const events of [
-      [approve, correction],
-      [correction, approve],
-    ]) {
-      const result = decide(events, opts());
-      assert.equal(result.found, true);
-      assert.equal(result.authorized, false, `approve id ${approveId.slice(0, 4)}…`);
-      assert.equal(result.requested, false);
-      assert.equal(result.tied, 2);
-      assert.match(result.reason, /^ambiguous: 2 reviewer verdicts share created_at 1000 and disagree/);
-    }
+test("no verdict at the coordinate → not found, never authorized", () => {
+  const result = decide([], opts());
+  assert.equal(result.found, false);
+  assert.equal(result.authorized, false);
+});
+
+test("two events at one coordinate refuse rather than pick", () => {
+  // Cannot happen while the relay enforces NIP-33 replacement — which is
+  // exactly why it must not be papered over if it ever does.
+  const approve = verdictMessage({ createdAt: 1000, id: "f".repeat(64) });
+  const revoke = verdictMessage({
+    createdAt: 1001,
+    id: "0".repeat(64),
+    verdict: "REQUEST-CHANGES",
+    autoMerge: "no",
+  });
+  for (const order of [[approve, revoke], [revoke, approve]]) {
+    const result = decide(order, opts());
+    assert.equal(result.authorized, false);
+    assert.match(result.reason, /replacement is not being enforced/);
   }
 });
 
-test("a tie of duplicates of one event is not a disagreement", () => {
-  // The workflow's paging stall-guard re-reads a second of history, so the
-  // same event arrives more than once. Deduplicating by id keeps that from
-  // looking like two verdicts.
-  const one = verdictMessage({ createdAt: 1000, id: "d".repeat(64) });
-  const result = decide([one, { ...one }, { ...one }], opts());
-  assert.equal(result.tied, 1);
-  assert.equal(result.authorized, true);
-});
-
-test("a tie whose members all authorize reports the harshest effective risk", () => {
-  const low = verdictMessage({ createdAt: 1000, id: "1".repeat(64) });
-  const medium = verdictMessage({ createdAt: 1000, id: "2".repeat(64), risk: "medium — product code" });
-  assert.equal(decide([low, medium], opts()).effectiveRisk, "medium");
-  assert.equal(decide([medium, low], opts()).effectiveRisk, "medium");
-});
-
-test("a tie of equal-risk authorizations reports a stable event id", () => {
-  const a = verdictMessage({ createdAt: 1000, id: "1".repeat(64) });
-  const b = verdictMessage({ createdAt: 1000, id: "2".repeat(64) });
-  assert.equal(decide([a, b], opts()).eventId, "1".repeat(64));
-  assert.equal(decide([b, a], opts()).eventId, "1".repeat(64));
-});
-
-test("a tie whose members all refuse reports the refusal, not ambiguity", () => {
-  const a = verdictMessage({ createdAt: 1000, id: "1".repeat(64), verdict: "REQUEST-CHANGES", autoMerge: "no" });
-  const b = verdictMessage({ createdAt: 1000, id: "2".repeat(64), verdict: "REQUEST-CHANGES", autoMerge: "no" });
-  const result = decide([a, b], opts());
-  assert.equal(result.tied, 2);
+test("a revocation at the coordinate is simply the value, and refuses", () => {
+  const result = decide([verdictMessage({ verdict: "REQUEST-CHANGES", autoMerge: "no" })], opts());
+  assert.equal(result.found, true);
   assert.equal(result.authorized, false);
   assert.equal(result.reason, "verdict is REQUEST-CHANGES");
 });
 
-test("an older approve never revives past a newer correction, tie or not", () => {
-  const events = [
-    verdictMessage({ createdAt: 1000 }),
-    verdictMessage({ createdAt: 1001, verdict: "REQUEST-CHANGES", autoMerge: "no" }),
-  ];
-  assert.equal(decide(events, opts()).tied, 1);
-  assert.equal(decide(events, opts()).authorized, false);
-});
-
-test("selectVerdictMessages returns only the newest second, deduplicated", () => {
-  const old = verdictMessage({ createdAt: 999 });
-  const a = verdictMessage({ createdAt: 1000, id: "a".repeat(64) });
-  const b = verdictMessage({ createdAt: 1000, id: "b".repeat(64) });
-  const selected = selectVerdictMessages([old, b, a, { ...a }], REVIEWER);
-  assert.deepEqual(
-    selected.map((e) => e.id),
-    ["a".repeat(64), "b".repeat(64)],
-  );
-});
-
-test("id-less events are never collapsed into each other", () => {
-  const a = { pubkey: REVIEWER, created_at: 1000, content: `x\n\n${trailer()}` };
-  const b = { pubkey: REVIEWER, created_at: 1000, content: `x\n\n${trailer({ verdict: "REQUEST-CHANGES", autoMerge: "no" })}` };
-  const result = decide([a, b], opts());
-  assert.equal(result.tied, 2);
+test("someone else's verdict at the coordinate is not the reviewer's", () => {
+  const result = decide([verdictMessage({ pubkey: OTHER })], opts());
+  assert.equal(result.found, false);
   assert.equal(result.authorized, false);
+});
+
+test("a malformed verdict blocks; there is no older value to fall back to", () => {
+  const result = decide(
+    [message({ content: `Round 2.\n\n${trailer({ verdict: "APPROVE" }).replace("VERDICT: APPROVE", "VERDICT: MAYBE")}` })],
+    opts(),
+  );
+  assert.equal(result.found, true);
+  assert.equal(result.authorized, false);
+  assert.match(result.reason, /malformed trailer \(verdict line\)/);
 });
 
 // --- Reviewed base ------------------------------------------------------
@@ -250,62 +206,4 @@ test("an unrelated merge-base value does not authorize", () => {
 test("the head check still runs before the base check", () => {
   const result = decide([verdictMessage({ head: OLD_HEAD, base: OLD_BASE })], opts());
   assert.match(result.reason, /^stale: reviewed 2+/);
-});
-
-// --- --select: what the authorize job hands the merge job ---------------
-// The authorize job reads the relay with trusted in-repo code and narrows the
-// channel's reviewer history to the standing verdict. It deliberately does NOT
-// evaluate: head, base and floor are GitHub facts the merge job derives for
-// itself, so parseArgs must not demand them here.
-
-test("--select parses without head, base or floor", () => {
-  const parsed = parseArgs(["--reviewer", REVIEWER, "--select"]);
-  assert.deepEqual(parsed, { reviewer: REVIEWER, select: true });
-});
-
-test("--select still requires a well-formed reviewer pubkey", () => {
-  assert.throws(() => parseArgs(["--reviewer", "nope", "--select"]), /64-hex pubkey/);
-});
-
-test("the evaluating form still requires head, base and floor", () => {
-  assert.throws(() => parseArgs(["--reviewer", REVIEWER, "--head", HEAD, "--base", BASE]), /--floor/);
-  const parsed = parseArgs(["--reviewer", REVIEWER, "--head", HEAD, "--base", BASE, "--floor", "low"]);
-  assert.equal(parsed.select, false);
-});
-
-test("selection hands over the newest verdict, not an older approval", () => {
-  // The Round 2 attack, at the layer that stops it: whatever an untrusted
-  // reader would rather hand over, selection over the full history returns the
-  // correction, and the merge job refuses on it.
-  const approval = verdictMessage({ createdAt: 1000, id: "f".repeat(64) });
-  const correction = verdictMessage({
-    createdAt: 1001,
-    id: "0".repeat(64),
-    verdict: "REQUEST-CHANGES",
-    autoMerge: "no",
-  });
-  for (const order of [[approval, correction], [correction, approval]]) {
-    const selected = selectVerdictMessages(order, REVIEWER);
-    assert.deepEqual(selected.map((e) => e.id), ["0".repeat(64)]);
-    assert.equal(decide(selected, opts()).authorized, false);
-  }
-});
-
-test("selection keeps every message of a tie, so the merge job sees the disagreement", () => {
-  const approval = verdictMessage({ createdAt: 1000, id: "f".repeat(64) });
-  const correction = verdictMessage({
-    createdAt: 1000,
-    id: "0".repeat(64),
-    verdict: "REQUEST-CHANGES",
-    autoMerge: "no",
-  });
-  const selected = selectVerdictMessages([approval, correction], REVIEWER);
-  assert.equal(selected.length, 2);
-  assert.equal(decide(selected, opts()).authorized, false);
-});
-
-test("selection drops messages that are not the reviewer's", () => {
-  const mine = verdictMessage({ createdAt: 1000 });
-  const theirs = verdictMessage({ createdAt: 2000, pubkey: OTHER });
-  assert.deepEqual(selectVerdictMessages([mine, theirs], REVIEWER).map((e) => e.content), [mine.content]);
 });

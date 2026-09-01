@@ -221,6 +221,36 @@ pub async fn handle_side_effects(
     }
 }
 
+/// Whether a kind:9005 moderation delete sent with `h=<channel_id>` may target
+/// an event whose stored channel is `target_channel_id`.
+///
+/// Two refusals, and the second one is load-bearing beyond moderation:
+///
+/// - A different channel: an admin of channel A could otherwise delete events
+///   in channel B by sending `h=A, e=<event-in-B>`.
+/// - **No channel at all.** Kind:9005 authority is granted by channel
+///   ownership/adminship, so an event that belongs to no channel has nothing
+///   for that authority to attach to and is out of reach of every channel
+///   owner and admin on the relay. Global-only kinds (`is_global_only_kind`,
+///   e.g. NIP-23 kind:30023) always have `channel_id = NULL`, so they can only
+///   ever be removed or replaced by their own author. Callers rely on that:
+///   `.github/workflows/buzz-pr-auto-merge.yml` reads the reviewer's merge
+///   authorization from an addressable kind:30023 coordinate precisely because
+///   the CI identity — which owns every PR channel — cannot redact it. Relaxing
+///   this arm would hand channel admins the power to erase a merge veto.
+pub(crate) fn moderation_delete_target_allowed(
+    target_channel_id: Option<Uuid>,
+    channel_id: Uuid,
+) -> anyhow::Result<()> {
+    match target_channel_id {
+        Some(target_ch) if target_ch != channel_id => Err(anyhow::anyhow!(
+            "target event belongs to a different channel"
+        )),
+        None => Err(anyhow::anyhow!("target event has no channel")),
+        _ => Ok(()),
+    }
+}
+
 /// Validate a standard NIP-09 deletion event before it is stored.
 ///
 /// Buzz accepts standard deletions for self-authored events, plus the owning
@@ -660,17 +690,7 @@ pub async fn validate_admin_event(
                 .map_err(|e| anyhow::anyhow!("db error looking up target: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
 
-            match target_event.channel_id {
-                Some(target_ch) if target_ch != channel_id => {
-                    return Err(anyhow::anyhow!(
-                        "target event belongs to a different channel"
-                    ));
-                }
-                None => {
-                    return Err(anyhow::anyhow!("target event has no channel"));
-                }
-                _ => {} // Same channel — OK
-            }
+            moderation_delete_target_allowed(target_event.channel_id, channel_id)?;
 
             // Check if actor is the event author.
             // For relay-signed REST messages, the real author is in the p tag.
@@ -1774,17 +1794,7 @@ async fn handle_delete_event_side_effect(
         .await
         .map_err(|e| anyhow::anyhow!("get_event_by_id failed: {e}"))?
     {
-        match target_event.channel_id {
-            Some(target_ch) if target_ch != channel_id => {
-                return Err(anyhow::anyhow!(
-                    "target event belongs to a different channel"
-                ));
-            }
-            None => {
-                return Err(anyhow::anyhow!("target event has no channel"));
-            }
-            _ => {} // Same channel — OK
-        }
+        moderation_delete_target_allowed(target_event.channel_id, channel_id)?;
     }
 
     // Look up thread metadata so we can pass parent/root IDs to the
@@ -3683,6 +3693,37 @@ pub async fn publish_nipia_unarchived(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A channel owner/admin's kind:9005 reach stops at their channel, and does
+    // not extend to events that belong to no channel at all. The second half is
+    // depended on outside the relay: buzz-pr-auto-merge.yml reads the
+    // reviewer's merge authorization from an addressable kind:30023 coordinate
+    // (always `channel_id = NULL`, see `is_global_only_kind`) specifically so
+    // the CI identity — owner of every PR channel — cannot delete a verdict
+    // that revokes an earlier approval. Without this, that design silently
+    // stops holding.
+    #[test]
+    fn moderation_delete_reaches_only_its_own_channel() {
+        let channel = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        assert!(moderation_delete_target_allowed(Some(channel), channel).is_ok());
+
+        let cross = moderation_delete_target_allowed(Some(other), channel).unwrap_err();
+        assert!(
+            cross.to_string().contains("different channel"),
+            "cross-channel delete must be refused, got: {cross}"
+        );
+    }
+
+    #[test]
+    fn moderation_delete_cannot_touch_a_channelless_event() {
+        let refusal = moderation_delete_target_allowed(None, Uuid::new_v4()).unwrap_err();
+        assert!(
+            refusal.to_string().contains("no channel"),
+            "a channel-less target must be out of reach of channel moderation, got: {refusal}"
+        );
+    }
 
     #[test]
     fn group_members_snapshot_keeps_members_past_one_thousand() {

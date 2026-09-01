@@ -1,54 +1,43 @@
 "use strict";
 
-// Selects and evaluates the reviewer's standing verdict for PR auto-merge
+// Evaluates the reviewer's standing verdict for PR auto-merge
 // (docs/pr-auto-merge.md).
 //
-// stdin:  JSON from `buzz messages get` — either a bare array of events or
-//         {"messages": [...]}. Pages may be concatenated by the caller into
-//         one array; ordering does not matter (created_at decides) and
-//         repeats are fine (events are deduplicated by id first, because the
-//         caller's paging stall-guard re-reads a second of history).
+// stdin:  a JSON array holding the ONE event at the reviewer's verdict
+//         coordinate, or {"events": [...]} / {"messages": [...]}.
 // args:   --reviewer <64-hex pubkey> --head <40-hex sha>
 //         --base <40-hex sha> --floor low|medium|high
-//   or:   --reviewer <64-hex pubkey> --select
-// stdout: one JSON object (see shape below), or with --select the JSON array
-//         of the reviewer's newest-tied verdict messages and nothing else.
+// stdout: one JSON object (see shape below).
 // exit:   0 whenever a decision was produced (including "no"); 2 on bad
 //         usage or unparseable input — a caller bug, never a quiet "no".
 //
-// --select exists for the authorize job (docs/pr-auto-merge.md): that job
-// reads the relay with trusted in-repo code and must hand the merge job the
-// STANDING verdict rather than a verdict of somebody else's choosing. It
-// narrows a channel's reviewer history to the messages that could be the
-// standing verdict, using exactly the selection decide() would use, without
-// evaluating them — head, base and floor are the merge job's to supply, from
-// GitHub, and are deliberately not knowable here.
+// ONE EVENT, BECAUSE THE SOURCE IS A COORDINATE AND NOT A LOG. The reviewer
+// publishes to the NIP-33 addressable coordinate
+// `(kind 30023, reviewer, d = pr-verdict-<repo>-<pr>)`, which is replaceable:
+// a correction overwrites the verdict it corrects, so the standing verdict is
+// simply the coordinate's current value.
 //
-// Selection is BROAD, evaluation is STRICT — and selection never continues
-// past the newest verdict-bearing message. The newest reviewer-authored
-// message containing a line-anchored `VERDICT:` IS the standing verdict
-// (the reviewer's protocol makes corrections restate the full trailer), so
-// a newer REQUEST-CHANGES or a malformed correction blocks; an older
-// APPROVE is never resurrected past it. Authorship is trustworthy because
-// the relay enforces event.pubkey == the authenticated publisher.
+// Earlier revisions read the reviewer's channel history instead and had to
+// select the newest verdict from many. That produced three defects in review —
+// an event-hash tiebreak that could prefer a revoked approval, a completeness
+// proof that held only over the live view, and a redaction tripwire that the
+// redactor could itself erase — because every one of them was an attempt to
+// reconstruct "which is current" from a log that a channel admin could rewrite.
+// None of that machinery is here, because the question is no longer asked.
+// Anything other than exactly one event is a refusal, not a selection problem.
 //
-// TIES ARE AMBIGUOUS, NOT ORDERED. Nostr `created_at` has one-second
-// resolution, so an approval and the correction that revokes it can share a
-// timestamp. There is no signed sequence, receipt order, or any other field
-// that establishes which the reviewer published second — an event-id
-// comparison is a hash comparison, not a clock. So when two or more distinct
-// verdict messages tie at the newest second, every one of them must
-// independently authorize; otherwise the decision is `ambiguous` and refuses.
-// A correction posted in the same second as its approval therefore blocks,
-// whichever way round it was sent, and the reviewer's next round resolves it.
+// Authorship is proved by the caller before this runs (BIP-340 over the NIP-01
+// id, author pinned to --reviewer) and again in the merge job; this file
+// re-checks the pubkey anyway, so a caller that forgets cannot silently pass
+// somebody else's trailer through.
 //
 // Output shape:
-//   found       a reviewer verdict message exists
+//   found       a reviewer verdict exists at the coordinate
 //   requested   VERDICT: APPROVE + AUTO-MERGE: yes + reviewed head == --head
 //               + reviewed merge base == --base
-//   authorized  requested && max(RISK, --floor) != high && no tie disagreement
+//   authorized  requested && max(RISK, --floor) != high
 //   plus verdict/risk/floor/effectiveRisk/reviewedHead/mergeBase/autoMerge/
-//   eventId/createdAt/tied/reason for the audit trail.
+//   eventId/createdAt/reason for the audit trail.
 
 const TIERS = ["low", "medium", "high"];
 
@@ -62,38 +51,6 @@ const TRAILER = {
   risk: /^RISK: (low|medium|high)(?:\s+[—-].*)?$/,
   autoMerge: /^AUTO-MERGE: (yes|no)$/,
 };
-
-// The distinct reviewer-authored verdict messages that tie at the newest
-// created_at. Deduplicated by event id first: the caller's paging stall-guard
-// deliberately re-reads a second of history, so the same event routinely
-// arrives twice and must not look like two verdicts. Sorted by id only so the
-// reported eventId is stable across input orderings — the order carries no
-// meaning and is never used to prefer one verdict over another.
-function selectVerdictMessages(events, reviewer) {
-  const distinct = new Map();
-  let anonymous = 0;
-  for (const e of events) {
-    if (!e || typeof e.content !== "string" || typeof e.pubkey !== "string") {
-      continue;
-    }
-    if (e.pubkey.toLowerCase() !== reviewer) {
-      continue;
-    }
-    if (!/^VERDICT:/m.test(e.content.replace(/\r\n/g, "\n"))) {
-      continue;
-    }
-    // An event with no id cannot be PROVEN a duplicate, so it counts as its
-    // own verdict rather than silently collapsing into another one.
-    const key = typeof e.id === "string" && e.id.length > 0 ? e.id : `\u0000anonymous-${(anonymous += 1)}`;
-    distinct.set(key, e);
-  }
-  const candidates = [...distinct.values()];
-  if (candidates.length === 0) {
-    return [];
-  }
-  const newest = candidates.reduce((acc, e) => Math.max(acc, e.created_at ?? 0), Number.NEGATIVE_INFINITY);
-  return candidates.filter((e) => (e.created_at ?? 0) === newest).sort((a, b) => String(a.id).localeCompare(String(b.id)));
-}
 
 function evaluateTrailer(content) {
   const lines = content.replace(/\r\n/g, "\n").trimEnd().split("\n");
@@ -172,55 +129,32 @@ function evaluateOne(message, { head, base, floor }) {
 }
 
 function decide(events, { reviewer, head, base, floor }) {
-  const messages = selectVerdictMessages(events, reviewer);
-  if (messages.length === 0) {
-    return { found: false, requested: false, authorized: false, reason: "no verdict message from reviewer" };
+  const mine = events.filter(
+    (e) => e && typeof e.content === "string" && typeof e.pubkey === "string" && e.pubkey.toLowerCase() === reviewer,
+  );
+  if (mine.length === 0) {
+    return { found: false, requested: false, authorized: false, reason: "no verdict from the reviewer" };
   }
-  const tied = messages.length;
-  const results = messages.map((message) => evaluateOne(message, { head, base, floor }));
-
-  if (results.every((r) => r.authorized)) {
-    // A tie in which every member authorizes is not a disagreement, so it is
-    // safe to act on — but report the harshest effective risk of the set
-    // rather than whichever one sorted first, so the audit trail never
-    // understates what was merged.
-    const worst = results.reduce((acc, r) =>
-      r.effectiveRisk !== acc.effectiveRisk && maxTier(acc.effectiveRisk, r.effectiveRisk) === r.effectiveRisk ? r : acc,
-    );
-    return { ...worst, tied };
-  }
-
-  const refused = results.find((r) => !r.authorized);
-  if (tied > 1 && results.some((r) => r.authorized)) {
-    // Same second, opposite answers, and nothing in the event establishes
-    // which came second. Refuse rather than guess; the reviewer's next round
-    // resolves it. `requested: false` routes this to a quiet skip — the
-    // reviewer already knows they corrected themselves.
+  if (mine.length > 1) {
+    // `(kind, pubkey, d)` is unique for a NIP-33 coordinate, so more than one
+    // means replacement is not being enforced upstream and "current value" is
+    // not a thing we can name. Refuse rather than pick.
     return {
-      ...refused,
-      tied,
+      found: true,
       requested: false,
       authorized: false,
-      reason: `ambiguous: ${tied} reviewer verdicts share created_at ${refused.createdAt ?? "?"} and disagree — ${refused.reason}`,
+      reason: `${mine.length} events at the verdict coordinate — replacement is not being enforced`,
     };
   }
-  return { ...refused, tied };
+  return evaluateOne(mine[0], { head, base, floor });
 }
 
 function parseArgs(argv) {
   const args = {};
-  const select = argv.includes("--select");
-  const positional = argv.filter((a) => a !== "--select");
-  for (let i = 0; i < positional.length; i += 2) {
-    args[positional[i]] = positional[i + 1];
+  for (let i = 0; i < argv.length; i += 2) {
+    args[argv[i]] = argv[i + 1];
   }
   const reviewer = args["--reviewer"];
-  if (select) {
-    if (!/^[0-9a-f]{64}$/.test(reviewer ?? "")) {
-      throw new Error("--reviewer must be a 64-hex pubkey");
-    }
-    return { reviewer, select: true };
-  }
   const head = args["--head"];
   const base = args["--base"];
   const floor = args["--floor"];
@@ -236,14 +170,14 @@ function parseArgs(argv) {
   if (!TIERS.includes(floor ?? "")) {
     throw new Error("--floor must be low|medium|high");
   }
-  return { reviewer, head, base, floor, select: false };
+  return { reviewer, head, base, floor };
 }
 
 function readEvents(raw) {
   const parsed = JSON.parse(raw);
-  const events = Array.isArray(parsed) ? parsed : parsed?.messages;
+  const events = Array.isArray(parsed) ? parsed : (parsed?.events ?? parsed?.messages);
   if (!Array.isArray(events)) {
-    throw new Error("input is neither an event array nor {messages: [...]}");
+    throw new Error("input is neither an event array nor {events: [...]}");
   }
   return events;
 }
@@ -251,8 +185,7 @@ function readEvents(raw) {
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const events = readEvents(require("node:fs").readFileSync(0, "utf8"));
-  const result = opts.select ? selectVerdictMessages(events, opts.reviewer) : decide(events, opts);
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  process.stdout.write(`${JSON.stringify(decide(events, opts))}\n`);
 }
 
 if (require.main === module) {
@@ -264,4 +197,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { decide, evaluateOne, evaluateTrailer, selectVerdictMessages, parseArgs, readEvents, maxTier };
+module.exports = { decide, evaluateOne, evaluateTrailer, parseArgs, readEvents, maxTier };

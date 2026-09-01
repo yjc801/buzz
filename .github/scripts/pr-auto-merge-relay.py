@@ -1,53 +1,74 @@
 #!/usr/bin/env python3
 """The PR auto-merge workflow's entire relay client. Pure stdlib, no binary.
 
-WHY THIS EXISTS. The workflow used to reach the relay through `buzz`, a binary
-downloaded from block/buzz's rolling `sprig-latest` release and therefore
-unreviewed. That binary needed the CI signing key, and the CI identity owns
-every PR channel — which means it can kind-9005 delete any message in one
-(crates/buzz-relay/src/handlers/side_effects.rs, "event author OR channel
-owner/admin"). Deletion is soft (`deleted_at = NOW()`) and every query path
-appends `deleted_at IS NULL`, so a redacted message is simply not there any
-more. Unreviewed code holding that key can therefore delete the reviewer's
-newer REQUEST-CHANGES and leave a short, apparently-complete history holding
-only the APPROVE it corrected. Verifying signatures does not help: the
-surviving event is genuine.
+TWO JOBS, AND THE SECOND ONE IS THE IMPORTANT ONE.
 
-The fix is not to guard the binary but to remove it. Everything the workflow
-asked `buzz` to do is a relay read or a relay write, and both are reachable
-from `POST /query` and `POST /events` behind NIP-98 auth
-(crates/buzz-relay/src/api/bridge.rs). scripts/buzz-mint-auth-tag.py already
-implements BIP-340 signing and NIP-01 event ids in pure stdlib for the
-auth-tag work. This script is those facts joined, and with it no unreviewed
-code runs in this workflow at all.
+1. It replaces `buzz` — a binary downloaded from block/buzz's rolling
+   `sprig-latest` release, and therefore unreviewed — for everything this
+   workflow does on the relay. Both the reads and the writes are reachable from
+   `POST /query` and `POST /events` behind NIP-98 auth
+   (crates/buzz-relay/src/api/bridge.rs), and scripts/buzz-mint-auth-tag.py
+   already implements BIP-340 signing and NIP-01 event ids in pure stdlib for
+   the auth-tag work. Joining those two facts means no unreviewed code runs in
+   this workflow at all.
 
-COMPLETENESS IS PROVED, NOT ASSUMED. The relay advertises `max_limit: 1000`
-(NIP-11) and clamps a filter's limit to it. Every read here asks for the full
-window and refuses unless the relay returns FEWER events than it asked for — a
-short page is the relay saying "that is all of them". A full window means the
-history may continue past the edge, so it is a refusal rather than a warning.
+2. It reads the merge authorization from a place no channel authority can
+   rewrite. That is the load-bearing part, and it is worth being precise about
+   why, because three earlier revisions got it wrong in three different ways.
 
-REDACTION LEAVES A TRACE, AND THE TRACE IS A REFUSAL. Completeness over the
-live view is not completeness over the history: the rows a reader never sees
-are exactly the ones someone deleted. So every channel read also refuses if
-the channel contains ANY kind-9005. That is precisely targeted rather than
-noisy — kind 5 is self-deletion only (plus an agent's owning human), so
-9005 is specifically the foreign/admin redaction primitive, and agents delete
-their own messages routinely while 9005 in a PR channel should never happen.
-A redaction can hide a message but not the fact that one occurred: deleting
-the 9005 requires another 9005, so one is always visible.
+WHY NOT READ THE VERDICT FROM THE CHANNEL. The CI identity owns every PR
+channel. A channel owner may kind-9005 delete anyone's message there
+(side_effects.rs, "event author OR channel owner/admin"); deletion is soft and
+every query path appends `deleted_at IS NULL`. So whoever holds this key can
+delete the reviewer's newer REQUEST-CHANGES and leave a genuine, correctly
+signed APPROVE above a history that looks complete. Verifying signatures does
+not help — the surviving event is real. Proving the page complete does not
+help — completeness over the live view says nothing about the rows someone
+removed. Scanning for the 9005 does not help either — an ordinary kind-5
+self-delete erases it, since the redactor authored it.
+
+Each of those was a detector inside the blast radius of the thing it detected.
+
+SO THE VERDICT LIVES AT AN ADDRESSABLE COORDINATE:
+
+    (kind 30023, reviewer, d = pr-verdict-<owner>-<repo>-<pr>)
+
+Kind-9005 authority comes from channel ownership, and the relay refuses a 9005
+whose target has no channel at all (`moderation_delete_target_allowed`, pinned
+by a unit test in side_effects.rs because this file now depends on it). Kind
+30023 is in `is_global_only_kind`, so its `channel_id` is always NULL even with
+a stray `h` tag. Only the reviewer's key can delete it (kind 5 is
+self-authored) or rewrite it (NIP-33 replacement is keyed by
+`(kind, pubkey, d)`).
+
+And because the coordinate is REPLACEABLE, the standing verdict is simply its
+current value — a correction overwrites what it corrects. Nothing here selects
+a newest, breaks a tie, or looks for a redaction. Those questions belonged to
+reading a log; this does not read a log.
+
+COMPLETENESS IS STILL PROVED, NOT ASSUMED. The relay advertises
+`max_limit: 1000` (NIP-11) and clamps a filter's limit to it, so every read
+here asks for the full window and refuses unless the relay returns FEWER events
+than it asked for. For the verdict that is a belt-and-braces check on a
+coordinate that should hold exactly one event; for the channel reads below —
+which are presentation only — it is what keeps a truncated page from reading as
+an absent notice.
 
 Commands:
   channel --repo <owner/name> --pr <n> --ci-pubkey <hex64>
       Resolve the PR's channel from the mirror's signed binding note and print
       the UUID. Exit 3 when the note is provably absent (the mirror has not
-      run yet — a skip, not a fault).
+      run yet — a skip, not a fault). Used for posting notices, never for
+      authorization.
+  standing-verdict --repo <owner/name> --pr <n> --reviewer <hex64>
+      Print the one signed event at the reviewer's verdict coordinate for this
+      PR, proved: signature, author, kind, and `d` tag. Exit 3 when the
+      reviewer has published no verdict.
   events --channel <uuid> --author <hex64> [--kind <n>]
-      Print that author's events in that channel as a JSON array, every one
-      signature-verified and proved to carry the channel's `h` tag.
-  standing-verdict --repo <owner/name> --pr <n> --ci-pubkey <hex64>
-                   --reviewer <hex64>
-      `channel` then `events` for the reviewer, as {"channel":…, "events":[…]}.
+      That author's events in that channel as a JSON array, signature-verified
+      and proved to carry the channel's `h` tag. Presentation only — it backs
+      the blocked-notice dedup scan, and a channel read must never be trusted
+      to authorize anything.
   send --channel <uuid>
       Publish a kind-9 message with the content on stdin. Prints the event id.
       Top-level and unthreaded, with no `p` tags — which is right for the
@@ -101,10 +122,6 @@ MINT = _load_mint()
 KIND_LONG_FORM = 30023
 # NIP-29 group chat message — what the reviewer's verdicts are.
 KIND_CHANNEL_MESSAGE = 9
-# NIP-29 moderation delete. The ONE kind a channel owner/admin can use against
-# somebody else's message; kind 5 is self-deletion. Its presence in a PR
-# channel is the redaction tripwire, not routine churn.
-KIND_ADMIN_DELETE = 9005
 # The relay's advertised NIP-11 max_limit. Asking for exactly this and
 # requiring a SHORT page back is what makes the read provably complete.
 RELAY_MAX_LIMIT = 1000
@@ -342,30 +359,59 @@ def build_message(secret, auth_tag_json, channel, content, created_at):
     return event
 
 
-def assert_no_admin_deletions(base, secret, auth_tag, channel, opener=None):
-    """Refuse if anything in this channel has been redacted by an owner/admin.
+def verdict_slug(repo, pr):
+    """The addressable coordinate the reviewer publishes their verdict at."""
+    return f"pr-verdict-{repo}-{pr}".lower().replace("/", "-")
 
-    Signature verification proves an event is genuine; it says nothing about
-    the events that are missing. This is the only check that looks at absence,
-    and it is what makes the completeness proof a statement about the HISTORY
-    rather than about the current view.
+
+def read_verdict_note(base, secret, auth_tag, repo, pr, reviewer, opener=None):
+    """The reviewer's standing verdict, from a place no channel admin can touch.
+
+    THIS IS THE WHOLE POINT OF THE DESIGN, so it is worth saying why a note and
+    not a channel message. Kind:9005 authority comes from channel ownership,
+    and the relay refuses a 9005 whose target has no channel at all
+    (`moderation_delete_target_allowed` in
+    crates/buzz-relay/src/handlers/side_effects.rs, pinned by a test there).
+    Kind:30023 is in `is_global_only_kind`, so its `channel_id` is always NULL
+    even if a stray `h` tag is present. A note is therefore out of reach of
+    every channel owner and admin on the relay — including the CI identity that
+    owns every PR channel and whose key is handed to unreviewed binaries in the
+    mirror workflows. Only the reviewer's own key can delete it (kind 5 is
+    self-authored) or rewrite it (NIP-33 replacement is keyed by
+    `(kind, pubkey, d)`).
+
+    And because the coordinate is REPLACEABLE, the standing verdict is simply
+    its current value. A correction replaces what it corrects. There is no
+    newest-of-many to select, no tie to break, no page to prove complete, and
+    no redaction to detect — those problems belonged to reading a log, and this
+    does not read a log.
     """
-    deletions = post_query(
+    slug = verdict_slug(repo, pr)
+    notes = post_query(
         base,
         secret,
         auth_tag,
-        [{"kinds": [KIND_ADMIN_DELETE], "#h": [channel], "limit": RELAY_MAX_LIMIT}],
+        [{"kinds": [KIND_LONG_FORM], "authors": [reviewer], "#d": [slug], "limit": RELAY_MAX_LIMIT}],
         opener=opener,
     )
-    require_short_page(deletions, RELAY_MAX_LIMIT, f"deletion scan in {channel}")
-    if deletions:
-        ids = ", ".join(str(d.get("id"))[:12] for d in deletions[:5])
+    require_short_page(notes, RELAY_MAX_LIMIT, f"verdict lookup for '{slug}'")
+    for note in notes:
+        prove(note, reviewer, f"verdict note {note.get('id')}")
+        if note.get("kind") != KIND_LONG_FORM:
+            raise Refusal(f"verdict lookup returned kind {note.get('kind')}, not {KIND_LONG_FORM}")
+        if tag_values(note, "d") != [slug]:
+            raise Refusal(f"verdict note carries d={tag_values(note, 'd')}, not ['{slug}']")
+    if not notes:
+        return None
+    if len(notes) > 1:
+        # `(kind, pubkey, d)` is unique by construction for a NIP-33
+        # coordinate, so more than one means the relay is not enforcing
+        # replacement and "the current value" is not a thing we can name.
         raise Refusal(
-            f"{len(deletions)} kind-{KIND_ADMIN_DELETE} moderation deletion(s) in {channel} "
-            f"({ids}) — an owner/admin has redacted this channel, so its history cannot be "
-            "proved intact and no verdict can be established from it"
+            f"{len(notes)} events at the addressable coordinate for '{slug}' — "
+            "replacement is not being enforced, so no standing verdict can be established"
         )
-    return True
+    return notes[0]
 
 
 def open_relay(env, ci_pubkey=None):
@@ -401,11 +447,10 @@ def resolve_pr_channel(base, secret, auth_tag, repo, pr, ci_pubkey, opener=None)
 def read_channel_events(base, secret, auth_tag, channel, author, kind, opener=None):
     """Every event of `kind` by `author` in `channel`, proved and complete.
 
-    The deletion scan runs FIRST. Reading the messages and then asking whether
-    the channel was redacted would report on a history we had already drawn a
-    conclusion from.
+    Used only for the blocked-notice dedup scan, which is presentation. The
+    merge authorization deliberately does NOT come from a channel — see
+    `read_verdict_note` for why a channel read cannot be trusted for that.
     """
-    assert_no_admin_deletions(base, secret, auth_tag, channel, opener=opener)
     events = post_query(
         base,
         secret,
@@ -417,17 +462,10 @@ def read_channel_events(base, secret, auth_tag, channel, author, kind, opener=No
     return verified_events(events, channel, author, kind)
 
 
-def standing_verdict(repo, pr, ci_pubkey, reviewer, env, opener=None):
-    base, secret, auth_tag = open_relay(env, ci_pubkey)
-    channel = resolve_pr_channel(base, secret, auth_tag, repo, pr, ci_pubkey, opener=opener)
-    if channel is None:
-        return None
-    return {
-        "channel": channel,
-        "events": read_channel_events(
-            base, secret, auth_tag, channel, reviewer, KIND_CHANNEL_MESSAGE, opener=opener
-        ),
-    }
+def standing_verdict(repo, pr, reviewer, env, opener=None):
+    base, secret, auth_tag = open_relay(env)
+    note = read_verdict_note(base, secret, auth_tag, repo, pr, reviewer, opener=opener)
+    return None if note is None else {"slug": verdict_slug(repo, pr), "event": note}
 
 
 # --- selftest ---------------------------------------------------------------
@@ -542,23 +580,26 @@ def selftest():
     except Refusal:
         pass
 
-    # The redaction tripwire: an empty deletion scan passes, any moderation
-    # delete refuses, and it is a FAULT rather than weather.
-    def scan(deletions):
-        return assert_no_admin_deletions(
-            "https://relay.example", ci_sec, "", channel,
-            opener=_fake_opener(deletions),
+    # The verdict note: proved, unique at its coordinate, and refused when the
+    # relay hands back anything else.
+    vslug = verdict_slug("yjc801/buzz", 101)
+    assert vslug == "pr-verdict-yjc801-buzz-101"
+
+    def read(payload):
+        return read_verdict_note(
+            "https://relay.example", ci_sec, "", "yjc801/buzz", 101, rev_pub,
+            opener=_fake_opener(payload),
         )
 
-    assert scan([]) is True
-    admin_delete = _sign(ci_sec, KIND_ADMIN_DELETE, [["h", channel], ["e", msg["id"]]], "")
-    _refuses("moderation delete present", lambda: scan([admin_delete]))
-    try:
-        scan([admin_delete])
-    except Unprovable:
-        raise AssertionError("a redacted channel must be a fault, not weather")
-    except Refusal:
-        pass
+    good = _sign(rev_sec, KIND_LONG_FORM, [["d", vslug]], "Round 1\n\nVERDICT: APPROVE")
+    assert read([good]) == good
+    assert read([]) is None
+    _refuses("forged verdict note", lambda: read([_sign(ci_sec, KIND_LONG_FORM, [["d", vslug]], "x")]))
+    _refuses("wrong coordinate", lambda: read([_sign(rev_sec, KIND_LONG_FORM, [["d", "other"]], "x")]))
+    _refuses("wrong kind", lambda: read([_sign(rev_sec, 9, [["d", vslug]], "x")]))
+    _refuses("edited after signing", lambda: read([dict(good, content=good["content"] + "!")]))
+    _refuses("two events at one coordinate", lambda: read(
+        [good, _sign(rev_sec, KIND_LONG_FORM, [["d", vslug]], "y", created_at=1001)]))
 
     # Outbound messages carry the NIP-OA delegation INSIDE the signature, in
     # the shape `buzz messages send` produces.
@@ -574,7 +615,7 @@ def selftest():
     # would not verify against what we sent.
     assert build_message(ci_sec, "", channel, "a\nb", 1)["content"] == "a\nb"
 
-    print("selftest: relay client proofs pass (NIP-98, binding, channel scoping, completeness, redaction, signing)")
+    print("selftest: relay client proofs pass (NIP-98, binding, verdict coordinate, channel scoping, completeness, signing)")
 
 
 def _opts(argv):
@@ -619,13 +660,15 @@ def _run(command, opts):
         if "/" not in repo:
             raise SystemExit("--repo must be owner/name")
         pr = _need(opts, "--pr", r"^[0-9]+$", "a number")
-        ci = _need(opts, "--ci-pubkey", HEX64_RE.pattern, "a 64-hex pubkey")
         reviewer = _need(opts, "--reviewer", HEX64_RE.pattern, "a 64-hex pubkey")
-        result = standing_verdict(repo, int(pr), ci, reviewer, os.environ)
+        result = standing_verdict(repo, int(pr), reviewer, os.environ)
         if result is None:
-            print(f"no binding note for {binding_slug(repo, pr)} — the mirror has not run yet", file=sys.stderr)
+            print(
+                f"the reviewer has published no verdict at {verdict_slug(repo, pr)}",
+                file=sys.stderr,
+            )
             return EXIT_ABSENT, None
-        return 0, json.dumps(result, separators=(",", ":"), ensure_ascii=False)
+        return 0, json.dumps(result["event"], separators=(",", ":"), ensure_ascii=False)
 
     if command == "send":
         channel = _need(opts, "--channel", UUID_RE.pattern, "a channel UUID")

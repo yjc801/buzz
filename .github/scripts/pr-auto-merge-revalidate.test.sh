@@ -61,8 +61,12 @@ PY
 
 # --- a signing helper, reusing the repo's own BIP-340 implementation --------
 sign_event() {
-  # sign_event <secret-hex> <content-file> -> signed event JSON on stdout
-  python3 - "$1" "$2" <<'PY'
+  # sign_event <secret-hex> <content-file> [kind] [tags-json] -> signed event JSON
+  # Defaults to the real shape: a kind-30023 note at this PR's verdict
+  # coordinate. The overrides exist so a scenario can hand the fence a
+  # correctly signed event of the WRONG shape, which is the thing the
+  # coordinate checks are there to refuse.
+  python3 - "$1" "$2" "${3:-30023}" "${4:-[[\"d\", \"pr-verdict-yjc801-buzz-4242\"]]}" <<'PY'
 import importlib.util, json, sys
 
 spec = importlib.util.spec_from_file_location("nostr", "scripts/buzz-mint-auth-tag.py")
@@ -73,8 +77,8 @@ sec = int(sys.argv[1], 16)
 event = {
     "pubkey": mod.xonly(sec).hex(),
     "created_at": 1700000000,
-    "kind": 9,
-    "tags": [["h", "room"]],
+    "kind": int(sys.argv[3]),
+    "tags": json.loads(sys.argv[4]),
     "content": open(sys.argv[2], encoding="utf-8").read(),
 }
 event["id"] = mod.event_id(event)
@@ -381,6 +385,39 @@ expect "one member of the standing set is not the reviewer's" contradiction
 reset_fixtures
 VERDICT_EVENTS="$VERDICT_EVENT"
 expect "standing verdict handed over as a bare object, not a set" contradiction
+
+# --- the verdict must BE the unredactable artifact, not merely signed ------
+# The security argument is that a channel admin cannot rewrite the coordinate.
+# A kind-9 message signed by the same reviewer is an equally valid signature
+# over an artifact that a channel admin CAN delete, so the merge job has to
+# check the shape itself rather than trust the job that read the relay.
+
+reset_fixtures
+VERDICT_EVENT=$(sign_event "$REVIEWER_SECRET" "$WORK/verdict.txt" 9 '[["h", "room"]]')
+VERDICT_EVENTS=$(verdict_set "$VERDICT_EVENT")
+ANNOUNCED_ID=$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+expect "verdict is a channel message rather than an addressable note" contradiction
+
+# Tags are arbitrary, so a channel message can carry the right `d` tag while
+# still being channel-scoped and therefore redactable. Only the kind check
+# catches this one — without it the coordinate check waves it through.
+reset_fixtures
+VERDICT_EVENT=$(sign_event "$REVIEWER_SECRET" "$WORK/verdict.txt" 9 '[["h", "room"], ["d", "pr-verdict-yjc801-buzz-4242"]]')
+VERDICT_EVENTS=$(verdict_set "$VERDICT_EVENT")
+ANNOUNCED_ID=$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+expect "channel message wearing the right coordinate tag" contradiction
+
+reset_fixtures
+VERDICT_EVENT=$(sign_event "$REVIEWER_SECRET" "$WORK/verdict.txt" 30023 '[["d", "pr-verdict-yjc801-buzz-9999"]]')
+VERDICT_EVENTS=$(verdict_set "$VERDICT_EVENT")
+ANNOUNCED_ID=$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+expect "verdict note belongs to a different PR's coordinate" contradiction
+
+reset_fixtures
+VERDICT_EVENT=$(sign_event "$REVIEWER_SECRET" "$WORK/verdict.txt" 30023 '[]')
+VERDICT_EVENTS=$(verdict_set "$VERDICT_EVENT")
+ANNOUNCED_ID=$(printf '%s' "$VERDICT_EVENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+expect "verdict note carries no coordinate at all" contradiction
 
 # --- the artifact the merge job cannot re-read, and therefore must prove ----
 

@@ -393,21 +393,31 @@ impl OwnerCache {
     /// deadline being re-armed at capacity must not wipe the other entries,
     /// or a saturated cache under a `/query` outage would collapse every
     /// sibling back to a serial inline lookup per event. A previously absent
-    /// author at capacity first purges expired retry deadlines (worthless),
-    /// then evicts a single arbitrary entry only if the map is still full.
+    /// author at capacity evicts exactly one entry — the space the newcomer
+    /// needs: the longest-expired retry record if there is one, else an
+    /// arbitrary entry. Expired records are not purged wholesale because their
+    /// `failures` counter is the author's backoff tier; dropping it would
+    /// restart every affected author at the base delay after its next failed
+    /// lookup and multiply serial relay calls during the same outage.
     fn insert(&self, author: String, entry: SiblingEntry) {
         let Ok(mut map) = self.siblings.lock() else {
             return;
         };
         if !map.contains_key(&author) && map.len() >= Self::SIBLING_CACHE_CAP {
             let now = std::time::Instant::now();
-            map.retain(|_, existing| {
-                !matches!(existing, SiblingEntry::Indeterminate { retry_at, .. } if *retry_at <= now)
-            });
-            if map.len() >= Self::SIBLING_CACHE_CAP {
-                if let Some(victim) = map.keys().next().cloned() {
-                    map.remove(&victim);
-                }
+            let victim = map
+                .iter()
+                .filter_map(|(cached, existing)| match existing {
+                    SiblingEntry::Indeterminate { retry_at, .. } if *retry_at <= now => {
+                        Some((cached, *retry_at))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(_, retry_at)| *retry_at)
+                .map(|(cached, _)| cached.clone())
+                .or_else(|| map.keys().next().cloned());
+            if let Some(victim) = victim {
+                map.remove(&victim);
             }
         }
         map.insert(author, entry);
@@ -8189,7 +8199,7 @@ mod author_gate_tests {
         assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
         std::thread::sleep(Duration::from_millis(5));
 
-        // A new author at capacity displaces the expired deadline, nothing else.
+        // A new author at capacity displaces the one expired deadline, nothing else.
         cache.cache_sibling("newcomer".into(), false);
         assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
         assert_eq!(
@@ -8221,6 +8231,46 @@ mod author_gate_tests {
             retained,
             OwnerCache::SIBLING_CACHE_CAP - 1,
             "a full cache evicts a single entry for a new author"
+        );
+    }
+
+    #[test]
+    fn test_sibling_cache_evicts_one_expired_record_and_keeps_other_backoff_tiers() {
+        let cache = OwnerCache::with_retry_backoff(
+            Some("00".into()),
+            Duration::from_millis(1),
+            Duration::from_millis(64),
+        );
+        // "old" expires first at the base tier; "tiered" has failed three
+        // times and climbed to a 4ms deadline.
+        assert_eq!(cache.note_indeterminate("old").as_millis(), 1);
+        for _ in 0..3 {
+            cache.note_indeterminate("tiered");
+        }
+        let proven: Vec<String> = (2..OwnerCache::SIBLING_CACHE_CAP)
+            .map(|i| format!("proven-{i}"))
+            .collect();
+        for author in &proven {
+            cache.cache_sibling(author.clone(), true);
+        }
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        std::thread::sleep(Duration::from_millis(10)); // both deadlines expired
+
+        // The newcomer takes exactly one slot: the longest-expired record.
+        cache.cache_sibling("newcomer".into(), false);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        for author in &proven {
+            assert_eq!(cache.sibling_state(author), SiblingCacheState::Proven(true));
+        }
+        assert_eq!(
+            cache.note_indeterminate("tiered").as_millis(),
+            8,
+            "the surviving expired record must keep its backoff tier (3 failures → 8ms next)"
+        );
+        assert_eq!(
+            cache.note_indeterminate("old").as_millis(),
+            1,
+            "only the longest-expired record was evicted, so it restarts at the base tier"
         );
     }
 

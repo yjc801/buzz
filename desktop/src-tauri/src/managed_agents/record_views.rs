@@ -59,6 +59,7 @@ impl AgentDefinition {
             respond_to: RespondTo::default(),
             respond_to_allowlist: Vec::new(),
             display_name: Some(self.display_name),
+            description: self.description,
             slug: Some(self.id),
             runtime: self.runtime,
             name_pool: self.name_pool,
@@ -93,6 +94,7 @@ impl ManagedAgentRecord {
                 .clone()
                 .unwrap_or_else(|| self.name.clone()),
             avatar_url: self.avatar_url.clone(),
+            description: self.description.clone(),
             system_prompt: self.system_prompt.clone().unwrap_or_default(),
             runtime: self.runtime.clone(),
             model: self.model.clone(),

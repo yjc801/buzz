@@ -109,6 +109,7 @@ async fn boundary_sync_managed_agent_profile_blocks_ncryptsec() {
         &format!("agent {NCRYPTSEC}"),
         None,
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -262,10 +263,14 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
-    ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
-    ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
-    ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
+    ("src/relay.rs", 2, 2),           // boundaries 2, 4
+    ("src/relay/submit.rs", 1, 1),    // boundaries 1 + 3 (shared funnel)
+    ("src/huddle/pipeline.rs", 1, 1), // boundary 5
+    // Boundary 6 is split across the module: the caller builds the URL,
+    // `submit_engram_event` (with the guard) lives in the sibling file the
+    // file-size ratchet forced it into.
+    ("src/commands/team_snapshot.rs", 1, 0),
+    ("src/commands/team_snapshot/relay_io.rs", 0, 1),
     ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL
     ("src/native_websocket.rs", 0, 2),                  // boundary 8 (WS frames; no events URL)
     // Test-only fixtures — no production egress, no guard:

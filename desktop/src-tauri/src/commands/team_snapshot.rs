@@ -123,6 +123,9 @@ fn definition_from_snapshot(
         id: Uuid::new_v4().to_string(),
         display_name: member.profile.display_name.trim().to_string(),
         avatar_url: effective_avatar(member),
+        description: crate::managed_agents::effective_agent_description(
+            member.profile.about.as_deref(),
+        ),
         system_prompt: member.definition.system_prompt.clone().unwrap_or_default(),
         runtime: member.definition.runtime.clone(),
         model: member.definition.model.clone(),
@@ -560,6 +563,10 @@ pub async fn confirm_team_snapshot_import(
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
+            // Linked definitions remain the sole description authority. Do
+            // not persist a second instance copy that can go stale after an
+            // edit or survive a later definition deletion.
+            description: None,
             slug: None,
             persona_id: Some(definition.id.clone()),
             private_key_nsec: private_key_nsec.clone(),
@@ -799,12 +806,15 @@ pub async fn confirm_team_snapshot_import(
         let relay_url = effective_agent_relay_url(&m.record.relay_url, &relay_ws);
 
         // Phase 4: profile sync (best-effort).
+        let profile_about =
+            crate::managed_agents::effective_agent_description(m.definition.description.as_deref());
         let profile_sync_error = sync_managed_agent_profile(
             &state,
             &relay_url,
             &m.agent_keys,
             &m.display_name,
             m.effective_avatar.as_deref(),
+            profile_about.as_deref(),
             m.auth_tag.as_deref(),
         )
         .await
@@ -882,111 +892,10 @@ pub async fn confirm_team_snapshot_import(
     })
 }
 
-/// Inline retention for the managed-agent kind:30177 event — mirrors
-/// `commands::personas::snapshot::import::retain_agent_pending`.
-fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
-    use crate::managed_agents::{
-        agent_events::{agent_event_content, build_agent_event},
-        persona_events::monotonic_created_at,
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
-    };
-    use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-    use nostr::JsonUtil;
+mod relay_io;
 
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let conn = open_retention_db(&scope.db_path)?;
-        let content = serde_json::to_string(&agent_event_content(record))
-            .map_err(|e| format!("failed to serialize agent content: {e}"))?;
-        let (owner_pubkey, event) = {
-            let keys = &scope.owner_keys;
-            let owner_pubkey = keys.public_key().to_hex();
-            let existing =
-                get_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
-            if existing.as_ref().is_some_and(|row| row.content == content) {
-                return Ok(());
-            }
-            let event = build_agent_event(record)?
-                .custom_created_at(monotonic_created_at(existing.map(|row| row.created_at)))
-                .sign_with_keys(keys)
-                .map_err(|e| format!("failed to sign agent event: {e}"))?;
-            (owner_pubkey, event)
-        };
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_MANAGED_AGENT,
-                pubkey: owner_pubkey,
-                d_tag: record.pubkey.clone(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
-        )
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: team-snapshot-import retain-agent: {e}");
-    }
-}
-
-/// POST a pre-built signed engram event to the relay, authenticating as the
-/// new agent. Mirrors the same helper in `snapshot::import`.
-pub(crate) async fn submit_engram_event(
-    state: &AppState,
-    agent_keys: &nostr::Keys,
-    event_json: &[u8],
-    url: &str,
-    auth_tag: Option<&str>,
-) -> Result<(), String> {
-    use crate::relay::build_nip98_auth_header_for_keys;
-    use reqwest::Method;
-
-    crate::egress_guard::assert_no_key_backup_bytes(event_json, "team snapshot engram submit")?;
-
-    // Wait before signing: the relay enforces NIP-98 freshness (±60s) and the
-    // gate may hold for up to MAX_HINT_SECONDS (300s). Building auth before the
-    // wait produces a stale `created_at` that the relay will reject.
-    crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, url, event_json)?;
-    let mut request = state
-        .http_client
-        .post(url)
-        .header("Authorization", auth)
-        .header("Content-Type", "application/json");
-    if let Some(tag) = auth_tag {
-        request = request.header("x-auth-tag", tag);
-    }
-    let response = request
-        .body(event_json.to_vec())
-        .send()
-        .await
-        .map_err(|e| crate::relay::classify_request_error(&e))?;
-
-    if !response.status().is_success() {
-        let msg = crate::relay::relay_error_message(response).await;
-        return Err(format!("relay rejected engram: {msg}"));
-    }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("failed to read relay response: {e}"))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("relay response not JSON: {e}"))?;
-    let accepted = parsed
-        .get("accepted")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !accepted {
-        let message = parsed
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        return Err(format!("relay rejected engram: {message}"));
-    }
-    Ok(())
-}
+use relay_io::retain_agent_pending;
+pub(crate) use relay_io::submit_engram_event;
 
 #[cfg(test)]
 mod tests;

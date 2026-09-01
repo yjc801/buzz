@@ -10,6 +10,8 @@ pub(crate) use access_policy::{owner_only, owner_only_access_build, projected_ac
 pub(crate) use agent_env::{
     baked_build_env, build_buzz_agent_provider_defaults, discovery_env_with_baked_floor,
 };
+mod agent_description;
+pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
 mod backend_migration;
 pub(crate) mod claude_config;
@@ -63,7 +65,8 @@ pub use backend::*;
 pub use backend_migration::*;
 pub use community_scope::*;
 pub(crate) use definition_validation::{
-    validate_agent_definition_text, validate_managed_agent_definition_text, validate_visible_text,
+    validate_agent_definition_text, validate_agent_description_text,
+    validate_managed_agent_definition_text, validate_visible_text,
 };
 pub use discovery::*;
 pub use env_vars::*;

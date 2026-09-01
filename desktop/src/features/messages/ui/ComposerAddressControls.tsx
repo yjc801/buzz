@@ -1,4 +1,4 @@
-import { ArrowUp, AtSign, X } from "lucide-react";
+import { ArrowUp, AtSign, Square, X } from "lucide-react";
 import {
   AnimatePresence,
   motion,
@@ -319,20 +319,32 @@ export function ComposerMentionButton({
 
 export function ComposerSendButton({
   isSending,
+  onFinishVoiceNote,
   sendDisabled,
 }: {
   isSending: boolean;
+  onFinishVoiceNote?: () => void;
   sendDisabled: boolean;
 }) {
+  const isFinishingVoiceNote = onFinishVoiceNote != null;
   return (
     <button
-      aria-label={isSending ? "Sending" : "Send message"}
+      aria-label={
+        isFinishingVoiceNote
+          ? "Finish voice note"
+          : isSending
+            ? "Sending"
+            : "Send message"
+      }
       className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground shadow transition-colors hover:bg-primary/90 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
-      data-testid="send-message"
+      data-testid={isFinishingVoiceNote ? "finish-voice-note" : "send-message"}
       disabled={sendDisabled || isSending}
-      type="submit"
+      onClick={onFinishVoiceNote}
+      type={isFinishingVoiceNote ? "button" : "submit"}
     >
-      {isSending ? (
+      {isFinishingVoiceNote ? (
+        <Square aria-hidden className="h-3.5 w-3.5 fill-current" />
+      ) : isSending ? (
         <SendSpinner />
       ) : (
         <ArrowUp aria-hidden className="h-4 w-4" />

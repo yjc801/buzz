@@ -1554,8 +1554,6 @@ pub(crate) mod tests {
         Arc::new(state)
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
     async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let observer = sqlx::PgPool::connect(&database_url)
@@ -1677,6 +1675,14 @@ pub(crate) mod tests {
             .execute(&observer)
             .await
             .expect("remove test community");
+    }
+
+    mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
+            super::audit_worker_retries_lock_timeout_until_original_entry_is_appended_once().await;
+        }
     }
 
     #[test]

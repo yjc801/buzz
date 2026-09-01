@@ -250,7 +250,11 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
 /// Cache for the agent's owner pubkey + sibling lookups.
 ///
 /// Siblings are other agents whose NIP-OA auth tag proves the same owner.
-/// Lookup results are cached for the process lifetime (attestations are immutable).
+/// Only *proven* verdicts are cached for the process lifetime (attestations
+/// are immutable): a lookup that failed because the relay was unreachable is
+/// [`SiblingVerdict::Indeterminate`] and is never cached — otherwise one relay
+/// blip would make this agent silently ignore a same-owner sibling until
+/// restart.
 struct OwnerCache {
     pubkey: Option<String>,
     /// author_hex → is_sibling (true = same owner, false = not)
@@ -287,10 +291,27 @@ impl OwnerCache {
     }
 }
 
+/// Outcome of one sibling profile verification attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingVerdict {
+    /// kind:0 fetched and its NIP-OA auth tag cryptographically proves the
+    /// same owner.
+    Sibling,
+    /// The relay answered and the profile is absent or does not prove the
+    /// same owner.
+    NotSibling,
+    /// The relay could not be consulted (timeout, network, or HTTP error) —
+    /// nothing was proven either way.
+    Indeterminate,
+}
+
 /// Check if `author` is the owner OR a sibling (same owner via NIP-OA).
 ///
 /// For unknown authors, queries their kind:0 profile to extract the NIP-OA
-/// auth tag and verify the owner matches. Result is cached.
+/// auth tag and verify the owner matches. Only proven verdicts are cached;
+/// an [`SiblingVerdict::Indeterminate`] lookup fails closed for THIS event
+/// but is retried on the next one, so a transient relay outage cannot poison
+/// a sibling for the rest of the process lifetime.
 async fn is_owner_or_sibling(
     author: &str,
     owner_cache: &OwnerCache,
@@ -312,9 +333,24 @@ async fn is_owner_or_sibling(
     }
 
     // Query the author's kind:0 profile to check for NIP-OA auth tag.
-    let is_sibling = check_sibling_via_profile(author, my_owner, rest_client).await;
-    owner_cache.cache_sibling(author.to_string(), is_sibling);
-    is_sibling
+    match check_sibling_via_profile(author, my_owner, rest_client).await {
+        SiblingVerdict::Sibling => {
+            owner_cache.cache_sibling(author.to_string(), true);
+            true
+        }
+        SiblingVerdict::NotSibling => {
+            owner_cache.cache_sibling(author.to_string(), false);
+            false
+        }
+        SiblingVerdict::Indeterminate => {
+            tracing::warn!(
+                author,
+                "sibling check indeterminate — relay profile query failed; \
+                 dropping this event without caching the verdict (next event retries)"
+            );
+            false
+        }
+    }
 }
 
 /// Return the workflow owner attributed by a relay-signed workflow message.
@@ -624,7 +660,10 @@ mod inbound_author_gate {
                 )
                 .await;
             if !decision.allowed {
-                tracing::debug!(
+                // INFO, not debug: under owner-only fleets a dropped event is
+                // the whole story of "the agent never answered", and the
+                // default log filter hides debug.
+                tracing::info!(
                     channel_id = %buzz_event.channel_id,
                     raw_author = %buzz_event.event.pubkey.to_hex(),
                     effective_author = %decision.effective_author,
@@ -868,16 +907,21 @@ pub(crate) async fn is_dm_channel(
 
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
 /// proves the same owner as us.
+///
+/// Distinguishes *proven absence* (the relay answered; no profile / no
+/// verifying tag) from *failure to consult the relay* — only the former may
+/// be cached by the caller.
 async fn check_sibling_via_profile(
     author: &str,
     expected_owner: &str,
     rest_client: &relay::RestClient,
-) -> bool {
+) -> SiblingVerdict {
     let filter = nostr::Filter::new()
         .kind(nostr::Kind::Metadata)
         .author(match nostr::PublicKey::from_hex(author) {
             Ok(pk) => pk,
-            Err(_) => return false,
+            // A malformed author key can never verify — definitively not a sibling.
+            Err(_) => return SiblingVerdict::NotSibling,
         })
         .limit(1);
 
@@ -885,28 +929,36 @@ async fn check_sibling_via_profile(
         .await
     {
         Ok(Ok(v)) => v,
-        _ => return false, // timeout or error — fail closed
+        Ok(Err(e)) => {
+            tracing::debug!(author, "sibling profile query failed: {e}");
+            return SiblingVerdict::Indeterminate;
+        }
+        Err(_) => {
+            tracing::debug!(author, "sibling profile query timed out");
+            return SiblingVerdict::Indeterminate;
+        }
     };
 
     // Look for an "auth" tag in the profile event.
     let events = match resp.as_array() {
         Some(arr) => arr,
-        None => return false,
+        // Non-array body is a server anomaly, not proof of absence.
+        None => return SiblingVerdict::Indeterminate,
     };
     let event = match events.first() {
         Some(e) => e,
-        None => return false,
+        None => return SiblingVerdict::NotSibling,
     };
     let tags = match event.get("tags").and_then(|t| t.as_array()) {
         Some(t) => t,
-        None => return false,
+        None => return SiblingVerdict::NotSibling,
     };
 
     // Find ["auth", owner_pk, conditions, sig] and verify the Schnorr signature.
     // Don't trust the relay — verify ourselves.
     let agent_pk = match nostr::PublicKey::from_hex(author) {
         Ok(pk) => pk,
-        Err(_) => return false,
+        Err(_) => return SiblingVerdict::NotSibling,
     };
 
     for tag in tags {
@@ -930,7 +982,7 @@ async fn check_sibling_via_profile(
         match buzz_sdk::nip_oa::verify_auth_tag(&tag_json, &agent_pk) {
             Ok(_) => {
                 tracing::debug!(author, expected_owner, "sibling verified via NIP-OA");
-                return true;
+                return SiblingVerdict::Sibling;
             }
             Err(e) => {
                 tracing::debug!(author, "NIP-OA auth tag verification failed: {e}");
@@ -938,7 +990,7 @@ async fn check_sibling_via_profile(
         }
     }
 
-    false
+    SiblingVerdict::NotSibling
 }
 
 /// Observer frames are published at a global rate of AT MOST ONE relay frame
@@ -7713,6 +7765,100 @@ mod author_gate_tests {
             .await,
             "respond_to=nobody must drop everything, DMs included"
         );
+    }
+
+    // ── sibling verdict caching ───────────────────────────────────────────
+    //
+    // A sibling lookup that failed because the relay was unreachable is
+    // Indeterminate: it fails closed for that one event but must NOT be
+    // cached, or a single relay blip makes this agent silently ignore a
+    // same-owner sibling until the process restarts.
+
+    /// Serve one JSON body for every request on a loopback port, as the
+    /// `/query` endpoint the sibling check consults.
+    async fn sibling_query_server(
+        body: serde_json::Value,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sibling query server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, server)
+    }
+
+    #[tokio::test]
+    async fn test_sibling_indeterminate_relay_failure_is_not_cached() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::new(Some(owner));
+        assert!(
+            !is_owner_or_sibling(&author, &cache, &dummy_rest_client()).await,
+            "an unverifiable author must fail closed for this event"
+        );
+        assert_eq!(
+            cache.is_known_sibling(&author),
+            None,
+            "a relay failure must not be cached as a permanent non-sibling verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sibling_proven_absence_is_cached_negative() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::new(Some(owner));
+        let (rest, server) = sibling_query_server(serde_json::json!([])).await;
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(
+            cache.is_known_sibling(&author),
+            Some(false),
+            "a relay-confirmed missing profile is definitive and may be cached"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sibling_valid_auth_tag_is_verified_and_cached() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let author = agent_keys.public_key().to_hex();
+        let tag_json =
+            buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_keys.public_key(), "")
+                .expect("compute auth tag");
+        let tag: serde_json::Value = serde_json::from_str(&tag_json).expect("tag json");
+        let profile = serde_json::json!([{ "tags": [tag] }]);
+        let cache = OwnerCache::new(Some(owner_keys.public_key().to_hex()));
+        let (rest, server) = sibling_query_server(profile).await;
+        assert!(
+            is_owner_or_sibling(&author, &cache, &rest).await,
+            "a kind:0 carrying a valid owner attestation must verify as a sibling"
+        );
+        assert_eq!(cache.is_known_sibling(&author), Some(true));
+        server.abort();
     }
 
     // ── is_dm_channel resolution ──────────────────────────────────────────

@@ -55,24 +55,24 @@ PY
 
 # The regression: --git-dir is absolute from desktop/, while --git-common-dir
 # can be ../.git. They still name the same directory in an ordinary checkout.
-check_instance "$main" xyz.block.buzz.app.dev ''
-check_instance "$main/desktop" xyz.block.buzz.app.dev ''
+check_instance "$main" xyz.waggle.app.dev ''
+check_instance "$main/desktop" xyz.waggle.app.dev ''
 
 # A branch name alone must never turn an ordinary checkout into a linked one.
 clean_env git -C "$main" -c core.hooksPath=/dev/null switch -q -c feature/local
-check_instance "$main" xyz.block.buzz.app.dev ''
-check_instance "$main/desktop" xyz.block.buzz.app.dev ''
+check_instance "$main" xyz.waggle.app.dev ''
+check_instance "$main/desktop" xyz.waggle.app.dev ''
 
 # Linked worktrees must retain their existing isolated identity from either cwd.
-check_instance "$linked" xyz.block.buzz.app.dev.feature-other other
-check_instance "$linked/desktop" xyz.block.buzz.app.dev.feature-other other
+check_instance "$linked" xyz.waggle.app.dev.feature-other other
+check_instance "$linked/desktop" xyz.waggle.app.dev.feature-other other
 
 # Preserve the current detached-worktree identity rather than conflating it
 # with the ordinary checkout. Detached naming itself is outside this fix.
 clean_env git -C "$linked" -c core.hooksPath=/dev/null checkout -q --detach
-check_instance "$linked/desktop" xyz.block.buzz.app.dev.head HEAD
+check_instance "$linked/desktop" xyz.waggle.app.dev.head HEAD
 
 ln -s "$main" "$tmp/main-link"
-check_instance "$tmp/main-link/desktop" xyz.block.buzz.app.dev ''
+check_instance "$tmp/main-link/desktop" xyz.waggle.app.dev ''
 
 printf 'Desktop instance environment: 8 cases passed\n'

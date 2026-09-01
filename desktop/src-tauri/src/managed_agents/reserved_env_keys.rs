@@ -74,6 +74,9 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // losing the waking mention, or making every ordinary start replay up
     // to 15 minutes of already-handled traffic.
     "BUZZ_ACP_REPLAY_FLOOR",
+    // Demo-build identity owns the child agent config root. A user override
+    // could silently reconnect a demo harness to production OAuth state.
+    "BUZZ_AGENT_CONFIG_DIR",
     // Desktop ownership markers: these brand every spawned harness with the
     // launching Desktop instance. A user-supplied override would let a
     // definition masquerade as a different instance or fake the nonce used

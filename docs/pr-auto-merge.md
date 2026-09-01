@@ -59,7 +59,10 @@ AUTO-MERGE: yes|no
 
 The merge job re-reads the coordinate immediately before the write, so a
 revocation that lands mid-run still stops the merge; this ordering means it
-does not have to be relied on.
+does not have to be relied on. It cannot be relied on all the way, either —
+see "What cannot be fenced, and why we stopped trying". Writing the
+non-authorizing note first is what keeps the reviewer out of that window in
+the ordinary case.
 
 **The same trailer is published to the verdict coordinate, and that copy is
 what CI reads.** After posting the review in the PR channel, the reviewer
@@ -67,8 +70,10 @@ writes it to `(kind 30023, reviewer, d = pr-verdict-<owner>-<repo>-<pr>)` —
 `buzz notes set --name pr-verdict-yjc801-buzz-<pr>`. The channel message is for
 humans; the note is the authorization artifact, and it is the only one CI
 consults. The two must agree, and a correction updates both: because the
-coordinate is replaceable, rewriting the note *is* the revocation, with no
-window in which a superseded approval is still readable. If the reviewer posts
+coordinate is replaceable, rewriting the note *is* the revocation — every
+subsequent read sees only the correction, and nothing has to be deleted. (Not
+every read that could still matter: the last one before a merge in flight is
+covered below.) If the reviewer posts
 a channel message and no note, CI sees no verdict and does nothing — the safe
 direction to fail. See "The authorization lives where this workflow cannot
 rewrite it" for why the note, rather than the message, is what counts.
@@ -212,6 +217,81 @@ applied per command rather than exported as `GH_TOKEN`, and stripped from the
 relay read's environment with `env -u` — not just left unexported, since a
 child process inherits the step's environment either way.
 
+### What cannot be fenced, and why we stopped trying
+
+That read is a **narrowing, not a fence**, and the difference is not a detail.
+
+`gh pr merge` is a write to GitHub. GitHub decides whether to accept it by
+evaluating conditions **it** can see: the head SHA passed to
+`--match-head-commit`, whether the PR is a draft, and the branch rules on
+`main`. It cannot see a Nostr relay. And the reviewer holds no GitHub
+credential — deliberately, because that absence is exactly what makes the
+verdict unforgeable by this workflow and by anyone holding the CI key.
+
+Those two facts together mean **no relay artifact can ever be a condition
+GitHub checks at the write.** Every relay read is a read, with a window after
+it. Moving the read closer to `gh pr merge` shortens the window; nothing placed
+on that side of the write closes it. A reviewer who replaces the coordinate
+after the last read and before GitHub accepts the merge has published a valid
+signed revocation that the merge does not, and cannot, observe.
+
+This is worth stating as flatly as the channel-redaction argument above,
+because it is the same mistake one system further out. Three revisions tried to
+fence the verdict with a detector living inside the blast radius of the thing
+it detected. Adding a fourth, fifth and sixth relay read is the same shape:
+building a fence out of the wrong system's state. The honest description of a
+pre-write read is *"catches every revocation that has already landed"*, and
+that is what the workflow's comment now says.
+
+The channel's `⏩ auto-merge authorized …` intent message is the observable
+edge of that window: before it, rewriting the note is reliable; after it, a
+merge is in flight and the note may not be read again in time.
+
+**So the residual is handled after the write instead.** Immediately after the
+merge, the step reads the coordinate once more and reports one of two states,
+kept distinct on purpose — calling a network blip a contradiction would be a
+false accusation:
+
+- **`CONTRADICTED`** — the coordinate now says no. A merge happened that
+  should not have.
+- **`UNCONFIRMED`** — the relay did not answer. Nobody can vouch for the merge
+  either way.
+
+Both go **red**, post the reason and a copy-pasteable `git revert <squash
+commit>` to the PR, and best-effort tell the PR channel (best-effort because
+the mirror archives that channel seconds after a merge; the PR comment is the
+durable record). Both are "after state changed", which is the one category
+this workflow's failure philosophy reserves red for rather than degrading to a
+warning. Prevention was impossible. Silence was not.
+
+`.github/scripts/pr-auto-merge-write.test.sh` executes this rather than
+arguing it: the relay stub serves a *different* value to the post-merge read
+than it served to the pre-write one, which is the race, and asserts that the
+merge happens, the run is red, the revert commit is named, both audiences are
+told, and the "all clear" audit comment is *not* posted. Deleting the
+post-merge read flips four scenarios from red to a silent success.
+
+**The stops that have no window at all are the GitHub-side ones**, because
+GitHub evaluates them as part of the merge:
+
+| Stop | Who can use it | Window |
+|---|---|---|
+| Convert the PR to a **draft**, or close it | anyone with `pull-requests: write` | none |
+| Push any commit to the PR branch | anyone who can push there | none — invalidates `--match-head-commit` |
+| Make a required check red (strict ruleset) | whatever produces that check | none |
+| Rewrite the verdict coordinate | the reviewer only | until the merge job's post-write read |
+| `no-auto-merge` label | anyone with write | until the merge job's pre-write read |
+
+The reviewer sits in the last-but-one row and, as configured today, in no other
+row: an agent with no GitHub credential has no unraceable stop. Giving it one
+is a small, strictly safety-increasing change the owner can make — a
+fine-grained PAT scoped to this repository with **Pull requests: read/write and
+nothing else**, used only to convert a PR to a draft. Such a token can block a
+merge and can never authorize one; it does not weaken the "the reviewer
+performs no GitHub writes that count as approval" boundary, because drafting is
+not an approval. It is an owner decision, not a code change, and this document
+does not assume it has been made.
+
 ### The merge job checks the shape, not just the signature
 
 A kind-9 channel message signed by the reviewer is an equally valid signature
@@ -330,7 +410,8 @@ the only honest record.
   summary) and touches nothing.
 - **Hold one PR, hard:** convert it to a **draft**, or close it. GitHub
   refuses to merge a draft as part of the merge operation itself, so there is
-  no window to race. This is the documented hard stop.
+  no window to race. This is the documented hard stop, and it is the only one
+  available to the reviewer's own revocation once a merge is in flight.
 - **Hold one PR, conveniently:** add the `no-auto-merge` label. It is honored
   when candidates are listed *and* re-read in the merge job immediately before
   the write — but it is still a read, and GitHub has no label condition for
@@ -376,10 +457,14 @@ the only honest record.
   --author <reviewer>` — CI reads only that. A review posted in the channel
   without the matching note is invisible to auto-merge by design.
 - **Revoking an approval:** the reviewer rewrites the note. Because the
-  coordinate is replaceable, that *is* the revocation — there is no window in
-  which the superseded approval is still readable, and nothing needs to be
-  deleted. Deleting the note also works (`buzz notes rm`) and reads as "no
-  verdict".
+  coordinate is replaceable, that *is* the revocation for every later read, and
+  nothing needs to be deleted. Deleting the note also works (`buzz notes rm`)
+  and reads as "no verdict". It is **not** a fence at the merge write: see
+  "What cannot be fenced, and why we stopped trying". If a merge is already in
+  flight and must not land, use the hard stop — convert the PR to a draft — and
+  rewrite the note afterwards. A revocation that arrives too late is detected
+  by the post-merge read and reported red on the PR with the revert command,
+  within seconds; it is not prevented.
 - **Rotating the reviewer:** `REVIEWER_PUBKEY` in the workflow is a reviewed
   constant, exactly like `EXPECTED_CI_PUBKEY` in the mirror. A retired
   reviewer key fails safe (no verdicts found, permanent no-op) — the pin
@@ -428,4 +513,8 @@ trailer contract above. Nothing merges until it is in place.
 > verdict does NOT authorize a merge, write the note before posting the
 > channel message, so you never stand publicly corrected while CI can still
 > read the old approval as live; when it DOES authorize, post the channel
-> message first, so nothing merges before the humans can see why.
+> message first, so nothing merges before the humans can see why. Once CI
+> posts its `⏩ auto-merge authorized …` intent message in the channel a merge
+> is in flight, and rewriting the note may no longer arrive in time — it is
+> still detected and reported red, but the only stop with no window is a human
+> converting the PR to a draft.

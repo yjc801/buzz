@@ -15,6 +15,17 @@
 # every invocation, and each scenario asserts on whether the merge was reached
 # — not merely on the step's exit code, because refusing is a clean exit.
 #
+# The second half of the file tests the half of the problem that CANNOT be
+# prevented. `gh pr merge` is a write to GitHub, GitHub cannot observe the
+# relay, and the reviewer holds no GitHub credential — so a revocation that
+# lands between the last read and the write is unstoppable by construction (see
+# "What cannot be fenced" in docs/pr-auto-merge.md). What is testable is that
+# it is not SILENT: the step reads the coordinate again after the merge, and a
+# contradiction there must go red, name the commit to revert, and alert both
+# the PR and the PR channel. The relay stub can therefore serve a DIFFERENT
+# value to the second read than it served to the first, which is precisely the
+# race, executed rather than argued.
+#
 # The step's script is EXTRACTED FROM THE WORKFLOW rather than copied, so
 # deleting the re-read fails this test instead of silently passing it.
 #
@@ -68,26 +79,52 @@ REVIEWER_PUB=$(NOSTR_SECRET="$REVIEWER_SECRET" python3 scripts/buzz-mint-auth-ta
 mkdir -p "$WORK/bin"
 
 # gh: records every call, so a scenario can assert the merge was never reached.
-cat > "$WORK/bin/gh" <<'GHEOF'
+MERGE_COMMIT=9999999999999999999999999999999999999999
+cat > "$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
-echo "$*" >> "$CALLS"
+echo "\$*" >> "\$CALLS"
+# The post-merge alert asks GitHub for the squash commit so it can print a
+# revert command that is copy-pasteable rather than a placeholder.
+case "\$*" in
+  *"pr view"*) echo ${MERGE_COMMIT} ;;
+esac
 exit 0
 GHEOF
 
 # python3: passes everything through to the real interpreter EXCEPT the relay
-# client, which is the network boundary this test replaces. $RELAY_FIXTURE
-# holds the event to return; $RELAY_EXIT non-zero simulates a failed read.
-cat > "$WORK/bin/python3" <<'PYEOF'
+# client, which is the network boundary this test replaces.
+#
+#   $RELAY_FIXTURE / $RELAY_EXIT    what the FIRST standing-verdict read sees
+#   $RELAY_FIXTURE2 / $RELAY_EXIT2  what every LATER read sees, when set
+#
+# The second pair is the race: the coordinate's value changing between the
+# pre-write read and the post-merge one, with the merge in between.
+write_relay_stub() {
+  cat > "$WORK/bin/python3" <<PYEOF
 #!/usr/bin/env bash
-case "$*" in
-  *pr-auto-merge-relay.py*)
-    [ "${RELAY_EXIT:-0}" -eq 0 ] || exit "$RELAY_EXIT"
-    cat "$RELAY_FIXTURE"
+case "\$*" in
+  *pr-auto-merge-relay.py*standing-verdict*)
+    ${1:-}
+    N=\$(cat "\$RELAY_CALLS" 2>/dev/null || echo 0); N=\$((N + 1)); echo "\$N" > "\$RELAY_CALLS"
+    if [ "\$N" -ge 2 ] && [ -n "\${RELAY_FIXTURE2:-}" ]; then
+      [ "\${RELAY_EXIT2:-0}" -eq 0 ] || exit "\${RELAY_EXIT2}"
+      cat "\$RELAY_FIXTURE2"
+    else
+      [ "\${RELAY_EXIT:-0}" -eq 0 ] || exit "\${RELAY_EXIT}"
+      cat "\$RELAY_FIXTURE"
+    fi
     ;;
-  *) exec "$REAL_PYTHON3" "$@" ;;
+  *pr-auto-merge-relay.py*send*)
+    cat > /dev/null
+    echo "relay send" >> "\$CALLS"
+    ;;
+  *) exec "\$REAL_PYTHON3" "\$@" ;;
 esac
 PYEOF
-chmod +x "$WORK/bin/gh" "$WORK/bin/python3"
+  chmod +x "$WORK/bin/python3"
+}
+write_relay_stub
+chmod +x "$WORK/bin/gh"
 REAL_PYTHON3=$(command -v python3)
 export REAL_PYTHON3
 
@@ -124,10 +161,15 @@ APPROVE_ID=$(printf '%s' "$APPROVE" | python3 -c 'import json,sys; print(json.lo
 run_merge() {
   : > "$WORK/calls"
   : > "$WORK/summary"
+  : > "$WORK/relay-calls"
   PATH="$WORK/bin:$PATH" \
   CALLS="$WORK/calls" \
   RELAY_FIXTURE="${RELAY_FIXTURE:-$WORK/live.json}" \
   RELAY_EXIT="${RELAY_EXIT:-0}" \
+  RELAY_FIXTURE2="${RELAY_FIXTURE2:-}" \
+  RELAY_EXIT2="${RELAY_EXIT2:-0}" \
+  RELAY_CALLS="$WORK/relay-calls" \
+  CHANNEL=00000000-0000-4000-8000-000000000000 \
   GITHUB_REPOSITORY="$REPO" \
   GITHUB_STEP_SUMMARY="$WORK/summary" \
   GITHUB_SERVER_URL=https://github.com \
@@ -169,7 +211,10 @@ expect() {
   fi
 }
 
-reset() { unset RELAY_EXIT ANNOUNCED_ID; printf '%s' "$APPROVE" > "$WORK/live.json"; }
+reset() {
+  unset RELAY_EXIT RELAY_EXIT2 RELAY_FIXTURE2 ANNOUNCED_ID
+  printf '%s' "$APPROVE" > "$WORK/live.json"
+}
 
 echo "# merge-write contract: the verdict must still be current at the write"
 
@@ -204,21 +249,83 @@ reset
 printf '[]' > "$WORK/live.json"
 expect "coordinate returned something unparseable → refuses" refused
 
+# --- the half that cannot be prevented, only detected ----------------------
+#
+# From here the relay serves a DIFFERENT value to the post-merge read than it
+# served to the pre-write one. That is the race in `docs/pr-auto-merge.md`
+# under "What cannot be fenced": the reviewer revoking after the last read and
+# before GitHub accepts the write. The merge is expected to HAPPEN in these
+# scenarios — asserting otherwise would be asserting something no code in this
+# repository can deliver. What must happen is that it does not pass silently.
+
+# expect_alert <label> <CONTRADICTED|UNCONFIRMED> — red, correctly labelled,
+# revert named, both audiences told, and the "all clear" audit comment NOT
+# posted. The two states are asserted apart on purpose: reporting a relay blip
+# as "the reviewer contradicted this merge" would be a false accusation.
+expect_alert() {
+  local label="$1" state="$2" status ok=1 why=""
+  status=$(run_merge)
+  [ "$status" -ne 0 ] || { ok=0; why="${why} exit=0(expected red);"; }
+  grep -q 'pr merge' "$WORK/calls" || { ok=0; why="${why} the merge never happened;"; }
+  grep -q 'This is a detection, not a prevention' "$WORK/calls" \
+    || { ok=0; why="${why} no alert comment on the PR;"; }
+  grep -q "git revert ${MERGE_COMMIT}" "$WORK/calls" \
+    || { ok=0; why="${why} the alert does not name the commit to revert;"; }
+  grep -q 'relay send' "$WORK/calls" || { ok=0; why="${why} the PR channel was not told;"; }
+  if grep -q 'Auto-merged on the reviewer' "$WORK/calls"; then
+    ok=0; why="${why} posted the all-clear audit comment anyway;"
+  fi
+  grep -q "MERGED, THEN ${state}" "$WORK/summary" \
+    || { ok=0; why="${why} the step summary does not report ${state};"; }
+  if [ "$ok" -eq 1 ]; then
+    PASSES=$((PASSES + 1))
+    echo "ok   ${label}"
+  else
+    FAILURES=$((FAILURES + 1))
+    echo "FAIL ${label}:${why}"
+    sed 's/^/       | /' "$WORK/stdout"
+  fi
+}
+
+reset
+sign_note REQUEST-CHANGES no > "$WORK/revoked.json"
+RELAY_FIXTURE2="$WORK/revoked.json"
+expect_alert "revoked inside the unclosable window → merges, then goes red and names the revert" CONTRADICTED
+
+reset
+sign_note APPROVE no > "$WORK/downgraded.json"
+RELAY_FIXTURE2="$WORK/downgraded.json"
+expect_alert "downgraded to AUTO-MERGE: no inside the window → merges, then goes red" CONTRADICTED
+
+reset
+RELAY_FIXTURE2="$WORK/live.json"
+RELAY_EXIT2=4
+expect_alert "the relay cannot confirm the verdict after the merge → red, and reported as UNCONFIRMED rather than as a contradiction" UNCONFIRMED
+
+# The happy path has to prove BOTH reads ran, or deleting the post-merge one
+# would leave every scenario above green by never contradicting anything.
+reset
+status=$(run_merge)
+READS=$(cat "$WORK/relay-calls" 2>/dev/null || echo 0)
+if [ "$status" -eq 0 ] && [ "${READS:-0}" -eq 2 ] \
+  && grep -q 'Auto-merged on the reviewer' "$WORK/calls" \
+  && ! grep -q 'This is a detection, not a prevention' "$WORK/calls"; then
+  PASSES=$((PASSES + 1))
+  echo "ok   verdict still standing after the merge → audit comment, and the coordinate was read on BOTH sides of the write"
+else
+  FAILURES=$((FAILURES + 1))
+  echo "FAIL the clean merge did not read the coordinate on both sides (exit ${status}, reads ${READS})"
+  sed 's/^/       | /' "$WORK/stdout"
+fi
+
 # The merge credential must not be reachable from the relay read. The stub
 # records what it saw, so this asserts on the child's real environment rather
 # than on the workflow's wording.
 reset
-cat > "$WORK/bin/python3" <<'PYEOF'
-#!/usr/bin/env bash
-case "$*" in
-  *pr-auto-merge-relay.py*)
-    echo "MERGE_TOKEN=${MERGE_TOKEN-<unset>} GH_TOKEN=${GH_TOKEN-<unset>}" >> "$CALLS"
-    cat "$RELAY_FIXTURE"
-    ;;
-  *) exec "$REAL_PYTHON3" "$@" ;;
-esac
-PYEOF
-chmod +x "$WORK/bin/python3"
+# Single-quoted, and NOT backslash-escaped: the writer injects this through
+# ${1}, and the result of a parameter expansion is not rescanned for
+# expansions — an escaped \$ would reach the stub as a literal backslash.
+write_relay_stub 'echo "MERGE_TOKEN=${MERGE_TOKEN-<unset>} GH_TOKEN=${GH_TOKEN-<unset>}" >> "$CALLS"'
 run_merge > /dev/null
 if grep -q 'MERGE_TOKEN=<unset>' "$WORK/calls"; then
   PASSES=$((PASSES + 1))

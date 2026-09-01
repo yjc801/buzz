@@ -192,7 +192,14 @@ PRs where reviewers litigated it.
    4 rounds on this one class). Backfill and live subscriptions must
    overlap — a gap between a finite history REQ and the live subscription
    silently drops events (PR #3995); a retired chunk must not keep a stale
-   scope fence (PR #6996). (PRs #3995, #6904, #6956, #6996)
+   scope fence (PR #6996). **And know the limit of the rule: when the system
+   performing the write cannot observe the system that authorizes it, no
+   number of re-reads is a fence.** A read placed closer to the write shortens
+   the window and never closes it, so say "narrowing", not "fence", and put
+   the guarantee on the far side — detect the contradiction after the write
+   and report it loudly — rather than shipping a fourth read that looks like
+   one (PR #101 spent three rounds on this). (PRs #3995, #6904, #6956, #6996,
+   #101)
 
 3. **Regression tests must bind the production seam and be falsifiable.**
    See "Review-Proven Test Standards" in [TESTING.md](TESTING.md) for the

@@ -63,10 +63,36 @@ name: buzz-pr-auto-merge
 #   evaluate  Holds the CI relay identity. Holds NO merge credential. Picks a
 #             candidate, reads the reviewer's verdict coordinate, announces
 #             intent in the PR channel, hands the signed note on.
-#   merge     Fresh runner, no relay access and no relay key. Holds
-#             AUTO_MERGE_TOKEN, and re-derives every GitHub-side gate for
-#             itself from the API, this repository's scripts, and the reviewed
-#             constants below — nothing is inherited on trust.
+#   merge     Fresh runner. Holds AUTO_MERGE_TOKEN and re-derives every
+#             GitHub-side gate for itself from the API, this repository's
+#             scripts, and the reviewed constants below — nothing is inherited
+#             on trust. It ALSO holds the CI relay identity, read-only in
+#             effect: it reads the verdict coordinate on both sides of the
+#             write and can only ever refuse with it, never authorize. (That
+#             was not true while the verdict lived in a channel this key could
+#             redact. It is true now — see the coordinate argument above.)
+#
+# WHAT CANNOT BE FENCED, AND WHY THE FIX IS ON THE OTHER SIDE OF THE WRITE.
+#
+# The merge is a write to GitHub. GitHub evaluates its own merge preconditions
+# — head SHA via --match-head-commit, draft state, branch rules — and it cannot
+# observe a Nostr relay. The reviewer holds no GitHub credential, deliberately:
+# that is exactly what makes the verdict unforgeable by this workflow. So no
+# relay artifact can ever be a precondition GitHub checks, and every relay read
+# is a read with a window after it.
+#
+# A read placed closer to `gh pr merge` therefore SHRINKS that window and never
+# closes it. Three revisions tried to fence the verdict with a same-system read
+# and each was wrong for the same reason; this is the same shape one system
+# further out. So the merge step does not pretend: it reads once before the
+# write to catch every revocation that has landed, and once AFTER the write to
+# catch the one that landed inside the window — seconds late, red, naming the
+# commit to revert. Prevention is impossible here. Silence is not.
+#
+# The unraceable stops all live in GitHub's own domain, where the merge is
+# evaluated: convert the PR to a draft, close it, or push to the branch (which
+# invalidates --match-head-commit). docs/pr-auto-merge.md, "What cannot be
+# fenced, and why we stopped trying", is the long form.
 #
 # WHAT THE VERDICT READ PROVES:
 #
@@ -99,7 +125,10 @@ name: buzz-pr-auto-merge
 # fails a PROOF rather than merely failing to arrive (an event signed by the
 # wrong key, scoped to the wrong channel, or duplicated on an addressable
 # coordinate), for a merge-job revalidation that CONTRADICTS the evaluate job,
-# and for anything after state changed (audit comment failed after a merge).
+# and for anything after state changed — an audit comment that failed after a
+# merge, and a post-merge verdict read that either contradicts the merge or
+# cannot be completed at all. After main has moved, "we merged and cannot say
+# whether we were still allowed to" is not weather.
 #
 # One merge per run: evaluate stops at the first candidate that passes, so
 # every merge was evaluated against a main that all of its gates observed.
@@ -185,6 +214,11 @@ jobs:
       effective: ${{ steps.sweep.outputs.effective }}
       event_id: ${{ steps.sweep.outputs.event_id }}
       verdict_events: ${{ steps.sweep.outputs.verdict_events }}
+      # Only so the merge job can shout into the PR channel if the post-merge
+      # confirmation contradicts the merge it just made. Not an input to any
+      # gate: the merge job proves the verdict from the signature and the
+      # coordinate, never from a channel this job named.
+      channel: ${{ steps.sweep.outputs.channel }}
     steps:
       # Before checkout so a no-candidate tick costs a single API call.
       - name: List candidate PRs
@@ -528,6 +562,7 @@ jobs:
               echo "effective=$EFFECTIVE"
               echo "event_id=$EVENT_ID"
               echo "verdict_events=$VERDICT_EVENTS"
+              echo "channel=$CH"
             } >> "$GITHUB_OUTPUT"
             decision "$N" "AUTHORIZED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR}) — handing to the merge job"
             # One merge per run: everything evaluated after a merge would be
@@ -775,73 +810,154 @@ jobs:
           RISK: ${{ needs.evaluate.outputs.risk }}
           EFFECTIVE: ${{ needs.evaluate.outputs.effective }}
           EVENT_ID: ${{ needs.evaluate.outputs.event_id }}
+          CHANNEL: ${{ needs.evaluate.outputs.channel }}
           BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
           BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
         run: |
           R="$GITHUB_REPOSITORY"
 
-          # LAST CHECK BEFORE THE WRITE: is the verdict still the coordinate's
-          # current value?
-          #
-          # Everything the revalidate step proved about the verdict was proved
-          # about a COPY — the event the evaluate job read minutes ago and
-          # serialized into a job output. Its signature, kind and coordinate
-          # are all still valid after the reviewer replaces it, because the
-          # reviewer replacing it does not alter the old event; it stops being
-          # current. Replaceability establishes currency at the instant of the
-          # read and says nothing later. Without this re-read, a revocation
-          # published between the two jobs loses to a merge that is still
-          # holding the approval it revoked. (CLAUDE.md "Review-Proven Rules"
-          # rule 2: an in-flight result must verify it is still the newest
-          # before it is acted on.)
-          #
-          # Why the relay key may be here now, when the whole point of the job
-          # split was to keep it out: the split existed because the verdict
-          # used to live in a channel this key could redact. It does not any
-          # more — the coordinate is out of reach of every channel authority,
-          # and this key cannot forge the reviewer's signature. So the read is
-          # one that can only ever REFUSE. It cannot manufacture an approval,
-          # and a compromised merge job already holds merge authority, so
-          # nothing is conceded by letting it also read.
-          STATUS=0
           # `env -u` and not just "don't export it as GH_TOKEN": the value is
           # in this step's environment, so a child inherits it by default. The
           # relay client has no business holding merge authority even for the
           # length of one read.
-          LIVE=$(env -u MERGE_TOKEN python3 .github/scripts/pr-auto-merge-relay.py standing-verdict \
+          relay() { env -u MERGE_TOKEN python3 .github/scripts/pr-auto-merge-relay.py "$@"; }
+
+          # Does the coordinate's CURRENT value still authorize this exact
+          # merge, and is it still the event the PR channel was told about?
+          # Silent on yes; prints the reason on no. Used on both sides of the
+          # write, which is the whole design below.
+          verdict_holds() {
+            local J ID
+            J=$(jq -c '[.]' <<<"$1" \
+              | node .github/scripts/pr-auto-merge-verdict.js \
+                  --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" \
+                  --base "$BASE_TIP" --floor "$FLOOR") \
+              || { echo "the coordinate's value could not be parsed"; return 1; }
+            if [ "$(jq -r .authorized <<<"$J")" != "true" ]; then
+              echo "the standing verdict no longer authorizes this merge ($(jq -r .reason <<<"$J"))"
+              return 1
+            fi
+            ID=$(jq -r '.eventId // "-"' <<<"$J")
+            if [ "$ID" != "$EVENT_ID" ]; then
+              echo "the coordinate now holds ${ID}, not the announced ${EVENT_ID}"
+              return 1
+            fi
+          }
+
+          # BEFORE THE WRITE. This is a NARROWING, not a fence — read the
+          # "What cannot be fenced, and why we stopped trying" section of
+          # docs/pr-auto-merge.md before adding another read here.
+          #
+          # Everything the revalidate step proved about the verdict was proved
+          # about a COPY: the event the evaluate job read minutes ago and
+          # serialized into a job output. Its signature, kind and coordinate
+          # all still pass after the reviewer replaces it, because replacing a
+          # NIP-33 coordinate does not alter the old event — it stops being
+          # current. Replaceability establishes currency at the instant of the
+          # read and says nothing about any later instant. (CLAUDE.md
+          # "Review-Proven Rules" rule 2: an in-flight result must verify it is
+          # still the newest before it is acted on.)
+          #
+          # So this read catches every revocation that lands before it, and one
+          # cannot exist that it also catches after it: `gh pr merge` is a
+          # write to GitHub, GitHub evaluates its own preconditions (head SHA,
+          # draft, branch rules) and cannot observe the relay, and the reviewer
+          # holds no GitHub credential — deliberately, because that is what
+          # makes the verdict unforgeable by this workflow. Moving this read
+          # closer to the write shrinks the window; nothing placed on this side
+          # of the write closes it. The residual is handled AFTER the merge.
+          #
+          # Why the relay key may be here at all, when the point of the job
+          # split was to keep it out: the split existed because the verdict
+          # used to live in a channel this key could redact. It does not any
+          # more — the coordinate is out of reach of every channel authority,
+          # and this key cannot forge the reviewer's signature. So this read
+          # can only ever REFUSE. It cannot manufacture an approval, and a
+          # compromised merge job already holds merge authority, so nothing is
+          # conceded by letting it also read.
+          STATUS=0
+          LIVE=$(relay standing-verdict \
             --repo "$R" --pr "$PR" --reviewer "$REVIEWER_PUBKEY") || STATUS=$?
           if [ "$STATUS" -ne 0 ]; then
             echo "::warning::PR #$PR: could not confirm the verdict is still current (exit $STATUS) — not merging"
             echo "- PR #$PR: REFUSED at the merge write (verdict currency unconfirmed)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          LIVE_JSON=$(jq -c '[.]' <<<"$LIVE" \
-            | node .github/scripts/pr-auto-merge-verdict.js \
-                --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" \
-                --base "$BASE_TIP" --floor "$FLOOR")
-          if [ "$(jq -r .authorized <<<"$LIVE_JSON")" != "true" ]; then
-            echo "::warning::PR #$PR: the reviewer's standing verdict no longer authorizes this merge ($(jq -r .reason <<<"$LIVE_JSON")) — not merging"
-            echo "- PR #$PR: REFUSED at the merge write (verdict withdrawn or changed)" >> "$GITHUB_STEP_SUMMARY"
+          if ! WHY=$(verdict_holds "$LIVE"); then
+            echo "::warning::PR #$PR: ${WHY} — not merging"
+            echo "- PR #$PR: REFUSED at the merge write (${WHY})" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          LIVE_ID=$(jq -r '.eventId // "-"' <<<"$LIVE_JSON")
-          if [ "$LIVE_ID" != "$EVENT_ID" ]; then
-            # Still authorizes, but it is not the event the PR channel was told
-            # about. Merging would leave an audit trail naming the wrong event.
-            echo "::warning::PR #$PR: the coordinate now holds ${LIVE_ID}, not the announced ${EVENT_ID} — not merging on a stale announcement"
-            echo "- PR #$PR: REFUSED at the merge write (verdict replaced since the announcement)" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          echo "verdict ${LIVE_ID} is still the standing value at the coordinate"
+          echo "verdict ${EVENT_ID} is still the standing value at the coordinate"
 
           # --match-head-commit makes the merge itself a conditional write: a
           # push racing this run is rejected by GitHub, not by our last read.
+          # It fences the head and nothing else — GitHub has no condition that
+          # observes a Nostr coordinate.
           if ! GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" -R "$R" --squash --match-head-commit "$HEAD_SHA"; then
             echo "::error::merge failed for PR #$PR — the PR channel was told a merge was authorized; reconcile by hand"
             exit 1
           fi
           echo "- PR #$PR: MERGED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR})" >> "$GITHUB_STEP_SUMMARY"
-          if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$(printf '🤖 Auto-merged on the reviewer'\''s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
+
+          # AFTER THE WRITE. The window above cannot be closed, so it is closed
+          # from the other side: read the coordinate once more, now that main
+          # has already moved. A revocation that landed inside the window shows
+          # up here — seconds later, loudly, naming the commit to revert —
+          # instead of never. Prevention was impossible. Silence was not.
+          #
+          # Every non-green outcome here is red, including a relay that simply
+          # did not answer. This is after state changed, which is precisely
+          # what the failure philosophy at the top of this file reserves red
+          # for: "we merged and cannot say whether we were still allowed to" is
+          # not weather, and a warning on a cron run reaches nobody.
+          #
+          # Two distinguishable outcomes, and they are not the same claim:
+          # CONTRADICTED means the reviewer's coordinate now says no, which is
+          # a merge that should not have happened. UNCONFIRMED means the relay
+          # did not answer, which is a merge nobody can vouch for either way.
+          # Both are red; saying "contradicted" for a network blip would be a
+          # false accusation, so they are labelled apart.
+          STATUS=0
+          AFTER=$(relay standing-verdict \
+            --repo "$R" --pr "$PR" --reviewer "$REVIEWER_PUBKEY") || STATUS=$?
+          if [ "$STATUS" -ne 0 ]; then
+            STATE=UNCONFIRMED
+            HEADLINE="**Merged, and the authorization could not be re-confirmed.**"
+            WHY="the verdict coordinate could not be read after the merge (exit $STATUS)"
+          elif ! WHY=$(verdict_holds "$AFTER"); then
+            STATE=CONTRADICTED
+            HEADLINE="**Merged, then the authorization did not survive the write.**"
+          else
+            STATE=""
+            WHY=""
+          fi
+
+          if [ -n "$STATE" ]; then
+            REVERT=$(GH_TOKEN="$MERGE_TOKEN" gh pr view "$PR" -R "$R" \
+              --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null) || REVERT=""
+            # shellcheck disable=SC2016  # backticks are markdown, not command substitution
+            ALERT=$(printf '🚨 %s\n\nPR #%s was squash-merged at `%s` on verdict `%s`, and the post-merge check of the reviewer'"'"'s verdict coordinate could not stand behind it: %s.\n\nThis is a detection, not a prevention — the merge write cannot be fenced on a relay value, see "What cannot be fenced" in `docs/pr-auto-merge.md`. `main` has already moved. Revert and re-review:\n\n```\ngit revert %s\n```\n\nRun: %s/%s/actions/runs/%s\n' \
+              "$HEADLINE" "$PR" "$HEAD_SHA" "$EVENT_ID" "$WHY" "${REVERT:-<the squash commit on main>}" \
+              "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")
+            if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$ALERT"; then
+              echo "::error::PR #$PR: the post-merge alert could not be posted to the PR — this run log is the only record"
+            fi
+            # Best-effort: the mirror archives the PR channel right after the
+            # merge event, so this send is racing an archive it cannot win
+            # every time. The PR comment above is the durable record.
+            if [ -n "${CHANNEL:-}" ]; then
+              printf '%s\n' "$ALERT" | relay send --channel "$CHANNEL" >/dev/null \
+                || echo "::warning::PR #$PR: post-merge alert not delivered to the PR channel — the PR comment is the durable record"
+            fi
+            echo "- PR #$PR: MERGED, THEN ${STATE} — ${WHY} (revert ${REVERT:-the squash commit})" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PR #$PR merged at ${HEAD_SHA}, then ${STATE}: ${WHY}. Revert ${REVERT:-the squash commit on main} and re-review."
+            exit 1
+          fi
+          echo "the verdict still stands after the merge"
+
+          # shellcheck disable=SC2016  # backticks are markdown, not command substitution
+          if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
             "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
             "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")"; then
             echo "::error::PR #$PR merged but the audit comment failed — the record is incomplete"

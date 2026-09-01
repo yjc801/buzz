@@ -77,7 +77,38 @@ fn launch_block_preserves_descriptor_and_spawn_policy() {
     assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_TIMEOUT"], "17");
     assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
     assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
+    assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "channel");
     assert_eq!(launch["owner_pubkey"], "owner-hex");
+}
+
+#[test]
+fn launch_block_thread_policy_is_authoritative_and_preserves_unrelated_env() {
+    let record = record();
+    let descriptor = EffectiveHarnessDescriptor {
+        command: "goose".into(),
+        args: vec![],
+        env: BTreeMap::from([
+            ("BUZZ_ACP_SESSION_POLICY".to_string(), "channel".to_string()),
+            ("KEEP_ME".to_string(), "yes".to_string()),
+        ]),
+    };
+
+    let launch = build_launch_block_for_policy(
+        &record,
+        &descriptor,
+        &[],
+        None,
+        None,
+        "owner-hex",
+        crate::managed_agents::AcpSessionPolicy::Thread,
+    );
+
+    assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "thread");
+    assert!(
+        launch["env"]["BUZZ_ACP_SESSION_POLICY"].is_null(),
+        "desktop policy must not be shadowed by descriptor env"
+    );
+    assert_eq!(launch["env"]["KEEP_ME"], "yes");
 }
 
 #[test]

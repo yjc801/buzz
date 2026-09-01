@@ -1,3 +1,9 @@
+import * as React from "react";
+import { generalChannelSeedAnchorSeconds } from "./e2eBridgeSeedAnchor";
+import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import { CommunitiesProvider } from "@/features/communities/useCommunities";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { emit, listen } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
@@ -18,6 +24,15 @@ import type { UnreadCatchUpChannelResult } from "@/shared/api/tauriUnreadCatchUp
 import { relayClient } from "@/shared/api/relayClient";
 import { activateRateLimit } from "@/shared/api/relayRateLimitGate";
 import { resolveAgentParallelism } from "@/features/agents/lib/agentParallelism";
+import { awaitLiveSwitchOutcome } from "@/features/agents/lib/liveSwitchOutcome";
+import {
+  _testRegisterKnownAgents,
+  ensureRelayObserverSubscription,
+  subscribeControlResults,
+} from "@/features/agents/observerRelayStore";
+import { switchManagedAgentModel } from "@/shared/api/agentControl";
+import { mockSearchHitMatches } from "./e2eBridgeSearch.ts";
+export { mockSearchHitMatches };
 import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type {
   ChannelTemplate,
@@ -377,6 +392,14 @@ type E2eConfig = {
     closeChannelLiveSubscriptionOnce?: boolean;
     /** Reject successive kind-9 sends with these messages, then resume. */
     sendMessageErrors?: string[];
+    /** Test-only observer control requests captured after mock publish. */
+    observerControlResults?: Array<{
+      type: "cancel_turn" | "switch_model";
+      status: string;
+      channelId?: string | null;
+      requestId?: string;
+      modelId?: string;
+    }>;
     /** Reject successive managed-agent starts, then resume. */
     startManagedAgentErrors?: string[];
     /** Delay (ms) after snapshotting a thread-replies page so E2E tests can
@@ -1400,6 +1423,25 @@ declare global {
         peers: number;
       }>;
     }) => void;
+    /** Run the real live-switch outcome and control transport through mock relay. */
+    __BUZZ_E2E_RUN_MODEL_SWITCH__?: (input: {
+      agentPubkey: string;
+      channelIds: string[];
+      modelId: string;
+      requestId: string;
+      timeoutMs?: number;
+    }) => Promise<string>;
+    /** Mount AgentSessionThreadPanel directly for channelId-only UI coverage. */
+    __BUZZ_E2E_MOUNT_AGENT_SESSION_PANEL__?: (input: {
+      agentPubkey: string;
+      channelId: string;
+      canInterruptTurn?: boolean;
+    }) => Promise<void>;
+    /** Resolve decoded test-only observer controls back through the mock relay. */
+    __BUZZ_E2E_OBSERVER_CONTROLS__?: Array<{
+      agentPubkey: string;
+      payload: unknown;
+    }>;
     __BUZZ_E2E_SEED_ACTIVE_TURNS__?: (input: {
       agentPubkey: string;
       channelId: string;
@@ -4098,6 +4140,9 @@ const mockFeedOverrides: RawHomeFeedResponse["feed"] = {
 };
 
 let installed = false;
+let directPanelRoot: Root | null = null;
+let directPanelContainer: HTMLDivElement | null = null;
+let directPanelQueryClient: QueryClient | null = null;
 let nextSocketId = 1;
 
 function syncMockRelayAgentsFromManagedAgents() {
@@ -4504,35 +4549,6 @@ function buildReplyMessageTags(
   return tags;
 }
 
-// The general-channel seeds below are seconds-scale backdated from "now" so
-// they always sort before user-sent messages in other specs, and specs that
-// assert a single `message-timeline-day-divider` depend on all of them
-// landing on the same calendar day. Anchoring on raw Date.now() let CI runs
-// that started within the largest backdate window (120s) after UTC midnight
-// split the seeds across "Yesterday"/"Today", rendering two dividers and
-// failing those specs with a strict-mode violation (see messaging.spec.ts
-// "day divider appears in timeline").
-//
-// Advancing the anchor forward past midnight (an earlier version of this
-// fix) put seeds up to GENERAL_SEED_MAX_BACKDATE_SECONDS - 30 in the future
-// relative to `now`, which broke the many specs that locate the just-sent
-// row with `.last()` — sortMessages ranks by created_at, so a future seed
-// sorts after a live send. Instead, anchor at the final second of the
-// *previous* UTC day: every offset below (anchor - 120 .. anchor) then
-// stays within that one earlier day, and anchor is always strictly less
-// than `now`, so seeds still sort before anything sent live.
-const GENERAL_SEED_MAX_BACKDATE_SECONDS = 120;
-
-export function generalChannelSeedAnchorSeconds(): number {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const secondsSinceUtcMidnight = nowSeconds % 86_400;
-  if (secondsSinceUtcMidnight >= GENERAL_SEED_MAX_BACKDATE_SECONDS) {
-    return nowSeconds;
-  }
-  const utcMidnightToday = nowSeconds - secondsSinceUtcMidnight;
-  return utcMidnightToday - 1;
-}
-
 function getMockMessageStore(channelId: string): RelayEvent[] {
   const existing = mockMessages.get(channelId);
   if (existing) {
@@ -4848,6 +4864,62 @@ function emitMockLiveEvent(channelId: string, event: RelayEvent) {
       }
     }
   }
+}
+
+let mockObserverControlSeq = 0;
+
+function emitMockObserverControlResult(
+  agentPubkey: string,
+  request: {
+    type: "cancel_turn" | "switch_model";
+    channelId?: string | null;
+    requestId?: string;
+    modelId?: string;
+  },
+  result: {
+    type: "cancel_turn" | "switch_model";
+    status: string;
+    channelId?: string | null;
+    requestId?: string;
+    modelId?: string;
+  },
+) {
+  const channelId = result.channelId ?? request.channelId ?? null;
+  const payload = {
+    type: result.type,
+    status: result.status,
+    ...(result.requestId !== undefined
+      ? { requestId: result.requestId }
+      : request.requestId !== undefined
+        ? { requestId: request.requestId }
+        : {}),
+    ...(result.modelId !== undefined
+      ? { modelId: result.modelId }
+      : request.modelId !== undefined
+        ? { modelId: request.modelId }
+        : {}),
+  };
+  mockObserverControlSeq += 1;
+  const observerEvent = createMockEvent(
+    KIND_AGENT_OBSERVER_FRAME,
+    JSON.stringify({
+      seq: mockObserverControlSeq,
+      timestamp: new Date().toISOString(),
+      kind: "control_result",
+      agentIndex: null,
+      channelId,
+      sessionId: null,
+      turnId: null,
+      payload,
+    }),
+    [
+      ["p", MOCK_IDENTITY_PUBKEY],
+      ["agent", agentPubkey],
+      ["frame", "telemetry"],
+    ],
+    agentPubkey,
+  );
+  emitMockLiveEvent(GLOBAL_MOCK_SUBSCRIPTION, observerEvent);
 }
 
 function emitOrDeferMockSendMessageLiveEcho(
@@ -9808,52 +9880,6 @@ async function handleUpdateManagedAgent(args: {
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };
 }
 
-/**
- * Mock-mode `search_messages` predicate, mirroring the relay's filter contract.
- *
- * `since`/`until` are NIP-01 bounds and both inclusive — the relay keeps events
- * where `since <= created_at <= until` (`crates/buzz-core/src/filter.rs`). The
- * `before:` operator's exclusivity is encoded upstream in
- * `parseSearchOperators`, which subtracts a second; the mock must not subtract
- * it a second time.
- *
- * Exported so the boundary behavior is unit-testable without a browser.
- */
-export function mockSearchHitMatches(
-  hit: Pick<
-    RawSearchHit,
-    "channel_id" | "pubkey" | "created_at" | "content" | "channel_name"
-  >,
-  filters: {
-    /** Lowercased FTS query; empty matches everything. */
-    query: string;
-    channelId?: string;
-    authorSet: Set<string> | null;
-    since?: number;
-    until?: number;
-  },
-): boolean {
-  if (filters.channelId && hit.channel_id !== filters.channelId) {
-    return false;
-  }
-  if (filters.authorSet && !filters.authorSet.has(hit.pubkey.toLowerCase())) {
-    return false;
-  }
-  if (filters.since != null && hit.created_at < filters.since) {
-    return false;
-  }
-  if (filters.until != null && hit.created_at > filters.until) {
-    return false;
-  }
-  if (!filters.query) {
-    return true;
-  }
-  return (
-    hit.content.toLowerCase().includes(filters.query) ||
-    (hit.channel_name?.toLowerCase().includes(filters.query) ?? false)
-  );
-}
-
 async function handleSearchMessages(
   args: {
     q: string;
@@ -11021,6 +11047,51 @@ function sendToMockSocket(args: {
   if (type === "EVENT") {
     const event = rest[0] as RelayEvent;
 
+    if (event.kind === KIND_AGENT_OBSERVER_FRAME) {
+      const frame = event.tags.find((tag) => tag[0] === "frame")?.[1];
+      if (frame === "control") {
+        let payload: {
+          type: "cancel_turn" | "switch_model";
+          channelId?: string | null;
+          requestId?: string;
+          modelId?: string;
+        };
+        try {
+          payload = JSON.parse(event.content);
+        } catch {
+          sendWsText(socket.handler, [
+            "OK",
+            event.id,
+            false,
+            "mock observer control payload is not JSON",
+          ]);
+          return;
+        }
+        window.__BUZZ_E2E_OBSERVER_CONTROLS__?.push({
+          agentPubkey: event.tags.find((tag) => tag[0] === "agent")?.[1] ?? "",
+          payload,
+        });
+        const configured = getConfig()?.mock?.observerControlResults ?? [];
+        const resultIndex = configured.findIndex(
+          (candidate) => candidate.type === payload.type,
+        );
+        const result =
+          resultIndex >= 0
+            ? configured.splice(resultIndex, 1)[0]
+            : {
+                type: payload.type,
+                status: payload.type === "cancel_turn" ? "sent" : "switched",
+              };
+        emitMockObserverControlResult(
+          event.tags.find((tag) => tag[0] === "agent")?.[1] ?? "",
+          payload,
+          result,
+        );
+        sendWsText(socket.handler, ["OK", event.id, true, ""]);
+        return;
+      }
+    }
+
     if (event.kind === 28936) {
       sendWsText(socket.handler, ["OK", event.id, true, ""]);
       return;
@@ -11291,6 +11362,92 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
+  window.__BUZZ_E2E_OBSERVER_CONTROLS__ = [];
+  window.__BUZZ_E2E_RUN_MODEL_SWITCH__ = async ({
+    agentPubkey,
+    channelIds,
+    modelId,
+    requestId,
+    timeoutMs = 8_000,
+  }) => {
+    _testRegisterKnownAgents("e2e-model-switch", [agentPubkey]);
+    await ensureRelayObserverSubscription();
+    // The mock relay has already been exercised by the app's normal observer
+    // subscription. The outcome helper below is the direct browser seam for the
+    // control-specific behavior, while the existing request capture proves the
+    // outgoing payload shape.
+    return awaitLiveSwitchOutcome({
+      requestId,
+      channelIds,
+      subscribe: (listener) => subscribeControlResults(agentPubkey, listener),
+      sendSwitches: async () => {
+        await Promise.all(
+          channelIds.map((channelId) =>
+            switchManagedAgentModel(agentPubkey, channelId, modelId, requestId),
+          ),
+        );
+      },
+      scheduleTimeout: (onTimeout) => {
+        const timeout = window.setTimeout(onTimeout, timeoutMs);
+        return () => window.clearTimeout(timeout);
+      },
+    });
+  };
+  window.__BUZZ_E2E_MOUNT_AGENT_SESSION_PANEL__ = async ({
+    agentPubkey,
+    channelId,
+    canInterruptTurn = true,
+  }) => {
+    directPanelRoot?.unmount();
+    directPanelContainer?.remove();
+    directPanelQueryClient?.clear();
+
+    directPanelContainer = document.createElement("div");
+    directPanelContainer.dataset.testid = "e2e-direct-agent-session-panel-root";
+    document.body.appendChild(directPanelContainer);
+    directPanelQueryClient = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+          networkMode: "always",
+          refetchOnWindowFocus: false,
+        },
+        mutations: { networkMode: "always" },
+      },
+    });
+    directPanelRoot = createRoot(directPanelContainer);
+    _testRegisterKnownAgents("e2e-direct-agent-session-panel", [agentPubkey]);
+
+    const agent = {
+      pubkey: agentPubkey,
+      name: mockDisplayNames.get(agentPubkey) ?? "E2E agent",
+      status: "running" as const,
+      agentSource: "managed" as const,
+      canInterruptTurn,
+      channelIds: [channelId],
+    };
+    directPanelRoot.render(
+      React.createElement(
+        QueryClientProvider,
+        { client: directPanelQueryClient },
+        React.createElement(
+          CommunitiesProvider,
+          null,
+          React.createElement(AgentSessionThreadPanel, {
+            agent,
+            canInterruptTurn,
+            channel: null,
+            channelId,
+            isSinglePanelView: true,
+            layout: "standalone",
+            onClose: () => {},
+            widthPx: 420,
+          }),
+        ),
+      ),
+    );
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+  };
   mockMediaProxyPort = config.mock?.mediaProxyInitiallyUnavailable
     ? 0
     : MOCK_MEDIA_PROXY_PORT;
@@ -12292,6 +12449,32 @@ export function maybeInstallE2eTauriMocks() {
         mockMeshState.nodeMode = null;
         mockMeshState.activeModel = null;
         return meshNodeStatus("off", null);
+      /** Build a test-only signed-looking observer control event. */
+      case "build_observer_control_event": {
+        const input = payload as { agentPubkey: string; payload: unknown };
+        return JSON.stringify(
+          createMockEvent(
+            KIND_AGENT_OBSERVER_FRAME,
+            JSON.stringify(input.payload),
+            [
+              ["p", input.agentPubkey],
+              ["agent", input.agentPubkey],
+              ["frame", "control"],
+            ],
+            DEFAULT_MOCK_IDENTITY.pubkey,
+          ),
+        );
+      }
+      case "decrypt_observer_event": {
+        const event = JSON.parse(
+          (payload as { eventJson: string }).eventJson,
+        ) as RelayEvent;
+        try {
+          return JSON.parse(event.content);
+        } catch {
+          throw new Error("mock observer event content is not JSON");
+        }
+      }
       case "get_identity": {
         const isLost =
           !mockIdentityLostCleared && activeConfig?.mock?.identityLost === true;
@@ -13681,6 +13864,8 @@ export function maybeInstallE2eTauriMocks() {
         // Post-create bootstrap reconcile: no new pairs in the mock world.
         return [];
       case "set_agent_managed_profiles":
+        return undefined;
+      case "set_thread_scoped_acp_sessions":
         return undefined;
       case "set_managed_agent_auto_restart":
         return handleSetManagedAgentAutoRestart(

@@ -436,11 +436,13 @@ enum SiblingVerdict {
     /// kind:0 fetched and its NIP-OA auth tag cryptographically proves the
     /// same owner.
     Sibling,
-    /// The relay answered and the profile is absent or does not prove the
+    /// The relay returned the author's profile and it does not prove the
     /// same owner.
     NotSibling,
-    /// The relay could not be consulted (timeout, network, or HTTP error) —
-    /// nothing was proven either way.
+    /// Nothing was attested either way: the relay could not be consulted
+    /// (timeout, network, or HTTP error), answered with a malformed body, or
+    /// has no kind:0 for the author yet — a sibling's profile may simply not
+    /// have been published or replicated, so its absence is not a verdict.
     Indeterminate,
 }
 
@@ -1058,9 +1060,10 @@ pub(crate) async fn is_dm_channel(
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
 /// proves the same owner as us.
 ///
-/// Distinguishes *proven absence* (the relay answered; no profile / no
-/// verifying tag) from *failure to consult the relay* — only the former may
-/// be cached by the caller.
+/// Only a *fetched* profile yields a verdict the caller may cache: a
+/// profile with no verifying tag is definitively [`SiblingVerdict::NotSibling`],
+/// while a failed query or a missing profile is
+/// [`SiblingVerdict::Indeterminate`] and retried under the bounded backoff.
 async fn check_sibling_via_profile(
     author: &str,
     expected_owner: &str,
@@ -1097,7 +1100,10 @@ async fn check_sibling_via_profile(
     };
     let event = match events.first() {
         Some(e) => e,
-        None => return SiblingVerdict::NotSibling,
+        // No kind:0 yet — not published, or not replicated to this relay.
+        // Not a verdict: the bounded backoff retries it, so a profile that
+        // appears later is picked up without a restart.
+        None => return SiblingVerdict::Indeterminate,
     };
     let tags = match event.get("tags").and_then(|t| t.as_array()) {
         Some(t) => t,
@@ -7977,7 +7983,7 @@ mod author_gate_tests {
     }
 
     #[tokio::test]
-    async fn test_sibling_proven_absence_is_cached_negative() {
+    async fn test_sibling_absent_profile_is_indeterminate_and_throttled() {
         let owner = nostr::Keys::generate().public_key().to_hex();
         let author = nostr::Keys::generate().public_key().to_hex();
         let cache = OwnerCache::new(Some(owner));
@@ -7985,8 +7991,28 @@ mod author_gate_tests {
         assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
         assert_eq!(
             cache.proven_verdict(&author),
+            None,
+            "a missing kind:0 is not a verdict — the profile may not exist or replicate yet"
+        );
+        assert_eq!(
+            cache.sibling_state(&author),
+            SiblingCacheState::Throttled,
+            "a missing profile is retried under the bounded backoff, not per event"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sibling_profile_without_matching_tag_is_cached_negative() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::new(Some(owner));
+        let (rest, server) = sibling_query_server(serde_json::json!([{ "tags": [] }])).await;
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(
+            cache.proven_verdict(&author),
             Some(false),
-            "a relay-confirmed missing profile is definitive and may be cached"
+            "a fetched profile with no verifying owner attestation is definitive"
         );
         server.abort();
     }
@@ -8014,7 +8040,8 @@ mod author_gate_tests {
     /// A `/query` stand-in that counts requests and answers HTTP 500 (a
     /// non-retriable status, so the harness sees an immediate error rather
     /// than the 2s timeout) until `healthy` is flipped, after which it answers
-    /// `200 []` — a relay-confirmed missing profile.
+    /// `200 [{"tags":[]}]` — a fetched profile with no owner attestation, i.e.
+    /// a definitive `NotSibling`.
     async fn flaky_sibling_query_server() -> (
         relay::RestClient,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -8040,7 +8067,7 @@ mod author_gate_tests {
                 let _ = socket.read(&mut request).await;
                 server_requests.fetch_add(1, Ordering::SeqCst);
                 let response = if server_healthy.load(Ordering::SeqCst) {
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]".to_string()
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n[{\"tags\":[]}]".to_string()
                 } else {
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                 };

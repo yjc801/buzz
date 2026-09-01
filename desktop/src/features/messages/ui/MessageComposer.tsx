@@ -28,14 +28,8 @@ import {
 import { useComposerFocusOwnership } from "@/features/messages/lib/useComposerFocusOwnership";
 import { isMentionCodeContext } from "@/features/messages/lib/mentionCodeContext";
 import { useMentions } from "@/features/messages/lib/useMentions";
-import {
-  getPersistentAgentAudienceScope,
-  usePersistentAgentAudience,
-} from "@/features/messages/lib/persistentAgentAudience";
-import {
-  setKeepMentionedAgentsPinned,
-  useKeepMentionedAgentsPinned,
-} from "@/features/messages/lib/autoPinMentionedAgentsPreference";
+import { getPersistentAgentAudienceScope } from "@/features/messages/lib/persistentAgentAudience";
+import { setKeepMentionedAgentsPinned } from "@/features/messages/lib/autoPinMentionedAgentsPreference";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { CUSTOM_EMOJI_NODE_NAME } from "@/features/messages/lib/customEmojiNode";
 import {
@@ -66,6 +60,7 @@ import { useComposerContentState } from "./useComposerContentState";
 import { useComposerPasteHandler } from "./useComposerPasteHandler";
 import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
 import { useImplicitAgentMentionProvenance } from "./useImplicitAgentMentionProvenance";
+import { useThreadAgentAudience } from "./useThreadAgentAudience";
 import { submitMessageEdit } from "./submitMessageEdit";
 import { prepareBackgroundLinkPreviews } from "@/features/messages/lib/linkPreviewPreparationStore";
 import { useComposerLinkPreviews } from "./useComposerLinkPreviews";
@@ -326,8 +321,12 @@ function MessageComposerImpl({
   onLinkSelectionChangeRef.current = linkEditor.showFromCursor;
   onLinkShortcutRef.current = linkEditor.openFromShortcut;
   useComposerSpoilerParticles(richText.editor, composerScrollRef);
-  const persistentAudience = usePersistentAgentAudience(audienceScope);
-  const keepMentionedAgentsPinned = useKeepMentionedAgentsPinned();
+  const { audience: persistentAudience, keepMentionedAgentsPinned } =
+    useThreadAgentAudience({
+      isAgentPubkey: mentions.isAgentPubkey,
+      rootTags: audienceContext?.rootTags ?? [],
+      scope: audienceScope,
+    });
   const addressPulse = useAddressMentionPulse();
   const {
     completeOptionsReveal: completeMentionOptionsReveal,
@@ -425,16 +424,11 @@ function MessageComposerImpl({
       setSpoileredAttachmentUrls(restoredSpoileredAttachmentUrls);
     }
   }, [editTarget?.id]);
-  // ── Focus on reply ──────────────────────────────────────────────────
-  // Use focusPreserve so that re-renders (e.g. new messages arriving in
-  // a thread) don't yank the cursor to the end while the user is editing.
   React.useEffect(() => {
     if (!replyTarget || composerDisabled) return;
     richText.focusPreserve();
   }, [composerDisabled, replyTarget, richText.focusPreserve]);
   useComposerAutofocus(richText.focus, effectiveDraftKey, composerDisabled);
-  // Hooks return a plain-text edit descriptor; `replacePlainTextRange`
-  // applies it as a single ProseMirror transaction (no markdown round-trip).
   const applyAutocompleteEdit = React.useCallback(
     (edit: AutocompleteEdit) => {
       richText.replacePlainTextRange(
@@ -511,10 +505,6 @@ function MessageComposerImpl({
   const insertEmoji = React.useCallback(
     (emoji: string) => {
       if (!richText.editor) return;
-      // A `:shortcode:` for a known custom emoji becomes a selectable atom
-      // node (same as the input rule / autocomplete), so it can be selected,
-      // copied, and deleted as one unit. Everything else (native unicode)
-      // inserts as plain content.
       const match = /^:([^:\s]+):$/.exec(emoji);
       const shortcode = match?.[1]?.toLowerCase();
       const known =
@@ -891,7 +881,11 @@ function MessageComposerImpl({
               onEmojiSelect={applyEmojiInsert}
               onMentionSelect={selectMentionSuggestion}
               onOptionsRevealComplete={completeMentionOptionsReveal}
-              onToggleAlwaysAddressAgent={toggleAlwaysAddressAgent}
+              onToggleAlwaysAddressAgent={(suggestion) =>
+                toggleAlwaysAddressAgent(suggestion, {
+                  preserveMention: true,
+                })
+              }
             />
             {media.uploadState.status === "error" ? (
               <div className="mb-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">

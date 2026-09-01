@@ -2,7 +2,7 @@
 //! and their supporting helpers.
 //!
 //! Import-side commands and helpers live in `snapshot::import` to keep this
-//! file under the 1000-line gate.
+//! file under the 1500-line gate.
 //!
 //! Split from `personas/mod.rs` to keep that file under the line-count gate.
 

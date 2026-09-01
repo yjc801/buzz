@@ -1,7 +1,7 @@
 //! Unit tests for `managed_agents/agent_snapshot.rs`.
 //!
 //! Kept in a sibling file so `agent_snapshot.rs` stays under the
-//! 1000-line gate; `#[path]`-included from there.
+//! 1500-line gate; `#[path]`-included from there.
 
 use super::*;
 use crate::managed_agents::types::{BackendKind, ManagedAgentRecord, RespondTo};

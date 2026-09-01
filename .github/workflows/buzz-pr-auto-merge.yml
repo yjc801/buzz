@@ -759,27 +759,89 @@ jobs:
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
       # The only step in either job that can write to the repository, and the
-      # only one AUTO_MERGE_TOKEN is exposed to.
+      # only one AUTO_MERGE_TOKEN is exposed to. Even here it is applied per
+      # command rather than exported as GH_TOKEN, and stripped from the
+      # environment of the relay read, so nothing but `gh pr merge` and the
+      # audit comment ever sees merge authority.
       - name: Merge
         if: steps.revalidate.outputs.proceed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+          MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.evaluate.outputs.pr }}
           HEAD_SHA: ${{ needs.evaluate.outputs.head }}
+          BASE_TIP: ${{ needs.evaluate.outputs.base_tip }}
           FLOOR: ${{ needs.evaluate.outputs.floor }}
           RISK: ${{ needs.evaluate.outputs.risk }}
           EFFECTIVE: ${{ needs.evaluate.outputs.effective }}
           EVENT_ID: ${{ needs.evaluate.outputs.event_id }}
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
+          BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
         run: |
           R="$GITHUB_REPOSITORY"
+
+          # LAST CHECK BEFORE THE WRITE: is the verdict still the coordinate's
+          # current value?
+          #
+          # Everything the revalidate step proved about the verdict was proved
+          # about a COPY — the event the evaluate job read minutes ago and
+          # serialized into a job output. Its signature, kind and coordinate
+          # are all still valid after the reviewer replaces it, because the
+          # reviewer replacing it does not alter the old event; it stops being
+          # current. Replaceability establishes currency at the instant of the
+          # read and says nothing later. Without this re-read, a revocation
+          # published between the two jobs loses to a merge that is still
+          # holding the approval it revoked. (CLAUDE.md "Review-Proven Rules"
+          # rule 2: an in-flight result must verify it is still the newest
+          # before it is acted on.)
+          #
+          # Why the relay key may be here now, when the whole point of the job
+          # split was to keep it out: the split existed because the verdict
+          # used to live in a channel this key could redact. It does not any
+          # more — the coordinate is out of reach of every channel authority,
+          # and this key cannot forge the reviewer's signature. So the read is
+          # one that can only ever REFUSE. It cannot manufacture an approval,
+          # and a compromised merge job already holds merge authority, so
+          # nothing is conceded by letting it also read.
+          STATUS=0
+          # `env -u` and not just "don't export it as GH_TOKEN": the value is
+          # in this step's environment, so a child inherits it by default. The
+          # relay client has no business holding merge authority even for the
+          # length of one read.
+          LIVE=$(env -u MERGE_TOKEN python3 .github/scripts/pr-auto-merge-relay.py standing-verdict \
+            --repo "$R" --pr "$PR" --reviewer "$REVIEWER_PUBKEY") || STATUS=$?
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::warning::PR #$PR: could not confirm the verdict is still current (exit $STATUS) — not merging"
+            echo "- PR #$PR: REFUSED at the merge write (verdict currency unconfirmed)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          LIVE_JSON=$(jq -c '[.]' <<<"$LIVE" \
+            | node .github/scripts/pr-auto-merge-verdict.js \
+                --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" \
+                --base "$BASE_TIP" --floor "$FLOOR")
+          if [ "$(jq -r .authorized <<<"$LIVE_JSON")" != "true" ]; then
+            echo "::warning::PR #$PR: the reviewer's standing verdict no longer authorizes this merge ($(jq -r .reason <<<"$LIVE_JSON")) — not merging"
+            echo "- PR #$PR: REFUSED at the merge write (verdict withdrawn or changed)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          LIVE_ID=$(jq -r '.eventId // "-"' <<<"$LIVE_JSON")
+          if [ "$LIVE_ID" != "$EVENT_ID" ]; then
+            # Still authorizes, but it is not the event the PR channel was told
+            # about. Merging would leave an audit trail naming the wrong event.
+            echo "::warning::PR #$PR: the coordinate now holds ${LIVE_ID}, not the announced ${EVENT_ID} — not merging on a stale announcement"
+            echo "- PR #$PR: REFUSED at the merge write (verdict replaced since the announcement)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "verdict ${LIVE_ID} is still the standing value at the coordinate"
+
           # --match-head-commit makes the merge itself a conditional write: a
           # push racing this run is rejected by GitHub, not by our last read.
-          if ! gh pr merge "$PR" -R "$R" --squash --match-head-commit "$HEAD_SHA"; then
+          if ! GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" -R "$R" --squash --match-head-commit "$HEAD_SHA"; then
             echo "::error::merge failed for PR #$PR — the PR channel was told a merge was authorized; reconcile by hand"
             exit 1
           fi
           echo "- PR #$PR: MERGED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR})" >> "$GITHUB_STEP_SUMMARY"
-          if ! gh pr comment "$PR" -R "$R" --body "$(printf '🤖 Auto-merged on the reviewer'\''s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
+          if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$(printf '🤖 Auto-merged on the reviewer'\''s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
             "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
             "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")"; then
             echo "::error::PR #$PR merged but the audit comment failed — the record is incomplete"

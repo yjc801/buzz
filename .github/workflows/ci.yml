@@ -1346,6 +1346,7 @@ jobs:
       - server-cross-compile
       - windows-rust
       - desktop-build-macos
+      - desktop-windows-build
     steps:
       - name: Every applicable lane succeeded or was skipped
         env:

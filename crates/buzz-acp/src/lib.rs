@@ -384,14 +384,39 @@ impl OwnerCache {
         backoff
     }
 
+    /// Number of cached authors at the eviction threshold.
+    const SIBLING_CACHE_CAP: usize = 256;
+
+    /// Insert or replace `author`'s entry under the bounded-size policy.
+    ///
+    /// Replacing an author already present never evicts anything — a retry
+    /// deadline being re-armed at capacity must not wipe the other entries,
+    /// or a saturated cache under a `/query` outage would collapse every
+    /// sibling back to a serial inline lookup per event. A previously absent
+    /// author at capacity first purges expired retry deadlines (worthless),
+    /// then evicts a single arbitrary entry only if the map is still full.
     fn insert(&self, author: String, entry: SiblingEntry) {
-        if let Ok(mut map) = self.siblings.lock() {
-            // Cap at 256 entries to prevent unbounded growth.
-            if map.len() >= 256 {
-                map.clear();
+        let Ok(mut map) = self.siblings.lock() else {
+            return;
+        };
+        if !map.contains_key(&author) && map.len() >= Self::SIBLING_CACHE_CAP {
+            let now = std::time::Instant::now();
+            map.retain(|_, existing| {
+                !matches!(existing, SiblingEntry::Indeterminate { retry_at, .. } if *retry_at <= now)
+            });
+            if map.len() >= Self::SIBLING_CACHE_CAP {
+                if let Some(victim) = map.keys().next().cloned() {
+                    map.remove(&victim);
+                }
             }
-            map.insert(author, entry);
         }
+        map.insert(author, entry);
+    }
+
+    /// Number of authors currently cached (proven or throttled).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.siblings.lock().map(|map| map.len()).unwrap_or(0)
     }
 }
 
@@ -8108,6 +8133,94 @@ mod author_gate_tests {
             cache.note_indeterminate("fresh").as_secs(),
             5,
             "backoff is tracked per author"
+        );
+    }
+
+    /// A cache whose retry deadlines expire almost immediately, filled to the
+    /// eviction threshold with proven verdicts for `authors`.
+    fn saturated_cache_with_proven(authors: &[String]) -> OwnerCache {
+        let cache = OwnerCache::with_retry_backoff(
+            Some("00".into()),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        for author in authors {
+            cache.cache_sibling(author.clone(), true);
+        }
+        cache
+    }
+
+    #[test]
+    fn test_sibling_cache_replacing_an_author_at_capacity_keeps_the_rest() {
+        let authors: Vec<String> = (0..OwnerCache::SIBLING_CACHE_CAP)
+            .map(|i| format!("author-{i}"))
+            .collect();
+        let cache = saturated_cache_with_proven(&authors);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+
+        // Re-arming one author's retry deadline at capacity — first arming,
+        // then re-arming after it expired — replaces that entry only.
+        cache.note_indeterminate(&authors[0]);
+        std::thread::sleep(Duration::from_millis(5));
+        cache.note_indeterminate(&authors[0]);
+
+        assert_eq!(
+            cache.len(),
+            OwnerCache::SIBLING_CACHE_CAP,
+            "replacing an existing author must not evict anything"
+        );
+        for author in &authors[1..] {
+            assert_eq!(
+                cache.sibling_state(author),
+                SiblingCacheState::Proven(true),
+                "re-arming {} at capacity must keep {author}'s proven verdict",
+                authors[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_sibling_cache_new_author_at_capacity_evicts_expired_deadlines_first() {
+        let proven: Vec<String> = (1..OwnerCache::SIBLING_CACHE_CAP)
+            .map(|i| format!("proven-{i}"))
+            .collect();
+        let cache = saturated_cache_with_proven(&proven);
+        cache.note_indeterminate("expired");
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        std::thread::sleep(Duration::from_millis(5));
+
+        // A new author at capacity displaces the expired deadline, nothing else.
+        cache.cache_sibling("newcomer".into(), false);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        assert_eq!(
+            cache.sibling_state("newcomer"),
+            SiblingCacheState::Proven(false)
+        );
+        for author in &proven {
+            assert_eq!(
+                cache.sibling_state(author),
+                SiblingCacheState::Proven(true),
+                "an expired deadline must be evicted before any proven verdict"
+            );
+        }
+
+        // With no expired deadlines left, one more new author evicts exactly
+        // one entry — never the whole map.
+        cache.cache_sibling("newcomer-2".into(), false);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        assert_eq!(
+            cache.sibling_state("newcomer-2"),
+            SiblingCacheState::Proven(false)
+        );
+        let retained = proven
+            .iter()
+            .chain(std::iter::once(&"newcomer".to_string()))
+            .filter(|author| cache.sibling_state(author) != SiblingCacheState::Unknown)
+            .count();
+        assert_eq!(
+            retained,
+            OwnerCache::SIBLING_CACHE_CAP - 1,
+            "a full cache evicts a single entry for a new author"
         );
     }
 

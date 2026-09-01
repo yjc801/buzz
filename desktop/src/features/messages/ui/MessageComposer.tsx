@@ -54,6 +54,7 @@ import { MessageComposerAutocompletes } from "./MessageComposerAutocompletes";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
 import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
+import { useComposerVoiceNote } from "./useComposerVoiceNote";
 import { useMentionSendFlow } from "./useMentionSendFlow";
 import { useAgentAddressLockPicker } from "./useAgentAddressLockPicker";
 import { useAddressMentionPulse } from "./useAddressMentionPulse";
@@ -84,6 +85,7 @@ function MessageComposerImpl({
   onAutoSubmitComplete,
   editTarget = null,
   isSending = false,
+  onAttachmentAcceptanceChange,
   onDeferredEditPendingChange,
   onCancelEdit,
   onCancelReply,
@@ -160,6 +162,16 @@ function MessageComposerImpl({
   );
   const internalMedia = useMediaUpload({ deferUploadsUntilSend: true });
   const media = mediaController ?? internalMedia;
+  const voiceNote = useComposerVoiceNote({
+    draftKey: effectiveDraftKey,
+    editTargetId: editTarget?.id ?? null,
+    media,
+    setFormattingOpen: setIsFormattingOpen,
+    setEmojiPickerOpen: setIsEmojiPickerOpen,
+  });
+  React.useEffect(() => {
+    onAttachmentAcceptanceChange?.(voiceNote.acceptsAttachment);
+  }, [onAttachmentAcceptanceChange, voiceNote.acceptsAttachment]);
   const {
     handleAttachmentEditSave,
     handleAttachmentRevert,
@@ -548,7 +560,12 @@ function MessageComposerImpl({
     const trimmed = syncComposerContentFromEditor().trim();
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
-      if (isEditSubmissionLocked) return;
+      // A live recording must be finished or discarded explicitly; never let an
+      // edit save snapshot text while a voice note is mid-capture (the editor's
+      // Enter shortcut bypasses the toolbar's Finish/Discard controls).
+      if (isEditSubmissionLocked || voiceNote.statusRef.current !== "idle") {
+        return;
+      }
       // Empty edits delete the message through handleEditSave.
       await submitMessageEdit({
         content: trimmed,
@@ -598,6 +615,7 @@ function MessageComposerImpl({
     if (
       (!trimmed && !hasMedia) ||
       disabledRef.current ||
+      voiceNote.statusRef.current !== "idle" ||
       isSendingRef.current ||
       isSubmitLockedRef.current ||
       isUploadingRef.current ||
@@ -673,6 +691,7 @@ function MessageComposerImpl({
     mentions.getDraftMentionRefs,
     mentions.restoreDraftMentionRefs,
     mentions.revalidateMentionPubkeys,
+    voiceNote.statusRef,
   ]);
   submitMessageRef.current = submitMessage;
   // Draft auto-submit runs once after persisted editor state loads.
@@ -701,7 +720,6 @@ function MessageComposerImpl({
     },
     [submitMessage],
   );
-  // ── Keyboard handling ───────────────────────────────────────────────
   // Tiptap handles formatting shortcuts (⌘B, ⌘I, etc.) natively.
   // Plain Enter → submit is now handled inside the Tiptap `submitOnEnter`
   // extension (fires before ProseMirror's splitBlock). This wrapper only
@@ -784,21 +802,22 @@ function MessageComposerImpl({
   useComposerPasteHandler({
     editor: richText.editor,
     scrollToBottom: scrollComposerToBottom,
-    setPendingImeta: media.setPendingImeta,
-    uploadFile: media.uploadFile,
+    setPendingImeta: voiceNote.setPendingImetaWhenIdle,
+    uploadFile: voiceNote.uploadFileWhenIdle,
   });
-  // ── Send button state ───────────────────────────────────────────────
   const sendDisabled =
     composerDisabled ||
     media.isUploading ||
+    voiceNote.status !== "idle" ||
     mentionSendFlow.isPreparingMentionSend ||
     (isContentEmpty &&
       media.pendingImeta.length === 0 &&
       media.queuedAttachments.length === 0);
   const handleCaptureSelection = React.useCallback(() => {}, []);
   const handlePaperclipClick = React.useCallback(() => {
-    void media.handlePaperclip();
-  }, [media.handlePaperclip]);
+    if (!voiceNote.hasAttachmentRef.current) void media.handlePaperclip();
+  }, [media.handlePaperclip, voiceNote.hasAttachmentRef]);
+  const acceptsDrop = ownsDropZone && voiceNote.acceptsAttachment;
   return (
     <>
       <footer
@@ -837,11 +856,11 @@ function MessageComposerImpl({
             )}
             data-submit-locked={isSubmitLocked ? "true" : "false"}
             data-testid="message-composer"
-            onDragEnter={ownsDropZone ? media.handleDragEnter : undefined}
-            onDragLeave={ownsDropZone ? media.handleDragLeave : undefined}
-            onDragOver={ownsDropZone ? media.handleDragOver : undefined}
+            onDragEnter={acceptsDrop ? media.handleDragEnter : undefined}
+            onDragLeave={acceptsDrop ? media.handleDragLeave : undefined}
+            onDragOver={acceptsDrop ? media.handleDragOver : undefined}
             onDrop={
-              ownsDropZone
+              acceptsDrop
                 ? (e) => {
                     if (isDeferredEditPending) {
                       e.preventDefault();
@@ -856,7 +875,7 @@ function MessageComposerImpl({
             }}
             ref={formRef}
           >
-            {ownsDropZone && media.isDragOver && <DropZoneOverlay />}
+            {acceptsDrop && media.isDragOver && <DropZoneOverlay />}
             <MessageComposerAutocompletes
               audienceControlsEnabled={Boolean(
                 audienceScope && editTarget == null,
@@ -944,6 +963,10 @@ function MessageComposerImpl({
               isFormattingOpen={isFormattingOpen}
               isSending={isSending || mentionSendFlow.isPreparingMentionSend}
               isUploading={media.isUploading}
+              isVoiceNoteProcessing={voiceNote.status !== "recording"}
+              isVoiceNoteRecording={voiceNote.status !== "idle"}
+              hasVoiceNoteAttachment={voiceNote.hasAttachment}
+              voiceNoteRecorder={voiceNote.recorderElement}
               onCaptureSelection={handleCaptureSelection}
               onAutoPinConfirmationDismiss={dismissAutoPinConfirmation}
               onAutoPinConfirmationHoverChange={setAutoPinConfirmationHovered}
@@ -954,6 +977,8 @@ function MessageComposerImpl({
               onLinkButton={linkEditor.openFromToolbar}
               onOpenMentionPicker={mentionPicker.openMentionSettings}
               onPaperclip={handlePaperclipClick}
+              onFinishVoiceNote={() => void voiceNote.finish()}
+              onVoiceNote={voiceNote.toggle}
               onRemoveAddressedAgent={removeAddressedAgent}
               pulseVersionByPubkey={addressPulse.pulseVersionByPubkey}
               sendDisabled={sendDisabled}

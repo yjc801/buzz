@@ -32,6 +32,7 @@ import type { AcpRuntime, ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import {
+  formatMessageSendError,
   getErrorMessage,
   getNonMemberMentionPubkeys as computeNonMemberMentionPubkeys,
   isManagedAgentRunning,
@@ -597,8 +598,9 @@ export function useMentionSendFlow({
             onComplete: async (uploaded, signal) => {
               try {
                 await finishSend(uploaded, signal);
-              } catch {
+              } catch (error) {
                 restoreComposerAfterFailure();
+                toast.error(formatMessageSendError(error));
               } finally {
                 settleUpload();
               }
@@ -624,8 +626,9 @@ export function useMentionSendFlow({
         if (!preparedUpload) {
           try {
             await finishSend([]);
-          } catch {
+          } catch (error) {
             restoreComposerAfterFailure();
+            toast.error(formatMessageSendError(error));
           }
         }
       } catch (error) {

@@ -1542,6 +1542,12 @@ declare global {
     __BUZZ_E2E_THREAD_REPLIES_PENDING__?: () => number;
     /** Uploads that passed mock-native registration and began relay work. */
     __BUZZ_E2E_LINK_PREVIEW_UPLOAD_STARTS__?: number;
+    /** Hold renderer-owned media fetches until their cancellation command. */
+    __BUZZ_E2E_HOLD_MEDIA_FETCHES__?: boolean;
+    /** Exact active/peak native media-fetch ownership for scheduler tests. */
+    __BUZZ_E2E_MEDIA_FETCH_STATE__?: { active: number; peak: number };
+    /** Object-URL lifecycle counters installed by the audio E2E regression. */
+    __BUZZ_E2E_AUDIO_OBJECT_URLS__?: { created: number; revoked: number };
   }
 }
 
@@ -1651,6 +1657,8 @@ let deferredLinkPreviewMetadataQueue: Array<() => void> = [];
 let deferredLinkPreviewUploadQueue: Array<() => void> = [];
 let deferredThreadRepliesQueue: Array<() => void> = [];
 let cancelledMediaUploadIds = new Set<string>();
+let cancelledMediaFetchIds = new Set<string>();
+let mockMediaFetchControllers = new Map<string, AbortController>();
 let deferNextChannelsRead = false;
 let deferredChannelsReadResolve: (() => void) | null = null;
 
@@ -11316,7 +11324,13 @@ export function maybeInstallE2eTauriMocks() {
   deferredLinkPreviewUploadQueue = [];
   deferredThreadRepliesQueue = [];
   cancelledMediaUploadIds = new Set<string>();
+  for (const controller of mockMediaFetchControllers.values()) {
+    controller.abort();
+  }
+  cancelledMediaFetchIds = new Set<string>();
+  mockMediaFetchControllers = new Map<string, AbortController>();
   window.__BUZZ_E2E_LINK_PREVIEW_UPLOAD_STARTS__ = 0;
+  window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
   window.__BUZZ_E2E_RELEASE_LINK_PREVIEW_METADATA__ = () => {
     const queued = deferredLinkPreviewMetadataQueue.splice(0);
     for (const release of queued) release();
@@ -14297,9 +14311,56 @@ export function maybeInstallE2eTauriMocks() {
         // The real command fetches relay media through Rust reqwest and
         // replies with raw bytes (`tauri::ipc::Response` → ArrayBuffer). In
         // E2E the browser fetch suffices — specs serve the URL via page.route.
-        const response = await fetch((payload as { url: string }).url);
-        if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
-        return await response.arrayBuffer();
+        const input = payload as { requestId?: string; url: string };
+        const requestId = input.requestId ?? crypto.randomUUID();
+        const controller = new AbortController();
+        mockMediaFetchControllers.set(requestId, controller);
+        if (cancelledMediaFetchIds.has(requestId)) controller.abort();
+        if (!window.__BUZZ_E2E_MEDIA_FETCH_STATE__) {
+          window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
+        }
+        const stats = window.__BUZZ_E2E_MEDIA_FETCH_STATE__;
+        stats.active += 1;
+        stats.peak = Math.max(stats.peak, stats.active);
+        try {
+          if (window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
+            await new Promise<never>((_resolve, reject) => {
+              const rejectCancelled = () =>
+                reject(new DOMException("fetch cancelled", "AbortError"));
+              if (controller.signal.aborted) {
+                rejectCancelled();
+                return;
+              }
+              controller.signal.addEventListener("abort", rejectCancelled, {
+                once: true,
+              });
+            });
+          }
+          const response = await fetch(input.url, {
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
+          return await response.arrayBuffer();
+        } finally {
+          stats.active -= 1;
+          mockMediaFetchControllers.delete(requestId);
+        }
+      }
+      case "cancel_media_fetch": {
+        const requestId = (payload as { requestId?: string }).requestId;
+        if (requestId) {
+          cancelledMediaFetchIds.add(requestId);
+          mockMediaFetchControllers.get(requestId)?.abort();
+        }
+        return null;
+      }
+      case "release_media_fetch": {
+        const requestId = (payload as { requestId?: string }).requestId;
+        if (requestId) {
+          cancelledMediaFetchIds.delete(requestId);
+          mockMediaFetchControllers.delete(requestId);
+        }
+        return null;
       }
       case "fetch_snapshot_bytes": {
         // The real command fetches + validates a snapshot attachment in memory

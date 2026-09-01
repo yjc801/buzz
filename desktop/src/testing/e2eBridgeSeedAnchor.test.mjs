@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { generalChannelSeedAnchorSeconds } from "./e2eBridge.ts";
+import { generalChannelSeedAnchorSeconds } from "./e2eBridgeSeedAnchor.ts";
 
 const originalDateNow = Date.now;
 

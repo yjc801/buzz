@@ -280,16 +280,17 @@ pub(crate) fn resolve_deploy_model_provider(
 
 /// Serialize the portable launch contract shared with provider-backed agents.
 ///
-/// `descriptor.env` is the authoritative six-layer environment. Policy values
-/// are deliberately separate because providers apply them below that layered
-/// environment, preserving the local spawn's power-user override semantics.
-pub(super) fn build_launch_block(
+/// `descriptor.env` is the authoritative six-layer environment for ordinary
+/// values. Desktop-owned settings are reserved, stripped from that layer, and
+/// emitted through `policy_env` so local and provider launches agree.
+fn build_launch_block_for_policy(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
     teams: &[crate::managed_agents::TeamRecord],
     effective_prompt: Option<&str>,
     effective_model: Option<&str>,
     owner_pubkey: &str,
+    session_policy: crate::managed_agents::AcpSessionPolicy,
 ) -> serde_json::Value {
     use crate::managed_agents::{
         known_acp_runtime, resolve_session_title, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
@@ -315,6 +316,7 @@ pub(super) fn build_launch_block(
         "BUZZ_ACP_AGENTS".into(),
         crate::managed_agents::acp_agents_value(&descriptor.command, record.parallelism),
     );
+    crate::managed_agents::insert_acp_session_policy_env(&mut policy_env, session_policy);
 
     if let Some(value) = effective_prompt {
         policy_env.insert("BUZZ_ACP_SYSTEM_PROMPT".into(), value.to_string());
@@ -375,7 +377,8 @@ pub(super) fn build_launch_block(
     // matching local, where `apply_claude_model_env(None)` removes both.
     let is_claude = runtime.map(|r| r.id == "claude").unwrap_or(false);
     let strip_key = |k: &str| {
-        (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
+        k.eq_ignore_ascii_case(crate::managed_agents::ACP_SESSION_POLICY_ENV_VAR)
+            || (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
             || (is_claude
                 && (k.eq_ignore_ascii_case("BUZZ_ACP_MODEL")
                     || k.eq_ignore_ascii_case("ANTHROPIC_MODEL")))
@@ -394,6 +397,26 @@ pub(super) fn build_launch_block(
         "policy_env": policy_env,
         "owner_pubkey": owner_pubkey,
     })
+}
+
+#[cfg(test)]
+pub(super) fn build_launch_block(
+    record: &ManagedAgentRecord,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    teams: &[crate::managed_agents::TeamRecord],
+    effective_prompt: Option<&str>,
+    effective_model: Option<&str>,
+    owner_pubkey: &str,
+) -> serde_json::Value {
+    build_launch_block_for_policy(
+        record,
+        descriptor,
+        teams,
+        effective_prompt,
+        effective_model,
+        owner_pubkey,
+        crate::managed_agents::AcpSessionPolicy::Channel,
+    )
 }
 
 pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result<(), String> {
@@ -463,13 +486,14 @@ pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
         crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
             .map_err(|error| crate::managed_agents::user_facing_harness_error(&error))?;
     let owner_pubkey = super::workspace_owner_hex(state)?;
-    let launch = build_launch_block(
+    let launch = build_launch_block_for_policy(
         record,
         &descriptor,
         &teams,
         effective.system_prompt.value.as_deref(),
         effective.model.value.as_deref(),
         &owner_pubkey,
+        crate::managed_agents::acp_session_policy(state),
     );
 
     let effective_parallelism =

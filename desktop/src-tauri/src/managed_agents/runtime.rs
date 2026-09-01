@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::agent_env::{build_buzz_agent_provider_defaults, idle_pool_sleep_env};
 
@@ -114,7 +114,6 @@ pub(crate) fn workspace_pair_key(
     app: &AppHandle,
     record: &ManagedAgentRecord,
 ) -> Option<ManagedAgentRuntimeKey> {
-    use tauri::Manager;
     let state = app.state::<crate::app_state::AppState>();
     resolve_workspace_pair_key(
         &record.pubkey,
@@ -259,6 +258,7 @@ pub fn build_managed_agent_summary(
             &key.relay_url,
             global_config,
             super::owner_only_access_build(),
+            super::acp_session_policy(app.state::<crate::app_state::AppState>().inner()),
         );
         (runtime, current)
     });
@@ -798,8 +798,10 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
-    crate::build_identity::apply_demo_config_home(&mut command)?;
+    // Resolve once and stamp the same value onto the snapshot below.
+    let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 
+    crate::build_identity::apply_demo_config_home(&mut command)?;
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
     // Written AFTER descriptor.env so the canonical persisted value wins over any
     // user-supplied BUZZ_ACP_EFFORT_LEVEL entry, mirroring the A1 model-authority pattern
@@ -851,6 +853,7 @@ pub fn spawn_agent_child(
             model: effective_model.as_deref(),
             provider: effective_provider.as_deref(),
             enforced_owner_only: super::owner_only_access_build(),
+            session_policy: acp_session_policy,
         },
     );
 

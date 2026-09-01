@@ -20,11 +20,21 @@
 # relay, and the reviewer holds no GitHub credential — so a revocation that
 # lands between the last read and the write is unstoppable by construction (see
 # "What cannot be fenced" in docs/pr-auto-merge.md). What is testable is that
-# it is not SILENT: the step reads the coordinate again after the merge, and a
-# contradiction there must go red, name the commit to revert, and alert both
-# the PR and the PR channel. The relay stub can therefore serve a DIFFERENT
-# value to the second read than it served to the first, which is precisely the
-# race, executed rather than argued.
+# it is not SILENT: the step reads the coordinate again after the merge, and an
+# authorization that no longer stands must go red, name the commit, and alert
+# both the PR and the PR channel. The relay stub can therefore serve a
+# DIFFERENT value to the second read than it served to the first, which is
+# precisely the race, executed rather than argued.
+#
+# What those scenarios must NOT assert is that the change happened before the
+# merge. Two reads establish only that the value differs across the write, and
+# the stub — which swaps the fixture by READ NUMBER, not by wall-clock position
+# relative to the stubbed merge — cannot distinguish "revoked, then merged"
+# from "merged, then revoked". That is not a limitation of the stub; nothing in
+# production can order a relay replacement against GitHub's acceptance either.
+# So the alert assertions below pin the honest claim (the authorization changed,
+# its timing is unknown) and pin the ABSENCE of the accusation, which is what
+# makes re-asserting a contradiction fail this test.
 #
 # The step's script is EXTRACTED FROM THE WORKFLOW rather than copied, so
 # deleting the re-read fails this test instead of silently passing it.
@@ -258,10 +268,16 @@ expect "coordinate returned something unparseable → refuses" refused
 # scenarios — asserting otherwise would be asserting something no code in this
 # repository can deliver. What must happen is that it does not pass silently.
 
-# expect_alert <label> <CONTRADICTED|UNCONFIRMED> — red, correctly labelled,
-# revert named, both audiences told, and the "all clear" audit comment NOT
-# posted. The two states are asserted apart on purpose: reporting a relay blip
-# as "the reviewer contradicted this merge" would be a false accusation.
+# expect_alert <label> <AUTHORIZATION-CHANGED|UNCONFIRMED> — red, correctly
+# labelled, revert named, both audiences told, and the "all clear" audit
+# comment NOT posted. The two states are asserted apart on purpose: reporting a
+# relay blip as "the authorization changed" would be a false report.
+#
+# It also asserts what the alert must NOT say. The evidence is two snapshots
+# either side of the write, so claiming the merge should not have happened is
+# an accusation this workflow cannot support — a valid merge followed by a
+# later change of mind produces the identical observation. Re-introducing that
+# claim fails here.
 expect_alert() {
   local label="$1" state="$2" status ok=1 why=""
   status=$(run_merge)
@@ -277,6 +293,20 @@ expect_alert() {
   fi
   grep -q "MERGED, THEN ${state}" "$WORK/summary" \
     || { ok=0; why="${why} the step summary does not report ${state};"; }
+  # The claim has to be the one the evidence supports. These are the wordings
+  # that asserted the revocation preceded the merge; re-introducing any of them
+  # fails here, because two snapshots either side of a write cannot show it.
+  if grep -qE 'did not survive the write|Revert and re-review|should not have happened' "$WORK/calls"; then
+    ok=0; why="${why} the alert claims the authorization was already gone when GitHub accepted the merge, which the two reads cannot establish;"
+  fi
+  if [ "$state" = AUTHORIZATION-CHANGED ]; then
+    grep -qF 'does not establish that the merge was unauthorized' "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not say the timing is unproved;"; }
+    grep -qF '*before* GitHub accepted the merge' "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not name the ordering that would make this a bad merge;"; }
+    grep -qF '*after* a valid merge' "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not name the ordering that would make this a valid one;"; }
+  fi
   if [ "$ok" -eq 1 ]; then
     PASSES=$((PASSES + 1))
     echo "ok   ${label}"
@@ -290,20 +320,20 @@ expect_alert() {
 reset
 sign_note REQUEST-CHANGES no > "$WORK/revoked.json"
 RELAY_FIXTURE2="$WORK/revoked.json"
-expect_alert "revoked inside the unclosable window → merges, then goes red and names the revert" CONTRADICTED
+expect_alert "the coordinate stops authorizing across the write → merges, then goes red, names the commit, and does not date the change" AUTHORIZATION-CHANGED
 
 reset
 sign_note APPROVE no > "$WORK/downgraded.json"
 RELAY_FIXTURE2="$WORK/downgraded.json"
-expect_alert "downgraded to AUTO-MERGE: no inside the window → merges, then goes red" CONTRADICTED
+expect_alert "downgraded to AUTO-MERGE: no across the write → merges, then goes red" AUTHORIZATION-CHANGED
 
 reset
 RELAY_FIXTURE2="$WORK/live.json"
 RELAY_EXIT2=4
-expect_alert "the relay cannot confirm the verdict after the merge → red, and reported as UNCONFIRMED rather than as a contradiction" UNCONFIRMED
+expect_alert "the relay cannot confirm the verdict after the merge → red, and reported as UNCONFIRMED rather than as a changed authorization" UNCONFIRMED
 
 # The happy path has to prove BOTH reads ran, or deleting the post-merge one
-# would leave every scenario above green by never contradicting anything.
+# would leave every scenario above green by never noticing anything.
 reset
 status=$(run_merge)
 READS=$(cat "$WORK/relay-calls" 2>/dev/null || echo 0)

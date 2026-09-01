@@ -103,9 +103,11 @@ security-review-check:
 
 # Validate the PR auto-merge risk classifier, verdict parser, event
 # verification, the relay client, the CI aggregate contract, the merge job's
-# revalidation fence, and the freshness check at the write itself. This — not `just gate` — is the gate that covers a change to any of
+# revalidation fence, the freshness check at the write itself, and the workflow
+# file that wires them together. This — not `just gate` — is the gate that covers a change to any of
 # them: `gate` maps .github/**, scripts/** and docs/** to "nothing to run".
 auto-merge-check:
+    actionlint .github/workflows/buzz-pr-auto-merge.yml
     node --check .github/scripts/pr-auto-merge-risk.js
     node --check .github/scripts/pr-auto-merge-verdict.js
     node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js

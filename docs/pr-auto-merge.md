@@ -249,13 +249,13 @@ merge is in flight and the note may not be read again in time.
 
 **So the residual is handled after the write instead.** Immediately after the
 merge, the step reads the coordinate once more and reports one of two states,
-kept distinct on purpose — calling a network blip a contradiction would be a
-false accusation:
+kept distinct on purpose — calling a network blip a changed authorization would
+be a false report:
 
-- **`CONTRADICTED`** — the coordinate now says no. A merge happened that
-  should not have.
-- **`UNCONFIRMED`** — the relay did not answer. Nobody can vouch for the merge
-  either way.
+- **`AUTHORIZATION-CHANGED`** — the coordinate authorized the merge before the
+  write and does not authorize it now.
+- **`UNCONFIRMED`** — the relay did not answer. There is no post-merge reading
+  at all.
 
 Both go **red**, post the reason and a copy-pasteable `git revert <squash
 commit>` to the PR, and best-effort tell the PR channel (best-effort because
@@ -264,12 +264,39 @@ durable record). Both are "after state changed", which is the one category
 this workflow's failure philosophy reserves red for rather than degrading to a
 warning. Prevention was impossible. Silence was not.
 
+#### And detection does not date what it detects
+
+`AUTHORIZATION-CHANGED` says the value differs across the write. It does **not**
+say the reviewer revoked *before* GitHub accepted the merge. Two sequences
+produce byte-identical observations:
+
+1. read `APPROVE` → reviewer revokes → GitHub accepts — a merge that should not
+   have landed.
+2. read `APPROVE` → GitHub accepts → reviewer revokes — an authorized merge,
+   followed by a later change of mind.
+
+Nothing available orders the relay replacement against GitHub's acceptance.
+Both systems self-report their own clocks, so the note's `created_at` and the
+merge commit's timestamp are two unsynchronised assertions rather than a
+receipt; treating their comparison as proof would be the same false invariant
+as calling the pre-write read a fence, one field further down.
+
+So the alert reports that the authorization changed and that its timing is
+unknown, names both sequences, and offers the revert conditionally. A human —
+the reviewer first — decides which it was. Asserting sequence 1 would be an
+accusation the evidence cannot carry, and on sequence 2 it would tell the owner
+to revert a merge that was authorized when it landed.
+
 `.github/scripts/pr-auto-merge-write.test.sh` executes this rather than
 arguing it: the relay stub serves a *different* value to the post-merge read
 than it served to the pre-write one, which is the race, and asserts that the
 merge happens, the run is red, the revert commit is named, both audiences are
 told, and the "all clear" audit comment is *not* posted. Deleting the
-post-merge read flips four scenarios from red to a silent success.
+post-merge read flips four scenarios from red to a silent success. Those
+scenarios also assert what the alert must **not** claim: restoring wording that
+asserts the revocation preceded the merge fails them, because the stub swaps
+its fixture by read number and therefore models both sequences at once — which
+is exactly the production ambiguity, not a shortcut in the test.
 
 **The stops that have no window at all are the GitHub-side ones**, because
 GitHub evaluates them as part of the merge:
@@ -279,7 +306,7 @@ GitHub evaluates them as part of the merge:
 | Convert the PR to a **draft**, or close it | anyone with `pull-requests: write` | none |
 | Push any commit to the PR branch | anyone who can push there | none — invalidates `--match-head-commit` |
 | Make a required check red (strict ruleset) | whatever produces that check | none |
-| Rewrite the verdict coordinate | the reviewer only | until the merge job's post-write read |
+| Rewrite the verdict coordinate | the reviewer only | never closes — the post-write read detects the change, but cannot date it |
 | `no-auto-merge` label | anyone with write | until the merge job's pre-write read |
 
 The reviewer sits in the last-but-one row and, as configured today, in no other
@@ -400,7 +427,8 @@ classifier/parser crash — for a merge-job revalidation that *contradicts* the
 evaluate job rather than merely finding the world moved (an unverifiable
 verdict, a floor that disagrees, a branch that fell behind: a bug or an
 attack, not weather), and for anything after state changed (merge failed after
-the intent message; audit comment failed after a merge), where a red run is
+the intent message; audit comment failed after a merge; the authorization no
+longer stands, or cannot be read, after a merge), where a red run is
 the only honest record.
 
 ## Ops runbook
@@ -462,9 +490,11 @@ the only honest record.
   and reads as "no verdict". It is **not** a fence at the merge write: see
   "What cannot be fenced, and why we stopped trying". If a merge is already in
   flight and must not land, use the hard stop — convert the PR to a draft — and
-  rewrite the note afterwards. A revocation that arrives too late is detected
-  by the post-merge read and reported red on the PR with the revert command,
-  within seconds; it is not prevented.
+  rewrite the note afterwards. A revocation that arrives too late shows up in
+  the post-merge read within seconds, red on the PR with the revert command —
+  but reported as "the authorization changed, timing unknown", because nothing
+  can prove it landed before the merge did. **If you revoked before the merge,
+  say so on the PR**; you are the only one who knows.
 - **Rotating the reviewer:** `REVIEWER_PUBKEY` in the workflow is a reviewed
   constant, exactly like `EXPECTED_CI_PUBKEY` in the mirror. A retired
   reviewer key fails safe (no verdicts found, permanent no-op) — the pin

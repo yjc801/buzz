@@ -1486,6 +1486,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-webhook-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buzz-core",
+ "buzz-ws-client",
+ "nostr 0.44.7",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "buzz-workflow"
 version = "0.1.0"
 dependencies = [

@@ -31,6 +31,17 @@ combination space (PR #6807). Scope Playwright locators — unscoped
 `getByText` in a required smoke test is a strict-mode flake (PR #6980).
 (PRs #6807, #6980, #6996, #7013)
 
+**When code makes a claim to a human, pin the claim it must *not* make.**
+Asserting only that an alert fires leaves its wording and its suggested remedy
+untested, and both are the part a human acts on. A scenario that pins the
+presence of the honest claim *and* the absence of the stronger one turns
+re-introducing an over-claim into a test failure instead of a review round.
+Assert the absence of the destructive command too — a `git revert` printed
+under a still-valid authorization is an instruction no matter what the prose
+around it says (PR #101, three rounds). Mutation-test both directions: restore
+the old wording, and re-collapse the states, and check each fails a scenario.
+(PR #101)
+
 ---
 
 ## Live Local Relay

@@ -192,7 +192,24 @@ PRs where reviewers litigated it.
    4 rounds on this one class). Backfill and live subscriptions must
    overlap — a gap between a finite history REQ and the live subscription
    silently drops events (PR #3995); a retired chunk must not keep a stale
-   scope fence (PR #6996). (PRs #3995, #6904, #6956, #6996)
+   scope fence (PR #6996).
+
+   **Know the limit of the rule.** A re-read is only a fence when the system
+   performing the write evaluates it. When the writing system cannot observe
+   the authorizing one — a GitHub merge conditioned on a Nostr value, an
+   external API conditioned on local state — no number of re-reads is a fence.
+   Each one shortens the window and none closes it. Call it a *narrowing*, put
+   the guarantee on the far side (detect after the write and report), and label
+   the detection with exactly what it proves: two reads either side of a write
+   establish that the value **changed**, never **when** it changed. The two
+   orderings produce byte-identical observations, and comparing the two
+   systems' self-reported clocks is not a receipt. Report "changed, timing
+   unknown" and make any destructive remedy conditional. PR #101 spent six
+   rounds learning this in two installments; the second existed only because
+   the first fix corrected the flagged claim and left the neighbouring one
+   standing. **When a finding says the code claims more than it can prove, audit
+   every other claim that code makes before pushing the fix.**
+   (PRs #3995, #6904, #6956, #6996, #101)
 
 3. **Regression tests must bind the production seam and be falsifiable.**
    See "Review-Proven Test Standards" in [TESTING.md](TESTING.md) for the
@@ -242,6 +259,22 @@ PRs where reviewers litigated it.
    handler, enumerate the modalities that can reach it and test the
    non-primary ones — that's where the defects were. (PRs #5958, #5972,
    #6793, #6860, #6862, #6908, #7006)
+
+9. **A predicate that gates a consequential action must return why, not
+   just no.** When one boolean guard serves callers that attach *different*
+   consequences to a failure, its unrelated failure modes get collapsed and
+   the harshest consequence is applied to all of them. A merge guard failed
+   both for "the standing verdict no longer authorizes" and for "the standing
+   verdict is a different event than the one announced"; before the write both
+   correctly refuse, but after the write only the first justifies a rollback —
+   so a reviewer republishing an *identical* approval produced a red run
+   announcing a revocation and printing a `git revert` for a merge its own
+   live evidence authorized (PR #101). Return a class, and let each caller
+   decide what each class means. Two corollaries: a remedy printed in an alert
+   is an **instruction** regardless of the prose above it, so gate the command
+   on the class rather than wording around it; and conservatism is free before
+   a state change and an accusation after it, so re-derive the consequence on
+   each side of the write instead of reusing one verdict. (PR #101)
 
 ---
 

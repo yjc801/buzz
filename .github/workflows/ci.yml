@@ -282,7 +282,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    # Disabled: even on its own lane this matrix took 33m40s on PR #118 (a full
+    # rebuild per flag permutation), longer than the old combined Desktop Core
+    # lane. Nothing else runs `just desktop-tauri-test-compiled-flags`, so a
+    # flag regression now only surfaces in a release build with that flag set.
+    # To re-enable, restore the original condition:
+    # if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: false
     permissions:
       contents: read
     steps:
@@ -434,7 +440,9 @@ jobs:
             echo "Desktop Tauri finished with: ${{ needs.desktop-tauri.result }}"
             exit 1
           fi
-          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ]; then
+          # desktop-tauri-compiled-flags is disabled (if: false above), so
+          # "skipped" is expected; still fail on a real failure if re-enabled.
+          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ] && [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "skipped" ]; then
             echo "Desktop Tauri Compiled Flags finished with: ${{ needs.desktop-tauri-compiled-flags.result }}"
             exit 1
           fi

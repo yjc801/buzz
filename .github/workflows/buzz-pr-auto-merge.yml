@@ -337,15 +337,25 @@ jobs:
           #   off  needs only the first half to be false, and that is settled
           #        the moment the verdict is read — a stale head, a moved
           #        base, a REQUEST-CHANGES, or a provably empty coordinate.
-          #        Every one of those leaves the loop at the not-requested
-          #        branch, which is why that branch clears the label rather
-          #        than merely declining to add it.
           #
-          # Everything that ends a tick early WITHOUT reading a verdict —
-          # mergeability still computing, a failed API or relay read, no PR
-          # channel yet — deliberately leaves the label alone. "We could not
-          # tell" is not "not approved", and clearing on a transient read
-          # failure would flap the queue on the relay's weather.
+          # UNPROVEN IS NOT DISPROVEN, AND THE DIFFERENCE DECIDES THE EARLY
+          # EXITS. A tick can end long before the verdict read — mergeability
+          # still computing, a zero-file view, a failed base or file listing
+          # read, no PR channel yet. Leaving the label alone there is right
+          # only while the claim is merely unproven. It is wrong once the
+          # claim is DISPROVEN, and the commonest route to a transient exit is
+          # the very push that disproves it: GitHub recomputes mergeability on
+          # every push, so a PR labelled at H1 and pushed to H2 reports
+          # MERGEABLE=UNKNOWN for the first tick or two and would otherwise
+          # keep advertising H1's approval against H2.
+          #
+          # So an already-labelled PR has its claim re-checked FIRST, by
+          # reconcile_manual_claim below, ahead of every one of those exits.
+          # That pass only ever removes — adding still needs the merge
+          # question settled, which is not settled that early. What remains
+          # genuinely unprovable (a failed base-ref read that also leaves the
+          # head matching, relay weather) still leaves the label alone:
+          # clearing on the relay's weather would flap the queue.
           MANUAL_MERGE_LABEL=approved-manual-merge
           sync_manual_label() {
             # sync_manual_label <pr> <on|off> <currently-labelled: true|false>
@@ -359,6 +369,41 @@ jobs:
                 || echo "::warning::PR #$N: could not remove the ${MANUAL_MERGE_LABEL} label"
             fi
             return 0
+          }
+
+          # Is the label's claim DISPROVEN for this PR? Echoes why when it is,
+          # and is the single definition of "ready for your click" — both the
+          # pre-gate reconciliation and MANUAL_WANT below ask this one
+          # question, so the two can never drift into disagreeing about what
+          # the label means.
+          #
+          # An empty <base-tip> means the current base could not be read. The
+          # head and the verdict kind can still disprove the claim on their
+          # own, so those are still checked; only the base comparison is
+          # skipped, because an unknown base cannot disprove anything.
+          #
+          # manual_claim_stale <verdict-kind> <reviewed-head> <head> \
+          #                    <reviewed-base> <base-tip-or-empty>
+          # exit 0 = disproven (reason on stdout), 1 = the claim still holds.
+          manual_claim_stale() {
+            local KIND="$1" RHEAD="$2" HEAD="$3" RBASE="$4" BTIP="$5"
+            if [ "$KIND" = "-" ] || [ -z "$KIND" ]; then
+              printf 'no usable verdict at the reviewer coordinate'
+              return 0
+            fi
+            if [ "$KIND" != APPROVE ] && [ "$KIND" != APPROVE-WITH-NITS ]; then
+              printf 'the standing verdict is %s' "$KIND"
+              return 0
+            fi
+            if [ "$RHEAD" != "$HEAD" ]; then
+              printf 'reviewed %s but the head is %s' "$RHEAD" "$HEAD"
+              return 0
+            fi
+            if [ -n "$BTIP" ] && [ "$RBASE" != "$BTIP" ]; then
+              printf 'reviewed against base %s but the base tip is %s' "$RBASE" "$BTIP"
+              return 0
+            fi
+            return 1
           }
 
           # --- Relay access. Every call below goes through the repository's own
@@ -429,6 +474,70 @@ jobs:
             relay standing-verdict --repo "$R" --pr "$1" --reviewer "$REVIEWER_PUBKEY"
           }
 
+          # Re-check an already-labelled PR's claim BEFORE the merge gates,
+          # so a disproven claim comes off even when the tick ends at one of
+          # the exits above the verdict read (see the label comment above).
+          # Only ever removes; never adds.
+          #
+          # Runs only for PRs that already carry the label — an unlabelled PR
+          # has no claim to disprove — so the common path pays nothing. A
+          # labelled one pays one extra API read and one extra relay read,
+          # both idempotent, and both re-done by the loop for the merge
+          # decision rather than cached: a value good enough to disprove a
+          # label is not automatically the value the merge gates may rely on.
+          #
+          # The parser is used here as a TRAILER READER only. --base and
+          # --floor feed `requested`/`authorized`, which this never reads; the
+          # three facts it does read (verdict, reviewedHead, mergeBase) are
+          # reported for any trailer that parses, whatever those two are. So
+          # the placeholders below cannot change the answer, and the
+          # comparison stays in manual_claim_stale.
+          UNKNOWN_SHA=0000000000000000000000000000000000000000
+          reconcile_manual_claim() {
+            # reconcile_manual_claim <pr> <head-sha> <base-ref>
+            # Clears HAS_MANUAL (a caller variable) when it drops the label.
+            local N="$1" HEAD="$2" BREF="$3" BTIP NOTE JSON WHY STATUS=0
+            BTIP=$(gh api "repos/$R/git/ref/heads/$BREF" --jq .object.sha) || BTIP=""
+            NOTE=$(fetch_verdict "$N") || STATUS=$?
+            if [ "$STATUS" -eq 3 ]; then
+              # Provably absent: the coordinate was read and holds nothing, so
+              # a label claiming an approval is known to be wrong.
+              drop_manual_claim "$N" "the reviewer has published no verdict for this PR"
+              return 0
+            fi
+            if [ "$STATUS" -ne 0 ]; then
+              # Weather, or content that failed a proof. Either way this pass
+              # cannot disprove anything; the loop reads it again below and
+              # classifies it there.
+              return 0
+            fi
+            if ! JSON=$(jq -c '[.]' <<<"$NOTE" \
+              | node .github/scripts/pr-auto-merge-verdict.js \
+                  --reviewer "$REVIEWER_PUBKEY" --head "$HEAD" \
+                  --base "$UNKNOWN_SHA" --floor low); then
+              echo "::error::verdict parser failed for PR #$N — this is a bug, not weather"
+              exit 1
+            fi
+            if WHY=$(manual_claim_stale \
+              "$(jq -r '.verdict // "-"' <<<"$JSON")" \
+              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" \
+              "$(jq -r '.mergeBase // "-"' <<<"$JSON")" "$BTIP"); then
+              drop_manual_claim "$N" "$WHY"
+            fi
+            return 0
+          }
+
+          drop_manual_claim() {
+            local N="$1" WHY="$2"
+            if [ "$DRY" = "true" ]; then
+              decision "$N" "RECONCILE (stale ${MANUAL_MERGE_LABEL}: ${WHY} — would drop)"
+              return 0
+            fi
+            sync_manual_label "$N" off true
+            HAS_MANUAL=false
+            decision "$N" "RECONCILE (stale ${MANUAL_MERGE_LABEL}: ${WHY} — dropped)"
+          }
+
           # One notice per (PR, head): dedup by scanning this identity's own
           # recent messages for the marker. A failed dedup read skips the post
           # (warn) — a missing notice is recoverable, a spammed channel is
@@ -475,6 +584,13 @@ jobs:
             if [ "$STATE" != "OPEN" ]; then
               decision "$N" "SKIP (state $STATE)"
               continue
+            fi
+
+            # Before any gate that can end this tick early: a label already on
+            # the PR is a published claim, and the exits below cannot tell a
+            # claim that is still good from one a push just invalidated.
+            if [ "$HAS_MANUAL" = "true" ]; then
+              reconcile_manual_claim "$N" "$HEAD_SHA" "$BASE_REF"
             fi
             if [ "$MERGEABLE" = "UNKNOWN" ]; then
               warn_skip "$N" "mergeability still computing"
@@ -571,20 +687,20 @@ jobs:
             REVIEWED_HEAD=$(jq -r '.reviewedHead // "-"' <<<"$VERDICT_JSON")
             REVIEWED_BASE=$(jq -r '.mergeBase // "-"' <<<"$VERDICT_JSON")
             # "Ready for your click": an APPROVE (with or without nits) over
-            # the integration that would actually merge today.
-            #
-            # BOTH SHAS, for the same reason gates 3 and 4 need both. main can
-            # advance under an unchanged head, and the parser then reports
-            # `stale base` and refuses (pr-auto-merge-verdict.js) — an
+            # the integration that would actually merge today. Same predicate
+            # the pre-gate reconciliation used, now with the real base tip in
+            # hand — BOTH SHAS, for the same reason gates 3 and 4 need both.
+            # main can advance under an unchanged head, and the parser then
+            # reports `stale base` and refuses (pr-auto-merge-verdict.js) — an
             # approval of head-against-B1 says nothing about head-against-B2.
             # A head-only predicate would keep calling that PR ready to click
             # and put an unreviewed integration in the owner's manual queue,
             # which is precisely the state docs/pr-auto-merge.md says an
             # approval must not survive into.
-            MANUAL_WANT=off
-            if [ "$FOUND" = "true" ] \
-              && [ "$REVIEWED_HEAD" = "$HEAD_SHA" ] && [ "$REVIEWED_BASE" = "$BASE_TIP" ] \
-              && { [ "$VERDICT_KIND" = "APPROVE" ] || [ "$VERDICT_KIND" = "APPROVE-WITH-NITS" ]; }; then
+            if manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" "$HEAD_SHA" \
+              "$REVIEWED_BASE" "$BASE_TIP" >/dev/null; then
+              MANUAL_WANT=off
+            else
               MANUAL_WANT=on
             fi
 
@@ -625,9 +741,10 @@ jobs:
               # and straight back out every time checks are in flight. Nor is
               # there a stale claim to clear: reaching this line at all
               # required REQUESTED, so the verdict already covers this head
-              # against this base tip. A pushed-to or overtaken PR left the
-              # loop at the not-requested branch above, where its label came
-              # off.
+              # against this base tip. A pushed-to or overtaken PR never gets
+              # here — it is dropped by the pre-gate reconciliation, or it
+              # leaves the loop at the not-requested branch above, and its
+              # label comes off at whichever it reaches first.
               decision "$N" "SKIP (checks still running; will re-evaluate)"
               continue
             fi

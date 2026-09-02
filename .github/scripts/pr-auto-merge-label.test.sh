@@ -108,7 +108,10 @@ case "$ALL" in
     ;;
   *"pr list"*)              f=pr_list.json ;;
   *"pr view"*)              f=pr_view.json ;;
-  *git/ref/heads*)          f=base_tip.txt ;;
+  *git/ref/heads*)
+    [ "${STUB_BASE_TIP_STATUS:-0}" -eq 0 ] || exit "$STUB_BASE_TIP_STATUS"
+    f=base_tip.txt
+    ;;
   *compare/*)               f=behind.txt ;;
   *"/files"*)               f=files.tsv ;;
   *) echo "stub gh: unhandled: $ALL" >&2; exit 9 ;;
@@ -190,7 +193,8 @@ PY
 reset_fixtures() {
   # Clear per-scenario overrides first: a leaked STUB_VERDICT_STATUS would
   # make later scenarios pass for the wrong reason.
-  unset STUB_VERDICT_STATUS STUB_CHANNEL_STATUS STUB_LABEL_WRITE_STATUS
+  unset STUB_VERDICT_STATUS STUB_CHANNEL_STATUS STUB_LABEL_WRITE_STATUS \
+    STUB_BASE_TIP_STATUS
   rm -rf "$FIXTURES"
   mkdir -p "$FIXTURES"
   : > "$LABEL_LOG"
@@ -255,6 +259,7 @@ run_sweep() {
   STUB_CHANNEL_STATUS="${STUB_CHANNEL_STATUS:-0}" \
   STUB_VERDICT_STATUS="${STUB_VERDICT_STATUS:-0}" \
   STUB_LABEL_WRITE_STATUS="${STUB_LABEL_WRITE_STATUS:-0}" \
+  STUB_BASE_TIP_STATUS="${STUB_BASE_TIP_STATUS:-0}" \
     bash -eo pipefail "$WORK/evaluate.sh" > "$WORK/stdout" 2>&1
   echo "$?"
 }
@@ -296,6 +301,21 @@ expect_label() {
     fail "$name: expected label writes [${want_log}], got [${got}]"
   else
     pass "$name (${want})"
+  fi
+}
+
+# expect_summary <label> <substring> — the step summary is what a human reads
+# to find out WHY a label moved, so the reason the predicate produces is part
+# of the contract, not debug output.
+expect_summary() {
+  local name="$1" want="$2" status
+  status=$(run_sweep)
+  if [ "$status" -ne 0 ]; then
+    fail "$name: step exited $status"
+  elif ! grep -qF -- "$want" "$WORK/summary"; then
+    fail "$name: expected the summary to contain [${want}], got [$(tr '\n' ' ' < "$WORK/summary")]"
+  else
+    pass "$name"
   fi
 }
 
@@ -409,6 +429,64 @@ DRY_RUN=true
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
 expect_label "dry-run touches nothing" none
 
+echo "## a disproven claim is dropped before the gates that end a tick early"
+
+# The push that invalidates a label is the same push that makes GitHub
+# recompute mergeability, so this pairing is the ORDINARY case, not a corner:
+# a PR labelled at H1 and pushed to H2 spends its first tick or two reporting
+# UNKNOWN. Every exit above the verdict read is represented below, because a
+# fix that covered only the mergeability one would leave the rest.
+reset_fixtures
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "a new head is cleared even while mergeability is recomputing" remove
+
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "a moved base is too" remove
+
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" REQUEST-CHANGES low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "so is a REQUEST-CHANGES" remove
+
+reset_fixtures
+labelled
+STUB_VERDICT_STATUS=3
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "and a coordinate that provably holds nothing" remove
+
+reset_fixtures
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+edit_view 'd["changedFiles"] = 0'
+expect_label "a zero-file view does not shelter a stale claim either" remove
+
+reset_fixtures
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+STUB_CHANNEL_STATUS=3
+expect_label "nor does a PR whose channel does not exist yet" remove
+
+# The base tip is unreadable, so the base half of the claim cannot be judged —
+# but the head half still can, and on its own it is enough to disprove.
+reset_fixtures
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+STUB_BASE_TIP_STATUS=1
+expect_label "a failed base read still clears a claim the head alone disproves" remove
+
+# Removing early is safe; adding early is not, because whether this sweep
+# will merge the PR is still unknown at that point.
+reset_fixtures
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "an unlabelled PR gains nothing from the early pass" none
+
 echo "## states the sweep must NOT act on"
 
 # Reaching the pending branch at all requires a requested verdict, which is
@@ -429,15 +507,56 @@ labelled
 STUB_VERDICT_STATUS=4
 expect_label "an unprovable relay read leaves the label alone" none
 
+# The claim is unproven this tick, not disproven — the sweep must not clear a
+# label on the relay's weather, or the queue flaps.
+reset_fixtures
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+STUB_VERDICT_STATUS=4
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "and that holds even when the claim happens to be stale" none
+
+# Mirror of the head case above: with no readable base tip there is nothing to
+# compare a reviewed base against, so an unknown base disproves nothing.
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+STUB_BASE_TIP_STATUS=1
+expect_label "an unreadable base tip cannot disprove the base half" none
+
 reset_fixtures
 labelled
 edit_view 'd["mergeable"] = "UNKNOWN"'
-expect_label "mergeability still computing leaves the label alone" none
+expect_label "mergeability still computing leaves a still-current claim alone" none
 
 reset_fixtures
 labelled
 STUB_CHANNEL_STATUS=3
-expect_label "a PR with no channel yet leaves the label alone" none
+expect_label "a PR with no channel yet leaves a still-current claim alone" none
+
+reset_fixtures
+DRY_RUN=true
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "dry-run reports the stale claim and writes nothing" none
+
+echo "## the reason a label moved reaches the step summary"
+
+reset_fixtures
+labelled
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_summary "a drop names the fact that disproved the claim" \
+  "reviewed ${OLD_HEAD} but the head is ${HEAD_SHA} — dropped"
+
+reset_fixtures
+DRY_RUN=true
+labelled
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_summary "and says so in the conditional in dry-run" \
+  "reviewed against base ${OLD_BASE} but the base tip is ${BASE_TIP} — would drop"
 
 echo "## reconciling PRs the sweep no longer evaluates"
 

@@ -493,10 +493,24 @@ the only honest record.
   The two directions are deliberately asymmetric. Adding needs the merge
   question settled, so nothing before the not-requested / blocked / authorized
   decision points may add it; removing needs only the verdict, so a stale
-  label is cleared even while checks are still running. Anything that ends a
-  tick before a verdict is read — mergeability still computing, a failed API
-  or relay read, no PR channel yet — leaves the label untouched, since "we
-  could not tell" is not "not approved".
+  label is cleared even while checks are still running.
+
+  Because of that asymmetry, a PR that **already carries the label** has its
+  claim re-checked before any of the gates that can end a tick early —
+  mergeability still computing, a zero-file view, a failed base or file
+  listing read, no PR channel yet. Without that pass those exits would
+  preserve a claim a push had just invalidated, and they are the *likely*
+  place to land after such a push: GitHub recomputes mergeability on every
+  push, so a PR labelled at H1 and pushed to H2 reports `MERGEABLE=UNKNOWN`
+  for the first tick or two. The pass only ever removes.
+
+  What stays untouched is the genuinely **unprovable**, which is not the same
+  as the disproven: relay weather, and a base tip that could not be read (the
+  head and the verdict kind can still disprove the claim on their own, so
+  those are still checked; only the base comparison is skipped). "We could not
+  tell" is not "not approved", and clearing on the relay's weather would flap
+  the queue. When the label does move, the step summary names the fact that
+  moved it.
 
   Visibility only: it gates nothing, the evaluate job holds no merge
   credential, label writes are best-effort warnings, and dry-run never touches

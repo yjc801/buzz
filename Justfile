@@ -523,6 +523,16 @@ test-unit:
         # a regression here silently accepts a tampered or replayed bundle,
         # so they must fail the gate rather than merely exist.
         cargo nextest run -p buzz-waker
+        # Webhook bridge: outbound trust boundary (redirects disabled, no
+        # expanded url or header value reaches a log line), per-rule dispatch
+        # dedup, the startup rule validation that keeps a malformed webhook
+        # from loading healthy, and the reconnect ladder that a relay closing
+        # every subscription must not pin at its bottom rung. Infra-free —
+        # the HTTP tests bind loopback sockets. Enumerated explicitly for the
+        # same reason as everything above: nothing in CI runs
+        # `cargo test --workspace`, so without this stanza the crate's tests
+        # execute in no lane at all.
+        cargo nextest run -p buzz-webhook-bridge
         # buzz-agent: two infra-free concerns run together by executing the
         # whole crate (lib + integration tests), because nothing in CI runs
         # `cargo test --workspace`, so without this stanza neither the crate's

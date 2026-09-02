@@ -123,6 +123,12 @@ run_unit_tests() {
   run_test_step "buzz-waker tests" \
     cargo test -p buzz-waker -- --nocapture
 
+  # Webhook bridge: outbound trust boundary, per-rule dispatch dedup, startup
+  # rule validation, and the reconnect ladder. Infra-free (the HTTP tests bind
+  # loopback sockets). Keep in step with the nextest path.
+  run_test_step "buzz-webhook-bridge tests" \
+    cargo test -p buzz-webhook-bridge -- --nocapture
+
   # buzz-agent model-capabilities corpus: the Rust half of the cross-language
   # drift guard. model_capabilities.rs embeds scripts/model-capabilities.json +
   # scripts/normative-corpus.json via include_str! and replays the full locked

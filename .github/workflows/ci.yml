@@ -309,7 +309,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    # Disabled by owner decision on PR #118: the compiled-flag matrix does not
+    # run on PRs. Even sharded, each state is a ~10 minute full rebuild plus
+    # the desktop lib suite, and the owner chose to drop it from the PR path.
+    # Nothing else compiles a BUZZ_BUILD_*-set build; run
+    # `just desktop-tauri-test-compiled-flags` by hand when touching a flag.
+    # To re-enable, restore the original condition:
+    # if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -465,8 +472,10 @@ jobs:
             echo "Desktop Tauri finished with: ${{ needs.desktop-tauri.result }}"
             exit 1
           fi
-          # Matrix job: this result is success only if every state shard passed.
-          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ]; then
+          # desktop-tauri-compiled-flags is disabled (if: false above), so
+          # "skipped" is expected. If re-enabled it is a matrix job whose result
+          # is success only when every state shard passed.
+          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ] && [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "skipped" ]; then
             echo "Desktop Tauri Compiled Flags finished with: ${{ needs.desktop-tauri-compiled-flags.result }}"
             exit 1
           fi

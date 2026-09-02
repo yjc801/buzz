@@ -117,8 +117,8 @@ pre-push:
       # Cargo's lock.
       # The compiled-flag matrix (`just desktop-tauri-test-compiled-flags`) is
       # not run here: it forces a full rebuild per permutation and is far too
-      # slow to push. CI covers it in the Desktop Tauri Compiled Flags lane,
-      # one job per build state.
+      # slow to push. Its CI lane (Desktop Tauri Compiled Flags) is disabled
+      # too, so run it by hand when touching a compiled flag.
       files: git diff --name-only origin/main...HEAD
       glob: ["desktop/src-tauri/**", "crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "Justfile"]
       run: just desktop-tauri-clippy && just desktop-tauri-test

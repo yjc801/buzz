@@ -76,7 +76,10 @@ jobs:
               - 'scripts/run-tests.sh'
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
-              - 'justfile'
+              # 'Justfile', not 'justfile': the pinned paths-filter passes only
+              # {dot: true} to picomatch, whose nocase default is false, so this
+              # is case-sensitive and the lowercase form matched nothing.
+              - 'Justfile'
             desktop:
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
@@ -131,6 +134,8 @@ jobs:
         run: |
           scripts/test-rust-cache-contract.sh
           scripts/test-rust-cache-contract-regressions.sh
+      - name: Path filter contract
+        run: scripts/test-path-filter-contract.sh
       - name: File size policy
         run: just file-size-check
 

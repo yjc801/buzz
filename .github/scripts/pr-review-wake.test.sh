@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# Contract test for the two halves of the reviewer wake path: the acknowledge-
+# ment cutoff in .github/workflows/buzz-pr-mirror.yml, and the sweep in
+# .github/workflows/buzz-pr-review-watchdog.yml.
+#
+# The sweep's only outputs are messages that WAKE somebody: a p-tag on the
+# reviewer cancels and re-prompts whatever turn he is running, and a p-tag on
+# the owner is a page. So the properties worth pinning are the two that decide
+# whether a message goes out at all — "is a verdict already in hand for THIS
+# head" and "is this PR still owed a notice RIGHT NOW" — plus the identity the
+# messages are signed with, which decides whether the sweep runs at all.
+#
+# The script under test is EXTRACTED FROM THE WORKFLOW, like
+# pr-auto-merge-revalidate.test.sh: a gate deleted from the YAML fails this
+# test instead of silently passing it. GitHub and the relay are stubbed (a
+# `gh` and a dispatching `python3` earlier on PATH, serving fixture files);
+# `scripts/buzz-mint-auth-tag.py` is NOT stubbed, so the identity fence does
+# its real derivation against a real test key.
+#
+# Usage: .github/scripts/pr-review-wake.test.sh   (from the repo root)
+
+set -uo pipefail
+
+WORKFLOW=.github/workflows/buzz-pr-review-watchdog.yml
+STEP="Evaluate reviewer responsiveness"
+REPO=yjc801/buzz
+PR=4242
+HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OLD_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+BASE_TIP=cccccccccccccccccccccccccccccccccccccccc
+CHANNEL=11111111-1111-1111-1111-111111111111
+REVIEWER_PUB=2222222222222222222222222222222222222222222222222222222222222222
+OWNER_PUB=3333333333333333333333333333333333333333333333333333333333333333
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "run from the repository root" >&2
+  exit 2
+fi
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+REAL_PYTHON3=$(command -v python3) || { echo "python3 required" >&2; exit 2; }
+export REAL_PYTHON3
+
+PASS=0
+FAILED=0
+fail() { echo "FAIL: $*" >&2; FAILED=$((FAILED + 1)); }
+ok() { PASS=$((PASS + 1)); }
+check() { # check <description> <condition-result-rc>
+  if [ "$2" -eq 0 ]; then ok; else fail "$1"; fi
+}
+
+# --- extract the step's script from the workflow ---------------------------
+# Deliberately not a YAML library: this must run on any box with python3 and
+# no pip installs, exactly like the workflow itself.
+"$REAL_PYTHON3" - "$WORKFLOW" "$STEP" > "$WORK/sweep.sh" <<'PY'
+import sys
+
+path, step = sys.argv[1], sys.argv[2]
+lines = open(path, encoding="utf-8").read().split("\n")
+try:
+    i = next(n for n, ln in enumerate(lines) if ln.strip() == f"- name: {step}")
+except StopIteration:
+    sys.exit(f"step {step!r} not found in {path}")
+try:
+    j = next(n for n in range(i, len(lines)) if lines[n].strip() == "run: |")
+except StopIteration:
+    sys.exit(f"step {step!r} has no literal run block")
+indent = len(lines[j]) - len(lines[j].lstrip()) + 2
+body = []
+for ln in lines[j + 1 :]:
+    if ln.strip() and not ln.startswith(" " * indent):
+        break
+    body.append(ln[indent:] if ln.strip() else "")
+if not body:
+    sys.exit(f"step {step!r} has an empty run block")
+sys.stdout.write("\n".join(body) + "\n")
+PY
+[ -s "$WORK/sweep.sh" ] || { echo "extraction produced nothing" >&2; exit 2; }
+
+# --- the identity pin is a cross-file invariant, checked statically ---------
+# All four workflows read the same BUZZ_CI_PRIVATE_KEY. A pin that disagrees
+# with its siblings does not degrade the sweep, it disables it: the fence
+# exits before evaluating a single PR, silently, forever. That was the state
+# this test was first written against.
+pin_of() { grep -m1 -oE '^ *EXPECTED_CI_PUBKEY: [0-9a-f]{64}' "$1" | awk '{print $2}'; }
+WATCHDOG_PIN=$(pin_of "$WORKFLOW")
+for SIBLING in .github/workflows/buzz-pr-mirror.yml \
+               .github/workflows/buzz-issue-mirror.yml \
+               .github/workflows/buzz-pr-auto-merge.yml; do
+  SIB_PIN=$(pin_of "$SIBLING")
+  [ -n "$SIB_PIN" ] || { fail "no EXPECTED_CI_PUBKEY in $SIBLING"; continue; }
+  if [ "$WATCHDOG_PIN" = "$SIB_PIN" ]; then ok; else
+    fail "CI identity pin $WATCHDOG_PIN disagrees with $SIBLING ($SIB_PIN)"
+  fi
+done
+
+# --- test identity ---------------------------------------------------------
+# A real key so the fence's real derivation runs; the pin it is compared
+# against is asserted above, not here.
+CI_SECRET=$("$REAL_PYTHON3" -c 'import hashlib; print(hashlib.sha256(b"watchdog-ci").hexdigest())')
+CI_PUB=$(NOSTR_SECRET="$CI_SECRET" "$REAL_PYTHON3" scripts/buzz-mint-auth-tag.py pubkey)
+[ ${#CI_PUB} -eq 64 ] || { echo "key derivation failed" >&2; exit 2; }
+
+# --- stubs -----------------------------------------------------------------
+mkdir -p "$WORK/bin"
+FIXTURES="$WORK/fixtures"
+export FIXTURES
+
+cat > "$WORK/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+# Only `gh pr view` is reached from the extracted step (the PR listing is a
+# separate workflow step). An unhandled request is a test bug, not a pass.
+case "$*" in
+  *"pr view"*)
+    [ -f "$FIXTURES/pr_view.rc" ] && exit "$(cat "$FIXTURES/pr_view.rc")"
+    cat "$FIXTURES/pr_view.json" ;;
+  *) echo "stub gh: unhandled: $*" >&2; exit 9 ;;
+esac
+GHEOF
+
+cat > "$WORK/bin/python3" <<'PYEOF'
+#!/usr/bin/env bash
+# Serves the relay client from fixtures; everything else (notably
+# scripts/buzz-mint-auth-tag.py) runs for real.
+if [ "${1:-}" != ".github/scripts/pr-auto-merge-relay.py" ]; then
+  exec "$REAL_PYTHON3" "$@"
+fi
+shift
+SUB="${1:-}"; shift || true
+ARGS="$*"
+case "$SUB" in
+  channel)
+    [ -f "$FIXTURES/channel.rc" ] && exit "$(cat "$FIXTURES/channel.rc")"
+    cat "$FIXTURES/channel.txt" ;;
+  standing-verdict)
+    [ -f "$FIXTURES/verdict.rc" ] && exit "$(cat "$FIXTURES/verdict.rc")"
+    cat "$FIXTURES/verdict.json" ;;
+  events)
+    AUTHOR=""
+    set -- $ARGS
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--author" ] && AUTHOR="${2:-}"
+      shift
+    done
+    if [ "$AUTHOR" = "$CI_PUB" ]; then
+      [ -f "$FIXTURES/events_ci.rc" ] && exit "$(cat "$FIXTURES/events_ci.rc")"
+      cat "$FIXTURES/events_ci.json"
+    else
+      [ -f "$FIXTURES/events_reviewer.rc" ] && exit "$(cat "$FIXTURES/events_reviewer.rc")"
+      cat "$FIXTURES/events_reviewer.json"
+    fi ;;
+  send)
+    { echo "SEND $ARGS"; cat; echo "--- end send ---"; } >> "$SENDS"
+    [ -f "$FIXTURES/send.rc" ] && exit "$(cat "$FIXTURES/send.rc")"
+    true ;;
+  *) echo "stub relay: unhandled: $SUB $ARGS" >&2; exit 9 ;;
+esac
+PYEOF
+chmod +x "$WORK/bin/gh" "$WORK/bin/python3"
+
+# --- fixtures --------------------------------------------------------------
+NOW=$(date +%s)
+SENDS="$WORK/sends.log"
+export SENDS CI_PUB
+
+# events_ci.json: the review request card, plus whatever markers a scenario
+# adds. `Review head: <full sha>` is the coordinate the sweep matches on.
+ci_events() { # ci_events <request-age-secs> [extra-json...]
+  local AGE="$1"; shift
+  {
+    printf '[{"created_at": %d, "content": "PR #%s update\\nReview head: `%s`"}' \
+      "$((NOW - AGE))" "$PR" "$HEAD_SHA"
+    for E in "$@"; do printf ',%s' "$E"; done
+    printf ']\n'
+  } > "$FIXTURES/events_ci.json"
+}
+nudge_marker() { printf '{"created_at": %d, "content": "Reviewer nudge for %s: no reply."}' \
+  "$((NOW - $1))" "$HEAD_SHA"; }
+stall_marker() { printf '{"created_at": %d, "content": "Reviewer unresponsive on %s"}' \
+  "$((NOW - $1))" "$HEAD_SHA"; }
+# A full verdict message in the repository's machine-trailer contract.
+verdict_msg() { # verdict_msg <age-secs> <reviewed-head>
+  printf '{"created_at": %d, "content": "Round 1 — clean.\\n\\nReviewed %s against merge base %s\\nVERDICT: REQUEST-CHANGES\\nRISK: low\\nAUTO-MERGE: no"}' \
+    "$((NOW - $1))" "$2" "$BASE_TIP"
+}
+reviewer_events() { # reviewer_events [json...]
+  { printf '['; local FIRST=1
+    for E in "$@"; do [ $FIRST -eq 1 ] || printf ','; FIRST=0; printf '%s' "$E"; done
+    printf ']\n'; } > "$FIXTURES/events_reviewer.json"
+}
+
+reset_fixtures() {
+  rm -rf "$FIXTURES"; mkdir -p "$FIXTURES"
+  : > "$SENDS"
+  cat > "$FIXTURES/pr_view.json" <<JSON
+{"state": "OPEN", "isDraft": false, "headRefOid": "$HEAD_SHA",
+ "headRepositoryOwner": {"login": "yjc801"}, "headRepository": {"name": "buzz"}}
+JSON
+  printf '%s\n' "$CHANNEL" > "$FIXTURES/channel.txt"
+  printf '3\n' > "$FIXTURES/verdict.rc"   # no standing verdict
+  ci_events 60
+  reviewer_events
+}
+
+run_sweep() {
+  rm -rf "$WORK/runner_temp"; mkdir -p "$WORK/runner_temp"
+  printf '[{"number": %s, "head": "%s"}]\n' "$PR" "$HEAD_SHA" \
+    > "$WORK/runner_temp/candidates.json"
+  : > "$WORK/summary"
+  PATH="$WORK/bin:$PATH" \
+  GITHUB_REPOSITORY="$REPO" \
+  GITHUB_EVENT_NAME=schedule \
+  GITHUB_STEP_SUMMARY="$WORK/summary" \
+  RUNNER_TEMP="$WORK/runner_temp" \
+  GH_TOKEN=stub \
+  DRY_RUN_INPUT=false \
+  FORCE_PR="" \
+  BUZZ_RELAY_URL=https://relay.invalid \
+  BUZZ_PRIVATE_KEY="$CI_SECRET" \
+  BUZZ_AUTH_TAG=stub \
+  REVIEWER_NAME=Alex \
+  REVIEWER_PUBKEY="$REVIEWER_PUB" \
+  OWNER_PUBKEY="$OWNER_PUB" \
+  EXPECTED_CI_PUBKEY="$CI_PUB" \
+  SILENT_SECS=900 \
+  DEAD_SECS=1800 \
+    bash -e "$WORK/sweep.sh" > "$WORK/stdout" 2>&1
+  RC=$?
+  return $RC
+}
+
+sent_count() { grep -c '^SEND ' "$SENDS" 2>/dev/null || true; }
+scenario() { echo "--- $1"; reset_fixtures; }
+
+# ===========================================================================
+# 1. Inside the silence window: nothing is owed yet.
+scenario "silent but inside SILENT_SECS → no notice"
+ci_events 300
+run_sweep; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should report waiting" "$(grep -q 'waiting — silent' "$WORK/stdout"; echo $?)"
+
+# 2. Past the silence window: one nudge, p-tagging the reviewer.
+scenario "silent past SILENT_SECS → nudge the reviewer"
+ci_events 1200
+run_sweep; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should post once" "$([ "$(sent_count)" = 1 ]; echo $?)"
+check "should p-tag the reviewer" "$(grep -q -- "--mention $REVIEWER_PUB" "$SENDS"; echo $?)"
+check "should carry the dedup marker" "$(grep -q "Reviewer nudge for $HEAD_SHA" "$SENDS"; echo $?)"
+
+# 3. THE STALE-VERDICT RACE. A review of the PREVIOUS head posts its verdict
+#    after the request for this head. It is verdict-shaped, it is inside the
+#    window, and it names no head but the old one — so it must not be read as
+#    a verdict for this head, or this head is never nudged again.
+scenario "verdict naming the OLD head → not a verdict for this head"
+ci_events 2100
+reviewer_events "$(verdict_msg 2000 "$OLD_HEAD")"
+run_sweep; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "must not report a verdict" "$(! grep -q 'verdict message posted' "$WORK/stdout"; echo $?)"
+check "should nudge" "$([ "$(sent_count)" = 1 ]; echo $?)"
+
+# 4. The same message naming THIS head does suppress the nudge.
+scenario "verdict naming this head → no notice"
+ci_events 2100
+reviewer_events "$(verdict_msg 2000 "$HEAD_SHA")"
+run_sweep; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should report the verdict" "$(grep -q 'verdict message posted' "$WORK/stdout"; echo $?)"
+
+# 5. An acknowledgement is not a verdict, even when it names this head.
+scenario "acknowledgement naming this head → still in progress"
+ci_events 300
+reviewer_events "$(printf '{"created_at": %d, "content": "Reviewing pushed head `%s` — tracing the workflow now."}' "$((NOW - 120))" "$HEAD_SHA")"
+run_sweep; RC=$?
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should report in progress" "$(grep -q 'in progress' "$WORK/stdout"; echo $?)"
+
+# 6-8. THE SNAPSHOT FENCE. candidates.json is read once at the start of the
+#      sweep; every one of these states can be entered before the write.
+for CASE in moved closed draft; do
+  scenario "PR $CASE after the snapshot → no notice"
+  ci_events 1200
+  case "$CASE" in
+    moved)  sed -i.bak "s/$HEAD_SHA/$OLD_HEAD/" "$FIXTURES/pr_view.json" ;;
+    closed) sed -i.bak 's/"OPEN"/"CLOSED"/' "$FIXTURES/pr_view.json" ;;
+    draft)  sed -i.bak 's/"isDraft": false/"isDraft": true/' "$FIXTURES/pr_view.json" ;;
+  esac
+  run_sweep; RC=$?
+  check "$CASE: expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+  check "$CASE: should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+  check "$CASE: should say the PR moved" "$(grep -q 'PR moved or closed' "$WORK/stdout"; echo $?)"
+done
+
+# 9. A failed revalidation read is an error, never a licence to post.
+scenario "GitHub unreadable at the write → error, no notice"
+ci_events 1200
+printf '9\n' > "$FIXTURES/pr_view.rc"
+run_sweep; RC=$?
+check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should record an error" "$(grep -q 'ERROR posting' "$WORK/stdout"; echo $?)"
+
+# 9b. A relay failure is an error too — and specifically NOT "the PR moved".
+#     The relay client has its own exit codes, one of which is 2, the code the
+#     snapshot fence uses; a send that failed has not proved anything about
+#     the PR's state.
+scenario "relay send fails → error, not a moved-PR skip"
+ci_events 1200
+printf '2\n' > "$FIXTURES/send.rc"
+run_sweep; RC=$?
+check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
+check "should record an error" "$(grep -q 'ERROR posting' "$WORK/stdout"; echo $?)"
+check "must not claim the PR moved" "$(! grep -q 'PR moved or closed' "$WORK/stdout"; echo $?)"
+
+# 10. A standing verdict covering this head ends the evaluation early.
+scenario "standing verdict covers this head → skip"
+ci_events 1200
+rm -f "$FIXTURES/verdict.rc"
+printf '{"content": "Reviewed %s against merge base %s\\nVERDICT: APPROVE"}\n' \
+  "$HEAD_SHA" "$BASE_TIP" > "$FIXTURES/verdict.json"
+run_sweep; RC=$?
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should report the standing verdict" "$(grep -q 'verdict already covers' "$WORK/stdout"; echo $?)"
+
+# 11. Nudged already and still silent: escalate to the owner exactly once.
+scenario "nudge went unanswered → one owner-facing stall notice"
+ci_events 3000 "$(nudge_marker 1000)"
+run_sweep; RC=$?
+check "should post once" "$([ "$(sent_count)" = 1 ]; echo $?)"
+check "should p-tag the owner" "$(grep -q -- "--mention $OWNER_PUB" "$SENDS"; echo $?)"
+check "should carry the stall marker" "$(grep -q "Reviewer unresponsive on $HEAD_SHA" "$SENDS"; echo $?)"
+
+scenario "stall notice already sent → nothing further"
+ci_events 3000 "$(nudge_marker 1000)" "$(stall_marker 500)"
+run_sweep; RC=$?
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+
+# 12. No request card naming this head yet (the mirror's quiet window).
+scenario "no request names this head → skip"
+printf '[{"created_at": %d, "content": "Review head: `%s`"}]\n' \
+  "$((NOW - 1200))" "$OLD_HEAD" > "$FIXTURES/events_ci.json"
+run_sweep; RC=$?
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should skip" "$(grep -q 'no review request names head' "$WORK/stdout"; echo $?)"
+
+# ===========================================================================
+# THE MIRROR'S ACKNOWLEDGEMENT CUTOFF.
+#
+# The mirror asks "has the reviewer already replied naming this head" only
+# after the quiet window, but must ask it about the whole interval since the
+# PUSH — checkout, CLI install, provisioning and the full-history scope walks
+# all sit in between, and an awake reviewer can acknowledge during them. The
+# computation is extracted from the workflow rather than restated, so deleting
+# the clamp, or going back to reading the clock at the question, fails here.
+echo "--- mirror: the acknowledgement cutoff is the push, not the question"
+
+MIRROR=.github/workflows/buzz-pr-mirror.yml
+"$REAL_PYTHON3" - "$MIRROR" > "$WORK/cutoff.sh" <<'CUTOFFPY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+try:
+    i = next(n for n, ln in enumerate(lines) if ln.strip().startswith("STEP_START="))
+    j = next(n for n in range(i, len(lines)) if lines[n].strip().startswith("PUSHED_AT=$((PUSHED_AT"))
+except StopIteration:
+    sys.exit("the PUSHED_AT computation was not found in " + sys.argv[1])
+indent = len(lines[i]) - len(lines[i].lstrip())
+body = "\n".join(ln[indent:] for ln in lines[i : j + 1])
+sys.stdout.write(body + '\nprintf "%s\\n" "$PUSHED_AT"\n')
+CUTOFFPY
+[ -s "$WORK/cutoff.sh" ] || { echo "cutoff extraction produced nothing" >&2; exit 2; }
+
+cutoff() { PR_UPDATED_AT="$1" bash -e "$WORK/cutoff.sh"; }
+as_iso() { "$REAL_PYTHON3" -c 'import sys,time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(sys.argv[1]))))' "$1"; }
+
+# The payload timestamp wins over the clock at the question: a push two hours
+# ago must not be read as "now" just because the job was slow getting here.
+GOT=$(cutoff "$(as_iso $((NOW - 7200)))")
+check "payload push time should be used (got $GOT, now $NOW)" \
+  "$([ "$GOT" -lt "$((NOW - 7000))" ] && [ "$GOT" -gt "$((NOW - 7400))" ]; echo $?)"
+
+# An unparseable or absent timestamp falls back to the step clock, not to 0:
+# an unbounded window would let a force-push BACK to a previously reviewed
+# head match that head's stale acknowledgement and suppress the mention.
+GOT=$(cutoff "")
+check "empty timestamp should fall back to now (got $GOT)" \
+  "$([ "$GOT" -gt "$((NOW - 60))" ]; echo $?)"
+GOT=$(cutoff "not a date")
+check "garbage timestamp should fall back to now (got $GOT)" \
+  "$([ "$GOT" -gt "$((NOW - 60))" ]; echo $?)"
+
+# A payload clock ahead of the runner must not move the cutoff into the
+# future, where it would see no acknowledgement at all.
+GOT=$(cutoff "$(as_iso $((NOW + 3600)))")
+check "future timestamp should be clamped to now (got $GOT)" \
+  "$([ "$GOT" -lt "$((NOW + 60))" ]; echo $?)"
+
+# And it must not be recomputed after the quiet-window sleep.
+SYNC_BLOCK=$(awk '/^ *synchronize\)$/,/^ *reopened\)$/' "$MIRROR")
+check "PUSHED_AT must not be reassigned in the synchronize branch" \
+  "$(! printf '%s' "$SYNC_BLOCK" | grep -qE '^ *PUSHED_AT='; echo $?)"
+
+echo
+echo "$PASS assertions passed, $FAILED failed"
+[ "$FAILED" -eq 0 ]

@@ -193,6 +193,12 @@ jobs:
           # on the update card so the reviewer knows which in-flight review
           # is now stale.
           PREV_HEAD_SHA: ${{ github.event.before }}
+          # When the push landed, per GitHub. The synchronize event bumps the
+          # PR's updated_at, so this is the push, not the workflow. It is the
+          # cutoff for "has the reviewer already acknowledged this head" —
+          # see PUSHED_AT below for why it cannot be read from the clock at
+          # the point the question is asked.
+          PR_UPDATED_AT: ${{ github.event.pull_request.updated_at }}
           # Quiet window before a push is announced to the reviewer. Pushes
           # arrive in bursts; each reviewer mention steers (cancels and
           # re-prompts) a review already running, so announcing every push
@@ -230,6 +236,38 @@ jobs:
         run: |
           NAME="buzz-pr-${PR_NUMBER}"
           RANGE="origin/${BASE_REF}...HEAD"
+
+          # WHEN THE PUSH LANDED — the cutoff for "has the reviewer already
+          # acknowledged this head", captured here and never later.
+          #
+          # A coder's in-channel handoff reaches an AWAKE reviewer, so he can
+          # start on this head and say so within seconds of the push. But the
+          # question is not asked until after checkout, CLI installation,
+          # channel resolution and provisioning, and the scope routing's
+          # full-history walks — minutes, on a busy room. A cutoff stamped at
+          # that point cannot see an acknowledgement that arrived during it,
+          # so the mirror would p-tag the reviewer and steer (cancel and
+          # re-prompt) the very review it was trying not to disturb. Reading
+          # the clock at the point of the question answers a different
+          # question than the one being asked.
+          #
+          # A cutoff is still needed rather than searching all history: a
+          # force-push BACK to a previously reviewed head would otherwise
+          # match that head's old acknowledgement and suppress the mention
+          # for good. Clamped to now so a skewed payload clock cannot push
+          # the cutoff into the future, and given the same 5 s allowance the
+          # review watchdog uses for author-stamped message clocks.
+          #
+          # python3 rather than `date -d`: BSD date has no -d, and this
+          # parse is covered by .github/scripts/pr-review-wake.test.sh, which
+          # developers run on macOS.
+          STEP_START=$(date +%s)
+          PUSHED_AT=$(python3 -c 'import calendar,sys,time; print(calendar.timegm(time.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ")))' \
+            "$PR_UPDATED_AT" 2>/dev/null || echo "")
+          if [ -z "$PUSHED_AT" ] || [ "$PUSHED_AT" -gt "$STEP_START" ]; then
+            PUSHED_AT="$STEP_START"
+          fi
+          PUSHED_AT=$((PUSHED_AT - 5))
           # Scratch file for the stderr of commands whose FAILURE MODE has to be
           # read, not just detected (see read_binding and archive_channel).
           ERRFILE=$(mktemp)
@@ -927,7 +965,9 @@ jobs:
                 # Resolution, provisioning and routing ran BEFORE the quiet
                 # window so a configuration fault fails fast; only the send
                 # waits. A newer push cancels this run during the sleep.
-                PUSHED_AT=$(date +%s)
+                # PUSHED_AT is the push itself (top of this script), not the
+                # clock here — everything above it can take minutes, and an
+                # acknowledgement that arrived during it still counts.
                 sleep "$REVIEW_QUIET_SECS"
                 ACKED=$(reviewer_replied_to_head "$CH" "$PUSHED_AT" "$HEAD_SHA") || exit 1
                 if [ "$ACKED" = no ]; then

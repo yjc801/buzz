@@ -248,21 +248,39 @@ edge of that window: before it, rewriting the note is reliable; after it, a
 merge is in flight and the note may not be read again in time.
 
 **So the residual is handled after the write instead.** Immediately after the
-merge, the step reads the coordinate once more and reports one of two states,
-kept distinct on purpose — calling a network blip a changed authorization would
-be a false report:
+merge, the step reads the coordinate once more and reports one of three states,
+kept distinct on purpose — each is a different claim, and calling a network blip
+or a republished approval a changed authorization would be a false report:
 
 - **`AUTHORIZATION-CHANGED`** — the coordinate authorized the merge before the
   write and does not authorize it now.
+- **`AUTHORIZATION-REISSUED`** — the coordinate holds a *different* event than
+  the one the PR channel was told about, and that event still authorizes this
+  exact head, base and risk floor.
 - **`UNCONFIRMED`** — the relay did not answer. There is no post-merge reading
   at all.
 
-Both go **red**, post the reason and a copy-pasteable `git revert <squash
-commit>` to the PR, and best-effort tell the PR channel (best-effort because
-the mirror archives that channel seconds after a merge; the PR comment is the
-durable record). Both are "after state changed", which is the one category
-this workflow's failure philosophy reserves red for rather than degrading to a
-warning. Prevention was impossible. Silence was not.
+All three go **red**, post the reason to the PR, and best-effort tell the PR
+channel (best-effort because the mirror archives that channel seconds after a
+merge; the PR comment is the durable record). All three are "after state
+changed", which is the one category this workflow's failure philosophy reserves
+red for rather than degrading to a warning. Prevention was impossible. Silence
+was not.
+
+The first two are **not** interchangeable, and only the first and the third
+carry a copy-pasteable `git revert <squash commit>`. Every replacement at a
+NIP-33 coordinate carries a new event ID — including the reviewer republishing
+the *same* `APPROVE` for the same head, which happens on a re-sign after an
+edit, a re-run, or a later round that reaches the same conclusion. A check that
+only asked "is this still the announced event?" would call that a revocation
+and tell the owner to consider reverting a merge that the reviewer's live,
+signed verdict authorizes. So the post-write check separates *the coordinate
+moved* from *the coordinate stopped authorizing*, and `AUTHORIZATION-REISSUED`
+says outright that the authorization is intact and no revert is indicated. What
+it does not claim is that nothing happened in between: a coordinate exposes only
+its current value, so a revocation that was itself replaced would leave no
+trace. It is red to put a human's eyes on the replacement, not because the merge
+is in doubt.
 
 #### And detection does not date what it detects
 
@@ -290,9 +308,11 @@ to revert a merge that was authorized when it landed.
 `.github/scripts/pr-auto-merge-write.test.sh` executes this rather than
 arguing it: the relay stub serves a *different* value to the post-merge read
 than it served to the pre-write one, which is the race, and asserts that the
-merge happens, the run is red, the revert commit is named, both audiences are
-told, and the "all clear" audit comment is *not* posted. Deleting the
-post-merge read flips four scenarios from red to a silent success. Those
+merge happens, the run is red, both audiences are told, and the "all clear"
+audit comment is *not* posted. It serves a revocation, a downgrade, a relay
+failure, and a republished approval — the last of which asserts the revert is
+*absent* and that nothing in the alert calls it a revocation. Deleting the
+post-merge read flips five scenarios from red to a silent success. Those
 scenarios also assert what the alert must **not** claim: restoring wording that
 asserts the revocation preceded the merge fails them, because the stub swaps
 its fixture by read number and therefore models both sequences at once — which

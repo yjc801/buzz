@@ -823,26 +823,50 @@ jobs:
           # length of one read.
           relay() { env -u MERGE_TOKEN python3 .github/scripts/pr-auto-merge-relay.py "$@"; }
 
-          # Does the coordinate's CURRENT value still authorize this exact
-          # merge, and is it still the event the PR channel was told about?
-          # Silent on yes; prints the reason on no. Used on both sides of the
-          # write, which is the whole design below.
-          verdict_holds() {
+          # Classify the coordinate's CURRENT value against this exact merge.
+          # Prints one class word, a space, and a human reason:
+          #
+          #   ok        the announced event is still the standing value
+          #   reissued  a DIFFERENT event stands, and it still authorizes this
+          #             head, this base and this floor
+          #   lost      the standing value does not authorize this merge, or
+          #             could not be read as a verdict at all
+          #
+          # `reissued` and `lost` are separate classes because they are not the
+          # same claim, and only one of them is a lost authorization. A NIP-33
+          # coordinate gets a new event ID whenever the reviewer republishes —
+          # including when they republish the SAME APPROVE for the same head.
+          # Treating that as a revocation would tell the owner their merge is
+          # unauthorized while the reviewer's live, signed verdict says it is,
+          # and — after the write — would prompt a revert of a merge the
+          # standing verdict authorizes. Callers decide what each class means
+          # on their side of the write; this function only reports what is
+          # there.
+          classify_verdict() {
             local J ID
             J=$(jq -c '[.]' <<<"$1" \
               | node .github/scripts/pr-auto-merge-verdict.js \
                   --reviewer "$REVIEWER_PUBKEY" --head "$HEAD_SHA" \
                   --base "$BASE_TIP" --floor "$FLOOR") \
-              || { echo "the coordinate's value could not be parsed"; return 1; }
+              || { echo "lost the coordinate's value could not be parsed"; return; }
             if [ "$(jq -r .authorized <<<"$J")" != "true" ]; then
-              echo "the standing verdict no longer authorizes this merge ($(jq -r .reason <<<"$J"))"
-              return 1
+              echo "lost the standing verdict no longer authorizes this merge ($(jq -r .reason <<<"$J"))"
+              return
             fi
             ID=$(jq -r '.eventId // "-"' <<<"$J")
             if [ "$ID" != "$EVENT_ID" ]; then
-              echo "the coordinate now holds ${ID}, not the announced ${EVENT_ID}"
-              return 1
+              echo "reissued the coordinate now holds ${ID}, not the announced ${EVENT_ID} — a different event, which does still authorize this head and base"
+              return
             fi
+            echo "ok the announced verdict is still the standing value at the coordinate"
+          }
+
+          # Split "<class> <reason>" into $CLASS and $WHY.
+          classify_into() {
+            local LINE
+            LINE=$(classify_verdict "$1")
+            CLASS=${LINE%% *}
+            WHY=${LINE#* }
           }
 
           # BEFORE THE WRITE. This is a NARROWING, not a fence — read the
@@ -884,7 +908,13 @@ jobs:
             echo "- PR #$PR: REFUSED at the merge write (verdict currency unconfirmed)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if ! WHY=$(verdict_holds "$LIVE"); then
+          # Before the write, every class but `ok` refuses. A `reissued`
+          # coordinate is not a lost authorization, but it is not the event the
+          # PR channel was told about either, and refusing here costs nothing:
+          # nothing has changed yet, and the next run reads the new event on
+          # its own terms.
+          classify_into "$LIVE"
+          if [ "$CLASS" != ok ]; then
             echo "::warning::PR #$PR: ${WHY} — not merging"
             echo "- PR #$PR: REFUSED at the merge write (${WHY})" >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -935,35 +965,84 @@ jobs:
           # for: "we merged and cannot say whether we were still allowed to" is
           # not weather, and a warning on a cron run reaches nobody.
           #
-          # Two outcomes, labelled apart because they are not the same claim:
-          # AUTHORIZATION-CHANGED means the coordinate no longer authorizes
-          # this merge, at an unknown point relative to it. UNCONFIRMED means
-          # the relay did not answer, so there is no post-merge reading at all.
-          # Reporting either as the other would be a false report.
+          # Three outcomes, labelled apart because they are three different
+          # claims and reporting any one as another would be a false report:
+          #
+          #   AUTHORIZATION-CHANGED  the coordinate no longer authorizes this
+          #                          merge, at an unknown point relative to it.
+          #   AUTHORIZATION-REISSUED the coordinate was replaced across the
+          #                          write and the replacement STILL authorizes
+          #                          this merge. The live verdict backs the
+          #                          merge; what is unknown is what the
+          #                          coordinate held in between.
+          #   UNCONFIRMED            the relay did not answer, so there is no
+          #                          post-merge reading at all.
+          #
+          # The middle one exists because a replacement always carries a new
+          # event ID, including when the reviewer republishes the same APPROVE
+          # for the same head — re-signing after an edit, a re-run, a second
+          # round that reaches the same conclusion. That is not a revocation,
+          # and saying it is would be the worst kind of false alarm: it would
+          # tell the owner to consider reverting a merge that the reviewer's
+          # current, signed, still-standing verdict authorizes.
+          #
+          # It is nevertheless red, and it does not get the all-clear comment.
+          # The audit line names the announced event as "still standing before
+          # and after the write", and that is no longer true; and a coordinate
+          # exposes only its current value, so nothing rules out an
+          # intermediate revocation that was itself replaced. What is reported
+          # is exactly that: the live verdict authorizes, the intermediate
+          # states are unknowable, and no revert is indicated.
           STATUS=0
           AFTER=$(relay standing-verdict \
             --repo "$R" --pr "$PR" --reviewer "$REVIEWER_PUBKEY") || STATUS=$?
+          SUGGEST_REVERT=no
           if [ "$STATUS" -ne 0 ]; then
             STATE=UNCONFIRMED
+            SUGGEST_REVERT=yes
             HEADLINE="**Merged, and the authorization could not be re-confirmed.**"
             WHY="the verdict coordinate could not be read after the merge (exit $STATUS)"
             DETAIL="Nobody can vouch for this merge either way until someone reads the coordinate by hand. If the authorization turns out to have been gone before GitHub accepted the write, \`main\` has already moved and this needs reverting:"
-          elif ! WHY=$(verdict_holds "$AFTER"); then
-            STATE=AUTHORIZATION-CHANGED
-            HEADLINE="**Merged, and the authorization no longer stands — but not when it stopped.**"
-            DETAIL="**This does not establish that the merge was unauthorized.** Two sequences produce exactly what was observed, and nothing here can tell them apart: the reviewer revoked *before* GitHub accepted the merge (it should not have landed), or the verdict changed *after* a valid merge (it landed correctly, and the policy moved afterwards). There is no receipt ordering a relay replacement against GitHub's acceptance, and two self-reported clocks are not one. The reviewer knows which it was. If it was the first, \`main\` has already moved and this needs reverting:"
           else
-            STATE=""
-            WHY=""
+            classify_into "$AFTER"
+            case "$CLASS" in
+              lost)
+                STATE=AUTHORIZATION-CHANGED
+                SUGGEST_REVERT=yes
+                HEADLINE="**Merged, and the authorization no longer stands — but not when it stopped.**"
+                DETAIL="**This does not establish that the merge was unauthorized.** Two sequences produce exactly what was observed, and nothing here can tell them apart: the reviewer revoked *before* GitHub accepted the merge (it should not have landed), or the verdict changed *after* a valid merge (it landed correctly, and the policy moved afterwards). There is no receipt ordering a relay replacement against GitHub's acceptance, and two self-reported clocks are not one. The reviewer knows which it was. If it was the first, \`main\` has already moved and this needs reverting:"
+                ;;
+              reissued)
+                STATE=AUTHORIZATION-REISSUED
+                HEADLINE="**Merged, and the verdict was republished across the write — the standing verdict still authorizes it.**"
+                DETAIL="**This is not a lost authorization, and no revert is indicated.** The event now at the coordinate is a different one, and it authorizes this exact head, base and risk floor — a republished approval, not a revocation. What cannot be established is what the coordinate held *in between*: it exposes only its current value, so an intermediate state that was itself replaced would leave no trace, and nothing orders a relay replacement against GitHub's acceptance in any case. This is red so that the replacement gets a human's eyes, not because the merge is in doubt: the reviewer should confirm the republication was theirs and intended."
+                ;;
+              *)
+                STATE=""
+                WHY=""
+                ;;
+            esac
           fi
 
           if [ -n "$STATE" ]; then
             REVERT=$(GH_TOKEN="$MERGE_TOKEN" gh pr view "$PR" -R "$R" \
               --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null) || REVERT=""
+            # The revert is offered only where it could be the right move. A
+            # republished approval is not a candidate for one, and printing a
+            # `git revert` under it would say otherwise no matter how the prose
+            # around it is worded.
+            if [ "$SUGGEST_REVERT" = yes ]; then
+              # shellcheck disable=SC2016  # backticks are markdown, not command substitution
+              REMEDY=$(printf '%s\n\n```\ngit revert %s\n```' \
+                "$DETAIL" "${REVERT:-<the squash commit on main>}")
+              NEXT="re-review, and revert ${REVERT:-the squash commit on main} if the authorization was already gone"
+            else
+              REMEDY="$DETAIL"
+              NEXT="confirm with the reviewer that the republication was theirs; the squash commit is ${REVERT:-unknown}"
+            fi
             # shellcheck disable=SC2016  # backticks are markdown, not command substitution
-            ALERT=$(printf '🚨 %s\n\nPR #%s was squash-merged at `%s` on verdict `%s`. Re-reading the reviewer'"'"'s verdict coordinate immediately after the merge: %s.\n\n%s\n\n```\ngit revert %s\n```\n\nThis is a detection, not a prevention — the merge write cannot be fenced on a relay value, and the post-merge read cannot date the change, see "What cannot be fenced" in `docs/pr-auto-merge.md`.\n\nRun: %s/%s/actions/runs/%s\n' \
-              "$HEADLINE" "$PR" "$HEAD_SHA" "$EVENT_ID" "$WHY" "$DETAIL" \
-              "${REVERT:-<the squash commit on main>}" \
+            ALERT=$(printf '🚨 %s\n\nPR #%s was squash-merged at `%s` on verdict `%s`. Re-reading the reviewer'"'"'s verdict coordinate immediately after the merge: %s.\n\n%s\n\nThis is a detection, not a prevention — the merge write cannot be fenced on a relay value, and the post-merge read cannot date what it finds, see "What cannot be fenced" in `docs/pr-auto-merge.md`.\n\nRun: %s/%s/actions/runs/%s\n' \
+              "$HEADLINE" "$PR" "$HEAD_SHA" "$EVENT_ID" "$WHY" "$REMEDY" \
               "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")
             if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$ALERT"; then
               echo "::error::PR #$PR: the post-merge alert could not be posted to the PR — this run log is the only record"
@@ -975,8 +1054,8 @@ jobs:
               printf '%s\n' "$ALERT" | relay send --channel "$CHANNEL" >/dev/null \
                 || echo "::warning::PR #$PR: post-merge alert not delivered to the PR channel — the PR comment is the durable record"
             fi
-            echo "- PR #$PR: MERGED, THEN ${STATE} — ${WHY} (timing relative to the merge unknown; revert ${REVERT:-the squash commit} if it was already gone)" >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::PR #$PR merged at ${HEAD_SHA}, then ${STATE}: ${WHY}. When it changed relative to the merge is unknown — re-review, and revert ${REVERT:-the squash commit on main} if the authorization was already gone."
+            echo "- PR #$PR: MERGED, THEN ${STATE} — ${WHY} (timing relative to the merge unknown; ${NEXT})" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PR #$PR merged at ${HEAD_SHA}, then ${STATE}: ${WHY}. When the coordinate changed relative to the merge is unknown — ${NEXT}."
             exit 1
           fi
           echo "the verdict still stands after the merge"

@@ -139,22 +139,27 @@ REAL_PYTHON3=$(command -v python3)
 export REAL_PYTHON3
 
 sign_note() {
-  # sign_note <verdict> <auto-merge> [base] -> signed kind-30023 event
-  python3 - "$REVIEWER_SECRET" "$1" "$2" "${3:-$BASE_TIP}" "$HEAD_SHA" "$PR" <<'PY'
+  # sign_note <verdict> <auto-merge> [base] [round] -> signed kind-30023 event
+  #
+  # `round` exists so a scenario can produce a SECOND, later event that is
+  # every bit as authorizing as the first — the reviewer republishing rather
+  # than revoking. It changes the content and the timestamp, so the event ID
+  # changes; nothing the verdict parser gates on changes.
+  python3 - "$REVIEWER_SECRET" "$1" "$2" "${3:-$BASE_TIP}" "$HEAD_SHA" "$PR" "${4:-1}" <<'PY'
 import importlib.util, json, sys
 
 spec = importlib.util.spec_from_file_location("nostr", "scripts/buzz-mint-auth-tag.py")
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-sec, verdict, automerge, base, head, pr = int(sys.argv[1], 16), *sys.argv[2:]
+sec, verdict, automerge, base, head, pr, rnd = int(sys.argv[1], 16), *sys.argv[2:]
 content = (
-    f"Round 1.\n\nReviewed {head} against merge base {base}\n"
+    f"Round {rnd}.\n\nReviewed {head} against merge base {base}\n"
     f"VERDICT: {verdict}\nRISK: medium — product code\nAUTO-MERGE: {automerge}\n"
 )
 event = {
     "pubkey": mod.xonly(sec).hex(),
-    "created_at": 1700000000 + len(verdict),
+    "created_at": 1700000000 + len(verdict) + int(rnd),
     "kind": 30023,
     "tags": [["d", f"pr-verdict-yjc801-buzz-{pr}"]],
     "content": content,
@@ -167,6 +172,16 @@ PY
 
 APPROVE=$(sign_note APPROVE yes)
 APPROVE_ID=$(printf '%s' "$APPROVE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# The SAME approval, republished: same reviewer, same head, same merge base,
+# same risk, still AUTO-MERGE: yes. Only the event ID differs, because that is
+# what replacing a NIP-33 coordinate does — a second round that reaches the
+# same conclusion, a re-sign after an edit, a re-run. The parser authorizes it.
+# It is the case that must not be reported as a revocation.
+REAPPROVE=$(sign_note APPROVE yes "$BASE_TIP" 2)
+REAPPROVE_ID=$(printf '%s' "$REAPPROVE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+[ "$REAPPROVE_ID" != "$APPROVE_ID" ] \
+  || { echo "harness bug: the republished approval has the same event ID" >&2; exit 2; }
 
 run_merge() {
   : > "$WORK/calls"
@@ -248,6 +263,10 @@ ANNOUNCED_ID=$(python3 -c 'print("a" * 64)')
 expect "coordinate replaced since the channel announcement → refuses" refused
 
 reset
+printf '%s' "$REAPPROVE" > "$WORK/live.json"
+expect "reviewer republished the same approval before the write → refuses, because it is not the announced event" refused
+
+reset
 RELAY_EXIT=4
 expect "relay unreachable at the write → refuses rather than assuming" refused
 
@@ -268,10 +287,12 @@ expect "coordinate returned something unparseable → refuses" refused
 # scenarios — asserting otherwise would be asserting something no code in this
 # repository can deliver. What must happen is that it does not pass silently.
 
-# expect_alert <label> <AUTHORIZATION-CHANGED|UNCONFIRMED> — red, correctly
-# labelled, revert named, both audiences told, and the "all clear" audit
-# comment NOT posted. The two states are asserted apart on purpose: reporting a
-# relay blip as "the authorization changed" would be a false report.
+# expect_alert <label> <AUTHORIZATION-CHANGED|AUTHORIZATION-REISSUED|UNCONFIRMED>
+# [revert:yes|no] — red, correctly labelled, both audiences told, and the "all
+# clear" audit comment NOT posted. The three states are asserted apart on
+# purpose: reporting a relay blip, or a republished approval, as "the
+# authorization changed" would be a false report, and each carries a different
+# remedy.
 #
 # It also asserts what the alert must NOT say. The evidence is two snapshots
 # either side of the write, so claiming the merge should not have happened is
@@ -279,14 +300,22 @@ expect "coordinate returned something unparseable → refuses" refused
 # later change of mind produces the identical observation. Re-introducing that
 # claim fails here.
 expect_alert() {
-  local label="$1" state="$2" status ok=1 why=""
+  local label="$1" state="$2" revert="${3:-yes}" status ok=1 why=""
   status=$(run_merge)
   [ "$status" -ne 0 ] || { ok=0; why="${why} exit=0(expected red);"; }
   grep -q 'pr merge' "$WORK/calls" || { ok=0; why="${why} the merge never happened;"; }
   grep -q 'This is a detection, not a prevention' "$WORK/calls" \
     || { ok=0; why="${why} no alert comment on the PR;"; }
-  grep -q "git revert ${MERGE_COMMIT}" "$WORK/calls" \
-    || { ok=0; why="${why} the alert does not name the commit to revert;"; }
+  if [ "$revert" = yes ]; then
+    grep -q "git revert ${MERGE_COMMIT}" "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not name the commit to revert;"; }
+  else
+    # A `git revert` printed under a still-authorizing verdict prescribes
+    # undoing an authorized merge, whatever the prose around it says.
+    if grep -q 'git revert' "$WORK/calls"; then
+      ok=0; why="${why} the alert offers a revert for a merge the standing verdict authorizes;"
+    fi
+  fi
   grep -q 'relay send' "$WORK/calls" || { ok=0; why="${why} the PR channel was not told;"; }
   if grep -q 'Auto-merged on the reviewer' "$WORK/calls"; then
     ok=0; why="${why} posted the all-clear audit comment anyway;"
@@ -306,6 +335,20 @@ expect_alert() {
       || { ok=0; why="${why} the alert does not name the ordering that would make this a bad merge;"; }
     grep -qF '*after* a valid merge' "$WORK/calls" \
       || { ok=0; why="${why} the alert does not name the ordering that would make this a valid one;"; }
+  fi
+  if [ "$state" = AUTHORIZATION-REISSUED ]; then
+    # The claim is the opposite one, and it has to be said outright: the live
+    # verdict authorizes this merge. Anything implying it was withdrawn is the
+    # false alarm this state exists to prevent.
+    grep -qF 'not a lost authorization' "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not say the authorization is intact;"; }
+    grep -qF 'authorizes this exact head, base and risk floor' "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not say what the replacement authorizes;"; }
+    grep -qF 'in between' "$WORK/calls" \
+      || { ok=0; why="${why} the alert does not say the intermediate states are unknowable;"; }
+    if grep -qE 'authorization no longer stands|no longer authorizes this merge' "$WORK/calls"; then
+      ok=0; why="${why} the alert reports a republished approval as a revocation;"
+    fi
   fi
   if [ "$ok" -eq 1 ]; then
     PASSES=$((PASSES + 1))
@@ -331,6 +374,16 @@ reset
 RELAY_FIXTURE2="$WORK/live.json"
 RELAY_EXIT2=4
 expect_alert "the relay cannot confirm the verdict after the merge → red, and reported as UNCONFIRMED rather than as a changed authorization" UNCONFIRMED
+
+# The case a lost-vs-changed distinction alone gets wrong. The coordinate moves
+# across the write, so the announced event is no longer the standing one — but
+# the standing one is a signed APPROVE for this same head, base and floor. It
+# is an audit condition, not a revocation, and the difference is the difference
+# between "have a look at this" and "consider reverting main".
+reset
+printf '%s' "$REAPPROVE" > "$WORK/reapproved.json"
+RELAY_FIXTURE2="$WORK/reapproved.json"
+expect_alert "the reviewer republished the same approval across the write → red and flagged, but not reported as a revocation and not offered a revert" AUTHORIZATION-REISSUED no
 
 # The happy path has to prove BOTH reads ran, or deleting the post-merge one
 # would leave every scenario above green by never noticing anything.

@@ -17,7 +17,10 @@ jobs:
   changes:
     name: Detect Changed Paths
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # 5, not 2: this job now invokes `just`, which Hermit downloads on first
+    # use here. Every other lane needs this job, so a marginal timeout would
+    # fail the whole run.
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -27,11 +30,27 @@ jobs:
       desktop-rust: ${{ steps.filter.outputs.desktop-rust }}
       web: ${{ steps.filter.outputs.web }}
       mobile: ${{ steps.filter.outputs.mobile }}
+      compiled-flag-states: ${{ steps.compiled-flag-states.outputs.states }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 2
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      # The desktop-tauri-compiled-flags matrix is generated from this, so the
+      # Justfile's `compiled_flag_states` is the only place the set of compiled
+      # build states is written. Adding one there adds a required CI shard with
+      # no workflow edit — and cannot silently skip it.
+      - name: Read compiled-flag build states
+        id: compiled-flag-states
+        run: |
+          states="$(just --evaluate compiled_flag_states)"
+          json="$(printf '%s' "$states" | jq -Rc 'split(" ") | map(select(length > 0))')"
+          if [ "$json" = "[]" ]; then
+            echo "::error::compiled_flag_states resolved to an empty list"
+            exit 1
+          fi
+          echo "states=$json" >> "$GITHUB_OUTPUT"
+          echo "compiled-flag states: $json"
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
@@ -277,8 +296,9 @@ jobs:
   # permutation is a distinct compile of the Tauri crate (build.rs declares
   # rerun-if-env-changed for all of them), so running the states sequentially
   # made this the longest desktop lane. One job per state verifies the same
-  # build shapes concurrently instead. Keep `state` in sync with
-  # `compiled_flag_states` in the Justfile.
+  # build shapes concurrently instead. The state list is read from the
+  # Justfile's `compiled_flag_states` by the `changes` job, so it is not
+  # duplicated here and a new state cannot be silently left out of CI.
   desktop-tauri-compiled-flags:
     name: Desktop Tauri Compiled Flags (${{ matrix.state }})
     runs-on: ubuntu-latest
@@ -288,7 +308,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        state: [probes, owner-only, demo-slug]
+        state: ${{ fromJSON(needs.changes.outputs.compiled-flag-states) }}
     permissions:
       contents: read
     steps:

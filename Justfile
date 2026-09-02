@@ -244,9 +244,12 @@ desktop-tauri-test: _ensure-sidecar-stubs
 desktop-terminal-performance-test:
     cargo test --manifest-path desktop/src-tauri/crates/buzz-terminal/Cargo.toml --release --test latency g3_renderer_acquire_stays_within_frame_budget -- --ignored --exact --nocapture
 
-# The compiled build states the flag matrix verifies. CI runs one job per
-# state so they compile and test concurrently; the aggregate recipe below
-# iterates this same list, so the set of states lives in exactly one place.
+# The compiled build states the flag matrix verifies. This is the only place
+# the set is written: CI's `changes` job reads it with
+# `just --evaluate compiled_flag_states` and generates the
+# desktop-tauri-compiled-flags matrix from it, and the aggregate recipe below
+# iterates it. Adding a state here adds a required CI shard and a local run,
+# with no workflow edit and no way to leave CI silently behind.
 compiled_flag_states := "probes owner-only demo-slug"
 
 # Verify compiled-flag behavior for a single build state. `build.rs` declares

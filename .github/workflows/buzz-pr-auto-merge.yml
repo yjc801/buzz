@@ -505,10 +505,24 @@ jobs:
               drop_manual_claim "$N" "the reviewer has published no verdict for this PR"
               return 0
             fi
+            if [ "$STATUS" -eq 4 ]; then
+              # Unprovable this tick. Nothing is disproven, so the label
+              # stays, and the loop reads the coordinate again below. No
+              # warn_skip here: this pass does not skip the PR.
+              return 0
+            fi
             if [ "$STATUS" -ne 0 ]; then
-              # Weather, or content that failed a proof. Either way this pass
-              # cannot disprove anything; the loop reads it again below and
-              # classifies it there.
+              # Definitive: content ARRIVED and failed a proof (1), or this
+              # step called the client wrong (2). Neither is retryable, and
+              # neither may be treated as weather HERE, because "the loop
+              # classifies it below" is exactly what the gates between here
+              # and the loop's own read can prevent — a labelled PR whose
+              # verdict fails its proof while GitHub reports UNKNOWN would
+              # end its tick at the mergeability gate, relay_status would
+              # never run, the run would stay green, and the label would sit
+              # on evidence the workflow itself calls a bug or an attack. So
+              # the classifier runs at the point of failure instead.
+              relay_status "$N" "$STATUS" "the verdict coordinate could not be read" || exit 1
               return 0
             fi
             if ! JSON=$(jq -c '[.]' <<<"$NOTE" \

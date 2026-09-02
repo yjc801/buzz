@@ -319,6 +319,42 @@ expect_summary() {
   fi
 }
 
+# expect_red <label> <substring> — a relay failure the client calls definitive
+# must fail the run and write no label. The distinction the workflow draws is
+# retryable (exit 4) vs. a proof that failed or a caller bug (1, 2); a pass
+# that reads the coordinate early has to preserve it, because the gates it
+# runs ahead of can end the tick before anything else would classify it.
+expect_red() {
+  local name="$1" want="$2" status got
+  status=$(run_sweep)
+  got=$(tr '\n' ' ' < "$LABEL_LOG" | sed 's/ *$//')
+  if [ "$status" -eq 0 ]; then
+    fail "$name: expected a non-zero step exit, got 0"
+  elif ! grep -qF -- "$want" "$WORK/stdout"; then
+    fail "$name: expected the log to contain [${want}]"
+  elif [ -n "$got" ]; then
+    fail "$name: expected no label write, got [${got}]"
+  else
+    pass "$name"
+  fi
+}
+
+# expect_missing_summary <label> <substring> — the other half of the contract
+# above. A pass that only ever removes a label must not report a SKIP for a PR
+# the sweep goes on to evaluate; a reader who cannot tell "this tick did
+# nothing here" from "this PR was skipped" is being misled by the log.
+expect_missing_summary() {
+  local name="$1" unwanted="$2" status
+  status=$(run_sweep)
+  if [ "$status" -ne 0 ]; then
+    fail "$name: step exited $status"
+  elif grep -qF -- "$unwanted" "$WORK/summary"; then
+    fail "$name: the summary should not mention [${unwanted}], got [$(tr '\n' ' ' < "$WORK/summary")]"
+  else
+    pass "$name"
+  fi
+}
+
 # expect_sets <label> <candidates-json> <reconcile-json>
 expect_sets() {
   local name="$1" want_c="$2" want_r="$3" status got_c got_r
@@ -540,6 +576,59 @@ labelled
 verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_label "dry-run reports the stale claim and writes nothing" none
+
+echo "## a definitive relay fault stays definitive"
+
+# The pre-gate read is the FIRST thing to see the coordinate, so it inherits
+# the obligation to classify what it saw. Exit 1 is content that arrived and
+# failed a proof — a forged binding note, a message scoped elsewhere, a
+# redaction of this PR's history — which the workflow treats as a bug or an
+# attack, not weather. Pair it with the mergeability recompute that a push
+# causes anyway and the tick would end at the gate below: nothing else ever
+# reads the coordinate, the run stays green, and the label keeps standing on
+# evidence known to be unusable.
+reset_fixtures
+labelled
+STUB_VERDICT_STATUS=1
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_red "a verdict that failed its proof is red even behind an early gate" \
+  "the verdict coordinate could not be read — the relay returned content that failed a proof (exit 1)"
+
+reset_fixtures
+labelled
+STUB_VERDICT_STATUS=2
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_red "and a caller fault is not weather either" \
+  "the verdict coordinate could not be read — the relay returned content that failed a proof (exit 2)"
+
+# With no gate in the way the loop's own read would have caught it. Pinned so
+# the early classification cannot quietly replace that with something softer.
+reset_fixtures
+labelled
+STUB_VERDICT_STATUS=1
+expect_red "with nothing in the way it is red at the first read" \
+  "the relay returned content that failed a proof (exit 1)"
+
+# Scope. The pre-gate pass runs only where there is a claim to disprove, so an
+# unlabelled PR still ends its tick at the gate exactly as it did before this
+# change — the fix does not widen what turns a run red.
+reset_fixtures
+STUB_VERDICT_STATUS=1
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "an unlabelled PR's tick still ends at the gate" none
+
+# The mirror image: exit 4 must NOT take the definitive path. Routing it
+# through the same classifier would be silent in the label writes — the run
+# stays green either way — and visible only here, as a skip announced for a PR
+# this pass does not skip. The zero-file gate is what makes the assertion
+# sharp: the loop never reaches its own verdict read, so the only thing that
+# could name the coordinate in the summary is the pre-gate pass.
+reset_fixtures
+labelled
+STUB_VERDICT_STATUS=4
+edit_view 'd["changedFiles"] = 0'
+expect_missing_summary "unprovable is reported by whoever actually skips, not by this pass" \
+  "the verdict coordinate could not be read"
 
 echo "## the reason a label moved reaches the step summary"
 

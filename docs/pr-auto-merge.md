@@ -512,6 +512,17 @@ the only honest record.
   the queue. When the label does move, the step summary names the fact that
   moved it.
 
+  Unprovable in that sense means the relay client's **exit 4** and nothing
+  else. Because this pass is the first thing to read the verdict coordinate,
+  it is also the first thing that can hide a failure to read it: a coordinate
+  whose content arrived and failed a proof (exit 1) or a client called wrong
+  (exit 2) is a bug or an attack, not weather, and the gates this pass runs
+  ahead of would end the tick before anything else classified it. So it runs
+  the same classifier the sweep's own read uses, at the point of failure — a
+  definitive fault fails the run there, with the label left alone, rather than
+  being downgraded into a green tick that keeps advertising evidence known to
+  be unusable.
+
   Visibility only: it gates nothing, the evaluate job holds no merge
   credential, label writes are best-effort warnings, and dry-run never touches
   labels. Reconciliation covers open PRs only — a PR closed while labelled

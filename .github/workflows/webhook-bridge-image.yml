@@ -15,6 +15,11 @@ name: Webhook bridge image
 #     owns `verify_event`, the signature check every delivery goes through)
 #   - Cargo.toml / Cargo.lock, which decide third-party versions and features
 #   - rust-toolchain.toml, which decides the compiler
+#   - .cargo/config.toml — the Dockerfile's `COPY . .` puts it at /build/.cargo,
+#     where Cargo discovers it, so its `[env]` and profile settings feed the
+#     compile
+#   - .dockerignore, which Docker applies before that `COPY` and so decides
+#     which sources reach the build at all
 #   - the Dockerfile and this workflow
 #
 # Anything left out here can merge to main and change the intended binary
@@ -48,6 +53,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".dockerignore"
       - "Dockerfile.webhook-bridge"
       - ".github/workflows/webhook-bridge-image.yml"
   pull_request:
@@ -58,6 +65,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".dockerignore"
       - "Dockerfile.webhook-bridge"
       - ".github/workflows/webhook-bridge-image.yml"
   workflow_dispatch: {}

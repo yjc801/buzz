@@ -470,6 +470,14 @@ the only honest record.
   our side. Treat the label as a convenience, not a fence; if the merge must
   not happen, use the draft.
 - **Hold everything:** `gh workflow disable buzz-pr-auto-merge.yml`.
+- **"Ready for your click":** the sweep maintains an `approved-manual-merge`
+  label — applied when the PR's current head carries an APPROVE or
+  APPROVE-WITH-NITS verdict the sweep will not merge (AUTO-MERGE: no, nits,
+  a high floor, or a refused gate), removed when the verdict goes stale or
+  the merge is handed off. Visibility only: it gates nothing, the evaluate
+  job holds no merge credential, label writes are best-effort warnings, and
+  dry-run never touches labels. Filter the queue with
+  `is:open label:approved-manual-merge`.
 - **Required ruleset on `main`:** a prerequisite for the feature doing
   anything at all. Everything else the workflow checks is a read with a window
   after it; a branch rule is evaluated by GitHub as part of the merge itself,

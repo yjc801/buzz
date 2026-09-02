@@ -205,6 +205,15 @@ jobs:
     if: github.repository == 'yjc801/buzz'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Job-level widening of the workflow's read-only default: the sweep
+    # maintains the `approved-manual-merge` visibility label, which needs
+    # pull-requests: write. Labels gate nothing — the merge credential still
+    # exists only in the merge job — so this cannot authorize a merge.
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+      statuses: read
     outputs:
       pr: ${{ steps.sweep.outputs.pr }}
       head: ${{ steps.sweep.outputs.head }}
@@ -284,6 +293,27 @@ jobs:
           warn_skip() {
             echo "::warning::PR #$1: $2 — skipped this tick"
             decision "$1" "SKIP (unproven: $2)"
+          }
+
+          # Visibility label, not a gate: `approved-manual-merge` marks a PR
+          # whose CURRENT head carries an APPROVE or APPROVE-WITH-NITS
+          # verdict that this sweep will nevertheless not merge (AUTO-MERGE:
+          # no, nits, a high floor, or a refused gate) — the owner's "ready
+          # for your click" queue. Removed when the verdict goes stale or the
+          # PR is handed to the merge job. Best-effort: a failed label write
+          # warns and never blocks a decision; dry-run touches nothing.
+          MANUAL_MERGE_LABEL=approved-manual-merge
+          sync_manual_label() {
+            local N="$1" WANT="$2"
+            [ "$DRY" = "true" ] && return 0
+            if [ "$WANT" = on ] && [ "$HAS_MANUAL" != "true" ]; then
+              gh pr edit "$N" -R "$R" --add-label "$MANUAL_MERGE_LABEL" \
+                || echo "::warning::PR #$N: could not add the ${MANUAL_MERGE_LABEL} label"
+            elif [ "$WANT" = off ] && [ "$HAS_MANUAL" = "true" ]; then
+              gh pr edit "$N" -R "$R" --remove-label "$MANUAL_MERGE_LABEL" \
+                || echo "::warning::PR #$N: could not remove the ${MANUAL_MERGE_LABEL} label"
+            fi
+            return 0
           }
 
           # --- Relay access. Every call below goes through the repository's own
@@ -371,7 +401,7 @@ jobs:
           }
 
           for N in $(jq -r 'sort | .[]' "$TMP/candidates.json"); do
-            VIEW=$(gh pr view "$N" -R "$R" --json state,headRefOid,baseRefName,mergeable,changedFiles,url,statusCheckRollup) || {
+            VIEW=$(gh pr view "$N" -R "$R" --json state,headRefOid,baseRefName,mergeable,changedFiles,url,labels,statusCheckRollup) || {
               warn_skip "$N" "PR read failed"
               continue
             }
@@ -381,6 +411,7 @@ jobs:
             MERGEABLE=$(jq -r .mergeable <<<"$VIEW")
             CHANGED=$(jq -r .changedFiles <<<"$VIEW")
             PR_URL=$(jq -r .url <<<"$VIEW")
+            HAS_MANUAL=$(jq -r --arg l "$MANUAL_MERGE_LABEL" '([.labels[]?.name] | index($l)) != null' <<<"$VIEW")
             if [ "$STATE" != "OPEN" ]; then
               decision "$N" "SKIP (state $STATE)"
               continue
@@ -472,8 +503,18 @@ jobs:
             EVENT_ID=$(jq -r '.eventId // "-"' <<<"$VERDICT_JSON")
             RISK=$(jq -r '.risk // "-"' <<<"$VERDICT_JSON")
             EFFECTIVE=$(jq -r '.effectiveRisk // "-"' <<<"$VERDICT_JSON")
+            VERDICT_KIND=$(jq -r '.verdict // "-"' <<<"$VERDICT_JSON")
+            REVIEWED_HEAD=$(jq -r '.reviewedHead // "-"' <<<"$VERDICT_JSON")
+            # "Ready for your click": a current-head APPROVE (with or without
+            # nits) that this sweep is not going to merge.
+            MANUAL_WANT=off
+            if [ "$FOUND" = "true" ] && [ "$REVIEWED_HEAD" = "$HEAD_SHA" ] \
+              && { [ "$VERDICT_KIND" = "APPROVE" ] || [ "$VERDICT_KIND" = "APPROVE-WITH-NITS" ]; }; then
+              MANUAL_WANT=on
+            fi
 
             if [ "$FOUND" != "true" ] || [ "$REQUESTED" != "true" ]; then
+              sync_manual_label "$N" "$MANUAL_WANT"
               decision "$N" "SKIP (${REASON}; floor ${FLOOR})"
               continue
             fi
@@ -513,6 +554,7 @@ jobs:
             fi
 
             if [ -n "$BLOCKED" ]; then
+              sync_manual_label "$N" "$MANUAL_WANT"
               REASONS=$(printf '%b' "$BLOCKED")
               decision "$N" "BLOCKED: $(printf '%s' "$REASONS" | tr '\n' '; ')"
               if [ "$DRY" != "true" ]; then
@@ -565,6 +607,7 @@ jobs:
               echo "verdict_events=$VERDICT_EVENTS"
               echo "channel=$CH"
             } >> "$GITHUB_OUTPUT"
+            sync_manual_label "$N" off
             decision "$N" "AUTHORIZED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR}) — handing to the merge job"
             # One merge per run: everything evaluated after a merge would be
             # judged against a main no gate observed. The next tick re-sweeps.

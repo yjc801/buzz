@@ -729,11 +729,13 @@ The mobile app lives in `mobile/` — a Flutter app using Riverpod + Hooks.
   over raw `Theme.of(context)` calls.
 - **Keep widgets small and composable.** One public widget per file; push
   private sub-widgets (`_Foo`) into sibling `part` files under a
-  `<page>/` folder rather than growing the page file. Hard ceiling:
-  **1000 lines/file**, enforced across Desktop, Web, and Mobile by the
+  `<page>/` folder rather than growing the page file. Mobile's hard ceiling is
+  **1200 lines/file**, enforced with the other surface-specific limits by the
   repository-level `just file-size-check` gate (`just check`, CI, and every
-  pre-push). If the guard trips, **split the file — never bump the limit or add
-  an override to slip under it.**
+  pre-push). If an individual file trips the guard, **split the file — never
+  bump a surface limit or add an override merely to admit that file.**
+  Deliberate repository-wide policy revisions must update the enforced rules,
+  tests, and guidance together.
 - Feature modules must not import from other feature modules — only from
   `shared/`.
 - Use `Grid` tokens for spacing, `Radii` for border radius.

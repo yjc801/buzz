@@ -180,11 +180,7 @@ export function ComposerMentionButton({
           <Tooltip disableHoverableContent>
             <TooltipTrigger asChild>
               <button
-                aria-label={
-                  hasAgents
-                    ? "Manage automatic agent mentions"
-                    : "Mention someone"
-                }
+                aria-label={hasAgents ? "Manage mentions" : "Mention someone"}
                 className={cn(
                   "flex h-8 items-center justify-center rounded-lg focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
                   showActiveChrome
@@ -205,9 +201,7 @@ export function ComposerMentionButton({
               </button>
             </TooltipTrigger>
             <TooltipContent>
-              {hasAgents
-                ? "Manage automatic agent mentions"
-                : "Mention someone"}
+              {hasAgents ? "Manage mentions" : "Mention someone"}
             </TooltipContent>
           </Tooltip>
           <AnimatePresence
@@ -234,7 +228,7 @@ export function ComposerMentionButton({
                     <Tooltip disableHoverableContent key={agent.pubkey}>
                       <TooltipTrigger asChild>
                         <motion.button
-                          aria-label={`Don't automatically mention ${agent.displayName} in this conversation`}
+                          aria-label={`Don't automatically mention ${agent.displayName} in this thread`}
                           animate={{ opacity: 1, scale: 1 }}
                           className="group/address relative rounded-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
                           data-testid={`composer-address-lock-remove-${agent.pubkey}`}
@@ -276,7 +270,7 @@ export function ComposerMentionButton({
                       </TooltipTrigger>
                       <TooltipContent>
                         Don't automatically mention {agent.displayName} in this
-                        conversation
+                        thread
                       </TooltipContent>
                     </Tooltip>
                   ))}

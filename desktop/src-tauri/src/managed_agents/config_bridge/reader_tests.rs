@@ -1,5 +1,5 @@
 //! Unit tests for `config_bridge/reader.rs` (kept in a sibling file so
-//! `reader.rs` stays under the 1000-line budget; `#[path]`-included from
+//! `reader.rs` stays under the 1500-line budget; `#[path]`-included from
 //! there).
 
 use std::{collections::BTreeMap, path::Path, sync::Mutex};

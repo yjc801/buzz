@@ -1014,18 +1014,23 @@ jobs:
   mobile-swift:
     name: Mobile Swift
     runs-on: macos-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     needs: [changes]
     # Fork divergence: mobile lanes are upstream-only (mac desktop fork).
     if: github.repository == 'block/buzz' && needs.changes.outputs.mobile == 'true'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Install Flutter dependencies
+        run: cd mobile && flutter pub get
       - name: Build
         run: swift build --package-path mobile/ios/BuzzPushKit
       - name: Build release
         run: swift build -c release --package-path mobile/ios/BuzzPushKit
       - name: Test
         run: swift test --package-path mobile/ios/BuzzPushKit
+      - name: Build complete unsigned iOS release
+        run: cd mobile && flutter build ios --release --no-codesign --no-pub
   security:
     name: Security
     runs-on: ubuntu-latest
@@ -1179,6 +1184,20 @@ jobs:
         # Serial: windows_resolver_tests mutate process-global env
         # (BUZZ_SHELL/GIT_BASH/SystemRoot) that SharedState::new reads.
         run: cargo test -p buzz-dev-mcp --target $env:TARGET -- --test-threads=1
+      - name: Test (buzz-agent auth coordinator)
+        # The auth coordinator single-flights on an OS advisory lock, which is
+        # LockFileEx on Windows; this integration suite drives real second
+        # processes on the same lock file, so it only exercises the Windows
+        # lock runtime if it runs ON Windows. Every other job compiles it but
+        # never executes it. Tests exercised on Windows: lock serialization
+        # (two coordinators race for the same key), cooldown sidecar sharing
+        # across processes, attempt-sidecar adoption (UserInitiated waiter
+        # adopts a predecessor's denial), and the in-process single-flight for
+        # same-key coalescing. Tests that are UNIX-ONLY and NOT executed here:
+        # crash-release (flock drop on SIGKILL, guarded by #[cfg(unix)]) and
+        # cross-process cache success/race (on-disk token handoff, also
+        # #[cfg(unix)]).
+        run: cargo test -p buzz-agent --target $env:TARGET --test databricks_auth_coordinator
       # Smoke-test the new host-prereq contract: Git for Windows (which provides
       # bash) is available on the runner, a shell command round-trips, and bash
       # does NOT resolve from System32 (so WSL's launcher is never picked up).

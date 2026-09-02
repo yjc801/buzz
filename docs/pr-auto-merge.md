@@ -580,9 +580,12 @@ above installed in the reviewer's prompt. The first armed run stopped at the
 write itself — gh's GraphQL merge mutation is closed to fine-grained PATs —
 so #116 landed by hand (its claim that it arrived via the pipeline did not
 come true) and #117 moved every merge-credential call to REST. The retry of
-the live end-to-end test is the docs-only PR that carried this correction;
-its audit comment on GitHub is the record of whether the pipeline performed
-that merge.
+the live end-to-end test is the docs-only PR that carried this correction. A
+present auto-merge audit comment on it is positive evidence the pipeline
+performed that merge; an absent one proves nothing by itself — the comment
+can fail after a successful merge, which exits red with "record is
+incomplete" — so absent a comment, consult the Actions run and the merge
+history.
 yjc801/velvet carries the same workflow revision but its branch ruleset is
 unavailable on the repository's current plan (private repo), so its gate 7
 refuses — velvet auto-merge stays a dry-run until that changes.

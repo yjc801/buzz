@@ -571,3 +571,13 @@ trailer contract above. Nothing merges until it is in place.
 > is in flight, and rewriting the note may no longer arrive in time — it is
 > still detected and reported red, but the only stop with no window is a human
 > converting the PR to a draft.
+
+## Rollout status
+
+Armed on this repo 2026-09-02: #101 merged, `AUTO_MERGE_TOKEN` set, the
+strict `CI Complete` ruleset active on `main`, and the canonical section
+above installed in the reviewer's prompt. This section landed via the first
+live end-to-end test of the pipeline (a docs-only PR — floor low).
+yjc801/velvet carries the same workflow revision but its branch ruleset is
+unavailable on the repository's current plan (private repo), so its gate 7
+refuses — velvet auto-merge stays a dry-run until that changes.

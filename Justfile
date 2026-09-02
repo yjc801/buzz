@@ -93,13 +93,29 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint, formatting, and repository policy checks
-check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check security-review-check file-size-check
+check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check security-review-check auto-merge-check file-size-check
 
 # Validate the trusted security-review workflow support and renderer contract.
 security-review-check:
     node --check .github/scripts/codex-security-review.js
     node --test .github/scripts/codex-security-review.test.js
     actionlint .github/workflows/codex-security-review.yml
+
+# Validate the PR auto-merge risk classifier, verdict parser, event
+# verification, the relay client, the CI aggregate contract, the merge job's
+# revalidation fence, the freshness check at the write itself, and the workflow
+# file that wires them together. This — not `just gate` — is the gate that covers a change to any of
+# them: `gate` maps .github/**, scripts/** and docs/** to "nothing to run".
+auto-merge-check:
+    actionlint .github/workflows/buzz-pr-auto-merge.yml
+    node --check .github/scripts/pr-auto-merge-risk.js
+    node --check .github/scripts/pr-auto-merge-verdict.js
+    node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js
+    python3 scripts/buzz-mint-auth-tag.py selftest
+    python3 .github/scripts/pr-auto-merge-relay.py selftest
+    python3 .github/scripts/pr-auto-merge-aggregate.test.py
+    bash .github/scripts/pr-auto-merge-revalidate.test.sh
+    bash .github/scripts/pr-auto-merge-write.test.sh
 
 # Run the repository-wide differential file-size ratchet and its policy tests.
 # The ratchet inspects only files changed from the merge base, so this stays

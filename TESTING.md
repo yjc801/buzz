@@ -38,8 +38,12 @@ presence of the honest claim *and* the absence of the stronger one turns
 re-introducing an over-claim into a test failure instead of a review round.
 Assert the absence of the destructive command too — a `git revert` printed
 under a still-valid authorization is an instruction no matter what the prose
-around it says (PR #101, three rounds). Mutation-test both directions: restore
-the old wording, and re-collapse the states, and check each fails a scenario.
+around it says (PR #101, three rounds). Where the evidence leaves a remedy
+*open* rather than ruling it out, the absence to pin is the claim, not the
+command: assert that the alert states the condition the remedy hangs on, and
+that none of the wordings which date the change survive. Mutation-test both
+directions: restore the old wording, and re-collapse the states, and check each
+fails a scenario.
 (PR #101)
 
 ---

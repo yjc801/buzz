@@ -266,15 +266,22 @@ PRs where reviewers litigated it.
    the harshest consequence is applied to all of them. A merge guard failed
    both for "the standing verdict no longer authorizes" and for "the standing
    verdict is a different event than the one announced"; before the write both
-   correctly refuse, but after the write only the first justifies a rollback —
-   so a reviewer republishing an *identical* approval produced a red run
-   announcing a revocation and printing a `git revert` for a merge its own
-   live evidence authorized (PR #101). Return a class, and let each caller
-   decide what each class means. Two corollaries: a remedy printed in an alert
-   is an **instruction** regardless of the prose above it, so gate the command
-   on the class rather than wording around it; and conservatism is free before
-   a state change and an accusation after it, so re-derive the consequence on
-   each side of the write instead of reusing one verdict. (PR #101)
+   correctly refuse, but after the write the second *rules a rollback out* —
+   the live verdict authorizes the merge — while the first only leaves it
+   open. Collapsed, a reviewer republishing an *identical* approval produced a
+   red run announcing a revocation and printing a `git revert` for a merge its
+   own live evidence authorized (PR #101). Return a class, and let each caller
+   decide what each class means. Three corollaries. A remedy printed in an
+   alert is an **instruction** regardless of the prose above it, so a class the
+   evidence *rules out* must not print the command at all. A class that leaves
+   the question *open* is not authority to act either: by rule 2 those same
+   snapshots cannot date the change, so distinguish "the remedy could be right"
+   from "the evidence says do it" — name the condition it depends on and the
+   evidence that would settle it (here, the reviewer saying which ordering it
+   was), and never let the run's own conclusion be that the write was
+   unauthorized. And conservatism is free before a state change and an
+   accusation after it, so re-derive the consequence on each side of the write
+   instead of reusing one verdict. (PR #101)
 
 ---
 

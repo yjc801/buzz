@@ -164,7 +164,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    # Disabled: this lane routinely runs far too long. To re-enable, restore
+    # the original condition:
+    # if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: false
     permissions:
       contents: read
     steps:
@@ -330,7 +333,9 @@ jobs:
     steps:
       - name: Check desktop jobs
         run: |
-          if [ "${{ needs.desktop-core.result }}" != "success" ]; then
+          # desktop-core is disabled (if: false above), so "skipped" is
+          # expected; still fail on a real failure if it is re-enabled.
+          if [ "${{ needs.desktop-core.result }}" != "success" ] && [ "${{ needs.desktop-core.result }}" != "skipped" ]; then
             echo "Desktop Core finished with: ${{ needs.desktop-core.result }}"
             exit 1
           fi

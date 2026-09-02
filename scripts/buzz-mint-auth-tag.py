@@ -10,6 +10,15 @@ Commands:
   mint --agent-pub <hex64>     Mint an auth tag for that agent pubkey.
                                Owner secret from NOSTR_OWNER_SECRET env (hex or nsec).
                                Optional --conditions per NIP-OA (default: empty).
+  verify-event --pubkey <hex64>
+                               Read one signed Nostr event as JSON on stdin and
+                               prove it: NIP-01 id recomputed from the event's
+                               own fields, BIP-340 signature checked against
+                               that id, author pinned to --pubkey. Prints the
+                               verified id; exits 1 if anything fails.
+                               No network, no secrets — this is how a caller
+                               holding only public data can trust an event it
+                               was handed by something it does not trust.
   selftest                     Verify implementation against the NIP-OA test vectors.
 
 Secrets are only ever read from env, never argv (argv leaks via `ps`).
@@ -17,6 +26,7 @@ Secrets are only ever read from env, never argv (argv leaks via `ps`).
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 
@@ -121,6 +131,78 @@ def schnorr_verify(msg32, pub32, sig64):
     return R is not None and R[1] % 2 == 0 and R[0] == r
 
 
+# --- NIP-01 events ----------------------------------------------------------
+
+# The id of a Nostr event is sha256 over a canonical serialization of the
+# event's own fields, and the signature is BIP-340 over that id. Together they
+# make an event self-proving: anyone holding the JSON can establish that this
+# author wrote exactly this content at exactly this time, with no relay, no
+# network, and no trust in whatever handed the JSON over.
+EVENT_FIELDS = ("id", "pubkey", "created_at", "kind", "tags", "content", "sig")
+
+
+def event_serialization(event):
+    """The NIP-01 preimage: [0, pubkey, created_at, kind, tags, content].
+
+    Compact separators and no ASCII escaping, so only the characters JSON
+    requires are escaped — which is what NIP-01 specifies.
+    """
+    return json.dumps(
+        [
+            0,
+            event["pubkey"],
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"],
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def event_id(event):
+    return hashlib.sha256(event_serialization(event).encode("utf-8")).hexdigest()
+
+
+def verify_event(event, expected_pubkey):
+    """Return the verified event id, or raise ValueError explaining the refusal.
+
+    Every check is a refusal, never a warning: a caller that merges code on the
+    strength of this event must not be able to proceed on a partial proof.
+    """
+    if not isinstance(event, dict):
+        raise ValueError("event must be a JSON object")
+    missing = [f for f in EVENT_FIELDS if f not in event]
+    if missing:
+        raise ValueError(f"event is missing {', '.join(missing)}")
+    if not isinstance(event["created_at"], int) or isinstance(event["created_at"], bool):
+        raise ValueError("created_at must be an integer")
+    if not isinstance(event["kind"], int) or isinstance(event["kind"], bool):
+        raise ValueError("kind must be an integer")
+    if not isinstance(event["content"], str):
+        raise ValueError("content must be a string")
+    if not isinstance(event["tags"], list):
+        raise ValueError("tags must be an array")
+    for name in ("id", "pubkey", "sig"):
+        if not isinstance(event[name], str):
+            raise ValueError(f"{name} must be a string")
+    pubkey = event["pubkey"].lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", pubkey):
+        raise ValueError("pubkey is not 64 hex characters")
+    if pubkey != expected_pubkey.lower():
+        raise ValueError(f"event author is {pubkey}, not the expected {expected_pubkey.lower()}")
+    sig = event["sig"].lower()
+    if not re.fullmatch(r"[0-9a-f]{128}", sig):
+        raise ValueError("sig is not 128 hex characters")
+    computed = event_id(event)
+    if computed != event["id"].lower():
+        raise ValueError(f"event id {event['id'].lower()} does not match its content (recomputed {computed})")
+    if not schnorr_verify(bytes.fromhex(computed), bytes.fromhex(pubkey), bytes.fromhex(sig)):
+        raise ValueError(f"signature does not verify for event {computed}")
+    return computed
+
+
 # --- nsec (bech32) ----------------------------------------------------------
 B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
@@ -207,7 +289,53 @@ def selftest():
     bad = bytearray(vec_sig)
     bad[0] ^= 1
     assert not schnorr_verify(msg, bytes.fromhex(owner_pub), bytes(bad)), "tampered sig accepted"
-    print("selftest: all NIP-OA vectors pass")
+    # NIP-01 serialization: the escaping rule is the part a signature check
+    # cannot catch — a wrong rule yields a wrong id, and a wrong id yields a
+    # "bad signature" that looks like tampering. Pin the exact preimage for a
+    # payload holding every character JSON must escape plus non-ASCII that it
+    # must NOT escape.
+    tricky = {
+        "pubkey": "00" * 32,
+        "created_at": 1,
+        "kind": 9,
+        "tags": [["h", "room"], ["e", "id", "", "reply"]],
+        "content": 'quote " backslash \\ newline \n tab \t em—dash 🐝',
+    }
+    expected = (
+        '[0,"' + "00" * 32 + '",1,9,[["h","room"],["e","id","","reply"]],'
+        '"quote \\" backslash \\\\ newline \\n tab \\t em—dash 🐝"]'
+    )
+    assert event_serialization(tricky) == expected, (
+        f"NIP-01 serialization drifted:\n  got {event_serialization(tricky)}\n  want {expected}"
+    )
+
+    # A signed event verifies; the same event with any field disturbed does not.
+    sec = int.from_bytes(hashlib.sha256(b"buzz selftest event key").digest(), "big") % N
+    signed = dict(tricky, pubkey=xonly(sec).hex())
+    signed["id"] = event_id(signed)
+    signed["sig"] = schnorr_sign(bytes.fromhex(signed["id"]), sec, bytes(32)).hex()
+    assert verify_event(signed, signed["pubkey"]) == signed["id"], "own event rejected"
+    for label, bad in (
+        ("content", dict(signed, content=signed["content"] + "!")),
+        ("created_at", dict(signed, created_at=2)),
+        ("kind", dict(signed, kind=1)),
+        ("tags", dict(signed, tags=[])),
+        ("sig", dict(signed, sig="00" * 64)),
+    ):
+        try:
+            verify_event(bad, signed["pubkey"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"tampered {label} accepted")
+    try:
+        verify_event(signed, "11" * 32)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("event from an unexpected author accepted")
+
+    print("selftest: all NIP-OA vectors pass; NIP-01 event verification passes")
 
 
 def main():
@@ -244,6 +372,25 @@ def main():
             raise SystemExit("set NOSTR_OWNER_SECRET (hex or nsec) in the environment")
         tag = mint(parse_secret(owner_env), agent_pub, conditions)
         print(json.dumps(tag, separators=(",", ":")))
+        return
+    if args[0] == "verify-event":
+        pubkey = None
+        it = iter(args[1:])
+        for a in it:
+            if a == "--pubkey":
+                pubkey = next(it)
+            else:
+                raise SystemExit(f"unknown arg: {a}")
+        if not pubkey or not re.fullmatch(r"[0-9a-fA-F]{64}", pubkey):
+            raise SystemExit("verify-event requires --pubkey <hex64>")
+        try:
+            event = json.loads(sys.stdin.read())
+        except ValueError as exc:
+            raise SystemExit(f"verify-event: stdin is not JSON: {exc}")
+        try:
+            print(verify_event(event, pubkey))
+        except ValueError as exc:
+            raise SystemExit(f"verify-event: {exc}")
         return
     raise SystemExit(__doc__)
 

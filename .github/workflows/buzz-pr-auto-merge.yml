@@ -75,13 +75,13 @@ name: buzz-pr-auto-merge
 # WHAT CANNOT BE FENCED, AND WHY THE FIX IS ON THE OTHER SIDE OF THE WRITE.
 #
 # The merge is a write to GitHub. GitHub evaluates its own merge preconditions
-# — head SHA via --match-head-commit, draft state, branch rules — and it cannot
+# — head SHA via the pinned `sha`, draft state, branch rules — and it cannot
 # observe a Nostr relay. The reviewer holds no GitHub credential, deliberately:
 # that is exactly what makes the verdict unforgeable by this workflow. So no
 # relay artifact can ever be a precondition GitHub checks, and every relay read
 # is a read with a window after it.
 #
-# A read placed closer to `gh pr merge` therefore SHRINKS that window and never
+# A read placed closer to the merge write therefore SHRINKS that window and never
 # closes it. Three revisions tried to fence the verdict with a same-system read
 # and each was wrong for the same reason; this is the same shape one system
 # further out. So the merge step does not pretend: it reads once before the
@@ -92,7 +92,7 @@ name: buzz-pr-auto-merge
 #
 # The unraceable stops all live in GitHub's own domain, where the merge is
 # evaluated: convert the PR to a draft, close it, or push to the branch (which
-# invalidates --match-head-commit). docs/pr-auto-merge.md, "What cannot be
+# invalidates the pinned head `sha`). docs/pr-auto-merge.md, "What cannot be
 # fenced, and why we stopped trying", is the long form.
 #
 # WHAT THE VERDICT READ PROVES:
@@ -733,7 +733,7 @@ jobs:
             || contradiction "verdict no longer authorizes: $(jq -r .reason <<<"$VERDICT_JSON")"
 
           # 5. Checks, re-read. A non-required check rerun after the sweep can
-          #    go pending or red without moving the head, and --match-head-commit
+          #    go pending or red without moving the head, and the pinned `sha`
           #    fences only the head.
           ROLLUP=$(jq '.statusCheckRollup // []' <<<"$VIEW")
           PENDING=$(jq '[.[] | select((.__typename == "CheckRun" and .status != "COMPLETED")
@@ -797,7 +797,7 @@ jobs:
       # The only step in either job that can write to the repository, and the
       # only one AUTO_MERGE_TOKEN is exposed to. Even here it is applied per
       # command rather than exported as GH_TOKEN, and stripped from the
-      # environment of the relay read, so nothing but `gh pr merge` and the
+      # environment of the relay read, so nothing but the merge write and the
       # audit comment ever sees merge authority.
       - name: Merge
         if: steps.revalidate.outputs.proceed == 'true'
@@ -884,7 +884,7 @@ jobs:
           # still the newest before it is acted on.)
           #
           # So this read catches every revocation that lands before it, and one
-          # cannot exist that it also catches after it: `gh pr merge` is a
+          # cannot exist that it also catches after it: the merge is a
           # write to GitHub, GitHub evaluates its own preconditions (head SHA,
           # draft, branch rules) and cannot observe the relay, and the reviewer
           # holds no GitHub credential — deliberately, because that is what
@@ -921,11 +921,19 @@ jobs:
           fi
           echo "verdict ${EVENT_ID} is still the standing value at the coordinate"
 
-          # --match-head-commit makes the merge itself a conditional write: a
+          # The `sha` parameter makes the merge itself a conditional write: a
           # push racing this run is rejected by GitHub, not by our last read.
           # It fences the head and nothing else — GitHub has no condition that
           # observes a Nostr coordinate.
-          if ! GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" -R "$R" --squash --match-head-commit "$HEAD_SHA"; then
+          #
+          # REST, not `gh pr merge`: the GraphQL mergePullRequest mutation
+          # behind `gh pr merge` is not accessible to a fine-grained PAT
+          # ("Resource not accessible by personal access token", observed on
+          # the first armed run, 33596879763), while the REST endpoint honors
+          # the same fence — `sha` is `--match-head-commit` by another name.
+          # Every MERGE_TOKEN call in this step is REST for the same reason.
+          if ! GH_TOKEN="$MERGE_TOKEN" gh api -X PUT "repos/$R/pulls/$PR/merge" \
+              -f merge_method=squash -f sha="$HEAD_SHA" >/dev/null; then
             echo "::error::merge failed for PR #$PR — the PR channel was told a merge was authorized; reconcile by hand"
             exit 1
           fi
@@ -938,7 +946,7 @@ jobs:
           # never. Prevention was impossible. Silence was not.
           #
           # What this read proves is exactly this and no more: the coordinate
-          # authorized the merge before `gh pr merge`, and does not authorize
+          # authorized the merge before the write, and does not authorize
           # it now. It does NOT establish WHEN it stopped. Two sequences
           # produce identical observations here:
           #
@@ -1025,8 +1033,8 @@ jobs:
           fi
 
           if [ -n "$STATE" ]; then
-            REVERT=$(GH_TOKEN="$MERGE_TOKEN" gh pr view "$PR" -R "$R" \
-              --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null) || REVERT=""
+            REVERT=$(GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/pulls/$PR" \
+              --jq '.merge_commit_sha // empty' 2>/dev/null) || REVERT=""
             # The revert is offered only where it could be the right move. A
             # republished approval is not a candidate for one, and printing a
             # `git revert` under it would say otherwise no matter how the prose
@@ -1044,7 +1052,7 @@ jobs:
             ALERT=$(printf '🚨 %s\n\nPR #%s was squash-merged at `%s` on verdict `%s`. Re-reading the reviewer'"'"'s verdict coordinate immediately after the merge: %s.\n\n%s\n\nThis is a detection, not a prevention — the merge write cannot be fenced on a relay value, and the post-merge read cannot date what it finds, see "What cannot be fenced" in `docs/pr-auto-merge.md`.\n\nRun: %s/%s/actions/runs/%s\n' \
               "$HEADLINE" "$PR" "$HEAD_SHA" "$EVENT_ID" "$WHY" "$REMEDY" \
               "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")
-            if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$ALERT"; then
+            if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$ALERT" >/dev/null; then
               echo "::error::PR #$PR: the post-merge alert could not be posted to the PR — this run log is the only record"
             fi
             # Best-effort: the mirror archives the PR channel right after the
@@ -1061,9 +1069,9 @@ jobs:
           echo "the verdict still stands after the merge"
 
           # shellcheck disable=SC2016  # backticks are markdown, not command substitution
-          if ! GH_TOKEN="$MERGE_TOKEN" gh pr comment "$PR" -R "$R" --body "$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
+          if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
             "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
-            "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")"; then
+            "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")" >/dev/null; then
             echo "::error::PR #$PR merged but the audit comment failed — the record is incomplete"
             exit 1
           fi

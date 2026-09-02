@@ -10,13 +10,13 @@
 # after the reviewer replaces it — replacing a NIP-33 coordinate does not alter
 # the old event, it stops being current.
 #
-# So the property under test is narrow and specific: `gh pr merge` must not run
+# So the property under test is narrow and specific: the merge write must not run
 # unless a FRESH read of the coordinate still authorizes. The gh stub records
 # every invocation, and each scenario asserts on whether the merge was reached
 # — not merely on the step's exit code, because refusing is a clean exit.
 #
 # The second half of the file tests the half of the problem that CANNOT be
-# prevented. `gh pr merge` is a write to GitHub, GitHub cannot observe the
+# prevented. The merge is a write to GitHub, GitHub cannot observe the
 # relay, and the reviewer holds no GitHub credential — so a revocation that
 # lands between the last read and the write is unstoppable by construction (see
 # "What cannot be fenced" in docs/pr-auto-merge.md). What is testable is that
@@ -96,7 +96,7 @@ echo "\$*" >> "\$CALLS"
 # The post-merge alert asks GitHub for the squash commit so it can print a
 # revert command that is copy-pasteable rather than a placeholder.
 case "\$*" in
-  *"pr view"*) echo ${MERGE_COMMIT} ;;
+  *"merge_commit_sha"*) echo ${MERGE_COMMIT} ;;
 esac
 exit 0
 GHEOF
@@ -221,7 +221,7 @@ expect() {
   status=$(run_merge)
   if [ "$status" -ne 0 ]; then
     got=error
-  elif grep -q 'pr merge' "$WORK/calls"; then
+  elif grep -qE 'pulls/[0-9]+/merge' "$WORK/calls"; then
     got=merged
   else
     got=refused
@@ -303,7 +303,7 @@ expect_alert() {
   local label="$1" state="$2" revert="${3:-yes}" status ok=1 why=""
   status=$(run_merge)
   [ "$status" -ne 0 ] || { ok=0; why="${why} exit=0(expected red);"; }
-  grep -q 'pr merge' "$WORK/calls" || { ok=0; why="${why} the merge never happened;"; }
+  grep -qE 'pulls/[0-9]+/merge' "$WORK/calls" || { ok=0; why="${why} the merge never happened;"; }
   grep -q 'This is a detection, not a prevention' "$WORK/calls" \
     || { ok=0; why="${why} no alert comment on the PR;"; }
   if [ "$revert" = yes ]; then

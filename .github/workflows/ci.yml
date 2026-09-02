@@ -273,22 +273,22 @@ jobs:
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
-  # Split out of Desktop Core: this one recipe was ~15 of the lane's ~29
-  # minutes, because every compiled-flag permutation forces a full rebuild of
-  # the Tauri crate. On its own lane it no longer serializes behind the
-  # frontend and Tauri checks.
+  # Split out of Desktop Core, then sharded by compile state. Each BUZZ_BUILD_*
+  # permutation is a distinct compile of the Tauri crate (build.rs declares
+  # rerun-if-env-changed for all of them), so running the states sequentially
+  # made this the longest desktop lane. One job per state verifies the same
+  # build shapes concurrently instead. Keep `state` in sync with
+  # `compiled_flag_states` in the Justfile.
   desktop-tauri-compiled-flags:
-    name: Desktop Tauri Compiled Flags
+    name: Desktop Tauri Compiled Flags (${{ matrix.state }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     needs: [changes]
-    # Disabled: even on its own lane this matrix took 33m40s on PR #118 (a full
-    # rebuild per flag permutation), longer than the old combined Desktop Core
-    # lane. Nothing else runs `just desktop-tauri-test-compiled-flags`, so a
-    # flag regression now only surfaces in a release build with that flag set.
-    # To re-enable, restore the original condition:
-    # if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
-    if: false
+    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        state: [probes, owner-only, demo-slug]
     permissions:
       contents: read
     steps:
@@ -342,8 +342,8 @@ jobs:
       # shells out to node for the demo-name boundary check.
       - name: Desktop build
         run: just desktop-build
-      - name: Desktop Tauri compiled-flag verification
-        run: just desktop-tauri-test-compiled-flags
+      - name: Desktop Tauri compiled-flag verification (${{ matrix.state }})
+        run: just desktop-tauri-test-compiled-flags-state '${{ matrix.state }}'
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
@@ -440,9 +440,8 @@ jobs:
             echo "Desktop Tauri finished with: ${{ needs.desktop-tauri.result }}"
             exit 1
           fi
-          # desktop-tauri-compiled-flags is disabled (if: false above), so
-          # "skipped" is expected; still fail on a real failure if re-enabled.
-          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ] && [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "skipped" ]; then
+          # Matrix job: this result is success only if every state shard passed.
+          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ]; then
             echo "Desktop Tauri Compiled Flags finished with: ${{ needs.desktop-tauri-compiled-flags.result }}"
             exit 1
           fi

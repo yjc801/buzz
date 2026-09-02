@@ -17,21 +17,28 @@ pub const SEEN_RING_CAPACITY: usize = 4096;
 /// Per-request timeout for a webhook call, including connect.
 pub const WEBHOOK_TIMEOUT_SECS: u64 = 10;
 
-/// An in-memory ring of recently seen event ids, used to suppress duplicate
-/// deliveries within one process lifetime (a reconnect's 600-second replay
-/// overlap re-delivers events the process already handled).
+/// An in-memory ring of recently delivered `(rule index, event id)` pairs,
+/// used to suppress duplicate deliveries within one process lifetime (a
+/// reconnect's 600-second replay overlap re-delivers events the process
+/// already handled).
 ///
-/// Bounded: when full, the oldest id is evicted — an event replayed after
-/// 4096 newer ones slipped past the ring would be re-delivered, which the
+/// The key is the pair, not the event id alone: one event can match several
+/// rules, and the relay delivers it once per subscription. Keying on the id
+/// alone would let whichever subscription arrived first suppress every other
+/// rule's webhook for that event — each rule is an independent consumer and
+/// deduplicates independently.
+///
+/// Bounded: when full, the oldest key is evicted — an event replayed after
+/// 4096 newer keys slipped past the ring would be re-delivered, which the
 /// at-least-once contract permits.
 pub struct SeenRing {
-    order: VecDeque<String>,
-    members: HashSet<String>,
+    order: VecDeque<(usize, String)>,
+    members: HashSet<(usize, String)>,
     capacity: usize,
 }
 
 impl SeenRing {
-    /// An empty ring holding up to `capacity` ids.
+    /// An empty ring holding up to `capacity` keys.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -41,10 +48,13 @@ impl SeenRing {
         }
     }
 
-    /// Record `event_id`. Returns `true` the first time an id is seen,
-    /// `false` for a duplicate still inside the ring.
-    pub fn first_sighting(&mut self, event_id: &str) -> bool {
-        if self.members.contains(event_id) {
+    /// Record `event_id` against the rule at `rule_index`. Returns `true` the
+    /// first time that pair is seen, `false` for a duplicate still inside the
+    /// ring. Two different rules seeing the same event are two first
+    /// sightings.
+    pub fn first_sighting(&mut self, rule_index: usize, event_id: &str) -> bool {
+        let key = (rule_index, event_id.to_string());
+        if self.members.contains(&key) {
             return false;
         }
         if self.order.len() >= self.capacity {
@@ -52,8 +62,8 @@ impl SeenRing {
                 self.members.remove(&evicted);
             }
         }
-        self.order.push_back(event_id.to_string());
-        self.members.insert(event_id.to_string());
+        self.order.push_back(key.clone());
+        self.members.insert(key);
         true
     }
 }
@@ -106,7 +116,7 @@ impl TokenBucket {
 pub struct PreparedRequest {
     method: reqwest::Method,
     url: String,
-    headers: Vec<(String, String)>,
+    headers: Vec<(reqwest::header::HeaderName, String)>,
     body: Option<serde_json::Value>,
 }
 
@@ -140,16 +150,57 @@ pub fn retry_worthy_status(status: u16) -> bool {
     status >= 500
 }
 
-/// The HTTP client every delivery shares — connection pooling, rustls, and
-/// the per-request timeout in one place.
+/// The HTTP client every delivery shares — connection pooling, rustls, the
+/// per-request timeout, and the redirect policy in one place.
+///
+/// Redirects are **disabled**. A rule may place a `${VAR}` secret in *any*
+/// header value (`X-Hook-Token: ${TOKEN}`) or in the url itself, and reqwest
+/// only strips a small standard credential set (`Authorization`, cookies,
+/// proxy-authorization, WWW-authenticate) when it follows a cross-origin
+/// redirect — a custom header keeps its value all the way to whatever host
+/// the `Location` names, including a private or link-local address. Following
+/// a redirect would also move the request into a trust domain nobody
+/// configured. The repo's other outbound webhook path closes the same
+/// boundary for the same reason (`crates/buzz-workflow/src/executor.rs`).
+/// A 3xx therefore surfaces to [`deliver`] as a plain non-success status.
 ///
 /// # Errors
 /// Client construction fails (TLS backend initialization).
 pub fn build_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("buzz-webhook-bridge/", env!("CARGO_PKG_VERSION")))
         .build()
+}
+
+/// A transport failure rendered as a fixed class name, safe to log.
+///
+/// `reqwest::Error` carries the request url and its `Display` appends
+/// `for url (...)`. This crate deliberately allows `${VAR}` secrets in that
+/// url (a signed url, a query token), so an ordinary DNS/TLS/connect/timeout
+/// failure formatted with `%error` would write the secret into the daemon's
+/// logs. Every value this returns is a `&'static str`, so no part of the
+/// request can travel with it.
+#[must_use]
+pub fn transport_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_builder() {
+        "malformed-request"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
 }
 
 async fn send_once(
@@ -167,10 +218,12 @@ async fn send_once(
 }
 
 /// Deliver one prepared webhook call: one attempt, plus one retry on
-/// transport error or 5xx. The final outcome is logged (rule name and the
-/// unexpanded URL template only — never the expanded URL or headers) and
-/// swallowed: a failed webhook must not affect the bridge's own loop, and
-/// the consumer's polling fallback owns everything past the retry.
+/// transport error or 5xx. The final outcome is logged (rule name, the
+/// unexpanded URL template, and a status or a [`transport_error_class`] —
+/// never the expanded URL, the expanded headers, or a `reqwest::Error`, all
+/// three of which can carry a configured secret) and swallowed: a failed
+/// webhook must not affect the bridge's own loop, and the consumer's polling
+/// fallback owns everything past the retry.
 pub async fn deliver(
     client: reqwest::Client,
     rule_name: String,
@@ -188,6 +241,20 @@ pub async fn deliver(
                         %status,
                         attempt,
                         "webhook delivered"
+                    );
+                    return;
+                }
+                if status.is_redirection() {
+                    // Redirects are disabled on purpose (see `build_client`);
+                    // say so, rather than leaving an operator to puzzle over a
+                    // bare 3xx "delivery failed".
+                    tracing::error!(
+                        rule = %rule_name,
+                        url = %url_template,
+                        %status,
+                        "webhook answered a redirect; redirects are disabled so \
+                         configured secrets cannot follow one — point the rule at \
+                         the final url instead"
                     );
                     return;
                 }
@@ -210,11 +277,14 @@ pub async fn deliver(
                 return;
             }
             Err(error) => {
+                // `%error` would carry the expanded url; only the class is
+                // safe to log. See `transport_error_class`.
+                let class = transport_error_class(&error);
                 if attempt == 1 {
                     tracing::warn!(
                         rule = %rule_name,
                         url = %url_template,
-                        %error,
+                        error_class = class,
                         "webhook transport error; retrying once"
                     );
                     continue;
@@ -222,7 +292,7 @@ pub async fn deliver(
                 tracing::error!(
                     rule = %rule_name,
                     url = %url_template,
-                    %error,
+                    error_class = class,
                     "webhook delivery failed after retry; dropping"
                 );
                 return;
@@ -237,21 +307,164 @@ mod tests {
     use crate::rules::parse_rules;
     use serde_json::json;
     use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn fields() -> EventFields {
+        EventFields {
+            id: "aa".repeat(32),
+            pubkey: "ab".repeat(32),
+            kind: 30023,
+            created_at: 1,
+            d_tag: Some("pr-1".to_string()),
+            content: "CONTENT".to_string(),
+        }
+    }
+
+    /// A one-shot HTTP stub on loopback: answers the first connection with
+    /// `response` and hands back the raw request text it received.
+    ///
+    /// Deliberately raw `TcpListener` rather than a mock-HTTP dependency —
+    /// what is under test is the transport policy of the real client
+    /// [`build_client`] builds, so nothing about the wire may be simulated.
+    async fn http_stub(response: String) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let read = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+            let _ = tx.send(request);
+        });
+        (port, rx)
+    }
+
+    fn rule_hitting(port: u16, headers: serde_json::Value, env: &HashMap<String, String>) -> Rule {
+        let raw = json!([{
+            "name": "stub",
+            "filter": { "kinds": [30023], "authors": ["ab".repeat(32)] },
+            "webhook": {
+                "url": format!("http://127.0.0.1:{port}/hook"),
+                "headers": headers,
+            }
+        }])
+        .to_string();
+        parse_rules(&raw, env).expect("parses").remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_answered_but_never_followed() {
+        // The endpoint an attacker would redirect *to*. Nothing may reach it.
+        let (collector_port, collector) =
+            http_stub("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_string()).await;
+        let (endpoint_port, endpoint) = http_stub(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: \
+             http://127.0.0.1:{collector_port}/collect\r\ncontent-length: 0\r\n\r\n"
+        ))
+        .await;
+
+        let env: HashMap<String, String> =
+            [("TOKEN".to_string(), "s3cret-must-not-travel".to_string())]
+                .into_iter()
+                .collect();
+        // A *custom* header: reqwest strips only Authorization/cookie/proxy
+        // credentials across a cross-origin redirect, so this is the value
+        // that would actually escape if redirects were followed.
+        let rule = rule_hitting(endpoint_port, json!({ "X-Hook-Token": "${TOKEN}" }), &env);
+        let request = PreparedRequest::build(&rule, &fields());
+
+        let response = send_once(&build_client().expect("client"), &request)
+            .await
+            .expect("the configured endpoint answers");
+        assert_eq!(
+            response.status().as_u16(),
+            307,
+            "the 3xx surfaces to the caller instead of being followed"
+        );
+
+        let seen = endpoint
+            .await
+            .expect("the configured endpoint saw the call");
+        assert!(
+            seen.contains("s3cret-must-not-travel"),
+            "sanity: the secret does reach the endpoint the rule configured"
+        );
+
+        // A followed redirect would connect within milliseconds; half a second
+        // of silence on loopback means the policy held.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), collector)
+                .await
+                .is_err(),
+            "the redirect target must never be contacted — following it would hand a configured \
+             secret to a host nobody configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_is_logged_as_a_class_never_as_the_url() {
+        // Bind then drop, so the port is closed but known-unused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let secret = "SUPERSECRET-QUERY-TOKEN";
+        let error = build_client()
+            .expect("client")
+            .post(format!("http://127.0.0.1:{port}/hook?token={secret}"))
+            .send()
+            .await
+            .expect_err("a closed port refuses the connection");
+
+        assert!(
+            error.to_string().contains(secret),
+            "reqwest's own Display carries the request url — this is precisely the leak \
+             transport_error_class exists to stop. If this assertion ever fails, reqwest changed \
+             and the sanitizer's rationale needs re-checking (got: {error})"
+        );
+        assert_eq!(
+            transport_error_class(&error),
+            "connect",
+            "a refused connection classifies as connect"
+        );
+    }
 
     #[test]
     fn the_ring_suppresses_duplicates_until_eviction() {
         let mut ring = SeenRing::new(3);
-        assert!(ring.first_sighting("a"));
-        assert!(!ring.first_sighting("a"), "a duplicate is suppressed");
-        assert!(ring.first_sighting("b"));
-        assert!(ring.first_sighting("c"));
+        assert!(ring.first_sighting(0, "a"));
+        assert!(!ring.first_sighting(0, "a"), "a duplicate is suppressed");
+        assert!(ring.first_sighting(0, "b"));
+        assert!(ring.first_sighting(0, "c"));
         // Capacity 3 is full of {a,b,c}; inserting d evicts a.
-        assert!(ring.first_sighting("d"));
+        assert!(ring.first_sighting(0, "d"));
         assert!(
-            ring.first_sighting("a"),
+            ring.first_sighting(0, "a"),
             "an evicted id counts as new again — at-least-once permits the re-delivery"
         );
-        assert!(!ring.first_sighting("d"));
+        assert!(!ring.first_sighting(0, "d"));
+    }
+
+    #[test]
+    fn one_event_is_a_first_sighting_once_per_rule() {
+        let mut ring = SeenRing::new(16);
+        assert!(ring.first_sighting(0, "shared"));
+        assert!(
+            ring.first_sighting(1, "shared"),
+            "a second rule matching the same event is its own first sighting — keying on the \
+             event id alone would let rule 0 suppress rule 1's webhook"
+        );
+        assert!(!ring.first_sighting(0, "shared"));
+        assert!(!ring.first_sighting(1, "shared"));
     }
 
     #[test]

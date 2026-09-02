@@ -22,6 +22,16 @@ an in-memory ring (capacity 4096) suppresses duplicates within one process
 lifetime, and there is no durable state and no volume. A failed delivery is
 retried once (transport error or 5xx), then logged and dropped.
 
+Duplicate suppression is keyed by **rule and event**, not by event alone: one
+event matching two rules fires both webhooks, exactly once each.
+
+**Redirects are disabled.** A rule may put a `${VAR}` secret in any header
+value, and reqwest strips only a small standard credential set across a
+cross-origin redirect — following a `Location` would hand a configured secret,
+and the request itself, to a host nobody configured (including a private
+address). A 3xx is logged as a delivery failure; point the rule at the final
+url.
+
 ### Configuration (environment)
 
 | Variable | Required | Meaning |
@@ -77,9 +87,23 @@ A JSON array of rules:
   implicitly, and substituted values are never re-scanned for further
   placeholders.
 
-A malformed rule fails startup; a malformed incoming event is logged and
-skipped; transport errors reconnect with capped exponential backoff. The
+A malformed rule fails startup. That includes the request primitives: the
+`url` must **expand** to an absolute `http`/`https` url with a host, and every
+header name and expanded value must be a valid HTTP header — validated while
+the rules are assembled, so a broken rule cannot load looking healthy and then
+fail on every event forever. Validation errors name the *template*, never the
+expansion.
+
+A malformed incoming event is logged and skipped. Transport errors reconnect
+with capped exponential backoff, and that ladder only resets once the relay has
+actually accepted the subscriptions (an `EOSE` per rule, or a connection that
+simply survives) — writing the REQ is not acceptance, so a relay that closes
+every subscription backs off instead of reconnecting twice a second. The
 process does not exit on transient errors.
+
+Log lines never carry an expanded url, an expanded header value, or a raw
+`reqwest::Error` (which embeds the request url): a transport failure is logged
+as a fixed class — `timeout`, `connect`, `request`, and so on.
 
 ## Worked example: dispatching PR auto-merge on a reviewer verdict
 
@@ -128,7 +152,7 @@ stays enabled as the polling fallback; the bridge is purely the fast path.
 
 Notes on this configuration:
 
-- The `authors` pin is the reviewer's pubkey — only *his* signed notes can
+- The `authors` pin is the reviewer's pubkey — only *their* signed notes can
   fire the dispatch, whatever else lands on the relay.
 - `GITHUB_DISPATCH_TOKEN` is a fine-grained PAT with **actions:write only**.
   It can start the gated auto-merge sweep; it cannot merge anything itself —
@@ -151,11 +175,15 @@ Deploy-by-image, patterned on the waker (see the comments in
 `.github/workflows/waker-image.yml` for why images are built in Actions
 rather than by Fly's remote builder):
 
-1. Every push to `main` touching this crate, `buzz-ws-client`, the
-   Dockerfile, or the workflow builds and pushes
+1. Every push to `main` touching the binary's build-input closure — this
+   crate, its in-repo dependencies (`buzz-ws-client`, `buzz-core`),
+   `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, the Dockerfile, or the
+   workflow — builds and pushes
    `registry.fly.io/buzz-webhook-bridge:sha-<short>` via
    `.github/workflows/webhook-bridge-image.yml` (requires the
-   `FLY_API_TOKEN` repo secret).
+   `FLY_API_TOKEN` repo secret). Adding an in-repo dependency to the crate
+   means adding its path to that filter in the same change, or the registry's
+   `main` image silently stops tracking `main`.
 2. Deploy the immutable sha tag:
 
    ```bash

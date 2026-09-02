@@ -39,12 +39,28 @@
 //! - Each (re)subscribe asks for a 600-second overlap
 //!   ([`bridge::RESUBSCRIBE_OVERLAP_SECS`]), so events that arrived while
 //!   the bridge was reconnecting are replayed rather than lost.
-//! - An in-memory ring of seen event ids ([`dispatch::SeenRing`], capacity
-//!   4096) suppresses duplicate deliveries *within one process lifetime*.
-//!   There is no durable state and no volume: a restart may re-deliver
-//!   whatever the overlap window replays, which at-least-once permits.
+//! - An in-memory ring ([`dispatch::SeenRing`], capacity 4096) suppresses
+//!   duplicate deliveries *within one process lifetime*, keyed by
+//!   `(rule, event id)` — one event matching two rules is two independent
+//!   deliveries, not a duplicate. There is no durable state and no volume: a
+//!   restart may re-deliver whatever the overlap window replays, which
+//!   at-least-once permits.
 //! - A failed delivery is retried once (transport error or 5xx), then
 //!   logged and dropped. The polling fallback owns everything past that.
+//!
+//! # Outbound trust boundary
+//!
+//! A rule's url and header values may hold `${VAR}` secrets, so two things
+//! are closed here rather than left to the endpoint's good behavior:
+//!
+//! - **Redirects are disabled** ([`dispatch::build_client`]). reqwest strips
+//!   only a small standard credential set across a cross-origin redirect, so
+//!   following a `Location` would forward a custom secret header — and the
+//!   request — to a host nobody configured, private addresses included.
+//! - **No log line carries an expanded value.** [`rules::Expanded`] renders
+//!   its template, and a transport failure is logged as a fixed class
+//!   ([`dispatch::transport_error_class`]) because `reqwest::Error`'s own
+//!   `Display` embeds the request url.
 
 #![deny(unsafe_code)]
 

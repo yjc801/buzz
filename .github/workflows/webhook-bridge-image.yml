@@ -5,12 +5,26 @@ name: Webhook bridge image
 # from source — the same pattern as waker-image.yml, and for the same reason:
 # building in Actions keeps the deploy step a pure image pull.
 #
-# Unlike the waker lane, the push trigger carries a tight `paths:` filter.
-# This fork economizes CI, and an image build must not fire on every push to
-# main — only on changes that can actually alter the built image's behavior:
-# the crate itself, its one in-repo transport dependency (buzz-ws-client),
-# the Dockerfile, and this workflow. A workspace-wide dependency bump
-# (Cargo.lock) that matters here can be shipped with `workflow_dispatch`.
+# The `paths:` filter must cover the *complete* build-input closure of the
+# binary this workflow ships, not just the crate directory. The Docker build
+# runs `cargo build --locked -p buzz-webhook-bridge`, so its inputs are:
+#
+#   - the crate itself
+#   - every in-repo dependency in its closure — `cargo tree -p
+#     buzz-webhook-bridge` resolves exactly buzz-ws-client and buzz-core (which
+#     owns `verify_event`, the signature check every delivery goes through)
+#   - Cargo.toml / Cargo.lock, which decide third-party versions and features
+#   - rust-toolchain.toml, which decides the compiler
+#   - the Dockerfile and this workflow
+#
+# Anything left out here can merge to main and change the intended binary
+# without producing a new image — including a security fix to verification —
+# leaving the registry's `main` tag silently stale until someone remembers a
+# manual dispatch. If a new in-repo dependency is added to the crate, add its
+# path here in the same change. Same set on both triggers: a lockfile bump can
+# break the alpine build (a new crate wanting a system library), and finding
+# that out on `main` is exactly the case the pull_request build exists to
+# prevent.
 #
 # Single-arch (linux/amd64) on purpose, matching waker-image.yml: the Fly app
 # runs shared-cpu-1x, which is x86_64.
@@ -30,12 +44,20 @@ on:
     paths:
       - "crates/buzz-webhook-bridge/**"
       - "crates/buzz-ws-client/**"
+      - "crates/buzz-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "Dockerfile.webhook-bridge"
       - ".github/workflows/webhook-bridge-image.yml"
   pull_request:
     paths:
       - "crates/buzz-webhook-bridge/**"
       - "crates/buzz-ws-client/**"
+      - "crates/buzz-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "Dockerfile.webhook-bridge"
       - ".github/workflows/webhook-bridge-image.yml"
   workflow_dispatch: {}

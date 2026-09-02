@@ -4,7 +4,11 @@
 //! Rules arrive as JSON (inline via `BRIDGE_RULES` or from
 //! `BRIDGE_RULES_FILE` — see [`crate::config`]) and are validated into
 //! [`Rule`]s at startup. A malformed rule fails startup loudly; nothing here
-//! is repaired or defaulted silently.
+//! is repaired or defaulted silently. That includes the request primitives:
+//! the expanded url must parse as an absolute `http`/`https` url with a host,
+//! and every header name and expanded value must parse as a real HTTP header
+//! — otherwise a broken rule would look healthy in the startup log and fail
+//! only once a matching event had already been consumed and dropped.
 //!
 //! # Secret hygiene
 //!
@@ -206,12 +210,20 @@ pub struct RuleFilter {
 pub struct Webhook {
     /// Request URL. Env-expanded (may hold secrets — see [`Expanded`]);
     /// event placeholders are substituted at dispatch time.
+    ///
+    /// Validated at assembly as an absolute `http`/`https` url with a host
+    /// (`validate_url`), but kept as a template string
+    /// rather than a parsed `Url`: the placeholders are substituted per
+    /// event, so there is no single parsed value to hold.
     pub url: Expanded,
     /// HTTP method, default `POST`.
     pub method: reqwest::Method,
-    /// Header name/value pairs. Values are env-expanded (this is where
-    /// `Authorization: Bearer ${TOKEN}` lives).
-    pub headers: Vec<(String, Expanded)>,
+    /// Header name/value pairs, both validated as real HTTP header
+    /// primitives at assembly. The name is stored typed; the value stays an
+    /// [`Expanded`] (this is where `Authorization: Bearer ${TOKEN}` lives) so
+    /// that a `Debug` of this struct renders the template, not the secret —
+    /// `HeaderValue`'s own `Debug` would print it.
+    pub headers: Vec<(reqwest::header::HeaderName, Expanded)>,
     /// Optional JSON body template. Event placeholders are substituted into
     /// its string values at dispatch time; no env expansion happens here.
     pub body: Option<Value>,
@@ -232,6 +244,49 @@ fn validate_author(author: &str) -> Result<String, String> {
         ));
     }
     Ok(normalized)
+}
+
+/// Reject a webhook url that is not an absolute `http`/`https` url with a
+/// host.
+///
+/// Runs on the **expanded** url — `${VAR}` can supply the scheme, the host,
+/// or the whole thing, so validating the template would prove nothing. The
+/// error names the *template*: the expansion is exactly where secrets live.
+/// `url::ParseError`'s own text never embeds the input, so appending it is
+/// safe.
+///
+/// `{{event.*}}` placeholders are still present at this point and are legal
+/// url text (they percent-encode inside a path), so a templated url validates
+/// as the shape it will keep.
+fn validate_url(rule: &str, url: &Expanded) -> Result<(), RuleError> {
+    let parsed = reqwest::Url::parse(url.reveal()).map_err(|error| {
+        invalid(
+            rule,
+            format!(
+                "webhook.url {template:?} does not expand to a valid url: {error}",
+                template = url.template()
+            ),
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(invalid(
+            rule,
+            format!(
+                "webhook.url {template:?} must expand to an http or https url",
+                template = url.template()
+            ),
+        ));
+    }
+    if parsed.host_str().unwrap_or_default().is_empty() {
+        return Err(invalid(
+            rule,
+            format!(
+                "webhook.url {template:?} expands to a url with no host",
+                template = url.template()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn expand_for(
@@ -287,12 +342,31 @@ fn validate_rule(
     };
 
     let url = expand_for(&name, raw.webhook.url.trim(), env)?;
+    validate_url(&name, &url)?;
     let mut headers = Vec::new();
     for (header_name, header_value) in raw.webhook.headers.unwrap_or_default() {
-        if header_name.trim().is_empty() {
-            return Err(invalid(&name, "a webhook header has an empty name"));
-        }
-        headers.push((header_name.clone(), expand_for(&name, &header_value, env)?));
+        let parsed_name = reqwest::header::HeaderName::from_bytes(header_name.trim().as_bytes())
+            .map_err(|_| {
+                invalid(
+                    &name,
+                    format!("webhook header name {header_name:?} is not a valid HTTP header name"),
+                )
+            })?;
+        let value = expand_for(&name, &header_value, env)?;
+        // The parsed value is discarded: `Webhook` stores the `Expanded` so a
+        // Debug of the rule cannot print the secret. Parsing here is what
+        // makes a malformed value fail startup instead of failing forever, one
+        // silently dropped event at a time.
+        reqwest::header::HeaderValue::from_str(value.reveal()).map_err(|_| {
+            invalid(
+                &name,
+                format!(
+                    "webhook header {header_name:?} expands to a value that is not a valid HTTP \
+                     header value"
+                ),
+            )
+        })?;
+        headers.push((parsed_name, value));
     }
 
     let max_per_minute = match raw.max_per_minute {
@@ -647,6 +721,131 @@ mod tests {
             parse_rules(&duplicate.to_string(), &env(&[])),
             Err(RuleError::Invalid { .. })
         ));
+    }
+
+    /// The startup contract: a rule whose expanded url or headers are not
+    /// usable HTTP primitives must fail startup, not "load successfully" and
+    /// then fail at reqwest's builder for every event forever — by then the
+    /// event has already been consumed against the dedup ring and dropped.
+    #[test]
+    fn a_url_that_is_not_an_http_url_fails_startup() {
+        let cases = [
+            ("not a url", "an opaque string"),
+            ("/relative/hook", "a relative path"),
+            ("ftp://example.com/hook", "a non-http scheme"),
+            ("file:///etc/passwd", "a file url"),
+            ("https://", "no host"),
+        ];
+        for (url, why) in cases {
+            let raw = json!([{
+                "name": "r",
+                "filter": { "kinds": [1], "authors": ["ab".repeat(32)] },
+                "webhook": { "url": url }
+            }])
+            .to_string();
+            let error = parse_rules(&raw, &env(&[])).expect_err("must refuse");
+            assert!(
+                matches!(error, RuleError::Invalid { .. }),
+                "{why} ({url:?}) must be refused at startup, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_assembled_out_of_env_and_placeholders_still_validates() {
+        let raw = json!([{
+            "name": "templated",
+            "filter": { "kinds": [1], "authors": ["ab".repeat(32)] },
+            "webhook": { "url": "${BASE}/repos/{{event.d_tag}}/dispatches" }
+        }])
+        .to_string();
+        parse_rules(&raw, &env(&[("BASE", "https://api.github.com")]))
+            .expect("a templated https url is valid");
+
+        // The same rule with a scheme-less ${BASE} is not: validation runs on
+        // the expansion, so a bad secret cannot smuggle a bad url past it.
+        let error = parse_rules(&raw, &env(&[("BASE", "api.github.com")]))
+            .expect_err("must refuse a scheme-less expansion");
+        assert!(matches!(error, RuleError::Invalid { .. }), "got {error:?}");
+    }
+
+    #[test]
+    fn a_header_name_or_value_that_is_not_a_header_fails_startup() {
+        let cases: [(serde_json::Value, &str); 4] = [
+            (json!({ "bad header": "v" }), "a space in the name"),
+            (json!({ "": "v" }), "an empty name"),
+            (json!({ "X-Hook": "line\nbreak" }), "a newline in the value"),
+            (json!({ "X-Hook": "nul\u{0000}byte" }), "a nul in the value"),
+        ];
+        for (headers, why) in cases {
+            let raw = json!([{
+                "name": "r",
+                "filter": { "kinds": [1], "authors": ["ab".repeat(32)] },
+                "webhook": { "url": "https://example.com/hook", "headers": headers }
+            }])
+            .to_string();
+            let error = parse_rules(&raw, &env(&[])).expect_err("must refuse");
+            assert!(
+                matches!(error, RuleError::Invalid { .. }),
+                "{why} must be refused at startup, got {error:?}"
+            );
+        }
+    }
+
+    /// Header validation runs on the *expanded* value, and its error must not
+    /// carry that value — the expansion is where the secret is.
+    #[test]
+    fn a_secret_that_expands_to_an_illegal_header_value_is_refused_without_naming_it() {
+        const SECRET: &str = "line-one\nX-Injected: hunter2";
+        let raw = json!([{
+            "name": "r",
+            "filter": { "kinds": [1], "authors": ["ab".repeat(32)] },
+            "webhook": {
+                "url": "https://example.com/hook",
+                "headers": { "Authorization": "Bearer ${HOOK_TOKEN}" }
+            }
+        }])
+        .to_string();
+        let error = parse_rules(&raw, &env(&[("HOOK_TOKEN", SECRET)])).expect_err("must refuse");
+        assert!(matches!(error, RuleError::Invalid { .. }), "got {error:?}");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("hunter2"),
+            "the error must not carry the expanded value: {rendered}"
+        );
+    }
+
+    /// Every url rejection path — the scheme check, the host check, and the
+    /// `url::ParseError` branch that appends the parser's own text — must
+    /// name the template and never the expansion.
+    #[test]
+    fn a_url_error_names_the_template_not_the_expansion() {
+        for expansion in [
+            "gopher://secret-host/path",     // rejected by the scheme check
+            "https://",                      // rejected by the host check
+            "sensitive-not-a-url",           // rejected by url::Url::parse
+            "http://[secret-not-an-ipv6]/x", // rejected by url::Url::parse
+        ] {
+            let raw = json!([{
+                "name": "r",
+                "filter": { "kinds": [1], "authors": ["ab".repeat(32)] },
+                "webhook": { "url": "${HOOK_URL}" }
+            }])
+            .to_string();
+            let error =
+                parse_rules(&raw, &env(&[("HOOK_URL", expansion)])).expect_err("must refuse");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("${HOOK_URL}"),
+                "the error must name the template ({expansion:?}): {rendered}"
+            );
+            for fragment in ["secret", "sensitive"] {
+                assert!(
+                    !rendered.contains(fragment),
+                    "the error must not carry the expansion ({expansion:?}): {rendered}"
+                );
+            }
+        }
     }
 
     #[test]

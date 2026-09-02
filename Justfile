@@ -103,8 +103,9 @@ security-review-check:
 
 # Validate the PR auto-merge risk classifier, verdict parser, event
 # verification, the relay client, the CI aggregate contract, the merge job's
-# revalidation fence, the freshness check at the write itself, and the workflow
-# file that wires them together. This — not `just gate` — is the gate that covers a change to any of
+# revalidation fence, the freshness check at the write itself, the sweep's
+# approved-manual-merge label transitions, and the workflow file that wires
+# them together. This — not `just gate` — is the gate that covers a change to any of
 # them: `gate` maps .github/**, scripts/** and docs/** to "nothing to run".
 auto-merge-check:
     actionlint .github/workflows/buzz-pr-auto-merge.yml
@@ -116,6 +117,7 @@ auto-merge-check:
     python3 .github/scripts/pr-auto-merge-aggregate.test.py
     bash .github/scripts/pr-auto-merge-revalidate.test.sh
     bash .github/scripts/pr-auto-merge-write.test.sh
+    bash .github/scripts/pr-auto-merge-label.test.sh
 
 # Run the repository-wide differential file-size ratchet and its policy tests.
 # The ratchet inspects only files changed from the merge base, so this stays

@@ -205,6 +205,15 @@ jobs:
     if: github.repository == 'yjc801/buzz'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Job-level widening of the workflow's read-only default: the sweep
+    # maintains the `approved-manual-merge` visibility label, which needs
+    # pull-requests: write. Labels gate nothing — the merge credential still
+    # exists only in the merge job — so this cannot authorize a merge.
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+      statuses: read
     outputs:
       pr: ${{ steps.sweep.outputs.pr }}
       head: ${{ steps.sweep.outputs.head }}
@@ -222,33 +231,55 @@ jobs:
       channel: ${{ steps.sweep.outputs.channel }}
     steps:
       # Before checkout so a no-candidate tick costs a single API call.
+      #
+      # The listing itself is UNFILTERED — no `--base`, drafts and holds
+      # included — and the eligibility filter moved into the jq below. Both
+      # sets come out of the one call: the candidates to evaluate, and the
+      # open PRs still carrying `approved-manual-merge` that are NOT
+      # candidates. The label says "this sweep evaluated this PR and found a
+      # current approval it will not merge"; the moment a PR is drafted, held
+      # with `no-auto-merge`, retargeted off main, or pushed from a fork, the
+      # sweep stops evaluating it and can no longer make that claim, so the
+      # label has to come off. Without this the label would depend on the
+      # ORDER of events — the same end state reads as labelled if the hold
+      # arrived after the approval and unlabelled if it arrived before.
       - name: List candidate PRs
         id: candidates
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr list -R "$GITHUB_REPOSITORY" --state open --base main --limit 100 \
-            --json number,isDraft,labels,headRepositoryOwner,headRepository \
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 200 \
+            --json number,isDraft,labels,baseRefName,headRepositoryOwner,headRepository \
             > "$RUNNER_TEMP/prs.json"
           jq '[.[]
                 | select(
                     (.isDraft | not)
                     and (((.labels // []) | map(.name) | index("no-auto-merge")) == null)
+                    and (.baseRefName == "main")
                     and (.headRepositoryOwner.login == "yjc801")
                     and (.headRepository.name == "buzz"))
                 | .number]' "$RUNNER_TEMP/prs.json" > "$RUNNER_TEMP/candidates.json"
+          jq --slurpfile candidates "$RUNNER_TEMP/candidates.json" \
+            '[.[]
+               | select(((.labels // []) | map(.name) | index("approved-manual-merge")) != null)
+               | .number
+               | select((IN($candidates[0][]) | not))]' \
+            "$RUNNER_TEMP/prs.json" > "$RUNNER_TEMP/label-reconcile.json"
           COUNT=$(jq 'length' "$RUNNER_TEMP/candidates.json")
+          STALE=$(jq 'length' "$RUNNER_TEMP/label-reconcile.json")
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "stale_labels=$STALE" >> "$GITHUB_OUTPUT"
           echo "eligible PRs: $(jq -c . "$RUNNER_TEMP/candidates.json")"
+          echo "stale approved-manual-merge labels: $(jq -c . "$RUNNER_TEMP/label-reconcile.json")"
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        if: steps.candidates.outputs.count != '0'
+        if: steps.candidates.outputs.count != '0' || steps.candidates.outputs.stale_labels != '0'
         with:
           persist-credentials: false
 
       - name: Evaluate
         id: sweep
-        if: steps.candidates.outputs.count != '0'
+        if: steps.candidates.outputs.count != '0' || steps.candidates.outputs.stale_labels != '0'
         env:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
@@ -284,6 +315,95 @@ jobs:
           warn_skip() {
             echo "::warning::PR #$1: $2 — skipped this tick"
             decision "$1" "SKIP (unproven: $2)"
+          }
+
+          # Visibility label, not a gate: `approved-manual-merge` marks a PR
+          # whose CURRENT INTEGRATION — this head against this base tip —
+          # carries an APPROVE or APPROVE-WITH-NITS verdict that this sweep
+          # will nevertheless not merge (AUTO-MERGE: no, nits, a high floor,
+          # or a refused gate) — the owner's "ready for your click" queue.
+          # Best-effort: a failed label write warns and never blocks a
+          # decision; dry-run touches nothing.
+          #
+          # WHEN THE LABEL MOVES, AND WHY THE TWO DIRECTIONS DIFFER. The
+          # label is a claim, so the sweep may only write the claim it can
+          # prove at that point in the tick.
+          #
+          #   on   needs BOTH halves: the verdict covers the integration that
+          #        would merge today, AND this sweep is not going to merge it.
+          #        The second half is only settled at the three decision
+          #        points below (not requested / blocked / authorized), so
+          #        nothing before them may add the label.
+          #   off  needs only the first half to be false, and that is settled
+          #        the moment the verdict is read — a stale head, a moved
+          #        base, a REQUEST-CHANGES, or a provably empty coordinate.
+          #
+          # UNPROVEN IS NOT DISPROVEN, AND THE DIFFERENCE DECIDES THE EARLY
+          # EXITS. A tick can end long before the verdict read — mergeability
+          # still computing, a zero-file view, a failed base or file listing
+          # read, no PR channel yet. Leaving the label alone there is right
+          # only while the claim is merely unproven. It is wrong once the
+          # claim is DISPROVEN, and the commonest route to a transient exit is
+          # the very push that disproves it: GitHub recomputes mergeability on
+          # every push, so a PR labelled at H1 and pushed to H2 reports
+          # MERGEABLE=UNKNOWN for the first tick or two and would otherwise
+          # keep advertising H1's approval against H2.
+          #
+          # So an already-labelled PR has its claim re-checked FIRST, by
+          # reconcile_manual_claim below, ahead of every one of those exits.
+          # That pass only ever removes — adding still needs the merge
+          # question settled, which is not settled that early. What remains
+          # genuinely unprovable (a failed base-ref read that also leaves the
+          # head matching, relay weather) still leaves the label alone:
+          # clearing on the relay's weather would flap the queue.
+          MANUAL_MERGE_LABEL=approved-manual-merge
+          sync_manual_label() {
+            # sync_manual_label <pr> <on|off> <currently-labelled: true|false>
+            local N="$1" WANT="$2" HAS="$3"
+            [ "$DRY" = "true" ] && return 0
+            if [ "$WANT" = on ] && [ "$HAS" != "true" ]; then
+              gh pr edit "$N" -R "$R" --add-label "$MANUAL_MERGE_LABEL" \
+                || echo "::warning::PR #$N: could not add the ${MANUAL_MERGE_LABEL} label"
+            elif [ "$WANT" = off ] && [ "$HAS" = "true" ]; then
+              gh pr edit "$N" -R "$R" --remove-label "$MANUAL_MERGE_LABEL" \
+                || echo "::warning::PR #$N: could not remove the ${MANUAL_MERGE_LABEL} label"
+            fi
+            return 0
+          }
+
+          # Is the label's claim DISPROVEN for this PR? Echoes why when it is,
+          # and is the single definition of "ready for your click" — both the
+          # pre-gate reconciliation and MANUAL_WANT below ask this one
+          # question, so the two can never drift into disagreeing about what
+          # the label means.
+          #
+          # An empty <base-tip> means the current base could not be read. The
+          # head and the verdict kind can still disprove the claim on their
+          # own, so those are still checked; only the base comparison is
+          # skipped, because an unknown base cannot disprove anything.
+          #
+          # manual_claim_stale <verdict-kind> <reviewed-head> <head> \
+          #                    <reviewed-base> <base-tip-or-empty>
+          # exit 0 = disproven (reason on stdout), 1 = the claim still holds.
+          manual_claim_stale() {
+            local KIND="$1" RHEAD="$2" HEAD="$3" RBASE="$4" BTIP="$5"
+            if [ "$KIND" = "-" ] || [ -z "$KIND" ]; then
+              printf 'no usable verdict at the reviewer coordinate'
+              return 0
+            fi
+            if [ "$KIND" != APPROVE ] && [ "$KIND" != APPROVE-WITH-NITS ]; then
+              printf 'the standing verdict is %s' "$KIND"
+              return 0
+            fi
+            if [ "$RHEAD" != "$HEAD" ]; then
+              printf 'reviewed %s but the head is %s' "$RHEAD" "$HEAD"
+              return 0
+            fi
+            if [ -n "$BTIP" ] && [ "$RBASE" != "$BTIP" ]; then
+              printf 'reviewed against base %s but the base tip is %s' "$RBASE" "$BTIP"
+              return 0
+            fi
+            return 1
           }
 
           # --- Relay access. Every call below goes through the repository's own
@@ -354,6 +474,84 @@ jobs:
             relay standing-verdict --repo "$R" --pr "$1" --reviewer "$REVIEWER_PUBKEY"
           }
 
+          # Re-check an already-labelled PR's claim BEFORE the merge gates,
+          # so a disproven claim comes off even when the tick ends at one of
+          # the exits above the verdict read (see the label comment above).
+          # Only ever removes; never adds.
+          #
+          # Runs only for PRs that already carry the label — an unlabelled PR
+          # has no claim to disprove — so the common path pays nothing. A
+          # labelled one pays one extra API read and one extra relay read,
+          # both idempotent, and both re-done by the loop for the merge
+          # decision rather than cached: a value good enough to disprove a
+          # label is not automatically the value the merge gates may rely on.
+          #
+          # The parser is used here as a TRAILER READER only. --base and
+          # --floor feed `requested`/`authorized`, which this never reads; the
+          # three facts it does read (verdict, reviewedHead, mergeBase) are
+          # reported for any trailer that parses, whatever those two are. So
+          # the placeholders below cannot change the answer, and the
+          # comparison stays in manual_claim_stale.
+          UNKNOWN_SHA=0000000000000000000000000000000000000000
+          reconcile_manual_claim() {
+            # reconcile_manual_claim <pr> <head-sha> <base-ref>
+            # Clears HAS_MANUAL (a caller variable) when it drops the label.
+            local N="$1" HEAD="$2" BREF="$3" BTIP NOTE JSON WHY STATUS=0
+            BTIP=$(gh api "repos/$R/git/ref/heads/$BREF" --jq .object.sha) || BTIP=""
+            NOTE=$(fetch_verdict "$N") || STATUS=$?
+            if [ "$STATUS" -eq 3 ]; then
+              # Provably absent: the coordinate was read and holds nothing, so
+              # a label claiming an approval is known to be wrong.
+              drop_manual_claim "$N" "the reviewer has published no verdict for this PR"
+              return 0
+            fi
+            if [ "$STATUS" -eq 4 ]; then
+              # Unprovable this tick. Nothing is disproven, so the label
+              # stays, and the loop reads the coordinate again below. No
+              # warn_skip here: this pass does not skip the PR.
+              return 0
+            fi
+            if [ "$STATUS" -ne 0 ]; then
+              # Definitive: content ARRIVED and failed a proof (1), or this
+              # step called the client wrong (2). Neither is retryable, and
+              # neither may be treated as weather HERE, because "the loop
+              # classifies it below" is exactly what the gates between here
+              # and the loop's own read can prevent — a labelled PR whose
+              # verdict fails its proof while GitHub reports UNKNOWN would
+              # end its tick at the mergeability gate, relay_status would
+              # never run, the run would stay green, and the label would sit
+              # on evidence the workflow itself calls a bug or an attack. So
+              # the classifier runs at the point of failure instead.
+              relay_status "$N" "$STATUS" "the verdict coordinate could not be read" || exit 1
+              return 0
+            fi
+            if ! JSON=$(jq -c '[.]' <<<"$NOTE" \
+              | node .github/scripts/pr-auto-merge-verdict.js \
+                  --reviewer "$REVIEWER_PUBKEY" --head "$HEAD" \
+                  --base "$UNKNOWN_SHA" --floor low); then
+              echo "::error::verdict parser failed for PR #$N — this is a bug, not weather"
+              exit 1
+            fi
+            if WHY=$(manual_claim_stale \
+              "$(jq -r '.verdict // "-"' <<<"$JSON")" \
+              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" \
+              "$(jq -r '.mergeBase // "-"' <<<"$JSON")" "$BTIP"); then
+              drop_manual_claim "$N" "$WHY"
+            fi
+            return 0
+          }
+
+          drop_manual_claim() {
+            local N="$1" WHY="$2"
+            if [ "$DRY" = "true" ]; then
+              decision "$N" "RECONCILE (stale ${MANUAL_MERGE_LABEL}: ${WHY} — would drop)"
+              return 0
+            fi
+            sync_manual_label "$N" off true
+            HAS_MANUAL=false
+            decision "$N" "RECONCILE (stale ${MANUAL_MERGE_LABEL}: ${WHY} — dropped)"
+          }
+
           # One notice per (PR, head): dedup by scanning this identity's own
           # recent messages for the marker. A failed dedup read skips the post
           # (warn) — a missing notice is recoverable, a spammed channel is
@@ -370,8 +568,23 @@ jobs:
               | relay send --channel "$CH" >/dev/null
           }
 
+          # Open PRs that left the candidate set while still labelled. They are
+          # by construction the ones the loop below will never reach, so the
+          # only place the label can come off is here. Membership of this list
+          # is itself the proof — a PR is on it because the candidate filter
+          # rejected it, not because of anything read per-PR — so no further
+          # evidence is needed to clear it.
+          for N in $(jq -r 'sort | .[]' "$TMP/label-reconcile.json"); do
+            if [ "$DRY" = "true" ]; then
+              decision "$N" "RECONCILE (not an auto-merge candidate — would drop ${MANUAL_MERGE_LABEL})"
+            else
+              sync_manual_label "$N" off true
+              decision "$N" "RECONCILE (not an auto-merge candidate — dropping ${MANUAL_MERGE_LABEL})"
+            fi
+          done
+
           for N in $(jq -r 'sort | .[]' "$TMP/candidates.json"); do
-            VIEW=$(gh pr view "$N" -R "$R" --json state,headRefOid,baseRefName,mergeable,changedFiles,url,statusCheckRollup) || {
+            VIEW=$(gh pr view "$N" -R "$R" --json state,headRefOid,baseRefName,mergeable,changedFiles,url,labels,statusCheckRollup) || {
               warn_skip "$N" "PR read failed"
               continue
             }
@@ -381,9 +594,17 @@ jobs:
             MERGEABLE=$(jq -r .mergeable <<<"$VIEW")
             CHANGED=$(jq -r .changedFiles <<<"$VIEW")
             PR_URL=$(jq -r .url <<<"$VIEW")
+            HAS_MANUAL=$(jq -r --arg l "$MANUAL_MERGE_LABEL" '([.labels[]?.name] | index($l)) != null' <<<"$VIEW")
             if [ "$STATE" != "OPEN" ]; then
               decision "$N" "SKIP (state $STATE)"
               continue
+            fi
+
+            # Before any gate that can end this tick early: a label already on
+            # the PR is a published claim, and the exits below cannot tell a
+            # claim that is still good from one a push just invalidated.
+            if [ "$HAS_MANUAL" = "true" ]; then
+              reconcile_manual_claim "$N" "$HEAD_SHA" "$BASE_REF"
             fi
             if [ "$MERGEABLE" = "UNKNOWN" ]; then
               warn_skip "$N" "mergeability still computing"
@@ -450,6 +671,10 @@ jobs:
             EV_STATUS=0
             NOTE=$(fetch_verdict "$N") || EV_STATUS=$?
             if [ "$EV_STATUS" -eq 3 ]; then
+              # Exit 3 is provably absent, not weather: the coordinate was
+              # read and holds nothing. A label claiming an approval is then
+              # known to be wrong, so it comes off (see sync_manual_label).
+              sync_manual_label "$N" off "$HAS_MANUAL"
               decision "$N" "SKIP (the reviewer has published no verdict for this PR)"
               continue
             fi
@@ -472,8 +697,29 @@ jobs:
             EVENT_ID=$(jq -r '.eventId // "-"' <<<"$VERDICT_JSON")
             RISK=$(jq -r '.risk // "-"' <<<"$VERDICT_JSON")
             EFFECTIVE=$(jq -r '.effectiveRisk // "-"' <<<"$VERDICT_JSON")
+            VERDICT_KIND=$(jq -r '.verdict // "-"' <<<"$VERDICT_JSON")
+            REVIEWED_HEAD=$(jq -r '.reviewedHead // "-"' <<<"$VERDICT_JSON")
+            REVIEWED_BASE=$(jq -r '.mergeBase // "-"' <<<"$VERDICT_JSON")
+            # "Ready for your click": an APPROVE (with or without nits) over
+            # the integration that would actually merge today. Same predicate
+            # the pre-gate reconciliation used, now with the real base tip in
+            # hand — BOTH SHAS, for the same reason gates 3 and 4 need both.
+            # main can advance under an unchanged head, and the parser then
+            # reports `stale base` and refuses (pr-auto-merge-verdict.js) — an
+            # approval of head-against-B1 says nothing about head-against-B2.
+            # A head-only predicate would keep calling that PR ready to click
+            # and put an unreviewed integration in the owner's manual queue,
+            # which is precisely the state docs/pr-auto-merge.md says an
+            # approval must not survive into.
+            if manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" "$HEAD_SHA" \
+              "$REVIEWED_BASE" "$BASE_TIP" >/dev/null; then
+              MANUAL_WANT=off
+            else
+              MANUAL_WANT=on
+            fi
 
             if [ "$FOUND" != "true" ] || [ "$REQUESTED" != "true" ]; then
+              sync_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL"
               decision "$N" "SKIP (${REASON}; floor ${FLOOR})"
               continue
             fi
@@ -502,6 +748,17 @@ jobs:
             if [ "$PENDING" -gt 0 ]; then
               # Transient by construction — checks resolve on their own, and a
               # "blocked: still running" notice would be pure noise.
+              #
+              # The label is left exactly as it is, in either direction.
+              # Adding is wrong because whether this sweep will merge is still
+              # open — a PR heading for auto-merge would flap into the queue
+              # and straight back out every time checks are in flight. Nor is
+              # there a stale claim to clear: reaching this line at all
+              # required REQUESTED, so the verdict already covers this head
+              # against this base tip. A pushed-to or overtaken PR never gets
+              # here — it is dropped by the pre-gate reconciliation, or it
+              # leaves the loop at the not-requested branch above, and its
+              # label comes off at whichever it reaches first.
               decision "$N" "SKIP (checks still running; will re-evaluate)"
               continue
             fi
@@ -513,6 +770,7 @@ jobs:
             fi
 
             if [ -n "$BLOCKED" ]; then
+              sync_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL"
               REASONS=$(printf '%b' "$BLOCKED")
               decision "$N" "BLOCKED: $(printf '%s' "$REASONS" | tr '\n' '; ')"
               if [ "$DRY" != "true" ]; then
@@ -565,6 +823,7 @@ jobs:
               echo "verdict_events=$VERDICT_EVENTS"
               echo "channel=$CH"
             } >> "$GITHUB_OUTPUT"
+            sync_manual_label "$N" off "$HAS_MANUAL"
             decision "$N" "AUTHORIZED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR}) — handing to the merge job"
             # One merge per run: everything evaluated after a merge would be
             # judged against a main no gate observed. The next tick re-sweeps.

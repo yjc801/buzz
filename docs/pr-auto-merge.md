@@ -470,6 +470,65 @@ the only honest record.
   our side. Treat the label as a convenience, not a fence; if the merge must
   not happen, use the draft.
 - **Hold everything:** `gh workflow disable buzz-pr-auto-merge.yml`.
+- **"Ready for your click":** the sweep maintains an `approved-manual-merge`
+  label. It is applied when **both** halves hold: the reviewer's verdict is an
+  APPROVE or APPROVE-WITH-NITS over the integration that would merge *today*
+  — naming this head **and** this base tip, the same pair gates 3 and 4
+  require — and this sweep is not going to merge it anyway (AUTO-MERGE: no,
+  nits, a high floor, or a refused gate). Head alone is not enough: `main`
+  advancing under an unchanged head makes the verdict stale (gate 4), and a
+  label that ignored the base would advertise an unreviewed integration as
+  ready to merge.
+
+  It is removed as soon as the first half stops holding — a new head, `main`
+  moving, a REQUEST-CHANGES, a verdict withdrawn from the coordinate — and
+  when the merge is handed to the merge job. It is also removed from any open
+  PR that has **left the candidate set** (drafted, `no-auto-merge`, retargeted
+  off `main`, or a fork head), because the sweep no longer evaluates that PR
+  and so can no longer vouch for it; the label is not a place to record an
+  approval the sweep did not just verify. That reconciliation is what makes
+  the label order-independent — the same end state reads the same whether the
+  hold arrived before or after the approval.
+
+  The two directions are deliberately asymmetric. Adding needs the merge
+  question settled, so nothing before the not-requested / blocked / authorized
+  decision points may add it; removing needs only the verdict, so a stale
+  label is cleared even while checks are still running.
+
+  Because of that asymmetry, a PR that **already carries the label** has its
+  claim re-checked before any of the gates that can end a tick early —
+  mergeability still computing, a zero-file view, a failed base or file
+  listing read, no PR channel yet. Without that pass those exits would
+  preserve a claim a push had just invalidated, and they are the *likely*
+  place to land after such a push: GitHub recomputes mergeability on every
+  push, so a PR labelled at H1 and pushed to H2 reports `MERGEABLE=UNKNOWN`
+  for the first tick or two. The pass only ever removes.
+
+  What stays untouched is the genuinely **unprovable**, which is not the same
+  as the disproven: relay weather, and a base tip that could not be read (the
+  head and the verdict kind can still disprove the claim on their own, so
+  those are still checked; only the base comparison is skipped). "We could not
+  tell" is not "not approved", and clearing on the relay's weather would flap
+  the queue. When the label does move, the step summary names the fact that
+  moved it.
+
+  Unprovable in that sense means the relay client's **exit 4** and nothing
+  else. Because this pass is the first thing to read the verdict coordinate,
+  it is also the first thing that can hide a failure to read it: a coordinate
+  whose content arrived and failed a proof (exit 1) or a client called wrong
+  (exit 2) is a bug or an attack, not weather, and the gates this pass runs
+  ahead of would end the tick before anything else classified it. So it runs
+  the same classifier the sweep's own read uses, at the point of failure — a
+  definitive fault fails the run there, with the label left alone, rather than
+  being downgraded into a green tick that keeps advertising evidence known to
+  be unusable.
+
+  Visibility only: it gates nothing, the evaluate job holds no merge
+  credential, label writes are best-effort warnings, and dry-run never touches
+  labels. Reconciliation covers open PRs only — a PR closed while labelled
+  keeps the label, which the documented queue filter already excludes. Filter
+  the queue with `is:open label:approved-manual-merge`. Contract test:
+  `.github/scripts/pr-auto-merge-label.test.sh`.
 - **Required ruleset on `main`:** a prerequisite for the feature doing
   anything at all. Everything else the workflow checks is a read with a window
   after it; a branch rule is evaluated by GitHub as part of the merge itself,

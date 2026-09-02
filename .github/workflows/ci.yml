@@ -1337,6 +1337,7 @@ jobs:
       - desktop-e2e-integration-shard
       - desktop-e2e-integration
       - backend-integration
+      - postgres-tests
       - relay-e2e
       - web
       - mobile

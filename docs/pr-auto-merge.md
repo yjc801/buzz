@@ -471,13 +471,39 @@ the only honest record.
   not happen, use the draft.
 - **Hold everything:** `gh workflow disable buzz-pr-auto-merge.yml`.
 - **"Ready for your click":** the sweep maintains an `approved-manual-merge`
-  label — applied when the PR's current head carries an APPROVE or
-  APPROVE-WITH-NITS verdict the sweep will not merge (AUTO-MERGE: no, nits,
-  a high floor, or a refused gate), removed when the verdict goes stale or
-  the merge is handed off. Visibility only: it gates nothing, the evaluate
-  job holds no merge credential, label writes are best-effort warnings, and
-  dry-run never touches labels. Filter the queue with
-  `is:open label:approved-manual-merge`.
+  label. It is applied when **both** halves hold: the reviewer's verdict is an
+  APPROVE or APPROVE-WITH-NITS over the integration that would merge *today*
+  — naming this head **and** this base tip, the same pair gates 3 and 4
+  require — and this sweep is not going to merge it anyway (AUTO-MERGE: no,
+  nits, a high floor, or a refused gate). Head alone is not enough: `main`
+  advancing under an unchanged head makes the verdict stale (gate 4), and a
+  label that ignored the base would advertise an unreviewed integration as
+  ready to merge.
+
+  It is removed as soon as the first half stops holding — a new head, `main`
+  moving, a REQUEST-CHANGES, a verdict withdrawn from the coordinate — and
+  when the merge is handed to the merge job. It is also removed from any open
+  PR that has **left the candidate set** (drafted, `no-auto-merge`, retargeted
+  off `main`, or a fork head), because the sweep no longer evaluates that PR
+  and so can no longer vouch for it; the label is not a place to record an
+  approval the sweep did not just verify. That reconciliation is what makes
+  the label order-independent — the same end state reads the same whether the
+  hold arrived before or after the approval.
+
+  The two directions are deliberately asymmetric. Adding needs the merge
+  question settled, so nothing before the not-requested / blocked / authorized
+  decision points may add it; removing needs only the verdict, so a stale
+  label is cleared even while checks are still running. Anything that ends a
+  tick before a verdict is read — mergeability still computing, a failed API
+  or relay read, no PR channel yet — leaves the label untouched, since "we
+  could not tell" is not "not approved".
+
+  Visibility only: it gates nothing, the evaluate job holds no merge
+  credential, label writes are best-effort warnings, and dry-run never touches
+  labels. Reconciliation covers open PRs only — a PR closed while labelled
+  keeps the label, which the documented queue filter already excludes. Filter
+  the queue with `is:open label:approved-manual-merge`. Contract test:
+  `.github/scripts/pr-auto-merge-label.test.sh`.
 - **Required ruleset on `main`:** a prerequisite for the feature doing
   anything at all. Everything else the workflow checks is a read with a window
   after it; a branch rule is evaluated by GitHub as part of the merge itself,

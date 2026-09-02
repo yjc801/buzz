@@ -588,6 +588,13 @@ the only honest record.
   so rebase, let CI rerun, and let the reviewer re-verdict the new head.
 - **Scheduled-workflow sleep:** GitHub disables cron on 60 days of repo
   inactivity; a `workflow_dispatch` re-arms it.
+- **Event-driven trigger:** `buzz-webhook-bridge`
+  (`crates/buzz-webhook-bridge/README.md`) can dispatch this workflow within
+  seconds of the reviewer publishing a verdict note, via a rule on
+  kind 30023 at the `pr-verdict-…` coordinate. When the bridge is deployed,
+  the 10-minute cron is demoted to the fallback path — keep it enabled: the
+  bridge is at-least-once and explicitly a latency optimizer, not a delivery
+  guarantee, and the cron is what owns missed deliveries.
 
 ## Reviewer prompt section (canonical copy)
 

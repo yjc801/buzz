@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+#
+# buzz-webhook-bridge — generic outbound relay→webhook bridge, deployed as a
+# normal always-on Fly app (like buzz-waker; see Dockerfile.waker). Its whole
+# job is holding a live relay subscription, which is exactly the workload
+# Sprites are built to suspend, so it is not a Sprite.
+#
+# Unlike the waker there is no provider stage, no entrypoint script, and no
+# volume: the bridge keeps no durable state by design — its at-least-once
+# contract is a latency optimizer over the consumers' own polling fallback
+# (see crates/buzz-webhook-bridge/src/lib.rs), so a restart losing the
+# in-memory dedup ring is acceptable.
+#
+# Both bases are pinned to manifest-list digests, matching Dockerfile.waker,
+# so either architecture resolves to immutable source bytes.
+
+FROM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS builder
+
+RUN apk add --no-cache \
+      build-base \
+      cmake \
+      git \
+      musl-dev \
+      openssl-dev \
+      openssl-libs-static \
+      perl \
+      pkgconf \
+      protoc
+WORKDIR /build
+COPY . .
+RUN cargo build --release --locked \
+      -p buzz-webhook-bridge --bin buzz-webhook-bridge \
+    && strip target/release/buzz-webhook-bridge
+
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+
+RUN apk add --no-cache ca-certificates \
+    && adduser -D -h /home/bridge bridge
+
+COPY --from=builder --chmod=0755 /build/target/release/buzz-webhook-bridge /usr/local/bin/buzz-webhook-bridge
+
+ENV HOME=/home/bridge \
+    PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    RUST_LOG=buzz_webhook_bridge=info
+
+WORKDIR /home/bridge
+USER bridge
+ENTRYPOINT ["/usr/local/bin/buzz-webhook-bridge"]

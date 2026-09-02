@@ -1,0 +1,38 @@
+[package]
+name = "buzz-webhook-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generic outbound relay-to-webhook bridge: matches relay events against configured rules and fires templated HTTP webhooks"
+
+[lib]
+name = "buzz_webhook_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-webhook-bridge"
+path = "src/main.rs"
+
+[dependencies]
+buzz-core = { workspace = true }
+# The relay transport, and the only reason this crate touches a socket — the
+# same client `buzz-waker`'s feeds use. Do not hand-roll a WS client here.
+buzz-ws-client = { workspace = true }
+nostr = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Every wss:// connection (tungstenite) and every webhook call (reqwest) goes
+# through rustls, which needs a process-level CryptoProvider installed before
+# the first TLS handshake — both ring and aws-lc-rs arrive transitively, so
+# rustls cannot auto-select one and panics at first use without an explicit
+# install in `main`. Same dependency and reason as crates/buzz-waker.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

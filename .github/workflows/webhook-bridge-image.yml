@@ -1,0 +1,150 @@
+name: Webhook bridge image
+
+# Builds the buzz-webhook-bridge image and pushes it to Fly's registry, so
+# deploying is `fly deploy --image <ref>` rather than `fly deploy` building
+# from source — the same pattern as waker-image.yml, and for the same reason:
+# building in Actions keeps the deploy step a pure image pull.
+#
+# The `paths:` filter must cover the *complete* build-input closure of the
+# binary this workflow ships, not just the crate directory. The Docker build
+# runs `cargo build --locked -p buzz-webhook-bridge`, so its inputs are:
+#
+#   - the crate itself
+#   - every in-repo dependency in its closure — `cargo tree -p
+#     buzz-webhook-bridge` resolves exactly buzz-ws-client and buzz-core (which
+#     owns `verify_event`, the signature check every delivery goes through)
+#   - Cargo.toml / Cargo.lock, which decide third-party versions and features
+#   - rust-toolchain.toml, which decides the compiler
+#   - .cargo/config.toml — the Dockerfile's `COPY . .` puts it at /build/.cargo,
+#     where Cargo discovers it, so its `[env]` and profile settings feed the
+#     compile
+#   - .dockerignore, which Docker applies before that `COPY` and so decides
+#     which sources reach the build at all
+#   - the Dockerfile and this workflow
+#
+# Anything left out here can merge to main and change the intended binary
+# without producing a new image — including a security fix to verification —
+# leaving the registry's `main` tag silently stale until someone remembers a
+# manual dispatch. If a new in-repo dependency is added to the crate, add its
+# path here in the same change. Same set on both triggers: a lockfile bump can
+# break the alpine build (a new crate wanting a system library), and finding
+# that out on `main` is exactly the case the pull_request build exists to
+# prevent.
+#
+# Single-arch (linux/amd64) on purpose, matching waker-image.yml: the Fly app
+# runs shared-cpu-1x, which is x86_64.
+#
+# Requires an FLY_API_TOKEN repo secret with push access to the app's registry:
+#
+#   fly tokens create deploy -a buzz-webhook-bridge
+#   gh secret set FLY_API_TOKEN --repo <owner>/<repo>
+#
+# Deploy a built image with:
+#   fly deploy --app buzz-webhook-bridge \
+#     --image registry.fly.io/buzz-webhook-bridge:sha-<short>
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/buzz-webhook-bridge/**"
+      - "crates/buzz-ws-client/**"
+      - "crates/buzz-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".dockerignore"
+      - "Dockerfile.webhook-bridge"
+      - ".github/workflows/webhook-bridge-image.yml"
+  pull_request:
+    paths:
+      - "crates/buzz-webhook-bridge/**"
+      - "crates/buzz-ws-client/**"
+      - "crates/buzz-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".dockerignore"
+      - "Dockerfile.webhook-bridge"
+      - ".github/workflows/webhook-bridge-image.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webhook-bridge-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Pull requests build without pushing: the image is a deploy artifact, and
+      # a fork PR has no registry credentials anyway. Catching a broken
+      # Dockerfile still has value, so the build itself always runs.
+      - name: Log in to Fly registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: registry.fly.io
+          # Fly's registry takes any username with a deploy token as the
+          # password; `x` is the documented placeholder.
+          username: x
+          password: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          IMAGE="registry.fly.io/buzz-webhook-bridge"
+          # sha- tag is the one to deploy: immutable, and names the commit the
+          # image was built from. `main` is a convenience pointer that moves.
+          echo "sha_tag=${IMAGE}:sha-${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "main_tag=${IMAGE}:main" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.webhook-bridge
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.main_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise
+        if: github.event_name != 'pull_request'
+        env:
+          SHA_TAG: ${{ steps.tags.outputs.sha_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Webhook bridge image pushed"
+            echo
+            echo '```'
+            echo "image:  $SHA_TAG"
+            echo "digest: $DIGEST"
+            echo '```'
+            echo
+            echo "Deploy it:"
+            echo
+            echo '```bash'
+            echo "fly deploy --app buzz-webhook-bridge --image $SHA_TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

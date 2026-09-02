@@ -32,6 +32,7 @@ members = [
     "crates/buzz-backend-sprites",
     "crates/buzz-provider-deploy",
     "crates/buzz-waker",
+    "crates/buzz-webhook-bridge",
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
 ]

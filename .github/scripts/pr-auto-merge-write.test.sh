@@ -10,13 +10,13 @@
 # after the reviewer replaces it — replacing a NIP-33 coordinate does not alter
 # the old event, it stops being current.
 #
-# So the property under test is narrow and specific: `gh pr merge` must not run
+# So the property under test is narrow and specific: the merge write must not run
 # unless a FRESH read of the coordinate still authorizes. The gh stub records
 # every invocation, and each scenario asserts on whether the merge was reached
 # — not merely on the step's exit code, because refusing is a clean exit.
 #
 # The second half of the file tests the half of the problem that CANNOT be
-# prevented. `gh pr merge` is a write to GitHub, GitHub cannot observe the
+# prevented. The merge is a write to GitHub, GitHub cannot observe the
 # relay, and the reviewer holds no GitHub credential — so a revocation that
 # lands between the last read and the write is unstoppable by construction (see
 # "What cannot be fenced" in docs/pr-auto-merge.md). What is testable is that
@@ -49,6 +49,11 @@ REPO=yjc801/buzz
 PR=4242
 HEAD_SHA=1111111111111111111111111111111111111111
 BASE_TIP=3333333333333333333333333333333333333333
+# Two DIFFERENT values, because which credential a call ran under is part of
+# the contract and not an incidental: MERGE_TOKEN is the only token in the job
+# with write authority, and the job's default token cannot merge at all.
+MERGE_TOKEN_VALUE=merge-write-token
+READ_TOKEN_VALUE=read-only-token
 
 [ -f "$WORKFLOW" ] || { echo "run from the repository root" >&2; exit 2; }
 
@@ -92,11 +97,17 @@ mkdir -p "$WORK/bin"
 MERGE_COMMIT=9999999999999999999999999999999999999999
 cat > "$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
-echo "\$*" >> "\$CALLS"
+# ONE RECORD PER INVOCATION, with the credential beside the arguments. This
+# stub exits 0 for anything, so a recorded call proves only that gh ran — what
+# the assertions have to be able to inspect is the REQUEST, and its token,
+# method, endpoint and fields are only a request while they are still one
+# record. A comment body is markdown and carries newlines, so those are folded
+# to spaces rather than allowed to split one call across several lines.
+{ printf 'token=%s %s' "\${GH_TOKEN-<unset>}" "\$*" | tr '\n' ' '; echo; } >> "\$CALLS"
 # The post-merge alert asks GitHub for the squash commit so it can print a
 # revert command that is copy-pasteable rather than a placeholder.
 case "\$*" in
-  *"pr view"*) echo ${MERGE_COMMIT} ;;
+  *"merge_commit_sha"*) echo ${MERGE_COMMIT} ;;
 esac
 exit 0
 GHEOF
@@ -199,8 +210,8 @@ run_merge() {
   GITHUB_STEP_SUMMARY="$WORK/summary" \
   GITHUB_SERVER_URL=https://github.com \
   GITHUB_RUN_ID=1 \
-  MERGE_TOKEN=stub \
-  GH_TOKEN=stub \
+  MERGE_TOKEN="$MERGE_TOKEN_VALUE" \
+  GH_TOKEN="$READ_TOKEN_VALUE" \
   REVIEWER_NAME=Alex \
   REVIEWER_PUBKEY="$REVIEWER_PUB" \
   PR="$PR" \
@@ -215,23 +226,103 @@ run_merge() {
 FAILURES=0
 PASSES=0
 
+# --- what a recorded call has to contain to be the request GitHub needs -----
+#
+# `gh api` is not `gh pr merge`: the request is assembled from flags, this
+# stub accepts any of them, and GitHub is not here to reject a malformed one.
+# So "a line mentioning the endpoint was recorded" is not evidence that a
+# merge would happen. Every element below is load-bearing, and each is checked
+# on its own so a failure names the one that regressed:
+#
+#   token=       MERGE_TOKEN is the only credential in this job with write
+#                authority; the job's default token cannot perform the merge.
+#   -X PUT       `gh api` sends POST as soon as an -f field is present, and
+#                the merge endpoint does not accept POST — this is the exact
+#                class of mistake the move off `gh pr merge` introduced.
+#   endpoint     matched as a whole path, so `pulls/N/merger` is not a match.
+#   merge_method the repository squashes; gh's default is a merge commit,
+#                which would put a different shape of history on main.
+#   sha          the conditional-write fence — `--match-head-commit` by
+#                another name. Without it, a head pushed between revalidation
+#                and the write is merged instead of rejected.
+
+# Loose on purpose: anything resembling an attempt to merge counts, so that a
+# MALFORMED write is reported as a broken merge rather than as a refusal.
+merge_attempted() { grep -qE 'pulls/[0-9]+/merge|pr merge ' "$WORK/calls"; }
+
+# Empty when the recorded merge request is the one GitHub needs; otherwise the
+# first thing wrong with it.
+merge_write_defect() {
+  local line
+  line=$(grep -E "(^| )repos/${REPO}/pulls/${PR}/merge( |$)" "$WORK/calls" | head -n1)
+  [ -n "$line" ] \
+    || { echo "the merge did not address repos/${REPO}/pulls/${PR}/merge"; return; }
+  case " $line " in *" token=${MERGE_TOKEN_VALUE} "*) ;;
+    *) echo "the merge did not run under the merge credential"; return ;;
+  esac
+  case " $line " in *" -X PUT "*) ;;
+    *) echo "the merge is not a PUT — gh api sends POST once -f fields are present, and the merge endpoint does not accept POST"; return ;;
+  esac
+  case " $line " in *" -f merge_method=squash "*) ;;
+    *) echo "the merge does not ask for a squash — gh's default is a merge commit"; return ;;
+  esac
+  case " $line " in *" -f sha=${HEAD_SHA} "*) ;;
+    *) echo "the merge is not fenced on the approved head (-f sha=${HEAD_SHA}) — a head pushed after revalidation would be merged"; return ;;
+  esac
+}
+
+# The alert and the audit comment are writes too, and both were `gh pr comment`
+# before this change. Everything else in this file asserts them by the prose in
+# their body, which a wrong endpoint or a missing credential leaves untouched.
+comment_write_defect() {
+  local marker="$1" line
+  line=$(grep -F -- "$marker" "$WORK/calls" | head -n1)
+  [ -n "$line" ] || { echo "no comment on the PR carrying \"${marker}\""; return; }
+  case " $line " in *" token=${MERGE_TOKEN_VALUE} "*) ;;
+    *) echo "the comment did not run under the merge credential"; return ;;
+  esac
+  case "$line" in *"api repos/${REPO}/issues/${PR}/comments "*) ;;
+    *) echo "the comment did not post to repos/${REPO}/issues/${PR}/comments"; return ;;
+  esac
+  case "$line" in *" -f body="*) ;;
+    *) echo "the comment did not pass its body as a field"; return ;;
+  esac
+}
+
+# The revert lookup is a read, but the gh stub answers it on the presence of
+# the jq expression alone — so a request aimed at the wrong endpoint still
+# yields a commit, and the revert assertion below still passes.
+revert_lookup_defect() {
+  local line
+  line=$(grep -E "(^| )api repos/${REPO}/pulls/${PR}( |$)" "$WORK/calls" | head -n1)
+  [ -n "$line" ] \
+    || { echo "the revert lookup did not read repos/${REPO}/pulls/${PR}"; return; }
+  case " $line " in *" token=${MERGE_TOKEN_VALUE} "*) ;;
+    *) echo "the revert lookup did not run under the merge credential"; return ;;
+  esac
+  case "$line" in *merge_commit_sha*) ;;
+    *) echo "the revert lookup does not ask for merge_commit_sha"; return ;;
+  esac
+}
+
 # expect <label> <merged|refused|error>
 expect() {
-  local label="$1" want="$2" status got
+  local label="$1" want="$2" status got defect=""
   status=$(run_merge)
   if [ "$status" -ne 0 ]; then
     got=error
-  elif grep -q 'pr merge' "$WORK/calls"; then
+  elif merge_attempted; then
     got=merged
   else
     got=refused
   fi
-  if [ "$got" = "$want" ]; then
+  [ "$got" != merged ] || defect=$(merge_write_defect)
+  if [ "$got" = "$want" ] && [ -z "$defect" ]; then
     PASSES=$((PASSES + 1))
     echo "ok   ${label} (${got})"
   else
     FAILURES=$((FAILURES + 1))
-    echo "FAIL ${label}: expected ${want}, got ${got} (exit ${status})"
+    echo "FAIL ${label}: expected ${want}, got ${got} (exit ${status})${defect:+ — ${defect}}"
     sed 's/^/       | /' "$WORK/stdout"
   fi
 }
@@ -245,6 +336,21 @@ echo "# merge-write contract: the verdict must still be current at the write"
 
 reset
 expect "coordinate still holds the announced approval → merges" merged
+
+# The write itself, named rather than left as a precondition of the scenarios
+# around it. Dropping PUT, the squash, or the pinned head leaves every one of
+# those scenarios reaching the endpoint; none of them is about the request.
+reset
+run_merge > /dev/null
+MERGE_DEFECT=$(merge_write_defect)
+if [ -z "$MERGE_DEFECT" ]; then
+  PASSES=$((PASSES + 1))
+  echo "ok   the merge is a squash PUT to repos/${REPO}/pulls/${PR}/merge, fenced on the approved head, under the merge credential"
+else
+  FAILURES=$((FAILURES + 1))
+  echo "FAIL the merge write: ${MERGE_DEFECT}"
+  sed 's/^/       | /' "$WORK/stdout"
+fi
 
 reset
 sign_note REQUEST-CHANGES no > "$WORK/live.json"
@@ -300,13 +406,18 @@ expect "coordinate returned something unparseable → refuses" refused
 # later change of mind produces the identical observation. Re-introducing that
 # claim fails here.
 expect_alert() {
-  local label="$1" state="$2" revert="${3:-yes}" status ok=1 why=""
+  local label="$1" state="$2" revert="${3:-yes}" status ok=1 why="" d
   status=$(run_merge)
   [ "$status" -ne 0 ] || { ok=0; why="${why} exit=0(expected red);"; }
-  grep -q 'pr merge' "$WORK/calls" || { ok=0; why="${why} the merge never happened;"; }
-  grep -q 'This is a detection, not a prevention' "$WORK/calls" \
-    || { ok=0; why="${why} no alert comment on the PR;"; }
+  if ! merge_attempted; then
+    ok=0; why="${why} the merge never happened;"
+  else
+    d=$(merge_write_defect); [ -z "$d" ] || { ok=0; why="${why} ${d};"; }
+  fi
+  d=$(comment_write_defect 'This is a detection, not a prevention')
+  [ -z "$d" ] || { ok=0; why="${why} ${d};"; }
   if [ "$revert" = yes ]; then
+    d=$(revert_lookup_defect); [ -z "$d" ] || { ok=0; why="${why} ${d};"; }
     grep -q "git revert ${MERGE_COMMIT}" "$WORK/calls" \
       || { ok=0; why="${why} the alert does not name the commit to revert;"; }
   else
@@ -390,14 +501,14 @@ expect_alert "the reviewer republished the same approval across the write → re
 reset
 status=$(run_merge)
 READS=$(cat "$WORK/relay-calls" 2>/dev/null || echo 0)
-if [ "$status" -eq 0 ] && [ "${READS:-0}" -eq 2 ] \
-  && grep -q 'Auto-merged on the reviewer' "$WORK/calls" \
+AUDIT_DEFECT=$(comment_write_defect 'Auto-merged on the reviewer')
+if [ "$status" -eq 0 ] && [ "${READS:-0}" -eq 2 ] && [ -z "$AUDIT_DEFECT" ] \
   && ! grep -q 'This is a detection, not a prevention' "$WORK/calls"; then
   PASSES=$((PASSES + 1))
   echo "ok   verdict still standing after the merge → audit comment, and the coordinate was read on BOTH sides of the write"
 else
   FAILURES=$((FAILURES + 1))
-  echo "FAIL the clean merge did not read the coordinate on both sides (exit ${status}, reads ${READS})"
+  echo "FAIL the clean merge did not read the coordinate on both sides (exit ${status}, reads ${READS})${AUDIT_DEFECT:+ — ${AUDIT_DEFECT}}"
   sed 's/^/       | /' "$WORK/stdout"
 fi
 

@@ -132,7 +132,9 @@ plus `workflow_dispatch`). Every gate must pass:
    properties: strictness from one rule and the contexts from another would
    still leave those contexts testable against a stale base.
 8. Every one of the above, re-read in the isolated merge job immediately
-   before acting, then `gh pr merge --squash --match-head-commit <sha>`.
+   before acting, then the REST merge (`PUT …/pulls/N/merge`) with `sha`
+   pinned to the approved head — `--match-head-commit` semantics; REST because
+   the GraphQL merge mutation is not accessible to a fine-grained PAT.
 
 Gates 3 and 4 are why an approval does not survive `main` moving. Without
 them, the reviewer could approve head H against base B1, `main` could advance
@@ -202,7 +204,8 @@ output. That copy stays valid forever: replacing the coordinate does not alter
 the old event, it stops being current. Replaceability establishes currency at
 the instant of the read and says nothing about any later instant.
 
-So the merge job reads the coordinate again immediately before `gh pr merge`
+So the merge job reads the coordinate again immediately before the merge
+write
 and requires the live value to still authorize *and* to still be the event the
 PR channel was told about. A revocation published between the two jobs stops
 the merge.
@@ -221,16 +224,16 @@ child process inherits the step's environment either way.
 
 That read is a **narrowing, not a fence**, and the difference is not a detail.
 
-`gh pr merge` is a write to GitHub. GitHub decides whether to accept it by
+The merge call is a write to GitHub. GitHub decides whether to accept it by
 evaluating conditions **it** can see: the head SHA passed to
-`--match-head-commit`, whether the PR is a draft, and the branch rules on
+the request's pinned `sha`, whether the PR is a draft, and the branch rules on
 `main`. It cannot see a Nostr relay. And the reviewer holds no GitHub
 credential — deliberately, because that absence is exactly what makes the
 verdict unforgeable by this workflow and by anyone holding the CI key.
 
 Those two facts together mean **no relay artifact can ever be a condition
 GitHub checks at the write.** Every relay read is a read, with a window after
-it. Moving the read closer to `gh pr merge` shortens the window; nothing placed
+it. Moving the read closer to the merge write shortens the window; nothing placed
 on that side of the write closes it. A reviewer who replaces the coordinate
 after the last read and before GitHub accepts the merge has published a valid
 signed revocation that the merge does not, and cannot, observe.
@@ -324,7 +327,7 @@ GitHub evaluates them as part of the merge:
 | Stop | Who can use it | Window |
 |---|---|---|
 | Convert the PR to a **draft**, or close it | anyone with `pull-requests: write` | none |
-| Push any commit to the PR branch | anyone who can push there | none — invalidates `--match-head-commit` |
+| Push any commit to the PR branch | anyone who can push there | none — invalidates the pinned merge `sha` |
 | Make a required check red (strict ruleset) | whatever produces that check | none |
 | Rewrite the verdict coordinate | the reviewer only | never closes — the post-write read detects the change, but cannot date it |
 | `no-auto-merge` label | anyone with write | until the merge job's pre-write read |

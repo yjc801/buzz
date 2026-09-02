@@ -1,5 +1,5 @@
 //! B5 effort lifecycle tests split out of `spawn_snapshot/tests.rs` to hold
-//! that file under the 1000-line file-size ratchet.
+//! that file under the 1500-line file-size ratchet.
 //!
 //! Included as `mod ext` inside `tests.rs`, so `use super::*` gives access to
 //! its `record`, `snap`, and `record_with_env_effort` helpers.

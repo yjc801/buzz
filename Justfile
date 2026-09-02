@@ -482,14 +482,21 @@ test-unit:
         # a regression here silently accepts a tampered or replayed bundle,
         # so they must fail the gate rather than merely exist.
         cargo nextest run -p buzz-waker
-        # buzz-agent model-capabilities corpus: the Rust half of the
-        # cross-language drift guard. `model_capabilities.rs` embeds
-        # scripts/model-capabilities.json + scripts/normative-corpus.json via
-        # include_str! and replays the full locked corpus as pure in-process tests (no
-        # infra). Enumerated explicitly because nothing in CI runs
-        # `cargo test --workspace`; without this step a manifest edit that
-        # diverges Rust from the corpus ships green.
-        cargo nextest run -p buzz-agent --lib
+        # buzz-agent: two infra-free concerns run together by executing the
+        # whole crate (lib + integration tests), because nothing in CI runs
+        # `cargo test --workspace`, so without this stanza neither the crate's
+        # library tests nor its integration tests execute remotely.
+        #   * model-capabilities corpus (lib): the Rust half of the
+        #     cross-language drift guard. `model_capabilities.rs` embeds
+        #     scripts/model-capabilities.json + scripts/normative-corpus.json via
+        #     include_str! and replays the full locked corpus as pure in-process
+        #     tests; without it a manifest edit that diverges Rust from the
+        #     corpus ships green.
+        #   * OAuth auth coordinator (lib concurrency matrix + databricks
+        #     integration tests): lock single-flight, cooldown, cross-process
+        #     crash recovery — infra-free via a stub OIDC provider and an
+        #     injected browser opener, no network or Postgres.
+        cargo nextest run -p buzz-agent
         # Admin API auth-boundary tests (api::admin in buzz-relay): the NIP-98
         # duplicate-tag rejections, the Host/Origin replay-ordering causal pair,
         # the admin.localhost origin/advertisement/canonical-URL pins, and the

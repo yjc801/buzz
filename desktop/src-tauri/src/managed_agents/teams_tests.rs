@@ -1,6 +1,6 @@
 //! Unit tests for `managed_agents/teams.rs`.
 //!
-//! Kept in a sibling file so `teams.rs` stays under the 1000-line gate;
+//! Kept in a sibling file so `teams.rs` stays under the 1500-line gate;
 //! `#[path]`-included from there.
 
 use super::{

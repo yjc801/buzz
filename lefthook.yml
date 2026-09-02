@@ -111,9 +111,14 @@ pre-push:
       exclude: ["desktop/src-tauri/**"]
       run: just desktop-test
     desktop-tauri-checks:
-      # Keep local lint parity with Desktop Core CI for every path that can
-      # affect the Tauri crate or its path dependencies. Run clippy and tests
-      # serially so parallel pre-push hooks do not contend for Cargo's lock.
+      # Keep local lint parity with the Desktop Tauri CI lane for every path
+      # that can affect the Tauri crate or its path dependencies. Run clippy
+      # and tests serially so parallel pre-push hooks do not contend for
+      # Cargo's lock.
+      # The compiled-flag matrix (`just desktop-tauri-test-compiled-flags`) is
+      # not run here: it forces a full rebuild per permutation and is far too
+      # slow to push. Its CI lane (Desktop Tauri Compiled Flags) is disabled
+      # too, so run it by hand when touching a compiled flag.
       files: git diff --name-only origin/main...HEAD
       glob: ["desktop/src-tauri/**", "crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "Justfile"]
       run: just desktop-tauri-clippy && just desktop-tauri-test

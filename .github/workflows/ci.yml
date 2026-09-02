@@ -17,7 +17,10 @@ jobs:
   changes:
     name: Detect Changed Paths
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # 5, not 2: this job now invokes `just`, which Hermit downloads on first
+    # use here. Every other lane needs this job, so a marginal timeout would
+    # fail the whole run.
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -27,11 +30,27 @@ jobs:
       desktop-rust: ${{ steps.filter.outputs.desktop-rust }}
       web: ${{ steps.filter.outputs.web }}
       mobile: ${{ steps.filter.outputs.mobile }}
+      compiled-flag-states: ${{ steps.compiled-flag-states.outputs.states }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 2
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      # The desktop-tauri-compiled-flags matrix is generated from this, so the
+      # Justfile's `compiled_flag_states` is the only place the set of compiled
+      # build states is written. Adding one there adds a required CI shard with
+      # no workflow edit — and cannot silently skip it.
+      - name: Read compiled-flag build states
+        id: compiled-flag-states
+        run: |
+          states="$(just --evaluate compiled_flag_states)"
+          json="$(printf '%s' "$states" | jq -Rc 'split(" ") | map(select(length > 0))')"
+          if [ "$json" = "[]" ]; then
+            echo "::error::compiled_flag_states resolved to an empty list"
+            exit 1
+          fi
+          echo "states=$json" >> "$GITHUB_OUTPUT"
+          echo "compiled-flag states: $json"
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
@@ -57,7 +76,10 @@ jobs:
               - 'scripts/run-tests.sh'
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
-              - 'justfile'
+              # 'Justfile', not 'justfile': the pinned paths-filter passes only
+              # {dot: true} to picomatch, whose nocase default is false, so this
+              # is case-sensitive and the lowercase form matched nothing.
+              - 'Justfile'
             desktop:
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
@@ -112,6 +134,8 @@ jobs:
         run: |
           scripts/test-rust-cache-contract.sh
           scripts/test-rust-cache-contract-regressions.sh
+      - name: Path filter contract
+        run: scripts/test-path-filter-contract.sh
       - name: File size policy
         run: just file-size-check
 
@@ -162,6 +186,45 @@ jobs:
   desktop-core:
     name: Desktop Core
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes]
+    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 2
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - name: Restore pnpm store cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+      - name: Desktop lint and format
+        run: just desktop-check
+      - name: Desktop unit tests
+        run: just desktop-test
+      - name: Desktop build
+        run: just desktop-build
+      # Only this lane saves the pnpm store: the two Tauri lanes restore the
+      # same key, and three concurrent saves of one key just race.
+      - name: Save pnpm store cache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+  desktop-tauri:
+    name: Desktop Tauri
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [changes]
     if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
@@ -175,6 +238,10 @@ jobs:
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
+          # Both Tauri lanes build the same crate, so they share one cache
+          # entry instead of each starting cold (rust-cache otherwise keys on
+          # the job id).
+          shared-key: desktop-tauri
           workspaces: desktop/src-tauri
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install Tauri dependencies (Linux)
@@ -213,10 +280,8 @@ jobs:
           restore-keys: pnpm-${{ runner.os }}-
       - name: Install desktop dependencies
         run: just desktop-install-ci
-      - name: Desktop lint and format
-        run: just desktop-check
-      - name: Desktop unit tests
-        run: just desktop-test
+      # tauri_build::try_build resolves frontendDist (../dist), so the Rust
+      # steps below need the frontend built first.
       - name: Desktop build
         run: just desktop-build
       - name: Desktop Tauri clippy
@@ -231,25 +296,88 @@ jobs:
         run: just desktop-tauri-test
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      - name: Desktop Tauri compiled-flag verification
-        run: just desktop-tauri-test-compiled-flags
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      - name: Upload desktop e2e artifacts
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+
+  # Split out of Desktop Core, then sharded by compile state. Each BUZZ_BUILD_*
+  # permutation is a distinct compile of the Tauri crate (build.rs declares
+  # rerun-if-env-changed for all of them), so running the states sequentially
+  # made this the longest desktop lane. One job per state verifies the same
+  # build shapes concurrently instead. The state list is read from the
+  # Justfile's `compiled_flag_states` by the `changes` job, so it is not
+  # duplicated here and a new state cannot be silently left out of CI.
+  desktop-tauri-compiled-flags:
+    name: Desktop Tauri Compiled Flags (${{ matrix.state }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [changes]
+    # Disabled by owner decision on PR #118: the compiled-flag matrix does not
+    # run on PRs. Even sharded, each state is a ~10 minute full rebuild plus
+    # the desktop lib suite, and the owner chose to drop it from the PR path.
+    # Nothing else compiles a BUZZ_BUILD_*-set build; run
+    # `just desktop-tauri-test-compiled-flags` by hand when touching a flag.
+    # To re-enable, restore the original condition:
+    # if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: false
+    strategy:
+      fail-fast: false
+      matrix:
+        state: ${{ fromJSON(needs.changes.outputs.compiled-flag-states) }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          name: desktop-e2e-artifacts
-          path: |
-            desktop/playwright-report
-            desktop/test-results
-          if-no-files-found: ignore
-      - name: Save pnpm store cache
-        if: github.event_name == 'push'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+          fetch-depth: 2
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          shared-key: desktop-tauri
+          workspaces: desktop/src-tauri
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install Tauri dependencies (Linux)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=120 \
+            build-essential \
+            curl \
+            file \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - name: Restore pnpm store cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+      # Needed for tauri_build::try_build's frontendDist, and the recipe itself
+      # shells out to node for the demo-name boundary check.
+      - name: Desktop build
+        run: just desktop-build
+      - name: Desktop Tauri compiled-flag verification (${{ matrix.state }})
+        run: just desktop-tauri-test-compiled-flags-state '${{ matrix.state }}'
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
@@ -323,7 +451,13 @@ jobs:
     name: Desktop
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [changes, desktop-core, desktop-smoke-e2e, desktop-windows-build]
+    needs:
+      - changes
+      - desktop-core
+      - desktop-tauri
+      - desktop-tauri-compiled-flags
+      - desktop-smoke-e2e
+      - desktop-windows-build
     if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
@@ -332,6 +466,17 @@ jobs:
         run: |
           if [ "${{ needs.desktop-core.result }}" != "success" ]; then
             echo "Desktop Core finished with: ${{ needs.desktop-core.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.desktop-tauri.result }}" != "success" ]; then
+            echo "Desktop Tauri finished with: ${{ needs.desktop-tauri.result }}"
+            exit 1
+          fi
+          # desktop-tauri-compiled-flags is disabled (if: false above), so
+          # "skipped" is expected. If re-enabled it is a matrix job whose result
+          # is success only when every state shard passed.
+          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ] && [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "skipped" ]; then
+            echo "Desktop Tauri Compiled Flags finished with: ${{ needs.desktop-tauri-compiled-flags.result }}"
             exit 1
           fi
           # desktop-smoke-e2e is disabled (if: false above), so "skipped" is
@@ -1350,6 +1495,8 @@ jobs:
       - rust-lint
       - unit-tests
       - desktop-core
+      - desktop-tauri
+      - desktop-tauri-compiled-flags
       - desktop-smoke-e2e
       - desktop
       - desktop-e2e-relay

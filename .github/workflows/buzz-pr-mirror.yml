@@ -3,7 +3,13 @@ name: buzz-pr-mirror
 # Gives every PR on this fork its own Buzz channel (#buzz-pr-N):
 #   opened      → create the channel, seed it with a summary card, add and
 #                 mention Alex for review
-#   synchronize → post a compact update (new head, shortstat, files)
+#   synchronize → after a quiet window, post a compact update (new head,
+#                 shortstat, files) that names the settled `Review head` and
+#                 re-mentions Alex unless he already replied to that head —
+#                 only a CI or human mention can wake a hibernated reviewer
+#                 (crates/buzz-waker/src/decide.rs — no agent-authored event
+#                 ever wakes anything), so a coder's "@Alex pushed the fix"
+#                 alone leaves him asleep
 #   closed      → post ✅ Merged / 🚫 Closed without merge, then archive
 #   reopened    → unarchive, and reverse the close annotations everywhere
 #
@@ -177,6 +183,25 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.number }}
+          # The payload head, not `git rev-parse HEAD`: it is the review
+          # request's identity (the reviewer pins its verdict to it and the
+          # review watchdog matches requests to heads by it), so it must be
+          # the head this event announced even if the branch moved again
+          # during checkout.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The head this push replaced (empty except on synchronize) — named
+          # on the update card so the reviewer knows which in-flight review
+          # is now stale.
+          PREV_HEAD_SHA: ${{ github.event.before }}
+          # Quiet window before a push is announced to the reviewer. Pushes
+          # arrive in bursts; each reviewer mention steers (cancels and
+          # re-prompts) a review already running, so announcing every push
+          # would restart the review several times per burst. A newer push
+          # cancels this run (concurrency above), so only the LAST push in a
+          # burst survives the sleep and reaches the mention. Repo variable
+          # BUZZ_REVIEW_QUIET_SECS overrides; keep it under 5 minutes or
+          # raise timeout-minutes to match.
+          REVIEW_QUIET_SECS: ${{ vars.BUZZ_REVIEW_QUIET_SECS || 180 }}
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
           # Pre-workflow PRs have no #buzz-pr-N channel; close notices for them
@@ -542,6 +567,10 @@ jobs:
           seed_card() {
             printf '**PR #%s — %s**\n' "$PR_NUMBER" "$PR_TITLE"
             printf '`%s` → `%s` by %s\n' "$HEAD_REF" "$BASE_REF" "$PR_AUTHOR"
+            # The full head SHA is the review request's identity: the reviewer
+            # pins its verdict to it and the review watchdog matches requests
+            # to heads by this exact line. Keep the wording stable.
+            printf 'Review head: `%s`\n' "$HEAD_SHA"
             printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
             printf '```\n%s\n```\n' "$(diff_files)"
             if [ -n "$PR_BODY" ]; then
@@ -644,6 +673,24 @@ jobs:
                 BEFORE="$OLDEST"
               fi
             done
+          }
+
+          reviewer_replied_to_head() {
+            # Prints yes/no: has the reviewer posted a message in channel $1
+            # since unix time $2 that names head $3? A coder's in-channel
+            # @mention reaches an AWAKE reviewer (it only cannot wake a
+            # sleeping one), so by the end of the quiet window he may already
+            # be reviewing this very head — a second p-tag would then steer
+            # (cancel and re-prompt) that review. A reply that does not name
+            # the head is treated as unrelated (most likely the verdict on
+            # the previous head landing during the window) and the mention
+            # still goes out. A failed read is an error, never "no": a relay
+            # blip must not become a p-tag that restarts a running review.
+            local PAGE COUNT
+            PAGE=$(buzz messages get --channel "$1" --since "$2" --limit 100) || return 1
+            COUNT=$(printf '%s' "$PAGE" | jq --arg r "$REVIEWER_PUBKEY" --arg h "$3" \
+              '[(.messages? // .)[]? | select(.pubkey == $r) | select(.content | contains($h[0:7]))] | length') || return 1
+            if [ "$COUNT" -gt 0 ]; then echo yes; else echo no; fi
           }
 
           coder_already_mentioned() {
@@ -877,12 +924,30 @@ jobs:
                 fi
                 SYNC_MENTIONS=()
                 [ "$NEWLY_OWNED" = yes ] && SYNC_MENTIONS+=(--mention "$CODER_PUBKEY")
+                # Resolution, provisioning and routing ran BEFORE the quiet
+                # window so a configuration fault fails fast; only the send
+                # waits. A newer push cancels this run during the sleep.
+                PUSHED_AT=$(date +%s)
+                sleep "$REVIEW_QUIET_SECS"
+                ACKED=$(reviewer_replied_to_head "$CH" "$PUSHED_AT" "$HEAD_SHA") || exit 1
+                if [ "$ACKED" = no ]; then
+                  SYNC_MENTIONS+=(--mention "$REVIEWER_PUBKEY")
+                fi
                 {
                   printf 'Updated to `%s` — %s\n' \
-                    "$(git rev-parse --short HEAD)" "$(git diff --shortstat "$RANGE")"
-                  printf '```\n%s\n```\n' "$(diff_files)"
+                    "${HEAD_SHA:0:7}" "$(git diff --shortstat "$RANGE")"
+                  printf 'Review head: `%s`' "$HEAD_SHA"
+                  if [ -n "$PREV_HEAD_SHA" ]; then
+                    printf ' (supersedes `%s`)' "${PREV_HEAD_SHA:0:12}"
+                  fi
+                  printf '\n```\n%s\n```\n' "$(diff_files)"
                   if [ "$NEWLY_OWNED" = yes ]; then
                     printf '\n%s— this update brought coder-owned paths into scope.\n' "$SCOPE_NAMES"
+                  fi
+                  if [ "$ACKED" = no ]; then
+                    printf '\n@%s please review this head. A review in progress on the previous head is stale.\n' "$REVIEWER_NAME"
+                  else
+                    echo "reviewer already replied to ${HEAD_SHA:0:12} — posting the update without a reviewer mention" >&2
                   fi
                 } | buzz messages send --channel "$CH" --content - "${SYNC_MENTIONS[@]}"
               fi

@@ -109,6 +109,7 @@ security-review-check:
 # them: `gate` maps .github/**, scripts/** and docs/** to "nothing to run".
 auto-merge-check:
     actionlint .github/workflows/buzz-pr-auto-merge.yml
+    actionlint .github/workflows/buzz-pr-review-watchdog.yml
     node --check .github/scripts/pr-auto-merge-risk.js
     node --check .github/scripts/pr-auto-merge-verdict.js
     node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js

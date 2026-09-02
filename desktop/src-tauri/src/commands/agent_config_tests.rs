@@ -1,5 +1,5 @@
 //! Unit tests for `commands/agent_config.rs` (split to keep `agent_config.rs`
-//! under the 1000-line file-size ratchet).
+//! under the 1500-line file-size ratchet).
 //!
 //! Included via `#[path = "agent_config_tests.rs"] mod tests;` at the bottom of
 //! `agent_config.rs`, so `use super::*` gives access to all items in that module.

@@ -153,8 +153,8 @@ with a TypeScript lookup table or an id comparison in a component.
    place that resolves it for dialog surfaces and publishes it through
    `ui/AgentRunLocationContext.tsx`; the field reads that context and lets an
    explicit `runLocation` prop win. Do **not** thread the value as a prop
-   through `AgentDefinitionDialog` / `AgentInstanceEditDialog` — both are
-   already over the 1000-line ceiling, and neither uses the value itself.
+   through `AgentDefinitionDialog` / `AgentInstanceEditDialog` — neither uses
+   the value itself, and the shared context keeps the dialog boundary stable.
    Surfaces rendered outside `AgentDialog` (e.g. `EditRespondToDialog`) pass the
    prop directly. Local names "your
    computer, including files, accounts, and connected tools"; remote names "the
@@ -216,9 +216,9 @@ with a TypeScript lookup table or an id comparison in a component.
    cosmetic — the Rust command rejects non-local backends because remote effort
    is set at deploy time via `policy_env`. Because it reads its inputs from the
    config surface the dialog already fetches (`useAgentConfigSurface`) and owns
-   its own mutation, it does **not** thread new props through the over-1000-line
-   dialog (see rule 11): keep effort state inside the section component, never
-   as dialog-level props. The read-only display is the `thinkingEffort`
+   its own mutation, it does **not** thread new props through the dialog (see
+   rule 11): keep effort state inside the section component, never as
+   dialog-level props. The read-only display is the `thinkingEffort`
    normalized field rendered by `AgentConfigPanel` via `NormalizedRow`, which
    already shows both facts — `field.value` (canonical, the effort the next
    spawn will launch with) and, when a running ACP session differs,

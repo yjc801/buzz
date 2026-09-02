@@ -4,7 +4,7 @@ use buzz_core::CommunityId;
 use sqlx::{Connection, PgPool};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
 async fn setup_db() -> Db {
     let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
@@ -17,6 +17,153 @@ async fn setup_db() -> Db {
             .expect("apply migration schema");
     }
     Db::from_pool(pool)
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn readiness_check_distinguishes_pool_exhaustion_from_success() {
+    let database_url = crate::test_support::database_url();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect size-one readiness test pool");
+    let held = pool
+        .acquire()
+        .await
+        .expect("hold the only readiness test connection");
+    let db = Db::from_pool(pool);
+
+    let exhausted = db
+        .readiness_check(tokio::time::Instant::now() + std::time::Duration::from_millis(25))
+        .await;
+    assert_eq!(exhausted, DbReadinessOutcome::PoolTimeout);
+
+    drop(held);
+    let recovered = db
+        .readiness_check(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    assert_eq!(recovered, DbReadinessOutcome::Success);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn readiness_check_classifies_closed_pool_query_timeout_and_query_error() {
+    let database_url = crate::test_support::database_url();
+
+    let closed_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect closed readiness test pool");
+    closed_pool.close().await;
+    let closed = Db::from_pool(closed_pool)
+        .readiness_check(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    assert_eq!(closed, DbReadinessOutcome::PoolError);
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect query classification test pool");
+    let db = Db::from_pool(pool);
+
+    let timed_out = db
+        .readiness_check_sql(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(25),
+            "SELECT pg_sleep(0.2)",
+        )
+        .await;
+    assert_eq!(timed_out, DbReadinessOutcome::QueryTimeout);
+
+    let query_error = db
+        .readiness_check_sql(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            "SELECT 1 / 0",
+        )
+        .await;
+    assert_eq!(query_error, DbReadinessOutcome::QueryError);
+
+    assert_eq!(
+        db.readiness_check(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await,
+        DbReadinessOutcome::Success,
+        "query failures must return the acquired connection to the pool"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn readiness_check_cancellation_balances_waiter_and_inflight_connection() {
+    let database_url = crate::test_support::database_url();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect cancellation readiness test pool");
+    let held = pool
+        .acquire()
+        .await
+        .expect("hold sole connection before waiter cancellation");
+    let db = Db::from_pool(pool);
+
+    let waiting_db = db.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_db
+            .readiness_check(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    waiting.abort();
+    assert!(waiting
+        .await
+        .expect_err("waiting check must be cancelled")
+        .is_cancelled());
+    drop(held);
+
+    assert_eq!(
+        db.readiness_check(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await,
+        DbReadinessOutcome::Success,
+        "cancelled pool waiter must not consume the released connection"
+    );
+
+    let querying_db = db.clone();
+    let querying = tokio::spawn(async move {
+        querying_db
+            .readiness_check_sql(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                "SELECT pg_sleep(5)",
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    querying.abort();
+    assert!(querying
+        .await
+        .expect_err("querying check must be cancelled")
+        .is_cancelled());
+
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let outcome = db
+                .readiness_check(
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+                )
+                .await;
+            match outcome {
+                DbReadinessOutcome::Success => break outcome,
+                DbReadinessOutcome::PoolTimeout => tokio::task::yield_now().await,
+                unexpected => panic!(
+                    "cancelled in-flight query produced unexpected recovery outcome: {unexpected:?}"
+                ),
+            }
+        }
+    })
+    .await
+    .expect("cancelled in-flight query must return or replace its connection");
+    assert_eq!(recovered, DbReadinessOutcome::Success);
 }
 
 async fn make_community(pool: &PgPool) -> Uuid {
@@ -397,6 +544,98 @@ async fn drop_scratch_db(admin: &PgPool, pool: PgPool, name: &str) {
     )))
     .execute(admin)
     .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn push_gateway_profile_migration_converges_brownfield_authority() {
+    let admin = PgPool::connect(&admin_url().await)
+        .await
+        .expect("connect admin database");
+    let (pool, name) = create_scratch_db_through(&admin, "push_profile", Some(42)).await;
+    let installation_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+
+    sqlx::query(
+        "INSERT INTO push_gateway_installations(\
+         id, app_attest_key_id, app_attest_public_key, assertion_counter, app_profile, \
+         token_ciphertext, token_fingerprint, endpoint_epoch, expires_at) \
+         VALUES($1, $2, $3, 0, 'buzz-ios-production', $4, $5, 1, $6)",
+    )
+    .bind(installation_id)
+    .bind(vec![1_u8])
+    .bind(vec![2_u8; 33])
+    .bind(vec![3_u8])
+    .bind(vec![4_u8; 32])
+    .bind(now + chrono::Duration::days(1))
+    .execute(&pool)
+    .await
+    .expect("insert legacy production installation");
+    sqlx::query(
+        "INSERT INTO push_gateway_delegations(\
+         id, installation_id, relay_pubkey, endpoint_epoch, generation, not_before, expires_at) \
+         VALUES($1, $2, $3, 1, 1, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(installation_id)
+    .bind(vec![5_u8; 32])
+    .bind(now)
+    .bind(now + chrono::Duration::hours(1))
+    .execute(&pool)
+    .await
+    .expect("insert delegation for legacy installation");
+
+    migration::run_migrations(&pool)
+        .await
+        .expect("apply dogfood-only migration");
+
+    let legacy_installations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM push_gateway_installations")
+            .fetch_one(&pool)
+            .await
+            .expect("count legacy installations");
+    let legacy_delegations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM push_gateway_delegations")
+            .fetch_one(&pool)
+            .await
+            .expect("count legacy delegations");
+    assert_eq!(legacy_installations, 0);
+    assert_eq!(legacy_delegations, 0);
+
+    sqlx::query(
+        "INSERT INTO push_gateway_installations(\
+         id, app_attest_key_id, app_attest_public_key, assertion_counter, app_profile, \
+         token_ciphertext, token_fingerprint, endpoint_epoch, expires_at) \
+         VALUES($1, $2, $3, 0, 'buzz-ios-dogfood', $4, $5, 1, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(vec![6_u8])
+    .bind(vec![7_u8; 33])
+    .bind(vec![8_u8])
+    .bind(vec![9_u8; 32])
+    .bind(now + chrono::Duration::days(1))
+    .execute(&pool)
+    .await
+    .expect("dogfood installation is accepted after migration");
+
+    let sandbox = sqlx::query(
+        "INSERT INTO push_gateway_installations(\
+         id, app_attest_key_id, app_attest_public_key, assertion_counter, app_profile, \
+         token_ciphertext, token_fingerprint, endpoint_epoch, expires_at) \
+         VALUES($1, $2, $3, 0, 'buzz-ios-sandbox', $4, $5, 1, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(vec![10_u8])
+    .bind(vec![11_u8; 33])
+    .bind(vec![12_u8])
+    .bind(vec![13_u8; 32])
+    .bind(now + chrono::Duration::days(1))
+    .execute(&pool)
+    .await;
+    assert!(sandbox.is_err(), "legacy sandbox profile must be rejected");
+
+    drop_scratch_db(&admin, pool, &name).await;
+    admin.close().await;
 }
 
 /// Insert identical community + channel rows into a database so the same

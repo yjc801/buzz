@@ -204,7 +204,8 @@ PRs where reviewers litigated it.
    establish that the value **changed**, never **when** it changed. The two
    orderings produce byte-identical observations, and comparing the two
    systems' self-reported clocks is not a receipt. Report "changed, timing
-   unknown" and make any destructive remedy conditional. PR #101 spent six
+   unknown", and treat a destructive remedy as a separate decision that needs
+   evidence this comparison does not carry — see rule 9. PR #101 spent six
    rounds learning this in two installments; the second existed only because
    the first fix corrected the flagged claim and left the neighbouring one
    standing. **When a finding says the code claims more than it can prove, audit

@@ -1,0 +1,350 @@
+name: buzz-pr-review-watchdog
+
+# Re-mentions the reviewer agent when a review request goes unanswered, and
+# tells the owner when even that does not help.
+#
+# WHY THIS EXISTS. Measured over Aug 4 – Sep 2 (219 PR channels, 295 review
+# rounds): the median request→verdict is 7 minutes, but the 17% of rounds over
+# 30 minutes carry 79% of all review latency, and half of the slowest rounds
+# are the reviewer producing nothing until a human types a bare `@Alex`, after
+# which he verdicts within minutes. Two more rounds were turns that died after
+# an acknowledgement ("the review did not reach a posted verdict"). The
+# mechanism: buzz-waker never wakes a hibernated agent on an agent-authored
+# event, so a coder's "@Alex pushed the fix" cannot wake him, and the harness
+# has no "produced no reply" watchdog. The mirror now re-mentions him on each
+# settled push; this sweep covers what that still misses — a mention the
+# harness dropped, a sprite that never woke, a turn that died mid-review.
+#
+# WHAT IT WRITES. At most two CI-authored messages per (PR, head):
+#   1. one nudge, p-tagging the reviewer, after SILENT_SECS with no reviewer
+#      message since the request, or after DEAD_SECS with reviewer messages
+#      but no verdict-shaped one;
+#   2. one owner-facing stall notice, p-tagging the owner, when the nudge is
+#      itself older than its window and still nothing verdict-shaped landed.
+# Both are re-proved against a fresh read of the PR at the moment of the write,
+# not just against the snapshot the sweep opened with: a push, close or draft
+# conversion in between turns a nudge into a wake for a head the mirror has
+# already superseded.
+# Both are deduplicated against the CI identity's own channel messages by a
+# marker line that names the head, the same pattern buzz-pr-auto-merge.yml
+# uses for its blocked notice. A new push changes the head and resets the
+# state. The windows are asymmetric on purpose: a nudge steers (cancels and
+# re-prompts) a turn that might be legitimately running, so the acked-but-no-
+# verdict case waits twice as long as pure silence.
+#
+# WHAT IT NEVER DOES. It authorizes nothing and merges nothing. Channel reads
+# are presentation (dedup and state), the verdict coordinate is consulted only
+# to skip PRs whose current head already has a verdict, and every write is a
+# notice. The reviewer's prompt is owner-managed; nothing here configures it.
+#
+# THE MENTION MUST COME FROM THIS CI IDENTITY. The wake decision keys on a
+# p-tag from a NON-agent author — the same reason the mirror's seed card is
+# what wakes a cold reviewer. `pr-auto-merge-relay.py send --mention` emits
+# that tag; the pin check below guarantees the key is the identity whose
+# profile carries the owner auth tag, so owner-only harnesses admit the turn.
+#
+# Dry-run by default on manual dispatch; the cron runs live. Public repo,
+# so the cadence is 10 minutes, offset from the auto-merge sweep (4-59/10).
+
+on:
+  schedule:
+    - cron: "9-59/10 * * * *" # off :00, offset from buzz-pr-auto-merge (4-59/10)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Evaluate every open PR and log decisions, but post nothing"
+        type: boolean
+        default: true
+      force_pr:
+        description: "PR number to evaluate with the age windows set to zero (testing)"
+        type: string
+        default: ""
+
+concurrency:
+  group: buzz-pr-review-watchdog
+  cancel-in-progress: false # a cancelled run could post a nudge and lose its dedup read
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sweep:
+    if: github.repository == 'yjc801/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: List open PRs
+        id: candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Same-repo, non-draft. No base filter: a review is owed on every
+          # open PR the mirror seeded, whatever it targets. Drafts are skipped
+          # because the reviewer is not owed a verdict on them.
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,isDraft,headRefOid,headRepositoryOwner,headRepository \
+            > "$RUNNER_TEMP/prs.json"
+          jq '[.[]
+                | select((.isDraft | not)
+                    and (.headRepositoryOwner.login == "yjc801")
+                    and (.headRepository.name == "buzz"))
+                | {number, head: .headRefOid}]' "$RUNNER_TEMP/prs.json" \
+            > "$RUNNER_TEMP/candidates.json"
+          COUNT=$(jq 'length' "$RUNNER_TEMP/candidates.json")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "open PRs: $(jq -c '[.[].number]' "$RUNNER_TEMP/candidates.json")"
+
+      - uses: actions/checkout@v4
+        if: steps.candidates.outputs.count != '0'
+        with:
+          persist-credentials: false
+
+      - name: Evaluate reviewer responsiveness
+        if: steps.candidates.outputs.count != '0'
+        env:
+          # still_owed() re-fetches each PR at the side-effect boundary.
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+          FORCE_PR: ${{ github.event.inputs.force_pr }}
+          BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
+          BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
+          # Alex — the reviewer agent. Pinned here and in the mirror and the
+          # auto-merge sweep; rotate all three together.
+          REVIEWER_NAME: Alex
+          REVIEWER_PUBKEY: 276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd
+          # Community owner — the stall notice is for a human.
+          OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+          # The CI identity whose profile carries the owner auth tag. A rotated
+          # key would author no binding notes and wake no owner-only agent.
+          # MUST equal the pin in buzz-pr-mirror.yml, buzz-issue-mirror.yml and
+          # buzz-pr-auto-merge.yml — all four read the same BUZZ_CI_PRIVATE_KEY,
+          # and this sweep resolves channels and reads its own dedup markers at
+          # this coordinate, so a divergent pin does not degrade, it exits at
+          # the fence below and disables the watchdog entirely. Asserted by
+          # .github/scripts/pr-review-wake.test.sh so a rotation that
+          # updates three of four files fails the gate.
+          EXPECTED_CI_PUBKEY: fbc33a2cf3637867fa90e9e3e334304701e1fdf3c57eae4283cea60134f604af
+          # No reviewer message at all since the request → nudge after this.
+          SILENT_SECS: "900"
+          # Reviewer messages but nothing verdict-shaped → nudge after this
+          # much silence since his last message. Longer than SILENT_SECS
+          # because a nudge steers a turn that may still be working.
+          DEAD_SECS: "1800"
+        run: |
+          R="$GITHUB_REPOSITORY"
+          relay() { python3 .github/scripts/pr-auto-merge-relay.py "$@"; }
+
+          DRY="${DRY_RUN_INPUT:-false}"
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then DRY=false; fi
+
+          CI_PUB=$(NOSTR_SECRET="$BUZZ_PRIVATE_KEY" python3 scripts/buzz-mint-auth-tag.py pubkey)
+          printf '%s' "$CI_PUB" | grep -qE '^[0-9a-f]{64}$' || {
+            echo "::error::CI pubkey derivation failed"
+            exit 1
+          }
+          if [ "$CI_PUB" != "$EXPECTED_CI_PUBKEY" ]; then
+            echo "::error::BUZZ_CI_PRIVATE_KEY derives to ${CI_PUB}, not the pinned ${EXPECTED_CI_PUBKEY}. A rotated key authors no binding notes and its mentions wake no owner-only agent."
+            exit 1
+          fi
+
+          decision() {
+            echo "PR #$1: $2"
+            echo "- PR #$1: $2" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Is this message a verdict FOR THIS HEAD?
+          #
+          # Shape mirrors pr-auto-merge-verdict.js: a `VERDICT:` line, or a
+          # bare verdict word on its own line (the pre-trailer form), or the
+          # `Reviewed <head> against` trailer. jq's `^`/`$` anchor the whole
+          # string, so line boundaries are spelled out; verified against the
+          # Aug-Sep corpus (all 384 verdicts match, no non-verdict reviewer
+          # message does).
+          #
+          # SHAPE IS NOT ENOUGH, AND NEITHER IS MENTIONING THE HEAD. A review
+          # of the PREVIOUS head routinely posts its verdict moments after the
+          # request for this one, and the reviewer contract REQUIRES that
+          # message to name the newer head ("the PR moved to B; I reviewed
+          # A"). So the sha appears in the prose of a message whose verdict
+          # belongs to A. Matching on appearance would let that message stand
+          # in THEIRS forever: every later sweep would report "verdict posted"
+          # for a head nobody reviewed, this head would never be nudged or
+          # escalated, and the standing note would go on correctly failing its
+          # own head check.
+          #
+          # So the head is taken from the verdict's own binding, not from the
+          # message: the LAST `Reviewed <sha> against` line — the machine
+          # trailer that pr-auto-merge-verdict.js enforces, and the only place
+          # a reviewer states what he actually reviewed — must name $h. Prose
+          # SHAs above it are ignored by construction. Requiring the trailer
+          # costs no corpus coverage (every verdict carries it) and errs
+          # toward a redundant nudge rather than toward silence.
+          verdict_shaped() {
+            jq -e --arg h "$2" --argjson t "$1" '
+              def reviewed_line:
+                test("^[ \\t>*]*\\**[Rr]eviewed( head)? `?[0-9a-f]{7,40}`? against");
+              [.[]
+                | select(.created_at >= $t)
+                | select((.content | test("(^|\\n)\\**(VERDICT: )?(APPROVE|APPROVE-WITH-NITS|REQUEST-CHANGES)\\**[ \\t]*(\\n|$)"))
+                      or (.content | split("\n") | any(reviewed_line)))
+                | select((.content | split("\n") | map(select(reviewed_line)) | last // "")
+                         | test("[Rr]eviewed( head)? `?" + $h + "`? against"))
+              ] | length > 0' <<<"$3" >/dev/null
+          }
+
+          # A WAKE CANNOT BE UN-SENT, AND NO READ CAN PROVE IT SAFE.
+          #
+          # still_owed() below re-reads GitHub at the write instead of trusting
+          # the start-of-sweep snapshot, and that closes the wide window (up to
+          # 100 PRs are evaluated serially against a relay, so minutes pass
+          # between selection and a given PR's write). It does NOT close the
+          # window, and it cannot: GitHub and the relay are separate systems,
+          # so a push, close or draft conversion can always land after the read
+          # returns and before the send goes out. Treating that read as a proof
+          # at the side-effect boundary would be exactly the mistake of calling
+          # an unproven state a proven one.
+          #
+          # Since the CHECK cannot be made atomic, the EFFECT is made safe. The
+          # harm of a stale notice is not that it is wrong, it is that it
+          # STEERS: a p-tag naming a superseded head can pull the reviewer off
+          # the successor review, and a stall page can send a human after a PR
+          # that no longer needs one. So every notice this sweep sends defers
+          # to the PR's live state in its own body — it asks for a review of
+          # whatever head is current, naming this head only as the observation
+          # that prompted it, and it disclaims itself outright if the live PR
+          # is closed, merged or a draft. That last clause matters because a
+          # close or a draft conversion can keep the very same head, so
+          # "review the current head" would still be an instruction to do work
+          # the watchdog's own eligibility rules say is not owed. Under the
+          # residual race the worst outcome is a redundant re-check of a head
+          # the reviewer would have re-checked anyway (his own contract
+          # re-reads the ref before reviewing), not a review pinned to a dead
+          # head or to a PR that no longer wants one.
+          #
+          # Failing to read is NOT "still owed": a GitHub blip must not become
+          # a wake, so still_owed returns 1 and the caller records an error.
+          DEFER='Review the PR'\''s current head; that sha is what this sweep last saw, not an instruction to review it if the PR has moved on. If the PR is now closed, merged or a draft, no review is owed — ignore this notice.'
+          STALE='If the PR has moved, closed or been drafted since this sweep read it, this notice is stale — ignore it, and the next sweep will re-evaluate the live head.'
+          still_owed() {
+            # $1 PR number, $2 head. 0 = unchanged, 1 = read failed, 2 = moved.
+            local LIVE
+            LIVE=$(gh pr view "$1" -R "$R" \
+              --json state,isDraft,headRefOid,headRepositoryOwner,headRepository) || return 1
+            jq -e --arg h "$2" '.state == "OPEN"
+                and (.isDraft | not)
+                and (.headRepositoryOwner.login == "yjc801")
+                and (.headRepository.name == "buzz")
+                and .headRefOid == $h' <<<"$LIVE" >/dev/null || return 2
+          }
+
+          post() {
+            # $1 PR number, $2 head, $3 channel, $4 mention pubkey; body on
+            # stdin. 0 = posted (or dry-run), 1 = error, 2 = PR moved.
+            # The fence lives HERE rather than at the four call sites so no
+            # future branch can reach the relay without it.
+            local RC=0
+            still_owed "$1" "$2" || RC=$?
+            if [ "$RC" -ne 0 ]; then
+              cat >/dev/null
+              return "$RC"
+            fi
+            if [ "$DRY" = "true" ]; then
+              echo "  (dry-run) would post to $3 mentioning ${4:0:12}: $(head -c 120 | tr '\n' ' ')"
+              return 0
+            fi
+            # Normalised to 1: the relay client has its own exit codes, and
+            # one of them is 2 — which here means "the PR moved", a decision
+            # a failed send has not earned.
+            relay send --channel "$3" --mention "$4" >/dev/null || return 1
+          }
+
+          # Wraps the `printf | post` pipelines: turns post's three outcomes
+          # into one decision line each, so "the PR moved" is never recorded
+          # as a send and never counted as a failure.
+          settle() {
+            # $1 PR number, $2 head, $3 rc, $4 decision text when posted
+            case "$3" in
+              0) decision "$1" "$4" ;;
+              2) decision "$1" "skip — PR moved or closed since the sweep snapshot; no notice for ${2:0:12}" ;;
+              *) decision "$1" "ERROR posting notice for ${2:0:12}"; FAIL=1 ;;
+            esac
+          }
+
+          NOW=$(date +%s)
+          FAIL=0
+          while IFS=$'\t' read -r N HEAD; do
+            [ -z "$N" ] && continue
+            SILENT="$SILENT_SECS"; DEAD="$DEAD_SECS"
+            if [ -n "$FORCE_PR" ] && [ "$FORCE_PR" = "$N" ]; then SILENT=0; DEAD=0; fi
+
+            RC=0
+            CH=$(relay channel --repo "$R" --pr "$N" --ci-pubkey "$EXPECTED_CI_PUBKEY") || RC=$?
+            if [ "$RC" -eq 3 ]; then decision "$N" "skip — no binding note (mirror has not run)"; continue; fi
+            if [ "$RC" -ne 0 ]; then decision "$N" "ERROR resolving channel (rc=$RC)"; FAIL=1; continue; fi
+
+            # Current head already has a standing verdict → nothing owed.
+            RC=0
+            NOTE=$(relay standing-verdict --repo "$R" --pr "$N" --reviewer "$REVIEWER_PUBKEY") || RC=$?
+            if [ "$RC" -eq 0 ] && jq -e --arg h "$HEAD" '.content | contains($h)' <<<"$NOTE" >/dev/null; then
+              decision "$N" "verdict already covers $HEAD"; continue
+            fi
+            if [ "$RC" -ne 0 ] && [ "$RC" -ne 3 ]; then decision "$N" "ERROR reading verdict (rc=$RC)"; FAIL=1; continue; fi
+
+            MINE=$(relay events --channel "$CH" --author "$EXPECTED_CI_PUBKEY") || { decision "$N" "ERROR reading CI messages"; FAIL=1; continue; }
+            REQ_T=$(jq -r --arg h "$HEAD" '[.[] | select(.content | contains("Review head: `" + $h + "`")) | .created_at] | max // empty' <<<"$MINE")
+            if [ -z "$REQ_T" ]; then decision "$N" "skip — no review request names head ${HEAD:0:12} yet (quiet window or pre-feature PR)"; continue; fi
+            AGE=$((NOW - REQ_T))
+
+            THEIRS=$(relay events --channel "$CH" --author "$REVIEWER_PUBKEY") || { decision "$N" "ERROR reading reviewer messages"; FAIL=1; continue; }
+            # 5 s allowance for author-stamped clocks.
+            SINCE=$((REQ_T - 5))
+            if verdict_shaped "$SINCE" "$HEAD" "$THEIRS"; then
+              decision "$N" "verdict message posted for ${HEAD:0:12} (note may lag)"; continue
+            fi
+            LAST_T=$(jq -r --argjson t "$SINCE" '[.[] | select(.created_at >= $t) | .created_at] | max // empty' <<<"$THEIRS")
+
+            NUDGE="Reviewer nudge for ${HEAD}"
+            STALL="Reviewer unresponsive on ${HEAD}"
+            NUDGE_T=$(jq -r --arg m "$NUDGE" '[.[] | select(.content | contains($m)) | .created_at] | max // empty' <<<"$MINE")
+            HAS_STALL=$(jq -r --arg m "$STALL" '[.[] | select(.content | contains($m))] | length' <<<"$MINE")
+
+            if [ -z "$LAST_T" ]; then
+              # Silent since the request.
+              if [ "$AGE" -lt "$SILENT" ]; then decision "$N" "waiting — silent ${AGE}s since request for ${HEAD:0:12}"; continue; fi
+              if [ -z "$NUDGE_T" ]; then
+                RC=0
+                # shellcheck disable=SC2016  # backticks are markdown, not command substitution
+                printf '%s: no reply %d min after the review request for `%s`.\n@%s please review this PR. %s\n' \
+                  "$NUDGE" "$((AGE / 60))" "$HEAD" "$REVIEWER_NAME" "$DEFER" | post "$N" "$HEAD" "$CH" "$REVIEWER_PUBKEY" || RC=$?
+                settle "$N" "$HEAD" "$RC" "NUDGED — silent ${AGE}s since request for ${HEAD:0:12}"; continue
+              fi
+              if [ $((NOW - NUDGE_T)) -ge "$SILENT" ] && [ "$HAS_STALL" = "0" ]; then
+                RC=0
+                printf '%s: no reviewer message %d min after the request and %d min after a nudge — needs a human.\n%s\n' \
+                  "$STALL" "$((AGE / 60))" "$(((NOW - NUDGE_T) / 60))" "$STALE" | post "$N" "$HEAD" "$CH" "$OWNER_PUBKEY" || RC=$?
+                settle "$N" "$HEAD" "$RC" "STALLED — owner notified for ${HEAD:0:12}"; continue
+              fi
+              decision "$N" "nudged $(((NOW - NUDGE_T) / 60)) min ago, still silent on ${HEAD:0:12}"; continue
+            fi
+
+            # Acked (or otherwise talking) but no verdict-shaped message.
+            IDLE=$((NOW - LAST_T))
+            if [ "$IDLE" -lt "$DEAD" ]; then decision "$N" "in progress — last reviewer message ${IDLE}s ago on ${HEAD:0:12}"; continue; fi
+            if [ -z "$NUDGE_T" ]; then
+              RC=0
+              # shellcheck disable=SC2016  # backticks are markdown, not command substitution
+              printf '%s: last reviewer message %d min ago on `%s`, no verdict.\n@%s if that review died, restart it; if it is still running, carry on. %s\n' \
+                "$NUDGE" "$((IDLE / 60))" "$HEAD" "$REVIEWER_NAME" "$DEFER" | post "$N" "$HEAD" "$CH" "$REVIEWER_PUBKEY" || RC=$?
+              settle "$N" "$HEAD" "$RC" "NUDGED — acked but no verdict for ${IDLE}s on ${HEAD:0:12}"; continue
+            fi
+            if [ $((NOW - NUDGE_T)) -ge "$DEAD" ] && [ "$HAS_STALL" = "0" ]; then
+              RC=0
+              printf '%s: acknowledged but no verdict %d min after the last reviewer message and %d min after a nudge — needs a human.\n%s\n' \
+                "$STALL" "$((IDLE / 60))" "$(((NOW - NUDGE_T) / 60))" "$STALE" | post "$N" "$HEAD" "$CH" "$OWNER_PUBKEY" || RC=$?
+              settle "$N" "$HEAD" "$RC" "STALLED — owner notified for ${HEAD:0:12}"; continue
+            fi
+            decision "$N" "nudged $(((NOW - NUDGE_T) / 60)) min ago, still no verdict on ${HEAD:0:12}"
+          done < <(jq -r '.[] | "\(.number)\t\(.head)"' "$RUNNER_TEMP/candidates.json")
+          exit "$FAIL"

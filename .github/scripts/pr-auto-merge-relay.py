@@ -69,15 +69,15 @@ Commands:
       and proved to carry the channel's `h` tag. Presentation only — it backs
       the blocked-notice dedup scan, and a channel read must never be trusted
       to authorize anything.
-  send --channel <uuid>
+  send --channel <uuid> [--mention <hex64>[,<hex64>...]]
       Publish a kind-9 message with the content on stdin. Prints the event id.
-      Top-level and unthreaded, with no `p` tags — which is right for the
-      workflow's own channel notices ("blocked at <sha>", "merging now") and
-      wrong for anything conversational. A reply needs an `e` tag and a
-      mention needs a `p` tag; neither is modelled here, because this client
-      exists to serve one workflow rather than to be a second CLI. Use
-      `buzz messages send --reply-to --mention` for anything a human reads
-      as part of a conversation.
+      Top-level and unthreaded. Without --mention it carries no `p` tags —
+      right for the workflow's own channel notices ("blocked at <sha>",
+      "merging now"). --mention adds one `p` tag per pubkey, which is what
+      the review watchdog needs: buzz-waker wakes a hibernated agent only on
+      a p-tagged event from a non-agent author, so a CI nudge without the tag
+      reaches nobody who is asleep. Replies (`e` tags) are still not modelled;
+      use `buzz messages send --reply-to` for anything conversational.
   selftest
       Verify the parsing/proof/signing helpers against fixtures. No network.
 
@@ -329,8 +329,14 @@ def post_event(base, secret, auth_tag, event, opener=None):
     return payload
 
 
-def build_message(secret, auth_tag_json, channel, content, created_at):
+def build_message(secret, auth_tag_json, channel, content, created_at, mentions=()):
     """A kind-9 channel message, shaped exactly as `buzz messages send` shapes it.
+
+    `mentions` are 64-hex pubkeys, each emitted as a `["p", <hex>]` tag after
+    the `h` and `auth` tags — the shape `buzz messages send --mention` emits
+    and the shape buzz-waker's wake decision reads. A malformed pubkey is
+    refused rather than published: a p-tag that names nobody wakes nobody,
+    and the send would still report success.
 
     The NIP-OA `auth` tag is the caller's membership delegation and is signed
     OVER, not merely sent alongside — the relay reads it from the event as well
@@ -347,6 +353,10 @@ def build_message(secret, auth_tag_json, channel, content, created_at):
         if not (isinstance(tag, list) and len(tag) == 4 and tag[0] == "auth"):
             raise Refusal('BUZZ_AUTH_TAG must be ["auth", <owner>, <conditions>, <sig>]')
         tags.append([str(x) for x in tag])
+    for mention in mentions:
+        if not HEX64_RE.match(mention or ""):
+            raise Refusal(f"--mention must be a 64-hex pubkey, got {mention!r}")
+        tags.append(["p", mention])
     event = {
         "pubkey": MINT.xonly(secret).hex(),
         "created_at": created_at,
@@ -614,6 +624,12 @@ def selftest():
     # Content is signed over verbatim — a message the relay altered in flight
     # would not verify against what we sent.
     assert build_message(ci_sec, "", channel, "a\nb", 1)["content"] == "a\nb"
+    tagged = build_message(ci_sec, auth_json, channel, "nudge", 1, [rev_pub, ci_pub])
+    assert tagged["tags"][0] == ["h", channel] and tagged["tags"][1][0] == "auth"
+    assert tagged["tags"][2:] == [["p", rev_pub], ["p", ci_pub]], "p tags follow h and auth, one per mention"
+    assert MINT.schnorr_verify(bytes.fromhex(tagged["id"]), bytes.fromhex(tagged["pubkey"]), bytes.fromhex(tagged["sig"])), "mention tags are signed over"
+    _refuses("mention not hex64", lambda: build_message(ci_sec, "", channel, "x", 1, ["alex"]))
+    _refuses("mention empty", lambda: build_message(ci_sec, "", channel, "x", 1, [""]))
 
     print("selftest: relay client proofs pass (NIP-98, binding, verdict coordinate, channel scoping, completeness, signing)")
 
@@ -675,8 +691,9 @@ def _run(command, opts):
         content = sys.stdin.read()
         if not content.strip():
             raise SystemExit("refusing to publish an empty message")
+        mentions = [m for m in opts.get("--mention", "").split(",") if m]
         base, secret, auth_tag = open_relay(os.environ)
-        event = build_message(secret, auth_tag, channel, content, int(time.time()))
+        event = build_message(secret, auth_tag, channel, content, int(time.time()), mentions)
         post_event(base, secret, auth_tag, event)
         return 0, event["id"]
 

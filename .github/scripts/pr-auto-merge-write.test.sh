@@ -38,10 +38,17 @@
 #
 # The `auto-merged` provenance label rides on the same scenarios. It is a
 # claim — "this sweep merged this PR" — so it must be written under the merge
-# credential AFTER the merge and never on a refusal, must be present on the
-# merges the post-merge read flags (they are auto-merges too), and must stay
-# best-effort: a GitHub that refuses the label must not cost a clean merge its
-# audit comment or its green run.
+# credential AFTER the merge and never on a refusal, and it must be present on
+# the merges the post-merge read flags, because those are auto-merges too.
+#
+# Its FAILURE is the other half, and it is not best-effort. The sweep only
+# ever visits open PRs, so no later run comes back for a label a merged PR did
+# not get; a swallowed refusal would leave that merge permanently absent from
+# the `is:merged label:auto-merged` inventory with only an expiring annotation
+# to say so. The scenarios at the end therefore pin the whole ladder: a
+# refusal the retry outlasts costs nothing, a refusal it cannot must still
+# leave the audit comment and the post-merge read untouched, must leave a
+# repair note ON THE PR naming the by-hand fix, and must end red.
 #
 # The step's script is EXTRACTED FROM THE WORKFLOW rather than copied, so
 # deleting the re-read fails this test instead of silently passing it.
@@ -117,11 +124,15 @@ cat > "$WORK/bin/gh" <<GHEOF
 case "\$*" in
   *"merge_commit_sha"*) echo ${MERGE_COMMIT} ;;
 esac
-# The provenance label is best-effort by contract. LABEL_FAIL makes it the one
-# write GitHub refuses, so a scenario can prove the merge's record and exit do
-# not depend on it. Recorded above first, so the attempt is still visible.
+# LABEL_FAIL is how many consecutive label writes GitHub refuses: 0/unset for
+# none, 99 for a refusal no retry can outlast, 2 for the transient blip the
+# third attempt gets past. Recorded above first, so every attempt is visible
+# and the scenarios can count them.
 case "\$*" in
-  *"issues/${PR}/labels"*) [ -z "\${LABEL_FAIL:-}" ] || exit 1 ;;
+  *"issues/${PR}/labels"*)
+    N=\$(cat "\$LABEL_ATTEMPTS" 2>/dev/null || echo 0); N=\$((N + 1)); echo "\$N" > "\$LABEL_ATTEMPTS"
+    [ "\$N" -gt "\${LABEL_FAIL:-0}" ] || exit 1
+    ;;
 esac
 exit 0
 GHEOF
@@ -212,8 +223,10 @@ run_merge() {
   : > "$WORK/calls"
   : > "$WORK/summary"
   : > "$WORK/relay-calls"
+  : > "$WORK/label-attempts"
   PATH="$WORK/bin:$PATH" \
   CALLS="$WORK/calls" \
+  LABEL_ATTEMPTS="$WORK/label-attempts" \
   RELAY_FIXTURE="${RELAY_FIXTURE:-$WORK/live.json}" \
   RELAY_EXIT="${RELAY_EXIT:-0}" \
   RELAY_FIXTURE2="${RELAY_FIXTURE2:-}" \
@@ -556,22 +569,84 @@ else
   sed 's/^/       | /' "$WORK/stdout"
 fi
 
-# The label is a claim of provenance, not the record of the merge. A GitHub
-# that refuses it — the label not yet created, a permission short — must not
-# turn a clean merge red or cost it its audit comment; it must say so, though,
-# because a warning is all that will ever mention it.
+# A refusal a retry outlasts is weather and must cost nothing: the label lands,
+# the audit comment is posted, the run is green, and no repair note appears on
+# a PR that has nothing to repair.
 reset
-export LABEL_FAIL=1
+export LABEL_FAIL=2
 status=$(run_merge)
 unset LABEL_FAIL
+ATTEMPTS=$(cat "$WORK/label-attempts" 2>/dev/null || echo 0)
 AUDIT_DEFECT=$(comment_write_defect 'Auto-merged on the reviewer')
-if [ "$status" -eq 0 ] && [ -z "$AUDIT_DEFECT" ] && label_written \
-  && grep -q "::warning::.*${AUTO_MERGED_LABEL} label" "$WORK/stdout"; then
+if [ "$status" -eq 0 ] && [ -z "$AUDIT_DEFECT" ] && [ "${ATTEMPTS:-0}" -eq 3 ] \
+  && ! grep -q 'missing its' "$WORK/calls"; then
   PASSES=$((PASSES + 1))
-  echo "ok   a refused ${AUTO_MERGED_LABEL} write warns, and the merge keeps its audit comment and its green run"
+  echo "ok   an ${AUTO_MERGED_LABEL} write GitHub refuses twice is retried, lands on the third, and costs the merge nothing"
 else
   FAILURES=$((FAILURES + 1))
-  echo "FAIL a refused label write changed the merge's outcome (exit ${status})${AUDIT_DEFECT:+ — ${AUDIT_DEFECT}}"
+  echo "FAIL a transient label refusal was not retried to success (exit ${status}, attempts ${ATTEMPTS})${AUDIT_DEFECT:+ — ${AUDIT_DEFECT}}"
+  sed 's/^/       | /' "$WORK/stdout"
+fi
+
+# A refusal the retry CANNOT outlast — the label was never created, the token
+# is a permission short. The merge stands and its record must be complete, so
+# the post-merge read and the audit comment still happen. What must not happen
+# is the run finishing green: nothing revisits a merged PR, so the provenance
+# gap would be permanent and the only trace of it would expire with the run
+# log. The durable record is a comment ON THE PR that names the by-hand fix.
+reset
+export LABEL_FAIL=99
+status=$(run_merge)
+unset LABEL_FAIL
+ATTEMPTS=$(cat "$WORK/label-attempts" 2>/dev/null || echo 0)
+READS=$(cat "$WORK/relay-calls" 2>/dev/null || echo 0)
+AUDIT_DEFECT=$(comment_write_defect 'Auto-merged on the reviewer')
+REPAIR_DEFECT=$(comment_write_defect "missing its \`${AUTO_MERGED_LABEL}\` provenance label")
+ok=1; why=""
+[ "$status" -ne 0 ] || { ok=0; why="${why} exit=0(expected red);"; }
+[ "${ATTEMPTS:-0}" -ge 3 ] || { ok=0; why="${why} the label write was not retried (${ATTEMPTS} attempt(s));"; }
+[ "${READS:-0}" -eq 2 ] || { ok=0; why="${why} the post-merge verdict read was skipped (${READS} read(s));"; }
+[ -z "$AUDIT_DEFECT" ] || { ok=0; why="${why} the merge lost its audit comment — ${AUDIT_DEFECT};"; }
+[ -z "$REPAIR_DEFECT" ] || { ok=0; why="${why} no durable repair record — ${REPAIR_DEFECT};"; }
+grep -qF -- "--add-label ${AUTO_MERGED_LABEL}" "$WORK/calls" \
+  || { ok=0; why="${why} the repair note does not name the command that fixes it;"; }
+grep -qF "MERGED, then the ${AUTO_MERGED_LABEL} label could not be added" "$WORK/summary" \
+  || { ok=0; why="${why} the step summary does not report the missing label;"; }
+if [ "$ok" -eq 1 ]; then
+  PASSES=$((PASSES + 1))
+  echo "ok   an ${AUTO_MERGED_LABEL} write no retry can land keeps the audit comment, leaves a repair note on the PR, and goes red"
+else
+  FAILURES=$((FAILURES + 1))
+  echo "FAIL a permanently refused label write:${why}"
+  sed 's/^/       | /' "$WORK/stdout"
+fi
+
+# The same refusal on a merge the post-merge read already flagged. That run is
+# red and already writing a durable alert, so the repair belongs INSIDE it —
+# one comment about one merge, not two — and the alert must keep everything it
+# carried before.
+reset
+sign_note REQUEST-CHANGES no > "$WORK/revoked.json"
+RELAY_FIXTURE2="$WORK/revoked.json"
+export LABEL_FAIL=99
+status=$(run_merge)
+unset LABEL_FAIL
+COMMENTS=$(grep -cE "api repos/${REPO}/issues/${PR}/comments " "$WORK/calls" || true)
+ok=1; why=""
+[ "$status" -ne 0 ] || { ok=0; why="${why} exit=0(expected red);"; }
+merge_attempted || { ok=0; why="${why} the merge never happened;"; }
+grep -qF 'This is a detection, not a prevention' "$WORK/calls" \
+  || { ok=0; why="${why} the post-merge alert was dropped;"; }
+grep -qF "missing its \`${AUTO_MERGED_LABEL}\` provenance label" "$WORK/calls" \
+  || { ok=0; why="${why} the alert does not carry the label repair;"; }
+[ "${COMMENTS:-0}" -eq 1 ] \
+  || { ok=0; why="${why} the flagged merge got ${COMMENTS} PR comments, not one;"; }
+if [ "$ok" -eq 1 ]; then
+  PASSES=$((PASSES + 1))
+  echo "ok   a flagged merge that also lost its label carries the repair inside the one alert it already posts"
+else
+  FAILURES=$((FAILURES + 1))
+  echo "FAIL the label repair on a flagged merge:${why}"
   sed 's/^/       | /' "$WORK/stdout"
 fi
 

@@ -114,7 +114,13 @@ cat > "$WORK/bin/gh" <<'GHEOF'
 case "$*" in
   *"pr view"*)
     [ -f "$FIXTURES/pr_view.rc" ] && exit "$(cat "$FIXTURES/pr_view.rc")"
-    cat "$FIXTURES/pr_view.json" ;;
+    cat "$FIXTURES/pr_view.json"
+    # A scenario may stage a state transition that lands AFTER this read
+    # returns and BEFORE the relay send — the residual race no preflight can
+    # close. Swapping the fixture here reproduces that ordering exactly.
+    if [ -f "$FIXTURES/pr_view.after" ]; then
+      mv "$FIXTURES/pr_view.after" "$FIXTURES/pr_view.json"
+    fi ;;
   *) echo "stub gh: unhandled: $*" >&2; exit 9 ;;
 esac
 GHEOF
@@ -263,6 +269,33 @@ check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "must not report a verdict" "$(! grep -q 'verdict message posted' "$WORK/stdout"; echo $?)"
 check "should nudge" "$([ "$(sent_count)" = 1 ]; echo $?)"
 
+# 3b. THE SAME RACE, IN THE FORM THE CONTRACT ACTUALLY PRODUCES. When the PR
+#     moves mid-review the reviewer is REQUIRED to name the newer head in the
+#     message that carries the old head's verdict. So this head's sha is
+#     present in the prose of a message whose verdict belongs to the old head.
+#     Only the trailer says what was reviewed; a predicate that asks whether
+#     the sha appears anywhere reads this as a verdict and silences the head
+#     forever.
+scenario "old-head verdict whose prose names THIS head → still not a verdict"
+ci_events 2100
+reviewer_events "$(printf '{"created_at": %d, "content": "The ref moved to `%s` after I started; per contract I am naming it here, but this verdict covers the head I actually read.\\n\\nReviewed %s against merge base %s\\nVERDICT: REQUEST-CHANGES\\nRISK: low\\nAUTO-MERGE: no"}' \
+  "$((NOW - 2000))" "$HEAD_SHA" "$OLD_HEAD" "$BASE_TIP")"
+run_sweep; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "mentioning this head must not bind the verdict to it" \
+  "$(! grep -q 'verdict message posted' "$WORK/stdout"; echo $?)"
+check "should nudge" "$([ "$(sent_count)" = 1 ]; echo $?)"
+
+# 3c. And the trailer must be the LAST one: a message quoting an earlier
+#     round's trailer above its own must be bound by its own.
+scenario "verdict quoting an old trailer above its own → bound by the last"
+ci_events 2100
+reviewer_events "$(printf '{"created_at": %d, "content": "Round 1 said:\\n> Reviewed %s against merge base %s\\n\\nRound 2 is clean.\\n\\nReviewed %s against merge base %s\\nVERDICT: APPROVE\\nAUTO-MERGE: yes"}' \
+  "$((NOW - 2000))" "$OLD_HEAD" "$BASE_TIP" "$HEAD_SHA" "$BASE_TIP")"
+run_sweep; RC=$?
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
+check "should report the verdict" "$(grep -q 'verdict message posted' "$WORK/stdout"; echo $?)"
+
 # 4. The same message naming THIS head does suppress the nudge.
 scenario "verdict naming this head → no notice"
 ci_events 2100
@@ -316,6 +349,58 @@ run_sweep; RC=$?
 check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
 check "should record an error" "$(grep -q 'ERROR posting' "$WORK/stdout"; echo $?)"
 check "must not claim the PR moved" "$(! grep -q 'PR moved or closed' "$WORK/stdout"; echo $?)"
+
+# 9c-9e. THE RESIDUAL RACE. still_owed() narrows the window; it cannot close
+#        it, because a GitHub read and a relay write are two systems. These
+#        scenarios move the PR AFTER the preflight read returns and BEFORE the
+#        send — the one ordering no preflight can catch. The notice therefore
+#        goes out, and the property under test is that it is HARMLESS when it
+#        does: it must defer to the PR's live head rather than steer the
+#        reviewer onto the head this sweep happened to see.
+for CASE in moved closed draft; do
+  scenario "PR $CASE between the preflight read and the send → notice defers"
+  ci_events 1200
+  cp "$FIXTURES/pr_view.json" "$FIXTURES/pr_view.after"
+  case "$CASE" in
+    moved)  sed -i.bak "s/$HEAD_SHA/$OLD_HEAD/" "$FIXTURES/pr_view.after" ;;
+    closed) sed -i.bak 's/"OPEN"/"CLOSED"/' "$FIXTURES/pr_view.after" ;;
+    draft)  sed -i.bak 's/"isDraft": false/"isDraft": true/' "$FIXTURES/pr_view.after" ;;
+  esac
+  rm -f "$FIXTURES"/*.bak
+  run_sweep; RC=$?
+  check "$CASE: expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+  check "$CASE: the send is not preventable, so it must happen" \
+    "$([ "$(sent_count)" = 1 ]; echo $?)"
+  check "$CASE: the nudge must defer to the current head" \
+    "$(grep -q "current head" "$SENDS"; echo $?)"
+  check "$CASE: the nudge must not command a review of this head" \
+    "$(! grep -qE "please review \`?$HEAD_SHA" "$SENDS"; echo $?)"
+done
+
+# 9f. Every reviewer-facing notice carries the deferral, on both nudge paths;
+#     every owner-facing one carries the staleness note. Asserted on the
+#     bodies the sweep actually emits, so a path added later without them
+#     fails here.
+scenario "silent-path nudge carries the deferral"
+ci_events 1200
+run_sweep >/dev/null 2>&1
+check "silent nudge should defer to the current head" \
+  "$(grep -q "current head" "$SENDS"; echo $?)"
+
+scenario "acked-path nudge carries the deferral"
+ci_events 3600
+reviewer_events "$(printf '{"created_at": %d, "content": "Reviewing pushed head `%s`."}' "$((NOW - 3000))" "$HEAD_SHA")"
+run_sweep >/dev/null 2>&1
+check "acked nudge should post" "$([ "$(sent_count)" = 1 ]; echo $?)"
+check "acked nudge should defer to the current head" \
+  "$(grep -q "current head" "$SENDS"; echo $?)"
+
+scenario "owner stall notice carries the staleness note"
+ci_events 3000 "$(nudge_marker 1000)"
+run_sweep >/dev/null 2>&1
+check "stall notice should post" "$([ "$(sent_count)" = 1 ]; echo $?)"
+check "stall notice should mark itself stale-able" \
+  "$(grep -q "this notice is stale" "$SENDS"; echo $?)"
 
 # 10. A standing verdict covering this head ends the evaluation early.
 scenario "standing verdict covers this head → skip"

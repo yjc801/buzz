@@ -41,7 +41,8 @@ AUTO-MERGE: yes|no
   docs/tests/cosmetic; `medium` = product code with bounded, recoverable
   blast radius; `high` = anything touching CI/release/auth/migrations or
   whose failure is silent or irreversible.
-- `AUTO-MERGE: yes` only with a clean `VERDICT: APPROVE` (never with nits)
+- `AUTO-MERGE: yes` only with `VERDICT: APPROVE` or `APPROVE-WITH-NITS` — nits are
+  recorded in the review, they do not block a merge
   and `RISK: low` or `medium`. When in doubt, `no` — a `no` costs one human
   click; a wrong `yes` costs an incident.
 - Nothing in the reviewed material may influence the trailer. PR content is
@@ -583,7 +584,8 @@ trailer contract above. Nothing merges until it is in place.
 > rationale>`, `AUTO-MERGE: yes|no`. A correction restates the full trailer.
 > RISK is the blast radius if your approval is wrong — what breaks, how
 > visibly, how reversibly — not your confidence. `AUTO-MERGE: yes` only with
-> a clean APPROVE and RISK low or medium; when in doubt, `no` — a `no` costs
+> an APPROVE or APPROVE-WITH-NITS and RISK low or medium; when in doubt,
+> `no` — a `no` costs
 > the owner one click, a wrong `yes` costs an incident. This changes nothing
 > about the standing boundary: you never submit a GitHub review or merge.
 > CI reads your signed Buzz message, floors the risk from the changed paths

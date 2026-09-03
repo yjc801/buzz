@@ -438,7 +438,7 @@ expect_label "a low-risk approval the reviewer would not auto-merge is not label
 
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS low yes
-expect_label "nits on a low-risk approval are the reviewer's call, not the owner's click" none
+expect_label "nits on a low-risk approval merge like a clean approval, so no label" none
 
 reset_fixtures
 edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'

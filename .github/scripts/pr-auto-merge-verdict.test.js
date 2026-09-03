@@ -68,10 +68,17 @@ test("a quoted trailer does not authorize — only the final four lines count", 
   assert.equal(result.requested, false);
 });
 
-test("APPROVE-WITH-NITS does not qualify", () => {
+test("APPROVE-WITH-NITS qualifies like APPROVE (nits are recorded, not blocking)", () => {
   const result = decide([verdictMessage({ verdict: "APPROVE-WITH-NITS" })], opts());
+  assert.equal(result.requested, true);
+  assert.equal(result.authorized, true);
+  assert.equal(result.reason, "ok");
+});
+
+test("REQUEST-CHANGES does not qualify", () => {
+  const result = decide([verdictMessage({ verdict: "REQUEST-CHANGES" })], opts());
   assert.equal(result.requested, false);
-  assert.equal(result.reason, "verdict is APPROVE-WITH-NITS");
+  assert.equal(result.reason, "verdict is REQUEST-CHANGES");
 });
 
 test("AUTO-MERGE: no is honored", () => {

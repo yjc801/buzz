@@ -1161,8 +1161,8 @@ jobs:
       # The only step in either job that can write to the repository, and the
       # only one AUTO_MERGE_TOKEN is exposed to. Even here it is applied per
       # command rather than exported as GH_TOKEN, and stripped from the
-      # environment of the relay read, so nothing but the merge write and the
-      # audit comment ever sees merge authority.
+      # environment of the relay read, so nothing but the merge write, the
+      # provenance label and the audit comment ever sees merge authority.
       - name: Merge
         if: steps.revalidate.outputs.proceed == 'true'
         env:
@@ -1305,6 +1305,30 @@ jobs:
             exit 1
           fi
           echo "- PR #$PR: MERGED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR})" >> "$GITHUB_STEP_SUMMARY"
+
+          # PROVENANCE LABEL, written the moment the merge has landed and
+          # BEFORE the post-merge read. It claims one thing — this sweep
+          # performed the merge — and that is true from here on whatever the
+          # read below finds, so it is not held back for the all-clear the
+          # way the audit comment is: a merge the post-merge read flags is
+          # still an auto-merge, and an owner filtering
+          # `is:merged label:auto-merged` is looking for exactly those too.
+          # Never before the write, either: GitHub may still reject the merge
+          # on the pinned `sha`, and a label on an unmerged PR would claim a
+          # merge that did not happen.
+          #
+          # Visibility only, like `approved-manual-merge` in the evaluate
+          # job: it gates nothing, and a failed write warns rather than goes
+          # red — the audit comment below is the durable record. REST under
+          # MERGE_TOKEN, as every write in this step is; the job's default
+          # token is read-only. The issues labels endpoint on a PR is covered
+          # by the same Pull requests: write permission the audit comment
+          # already relies on.
+          AUTO_MERGED_LABEL=auto-merged
+          if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/labels" \
+              -f "labels[]=$AUTO_MERGED_LABEL" >/dev/null; then
+            echo "::warning::PR #$PR: merged, but the ${AUTO_MERGED_LABEL} label could not be added — the audit comment is the record; check that the label exists (docs/pr-auto-merge.md, ops runbook)"
+          fi
 
           # AFTER THE WRITE. The window above cannot be closed, so it is closed
           # from the other side: read the coordinate once more, now that main

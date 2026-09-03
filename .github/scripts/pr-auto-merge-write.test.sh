@@ -36,6 +36,13 @@
 # its timing is unknown) and pin the ABSENCE of the accusation, which is what
 # makes re-asserting a contradiction fail this test.
 #
+# The `auto-merged` provenance label rides on the same scenarios. It is a
+# claim — "this sweep merged this PR" — so it must be written under the merge
+# credential AFTER the merge and never on a refusal, must be present on the
+# merges the post-merge read flags (they are auto-merges too), and must stay
+# best-effort: a GitHub that refuses the label must not cost a clean merge its
+# audit comment or its green run.
+#
 # The step's script is EXTRACTED FROM THE WORKFLOW rather than copied, so
 # deleting the re-read fails this test instead of silently passing it.
 #
@@ -54,6 +61,7 @@ BASE_TIP=3333333333333333333333333333333333333333
 # with write authority, and the job's default token cannot merge at all.
 MERGE_TOKEN_VALUE=merge-write-token
 READ_TOKEN_VALUE=read-only-token
+AUTO_MERGED_LABEL=auto-merged
 
 [ -f "$WORKFLOW" ] || { echo "run from the repository root" >&2; exit 2; }
 
@@ -108,6 +116,12 @@ cat > "$WORK/bin/gh" <<GHEOF
 # revert command that is copy-pasteable rather than a placeholder.
 case "\$*" in
   *"merge_commit_sha"*) echo ${MERGE_COMMIT} ;;
+esac
+# The provenance label is best-effort by contract. LABEL_FAIL makes it the one
+# write GitHub refuses, so a scenario can prove the merge's record and exit do
+# not depend on it. Recorded above first, so the attempt is still visible.
+case "\$*" in
+  *"issues/${PR}/labels"*) [ -z "\${LABEL_FAIL:-}" ] || exit 1 ;;
 esac
 exit 0
 GHEOF
@@ -289,6 +303,30 @@ comment_write_defect() {
   esac
 }
 
+# The provenance label is the write that says "this sweep merged this PR", so
+# it has the comment's three requirements — endpoint, credential, field — and
+# one more: ORDER. Written before the merge it would claim a merge GitHub may
+# still reject on the pinned `sha`.
+label_written() { grep -qE "(^| )api repos/${REPO}/issues/${PR}/labels( |$)" "$WORK/calls"; }
+label_write_defect() {
+  local line merge_at label_at
+  line=$(grep -nE "(^| )api repos/${REPO}/issues/${PR}/labels( |$)" "$WORK/calls" | head -n1)
+  [ -n "$line" ] || { echo "no ${AUTO_MERGED_LABEL} label was added to the merged PR"; return; }
+  label_at=${line%%:*}
+  line=${line#*:}
+  case " $line " in *" token=${MERGE_TOKEN_VALUE} "*) ;;
+    *) echo "the label was not added under the merge credential"; return ;;
+  esac
+  case " $line " in *" -f labels[]=${AUTO_MERGED_LABEL} "*) ;;
+    *) echo "the label write does not add ${AUTO_MERGED_LABEL} as a labels[] field"; return ;;
+  esac
+  merge_at=$(grep -nE "(^| )repos/${REPO}/pulls/${PR}/merge( |$)" "$WORK/calls" | head -n1)
+  merge_at=${merge_at%%:*}
+  if [ -z "$merge_at" ] || [ "$merge_at" -ge "$label_at" ]; then
+    echo "the label was written before the merge — it would claim a merge GitHub may still reject"
+  fi
+}
+
 # The revert lookup is a read, but the gh stub answers it on the presence of
 # the jq expression alone — so a request aimed at the wrong endpoint still
 # yields a commit, and the revert assertion below still passes.
@@ -317,6 +355,10 @@ expect() {
     got=refused
   fi
   [ "$got" != merged ] || defect=$(merge_write_defect)
+  [ "$got" != merged ] || [ -n "$defect" ] || defect=$(label_write_defect)
+  if [ "$got" = refused ] && label_written; then
+    defect="a ${AUTO_MERGED_LABEL} label was added to a PR that was not merged"
+  fi
   if [ "$got" = "$want" ] && [ -z "$defect" ]; then
     PASSES=$((PASSES + 1))
     echo "ok   ${label} (${got})"
@@ -328,7 +370,7 @@ expect() {
 }
 
 reset() {
-  unset RELAY_EXIT RELAY_EXIT2 RELAY_FIXTURE2 ANNOUNCED_ID
+  unset RELAY_EXIT RELAY_EXIT2 RELAY_FIXTURE2 ANNOUNCED_ID LABEL_FAIL
   printf '%s' "$APPROVE" > "$WORK/live.json"
 }
 
@@ -413,6 +455,8 @@ expect_alert() {
     ok=0; why="${why} the merge never happened;"
   else
     d=$(merge_write_defect); [ -z "$d" ] || { ok=0; why="${why} ${d};"; }
+    # A flagged merge is still a merge this sweep performed.
+    d=$(label_write_defect); [ -z "$d" ] || { ok=0; why="${why} ${d};"; }
   fi
   d=$(comment_write_defect 'This is a detection, not a prevention')
   [ -z "$d" ] || { ok=0; why="${why} ${d};"; }
@@ -509,6 +553,25 @@ if [ "$status" -eq 0 ] && [ "${READS:-0}" -eq 2 ] && [ -z "$AUDIT_DEFECT" ] \
 else
   FAILURES=$((FAILURES + 1))
   echo "FAIL the clean merge did not read the coordinate on both sides (exit ${status}, reads ${READS})${AUDIT_DEFECT:+ — ${AUDIT_DEFECT}}"
+  sed 's/^/       | /' "$WORK/stdout"
+fi
+
+# The label is a claim of provenance, not the record of the merge. A GitHub
+# that refuses it — the label not yet created, a permission short — must not
+# turn a clean merge red or cost it its audit comment; it must say so, though,
+# because a warning is all that will ever mention it.
+reset
+export LABEL_FAIL=1
+status=$(run_merge)
+unset LABEL_FAIL
+AUDIT_DEFECT=$(comment_write_defect 'Auto-merged on the reviewer')
+if [ "$status" -eq 0 ] && [ -z "$AUDIT_DEFECT" ] && label_written \
+  && grep -q "::warning::.*${AUTO_MERGED_LABEL} label" "$WORK/stdout"; then
+  PASSES=$((PASSES + 1))
+  echo "ok   a refused ${AUTO_MERGED_LABEL} write warns, and the merge keeps its audit comment and its green run"
+else
+  FAILURES=$((FAILURES + 1))
+  echo "FAIL a refused label write changed the merge's outcome (exit ${status})${AUDIT_DEFECT:+ — ${AUDIT_DEFECT}}"
   sed 's/^/       | /' "$WORK/stdout"
 fi
 

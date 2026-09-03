@@ -321,7 +321,11 @@ post-merge read flips five scenarios from red to a silent success. Those
 scenarios also assert what the alert must **not** claim: restoring wording that
 asserts the revocation preceded the merge fails them, because the stub swaps
 its fixture by read number and therefore models both sequences at once — which
-is exactly the production ambiguity, not a shortcut in the test.
+is exactly the production ambiguity, not a shortcut in the test. The same file
+pins the `auto-merged` provenance label: written under the merge credential
+after the merge and never on a refusal, present on the flagged merges too, and
+best-effort — a refused label write leaves the audit comment and the run's
+exit untouched.
 
 **The stops that have no window at all are the GitHub-side ones**, because
 GitHub evaluates them as part of the merge:
@@ -435,8 +439,12 @@ together (`just auto-merge-check`, wired into CI's contract steps).
   merge does not happen this tick. The wording is hedged on purpose: the
   message is written by `evaluate`, and the isolated `merge` job re-checks
   every gate afterwards and may still refuse.
-- After merging, CI leaves a GitHub PR comment naming the verdict event id,
-  RISK, floor, effective tier, head SHA, and the run.
+- After merging, CI adds the `auto-merged` label to the PR — the moment the
+  write lands, before the post-merge verdict read, so a sweep merge that read
+  later flags carries it too — and leaves a GitHub PR comment naming the
+  verdict event id, RISK, floor, effective tier, head SHA, and the run. The
+  label is provenance, not a gate: `is:pr is:merged label:auto-merged` lists
+  every merge the sweep performed.
 - When the reviewer requested auto-merge but a gate refused, CI posts one
   `⛔ auto-merge blocked at <sha>` notice per head naming every failed gate.
 
@@ -515,6 +523,20 @@ the only honest record.
   keeps the label, which the documented queue filter already excludes. Filter
   the queue with `is:open label:approved-manual-merge`. Contract test:
   `.github/scripts/pr-auto-merge-label.test.sh`.
+- **"Which merges were the sweep's?":** every PR the merge job merges gets
+  the `auto-merged` label, written immediately after the merge write succeeds
+  and before the post-merge verdict read. The label claims only that this
+  workflow performed the merge, which stays true whatever that read finds, so
+  a merge the run later flags red carries it too; it is never written before
+  the merge, because GitHub may still reject the write on the pinned `sha`.
+  Provenance only: it gates nothing, and a failed write is a warning — the
+  audit comment is the durable record. Written with `AUTO_MERGE_TOKEN` over
+  REST under the same Pull requests: write permission the audit comment uses;
+  the merge job's default token stays read-only. Filter with
+  `is:pr is:merged label:auto-merged`. Create the label once, with a
+  deliberate colour and description (`gh label create auto-merged`), the way
+  `no-auto-merge` and `approved-manual-merge` were. Contract test:
+  `.github/scripts/pr-auto-merge-write.test.sh`.
 - **Required ruleset on `main`:** a prerequisite for the feature doing
   anything at all. Everything else the workflow checks is a read with a window
   after it; a branch rule is evaluated by GitHub as part of the merge itself,

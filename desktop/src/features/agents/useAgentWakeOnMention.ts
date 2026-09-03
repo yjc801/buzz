@@ -265,7 +265,7 @@ export function useAgentWakeOnMention(enabled: boolean) {
           );
           const started = await startMutation.mutateAsync({
             pubkey,
-            wakeReplayFloorTs: committedFloorTs,
+            replayFloorUnix: committedFloorTs,
           });
           committedFloorAdopted = started.freshGeneration === true;
           return started;

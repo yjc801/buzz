@@ -6,14 +6,15 @@ use super::managed_agent_definition::validate_create_definition;
 use crate::{
     app_state::AppState,
     managed_agents::{
+        bestie_assignment::{recover_pending_assignment_cleanup, with_agent_assignments_cleared},
         build_managed_agent_summary, current_instance_id, ensure_persona_is_active,
         find_managed_agent_mut, load_managed_agents, load_personas, load_teams,
-        normalize_agent_args, resolve_provider_binary, save_managed_agents,
-        start_managed_agent_process, stop_managed_agent_process, stop_managed_agent_workspace_pair,
-        sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
-        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentSummary,
-        RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
-        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        managed_agents_base_dir, normalize_agent_args, resolve_provider_binary,
+        save_managed_agents, start_managed_agent_process, stop_managed_agent_process,
+        stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
+        validate_provider_config, BackendKind, CreateManagedAgentRequest,
+        CreateManagedAgentResponse, ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND,
+        DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -179,6 +180,7 @@ pub(super) async fn start_local_agent_with_preflight(
     allow_fresh_create_start: bool,
     expected_relay_url: Option<&str>,
     expected_signer_pubkey: Option<&str>,
+    replay_floor_unix: Option<u64>,
 ) -> Result<ManagedAgentSummary, String> {
     let record_snapshot = {
         let _store_guard = state
@@ -272,6 +274,7 @@ pub(super) async fn start_local_agent_with_preflight(
         &mut runtimes,
         Some(workspace_owner.as_str()),
         &workspace_relay_url,
+        replay_floor_unix,
     )?;
     save_managed_agents(app, &records)?;
     if let Some(saved_record) = records.iter().find(|r| r.pubkey == pubkey) {
@@ -732,7 +735,8 @@ pub async fn create_managed_agent(
     // ── Phase 3b: local spawn (async preflight outside store lock) ───────────
     let mut spawn_error = None;
     let agent = if input.spawn_after_create && input.backend == BackendKind::Local {
-        match start_local_agent_with_preflight(&app, &state, &pubkey, true, None, None).await {
+        match start_local_agent_with_preflight(&app, &state, &pubkey, true, None, None, None).await
+        {
             Ok(agent) => agent,
             Err(error) => {
                 let _store_guard = state
@@ -838,7 +842,9 @@ pub async fn create_managed_agent(
 #[tauri::command]
 pub async fn start_managed_agent(
     pubkey: String,
-    wake_replay_floor: Option<u64>, // see `apply_wake_replay_floor`
+    // Named to match upstream's IPC contract for the same concept; the
+    // payload-side helper is still `apply_wake_replay_floor`.
+    replay_floor_unix: Option<u64>,
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     app: AppHandle,
@@ -924,7 +930,7 @@ pub async fn start_managed_agent(
             StartTarget::Provider {
                 backend: record.backend.clone(),
                 cached_binary_path: record.provider_binary_path.clone(),
-                agent_json: build_deploy_payload(&app, &state, record, wake_replay_floor)?,
+                agent_json: build_deploy_payload(&app, &state, record, replay_floor_unix)?,
             }
         };
 
@@ -939,6 +945,10 @@ pub async fn start_managed_agent(
             false,
             expected_relay_url.as_deref(),
             expected_signer_pubkey.as_deref(),
+            // A wake deploy's floor reaches a LOCAL spawn as process env; the
+            // provider path instead carries it inside `agent_json` (see
+            // `apply_wake_replay_floor`). Both end up as BUZZ_ACP_REPLAY_FLOOR.
+            replay_floor_unix,
         )
         .await
         .map(|agent| StartManagedAgentOutcome {
@@ -1073,6 +1083,20 @@ pub async fn stop_managed_agent(
 
 // Async so the blocking body (disk reads/writes, process termination, keyring
 // delete, nest regeneration) runs off the main UI thread via spawn_blocking.
+fn run_managed_agent_deletion<T>(
+    base_dir: &std::path::Path,
+    pubkey: &str,
+    records: &mut Vec<ManagedAgentRecord>,
+    delete: impl FnOnce(&mut Vec<ManagedAgentRecord>) -> Result<T, String>,
+) -> Result<T, String> {
+    recover_pending_assignment_cleanup(base_dir, |pending_pubkey| {
+        records
+            .iter()
+            .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
+    })?;
+    with_agent_assignments_cleared(base_dir, pubkey, || delete(records))
+}
+
 #[tauri::command]
 pub async fn delete_managed_agent(
     pubkey: String,
@@ -1088,6 +1112,12 @@ pub async fn delete_managed_agent(
                 .lock()
                 .map_err(|error| error.to_string())?;
             let mut records = load_managed_agents(&app)?;
+            let base_dir = managed_agents_base_dir(&app)?;
+            recover_pending_assignment_cleanup(&base_dir, |pending_pubkey| {
+                records
+                    .iter()
+                    .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
+            })?;
             let mut runtimes = state
                 .managed_agent_processes
                 .lock()
@@ -1119,16 +1149,17 @@ pub async fn delete_managed_agent(
                 }
             }
 
-            if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
-                stop_managed_agent_process(&app, record, &mut runtimes)?;
-            }
-            state.clear_agent_session_caches(&pubkey);
-            let initial_len = records.len();
-            records.retain(|record| record.pubkey != pubkey);
-            if records.len() == initial_len {
+            if !records.iter().any(|record| record.pubkey == pubkey) {
                 return Err(format!("agent {pubkey} not found"));
             }
-            save_managed_agents(&app, &records)?;
+            run_managed_agent_deletion(&base_dir, &pubkey, &mut records, |records| {
+                if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
+                    stop_managed_agent_process(&app, record, &mut runtimes)?;
+                }
+                state.clear_agent_session_caches(&pubkey);
+                records.retain(|record| record.pubkey != pubkey);
+                save_managed_agents(&app, records)
+            })?;
             crate::managed_agents::delete_agent_key(&pubkey);
             // Tombstone after confirmed removal (inside lock; every published
             // agent tombstones). The NIP-IA kind:9035 archive request — which

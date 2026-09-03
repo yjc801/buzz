@@ -232,19 +232,27 @@ fn launch_block_non_claude_preserves_user_model_env() {
 }
 
 #[test]
-fn launch_block_claude_runtime_injects_effort_level_when_set() {
-    // I-4: remote parity — record.effort_level → BUZZ_ACP_EFFORT_LEVEL in policy_env.
-    let mut record = record();
-    record.effort_level = Some("high".to_string());
+fn launch_block_claude_runtime_carries_projected_effort_in_launch_env() {
+    // Under the harness-agnostic projection, effort no longer rides
+    // policy_env: `resolve_effective_harness_descriptor` reduces
+    // `descriptor.env` to exactly one effort key (for a keyless claude
+    // runtime, the ACP sentinel) holding the effective value, and
+    // build_launch_block passes that env through to launch.env verbatim.
+    let record = record();
     let descriptor = EffectiveHarnessDescriptor {
         command: "claude".into(),
         args: vec![],
-        env: BTreeMap::new(),
+        // The single projected effort key the descriptor resolver emits.
+        env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "high".to_string())]),
     };
     let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
     assert_eq!(
-        launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
-        "claude remote must receive BUZZ_ACP_EFFORT_LEVEL when effort_level is set"
+        launch["env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
+        "the projected effort key must survive into launch.env"
+    );
+    assert!(
+        launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+        "effort is not a policy_env value under the projection design"
     );
 }
 
@@ -266,31 +274,39 @@ fn launch_block_does_not_inject_effort_level_when_absent() {
 
 /// B5 remote parity: when a canonical effort_level is persisted, a conflicting
 /// user-supplied BUZZ_ACP_EFFORT_LEVEL in descriptor.env must NOT shadow it.
-/// The canonical value in policy_env (tier 1) must win in the final build_env
-/// output — the key must be absent from launch.env (tier 2) so tier 1 is
-/// authoritative.
+/// The projection resolves the collision before build_launch_block sees it, so
+/// the canonical value is the single effort key carried into launch.env.
 #[test]
 fn launch_block_canonical_effort_strips_user_env_collision() {
+    // Remote parity for the authority collision: the canonical column and a
+    // conflicting user `BUZZ_ACP_EFFORT_LEVEL` both present. The projection
+    // (run inside `resolve_effective_harness_descriptor`) resolves it —
+    // canonical `high` wins over the user `low` transport sentinel — and
+    // build_launch_block carries exactly that one value into launch.env,
+    // identical to the local spawn path.
     let mut record = record();
+    record.runtime = Some("claude".into());
     record.effort_level = Some("high".to_string());
-    let descriptor = EffectiveHarnessDescriptor {
-        command: "claude".into(),
-        args: vec![],
-        // User-supplied conflicting value in descriptor.env.
-        env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string())]),
-    };
+    record
+        .env_vars
+        .insert("BUZZ_ACP_EFFORT_LEVEL".into(), "low".into());
+    let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+        &record,
+        &[],
+        &Default::default(),
+    )
+    .expect("claude descriptor resolves");
     let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
 
-    // Canonical must be in policy_env (tier 1).
+    // The projected canonical authority is the single effort value carried.
     assert_eq!(
-        launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
-        "canonical effort must be in policy_env when record.effort_level is Some"
+        launch["env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
+        "canonical effort must win the collision and reach launch.env"
     );
-    // Conflicting user value must be absent from launch.env (tier 2) so it
-    // cannot shadow the canonical tier-1 value in build_env.
+    // Effort is not a policy_env value under the projection design.
     assert!(
-        launch["env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
-        "user BUZZ_ACP_EFFORT_LEVEL must be stripped from launch.env when canonical is present"
+        launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+        "effort is carried in launch.env, never policy_env"
     );
 }
 

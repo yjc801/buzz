@@ -23,10 +23,11 @@ export type StartManagedAgentOutcome = {
 export async function startManagedAgent(
   pubkey: string,
   options?: {
-    /** Unix seconds of the mention that triggered a wake deploy. Carried into
-     * the new harness as its startup replay floor so cold-start latency cannot
-     * drop the very message that woke it. Omitted for ordinary starts. */
-    wakeReplayFloorTs?: number;
+    /** Unix seconds of the mention that triggered this start. Carried into the
+     * new harness as its startup replay floor so cold-start latency cannot drop
+     * the very message that wanted it — a wake-on-mention deploy or a
+     * publish-first detached start. Omitted for ordinary starts. */
+    replayFloorUnix?: number;
     /** Tenant scope captured by the caller before its first await; the
      * backend fails closed before any spawn/deploy side effect when the
      * active community no longer matches. */
@@ -41,7 +42,7 @@ export async function startManagedAgent(
     fresh_generation: boolean | null;
   }>("start_managed_agent", {
     pubkey,
-    wakeReplayFloor: options?.wakeReplayFloorTs ?? null,
+    replayFloorUnix: options?.replayFloorUnix ?? null,
     expectedRelayUrl: options?.expectedRelayUrl ?? null,
     expectedSignerPubkey: options?.expectedSignerPubkey ?? null,
   });
@@ -87,10 +88,6 @@ export async function setManagedAgentAutoRestart(
 }
 
 /**
- * Assign a managed agent to a community (pass a relay URL) or unscope it
- * (`null` = offered in every community). Display/uniqueness scope only.
- */
-/**
  * Move an agent between running locally and running on a provider, keeping its
  * identity — pubkey, channel grants, git ACL, auth tag and engrams all follow.
  *
@@ -117,6 +114,10 @@ export async function setManagedAgentBackend(
   return fromRawManagedAgent(response);
 }
 
+/**
+ * Assign a managed agent to a community (pass a relay URL) or unscope it
+ * (`null` = offered in every community). Display/uniqueness scope only.
+ */
 export async function setManagedAgentCommunity(
   pubkey: string,
   communityRelayUrl: string | null,
@@ -148,21 +149,6 @@ export async function setManagedAgentWakerEnabled(
     },
   );
   return fromRawManagedAgent(response);
-}
-
-/**
- * B5: persist the canonical startup effort for a local managed agent. Applied
- * as `BUZZ_ACP_EFFORT_LEVEL` at the next spawn. Pass `null` to clear (reverts
- * to the adapter default). Rejects non-local agents.
- */
-export async function persistAgentEffortLevel(
-  pubkey: string,
-  effortLevel: string | null,
-): Promise<void> {
-  return invokeTauri<void>("persist_agent_effort_level", {
-    pubkey,
-    effortLevel,
-  });
 }
 
 export async function listManagedAgentRuntimes(): Promise<

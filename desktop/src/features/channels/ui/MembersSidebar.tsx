@@ -12,10 +12,8 @@ import {
   coalesceAgentAutocompleteCandidates,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentDirectoryReady,
   isAgentIdentityInAllowedList,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
-import { isOtherSetupAgent } from "@/features/agents/lib/otherSetupAgent";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import { useClassifiedMembers } from "@/features/channels/lib/useClassifiedMembers";
 import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
@@ -32,7 +30,7 @@ import {
 } from "@/features/profile/hooks";
 import { formatOwnerLabel } from "@/features/profile/lib/identity";
 import { rankUserCandidatesBySearch } from "@/features/profile/lib/userCandidateSearch";
-import { usePresenceQuery } from "@/features/presence/hooks";
+import { useAgentAvailabilityLookup } from "@/features/agents/lib/useAgentAvailability";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { changeChannelMemberRole } from "@/shared/api/tauri";
@@ -186,9 +184,6 @@ export function MembersSidebar({
     managedAgentsQuery,
     relayAgentsQuery,
   } = useClassifiedMembers(rawMembers, currentPubkey);
-  const agentDirectoriesReady =
-    isAgentDirectoryReady(managedAgentsQuery) &&
-    isAgentDirectoryReady(relayAgentsQuery);
   const activeMembers = React.useMemo(
     () =>
       [...people, ...bots].sort((left, right) =>
@@ -200,9 +195,13 @@ export function MembersSidebar({
     () => rawMembers.map((member) => member.pubkey),
     [rawMembers],
   );
-  const memberPresenceQuery = usePresenceQuery(allMemberPubkeys, {
-    enabled: open && rawMembers.length > 0,
-  });
+  // The query itself is still needed for the resolved/unresolved distinction:
+  // `getAvailability` collapses "not yet loaded" and "resolved offline" to
+  // different values, but only the query says whether it has settled at all.
+  const { getAvailability, query: memberPresenceQuery } =
+    useAgentAvailabilityLookup(allMemberPubkeys, {
+      enabled: open && rawMembers.length > 0,
+    });
   const memberProfilesQuery = useUsersBatchQuery(allMemberPubkeys, {
     enabled: open && rawMembers.length > 0,
   });
@@ -336,7 +335,7 @@ export function MembersSidebar({
         displayName: agent.name,
         avatarUrl: null,
         nip05Handle: null,
-        ownerPubkey: null,
+        ownerPubkey: agent.ownerPubkey,
         isAgent: true,
       });
     }
@@ -520,6 +519,7 @@ export function MembersSidebar({
     handleRemoveMember,
     isActionPending,
   } = useMembersSidebarActions({
+    getAvailability,
     channelId,
     controllableManagedBots,
     removableManagedBots,
@@ -622,16 +622,6 @@ export function MembersSidebar({
     const managedAgent = memberIsBot
       ? managedAgentByPubkey.get(normalizePubkey(member.pubkey))
       : undefined;
-    const showOtherSetupMarker =
-      memberIsBot &&
-      isOtherSetupAgent({
-        agentDirectoriesReady,
-        currentPubkey,
-        managedAgents: managedAgentsQuery.data ?? [],
-        profileOwnerPubkey: memberProfile?.ownerPubkey,
-        pubkey: member.pubkey,
-        relayAgents: relayAgentsQuery.data ?? [],
-      });
     const managedAgentRuntime =
       memberIsBot && relayUrl
         ? findManagedAgentRuntime(
@@ -647,8 +637,7 @@ export function MembersSidebar({
       managedAgent?.backend.type === "local" && relayUrl
         ? managedAgentPairAction(managedAgentRuntime)
         : undefined;
-    const presenceStatus =
-      memberPresenceQuery.data?.[member.pubkey.toLowerCase()] ?? null;
+    const presenceStatus = getAvailability(member.pubkey);
     // Undefined data = the presence query has not resolved yet — which is
     // NOT the same as a resolved "offline" (a missing entry in resolved
     // data). Provider lifecycle controls must not act on the unresolved
@@ -702,7 +691,7 @@ export function MembersSidebar({
         presenceResolved={presenceResolved}
         presenceStatus={presenceStatus}
         profileAvatarUrl={memberProfile?.avatarUrl ?? null}
-        showOtherSetupMarker={showOtherSetupMarker}
+        profileOwnerPubkey={memberProfile?.ownerPubkey}
         viewerIsOwner={viewerIsOwner}
       />
     );

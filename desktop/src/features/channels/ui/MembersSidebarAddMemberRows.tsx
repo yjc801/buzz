@@ -1,3 +1,4 @@
+import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { Bot } from "lucide-react";
 import type * as React from "react";
 
@@ -77,6 +78,10 @@ export function AddMemberSearchResultRow({
                 <Bot aria-hidden="true" className="h-4 w-4" />
                 agent
               </span>
+              <AgentManagementMarker
+                pubkey={user.pubkey}
+                ownerPubkey={user.ownerPubkey}
+              />
             </div>
             <span className="block truncate font-mono text-2xs text-muted-foreground">
               {truncatePubkey(user.pubkey)}

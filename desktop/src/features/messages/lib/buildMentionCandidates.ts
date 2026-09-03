@@ -161,6 +161,7 @@ export function buildMentionCandidates({
       personaId: managedAgentPersonaIdsByPubkey.get(pubkey) ?? linkedPersonaId,
       isAgent: memberAgentPubkeys.has(pubkey),
       isActiveAgent: activeAgentPubkeys.has(pubkey),
+      isManagedAgent: managedAgentNamesByPubkey.has(pubkey),
       ownerPubkey: profile?.ownerPubkey ?? null,
       personaName: personaNameByPubkey.get(pubkey) ?? null,
       role: member.role,
@@ -188,7 +189,7 @@ export function buildMentionCandidates({
         (activePersonaById.has(pubkey) ? pubkey : undefined),
       ownerPubkey: agent.ownerPubkey,
       isAgent: true,
-      isActiveAgent: agent.status !== "offline",
+      isActiveAgent: agent.status === "online" || agent.status === "away",
     });
   }
   for (const agent of managedAgents ?? []) {

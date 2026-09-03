@@ -335,13 +335,13 @@ fn build_launch_block_for_policy(
         };
         policy_env.insert(model_key.into(), value.to_string());
     }
-    // I-4: remote parity for persisted startup effort. Mirrors the local spawn
-    // path in runtime.rs. The harness reads BUZZ_ACP_EFFORT_LEVEL into
-    // PoolStartup.startup_effort and applies it at first session creation via
-    // resolve_startup_effort().
-    if let Some(ref value) = record.effort_level {
-        policy_env.insert("BUZZ_ACP_EFFORT_LEVEL".into(), value.clone());
-    }
+    // Startup effort needs no remote-specific handling: the harness-agnostic
+    // effort projection already ran inside `resolve_effective_harness_descriptor`,
+    // so `descriptor.env` (→ `launch.env`, tier 2) carries exactly one effort key
+    // holding the effective value, with every foreign/legacy/transport effort key
+    // stripped. Tier 2 later-wins over `policy_env` (tier 1) and no authoritative
+    // tier-3 key collides with an effort key, so the projected value reaches the
+    // remote pod verbatim — identical authority to the local spawn.
     if let Some(value) = record.idle_timeout_seconds {
         policy_env.insert("BUZZ_ACP_IDLE_TIMEOUT".into(), value.to_string());
     }
@@ -358,14 +358,6 @@ fn build_launch_block_for_policy(
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
-    // B5 remote parity: when a canonical effort_level is persisted, strip
-    // BUZZ_ACP_EFFORT_LEVEL from launch.env so it cannot shadow the canonical
-    // value in policy_env (tier 1). In the k8s three-tier model tier 2
-    // (launch.env) overwrites tier 1 (policy_env) — later-wins — so the key
-    // must be absent from tier 2 whenever a canonical value is present.
-    // When effort_level is None there is no canonical to protect, so user
-    // env passthrough stands (env may legitimately seed startup effort).
-    //
     // B2 remote parity: mirror the local A1 model authority. For a Claude
     // launch, ALWAYS strip BOTH BUZZ_ACP_MODEL and ANTHROPIC_MODEL from
     // launch.env — the resolved canonical model rides policy_env.ANTHROPIC_MODEL
@@ -375,10 +367,13 @@ fn build_launch_block_for_policy(
     // canonical model. When no canonical model is present, neither key is in
     // policy_env, so stripping them keeps the remote process free of both —
     // matching local, where `apply_claude_model_env(None)` removes both.
+    //
+    // Effort keys need no stripping here: the projection already reduced
+    // `descriptor.env` to exactly one effort key holding the effective value,
+    // so launch.env carries the authority directly (see the effort note above).
     let is_claude = runtime.map(|r| r.id == "claude").unwrap_or(false);
     let strip_key = |k: &str| {
         k.eq_ignore_ascii_case(crate::managed_agents::ACP_SESSION_POLICY_ENV_VAR)
-            || (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
             || (is_claude
                 && (k.eq_ignore_ascii_case("BUZZ_ACP_MODEL")
                     || k.eq_ignore_ascii_case("ANTHROPIC_MODEL")))

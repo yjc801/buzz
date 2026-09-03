@@ -489,3 +489,7 @@ mod tests {
         assert_eq!(filter["page"], serde_json::json!(1));
     }
 }
+
+#[cfg(test)]
+#[path = "profile_presence_tests.rs"]
+mod presence_tests;

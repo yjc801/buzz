@@ -1066,6 +1066,11 @@ jobs:
             || contradiction "verdict parser failed"
           [ "$(jq -r .authorized <<<"$VERDICT_JSON")" = "true" ] \
             || contradiction "verdict no longer authorizes: $(jq -r .reason <<<"$VERDICT_JSON")"
+          # The audit comment names the verdict the merge actually ran on. Two
+          # kinds authorize now, so a hardcoded "APPROVE" would misreport a
+          # nits approval in the permanent record. Derived here, from this
+          # job's own re-read, rather than carried over from evaluate.
+          echo "verdict=$(jq -r '.verdict' <<<"$VERDICT_JSON")" >> "$GITHUB_OUTPUT"
 
           # 5. Checks, re-read. A non-required check rerun after the sweep can
           #    go pending or red without moving the head, and the pinned `sha`
@@ -1146,6 +1151,9 @@ jobs:
           RISK: ${{ needs.evaluate.outputs.risk }}
           EFFECTIVE: ${{ needs.evaluate.outputs.effective }}
           EVENT_ID: ${{ needs.evaluate.outputs.event_id }}
+          # From the revalidate step's own re-read of the coordinate, not from
+          # the evaluate job — this job trusts nothing that one concluded.
+          VERDICT_KIND: ${{ steps.revalidate.outputs.verdict }}
           CHANNEL: ${{ needs.evaluate.outputs.channel }}
           BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
           BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
@@ -1404,8 +1412,8 @@ jobs:
           echo "the verdict still stands after the merge"
 
           # shellcheck disable=SC2016  # backticks are markdown, not command substitution
-          if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
-            "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
+          if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: %s by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
+            "$VERDICT_KIND" "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
             "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")" >/dev/null; then
             echo "::error::PR #$PR merged but the audit comment failed — the record is incomplete"
             exit 1

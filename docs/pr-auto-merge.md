@@ -117,9 +117,10 @@ plus `workflow_dispatch`). Every gate must pass:
    this repo (no forks).
 2. GitHub reports the PR `MERGEABLE` (no conflicts).
 3. The reviewer's standing verdict — the current value of their addressable
-   verdict coordinate for this PR — is `VERDICT: APPROVE` + `AUTO-MERGE: yes`,
-   its `Reviewed` SHA equals the PR's **current** head, and the merge base it
-   names equals the **current** tip of the base branch.
+   verdict coordinate for this PR — is `VERDICT: APPROVE` or
+   `VERDICT: APPROVE-WITH-NITS` (nits are recorded, they do not block) +
+   `AUTO-MERGE: yes`, its `Reviewed` SHA equals the PR's **current** head, and
+   the merge base it names equals the **current** tip of the base branch.
 4. The branch is not behind the base branch (`behind_by == 0`), read
    independently of the reviewer's own merge-base arithmetic.
 5. Effective risk = `max(path floor, reviewer RISK)` is `low` or `medium`.

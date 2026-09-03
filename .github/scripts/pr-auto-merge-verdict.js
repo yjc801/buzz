@@ -33,7 +33,8 @@
 //
 // Output shape:
 //   found       a reviewer verdict exists at the coordinate
-//   requested   VERDICT: APPROVE + AUTO-MERGE: yes + reviewed head == --head
+//   requested   VERDICT: APPROVE or APPROVE-WITH-NITS + AUTO-MERGE: yes + reviewed head == --head
+//               (nits are recorded, not blocking — the reviewer's own definition)
 //               + reviewed merge base == --base
 //   authorized  requested && max(RISK, --floor) != high
 //   plus verdict/risk/floor/effectiveRisk/reviewedHead/mergeBase/autoMerge/
@@ -101,7 +102,7 @@ function evaluateOne(message, { head, base, floor }) {
     mergeBase: trailer.mergeBase,
     effectiveRisk: maxTier(trailer.risk, floor),
   };
-  if (trailer.verdict !== "APPROVE") {
+  if (trailer.verdict !== "APPROVE" && trailer.verdict !== "APPROVE-WITH-NITS") {
     return { ...identity, ...facts, reason: `verdict is ${trailer.verdict}` };
   }
   if (trailer.autoMerge !== "yes") {

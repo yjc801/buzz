@@ -320,7 +320,7 @@ jobs:
           # Visibility label, not a gate: `approved-manual-merge` marks a PR
           # whose CURRENT INTEGRATION — this head against this base tip —
           # carries an APPROVE or APPROVE-WITH-NITS verdict that this sweep
-          # will nevertheless not merge (AUTO-MERGE: no, nits, a high floor,
+          # will nevertheless not merge  (AUTO-MERGE: no, a high floor,
           # or a refused gate) — the owner's "ready for your click" queue.
           # Best-effort: a failed label write warns and never blocks a
           # decision; dry-run touches nothing.
@@ -709,7 +709,7 @@ jobs:
             # the effective risk — max(reviewer RISK, path floor) — is high.
             # That is the one blocked case a human is expected to resolve by
             # merging. Low-risk approvals the sweep declines for other reasons
-            # (AUTO-MERGE: no, nits, a refused gate) are not queued: they
+            # (AUTO-MERGE: no, a refused gate) are not queued: they
             # are the reviewer's or CI's call to revisit, not the owner's
             # click. The base tip is deliberately NOT part of the claim: a
             # manual merge re-checks main anyway, and on a busy day every

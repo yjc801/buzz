@@ -499,6 +499,115 @@ SYNC_BLOCK=$(awk '/^ *synchronize\)$/,/^ *reopened\)$/' "$MIRROR")
 check "PUSHED_AT must not be reassigned in the synchronize branch" \
   "$(! printf '%s' "$SYNC_BLOCK" | grep -qE '^ *PUSHED_AT='; echo $?)"
 
+# ===========================================================================
+# THE MIRROR'S AUTHOR/RECIPIENT ROUTING.
+#
+# `route_scope` decides the ONE p-tag that can wake a coder: CI is the only
+# non-agent author on a PR channel, and no agent-authored event ever wakes
+# anything (crates/buzz-waker/src/decide.rs), so a recipient CI does not
+# mention here cannot be started by the reviewer's later handoff. Two
+# properties therefore have to hold together, and neither is visible from
+# reading either side alone:
+#
+#   * a coder is mentioned on his OWN PR for every path in it. `agent/<slug>`
+#     asserts he wrote the head, and the reviewer's ownership table hands him
+#     any path in this repo — so gating the mention on the path glob leaves a
+#     docs-only or web-only `agent/` PR assigned to someone CI never notified.
+#     That gap shipped once and is what this case pins.
+#   * a coder is NOT mentioned on a PR he did not write, whatever it touches.
+#
+# And the `Author:` line stays display-only: it is built inside a card made of
+# repo- and PR-controlled material, on a workflow that runs from the PR's own
+# head, so it may state a fact but must never instruct the reviewer where to
+# send findings. Extracted from the workflow, not restated, so deleting either
+# rule fails here.
+echo "--- mirror: the coder is mentioned on his own PR, and only on his own PR"
+
+"$REAL_PYTHON3" - "$MIRROR" > "$WORK/route.sh" <<'ROUTEPY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+try:
+    i = next(n for n, ln in enumerate(lines) if ln.strip() == 'AUTHOR_LINE=""')
+    j = next(n for n in range(i, len(lines))
+             if lines[n].strip() == "}" and lines[n - 1].strip() == "return 0")
+except StopIteration:
+    sys.exit("the route_scope definition was not found in " + sys.argv[1])
+indent = len(lines[i]) - len(lines[i].lstrip())
+sys.stdout.write("\n".join(ln[indent:] for ln in lines[i : j + 1]) + "\n")
+ROUTEPY
+[ -s "$WORK/route.sh" ] || { echo "route_scope extraction produced nothing" >&2; exit 2; }
+
+# The diff is the only input route_scope reads besides HEAD_REF, and it reads
+# it through `git diff --name-only`; stub that rather than build a repository.
+cat > "$WORK/route-drive.sh" <<'DRIVEEOF'
+set -uo pipefail
+CODER_NAME=TestCoder
+CODER_PUBKEY=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+RANGE=unused
+git() { case "$*" in *--name-only*) printf '%s\n' "$FAKE_FILES" ;; *) return 0 ;; esac; }
+# shellcheck disable=SC1091
+. "$ROUTE_SH"
+route_scope
+printf 'mentions=%s\n' "${SCOPE_MENTIONS[*]-}"
+printf 'names=%s\n' "$SCOPE_NAMES"
+printf 'author=%s\n' "$AUTHOR_LINE"
+DRIVEEOF
+
+route() { # route <head-ref> <changed-file>
+  HEAD_REF="$1" FAKE_FILES="$2" ROUTE_SH="$WORK/route.sh" \
+    bash "$WORK/route-drive.sh"
+}
+field() { printf '%s\n' "$1" | grep -m1 "^$2=" | cut -d= -f2-; }
+
+# His own PR, inside his declared scope: mentioned.
+OUT=$(route agent/testcoder crates/buzz-relay/src/lib.rs) || { echo "$OUT" >&2; exit 2; }
+check "agent/ + owned path should p-tag the coder" \
+  "$(printf '%s' "$(field "$OUT" mentions)" | grep -q '^--mention d\{64\}$'; echo $?)"
+check "agent/ + owned path should name a coding agent as author" \
+  "$(printf '%s' "$(field "$OUT" author)" | grep -q 'Author: a coding agent'; echo $?)"
+
+# His own PR, OUTSIDE his declared scope: still mentioned. He wrote it, the
+# reviewer hands it to him, and this is the only mention that can wake him —
+# "out of my scope, say so and stop" is his answer to give, not CI's.
+OUT=$(route agent/testcoder docs/readme.md) || { echo "$OUT" >&2; exit 2; }
+check "agent/ + unowned path should still p-tag the coder" \
+  "$(printf '%s' "$(field "$OUT" mentions)" | grep -q '^--mention d\{64\}$'; echo $?)"
+check "agent/ + unowned path should still name him in the heads-up" \
+  "$(printf '%s' "$(field "$OUT" names)" | grep -q '@TestCoder'; echo $?)"
+
+# Not his PR, but in his paths: named for reference, never p-tagged. Waking
+# him buys a deploy and a coder standing by for findings that are the owner's.
+OUT=$(route claude/owner-branch .github/workflows/buzz-pr-mirror.yml) \
+  || { echo "$OUT" >&2; exit 2; }
+check "owner branch + owned path should not p-tag the coder" \
+  "$([ -z "$(field "$OUT" mentions)" ]; echo $?)"
+check "owner branch + owned path should not name him in the heads-up" \
+  "$([ -z "$(field "$OUT" names)" ]; echo $?)"
+check "owner branch should name the owner as author" \
+  "$(printf '%s' "$(field "$OUT" author)" | grep -q 'Author: the owner'; echo $?)"
+check "owner branch + owned path should still name the path owner" \
+  "$(printf '%s' "$(field "$OUT" author)" | grep -q 'TestCoder'; echo $?)"
+
+# Not his PR, not his paths: nobody is routed, and the card says so.
+OUT=$(route claude/owner-branch web/app.tsx) || { echo "$OUT" >&2; exit 2; }
+check "owner branch + unowned path should not p-tag the coder" \
+  "$([ -z "$(field "$OUT" mentions)" ]; echo $?)"
+check "owner branch + unowned path should say no coder owns the paths" \
+  "$(printf '%s' "$(field "$OUT" author)" | grep -qi 'no coding agent owns'; echo $?)"
+
+# The Author line is display-only. A PR that edits this workflow chooses the
+# text of its own review request under CI's key, so an instruction here is an
+# injection path into the reviewer's routing; the reviewer must derive the
+# branch class from its own authenticated GitHub read instead.
+for CASE in "agent/testcoder|crates/x.rs" "agent/testcoder|docs/x.md" \
+            "claude/o|scripts/x.sh" "claude/o|web/x.tsx"; do
+  OUT=$(route "${CASE%%|*}" "${CASE##*|}") || { echo "$OUT" >&2; exit 2; }
+  check "Author line for ${CASE} should issue no routing directive" \
+    "$(! printf '%s' "$(field "$OUT" author)" \
+        | grep -qiE 'findings go|route the findings|route (this|it) .*by hand|own\(s\).*findings'; echo $?)"
+done
+
 echo
 echo "$PASS assertions passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

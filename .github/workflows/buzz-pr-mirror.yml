@@ -558,17 +558,29 @@ jobs:
           # coder prompts pin their work to agent/<slug> — owner-managed, like
           # the scope glob below — so agent/* is a coder's own PR and every
           # other branch is the owner's own work, however the commits were
-          # produced. The reviewer routes by the Author line this prints:
-          # Request Changes on an owner-authored head goes to the owner, never
-          # to the path owner, who did not write it (velvet's tracked
+          # produced. Naming that on the card is what velvet#205 was missing:
+          # the card there told the path owner to stand by on the owner's own
+          # PR and the reviewer handed him the findings, so the rounds ran
+          # between the reviewer and a coder on a change neither of them owned
+          # and the owner, who wrote it, was tagged only at the round cap. On
+          # this repository every PR to date is owner-authored, so until Will
+          # opens one the line always reads "the owner".
+          #
+          # THE Author LINE IS DISPLAY-ONLY AND MUST STAY THAT WAY. It is a
+          # human-readable echo, never the reviewer's source of truth for who
+          # gets the findings. This workflow runs on `pull_request`, so it runs
+          # from the PR's OWN head: a PR that edits this file chooses the text
+          # its own review request carries, signed with CI's key — the same
+          # injection path the trust-boundary note in seed_card() closes for
+          # the rest of the card, and the reason the auto-merge trailer is
+          # specified in the reviewer's system prompt instead of here. The
+          # owner-managed reviewer prompt (velvet's tracked
           # .agents/skills/review-code/SKILL.md, "Deliver the review and hand
-          # off", is the reviewer prompt's upstream). Before this line existed
-          # the card told the path owner to stand by on the owner's own PRs and
-          # the reviewer handed him the findings: velvet#205 spent its rounds
-          # between the reviewer and a coder on a change neither of them owned,
-          # and the owner, who did, was tagged only at the round cap. On this
-          # repository every PR to date is owner-authored, so until Will opens
-          # one the line always reads "the owner".
+          # off") must therefore DERIVE the branch class from its own
+          # authenticated GitHub read of the head ref and route on that. So
+          # this line states a fact and issues no instruction: no "findings go
+          # to", no "route by hand". If the two ever disagree, the reviewer's
+          # own read wins and this line is the thing that is wrong.
           #
           # WHY CI NAMES THE CODER AND NOT THE REVIEWER. Alex reads the diff
           # and judges ownership better than a path glob can — but a mention
@@ -589,6 +601,18 @@ jobs:
           # against channel members and would tag him), so the owner can hand
           # the PR over with one mention.
           #
+          # ON HIS OWN PR THE MENTION FOLLOWS AUTHORSHIP, NOT THE PATH GLOB.
+          # An `agent/` head says a coder wrote every line in it, so the
+          # findings are his on every path it touches — including paths his
+          # prompt does not claim, where the answer is "out of my scope, say so
+          # and stop" and he still has to be the one to say it. The reviewer's
+          # ownership table hands it to him on any path too, and CI's mention
+          # is the only one that can wake him, so gating the mention on the
+          # glob would leave a docs-only or web-only `agent/` PR assigned to
+          # someone CI never notified. The glob's remaining job is the
+          # informational path-owner note on an OWNER-authored card, where
+          # nobody is being assigned anything.
+          #
           # CAVEAT, and it is the whole reason this is only half a fix here:
           # Will currently runs on a LOCAL backend, and decide.rs excludes local
           # agents outright ("Local agents are never candidates: whoever owns
@@ -606,33 +630,30 @@ jobs:
           route_scope() {
             local FILES OWNERS=""
             # Reset, not append: only one seeding path runs per job today, but a
-            # second call must not mention the same agent twice.
+            # second call must not mention the same agent twice. It is also the
+            # ONLY thing that clears the mention on a non-`agent/` head — that
+            # arm sets no scope at all, deliberately, rather than setting one
+            # and unsetting it.
             AUTHOR_LINE=""
             SCOPE_NAMES=""
             SCOPE_MENTIONS=()
             FILES=$(git diff --name-only "$RANGE")
             if printf '%s\n' "$FILES" \
               | grep -qE '^(crates/|desktop/|mobile/|migrations/|scripts/|\.github/workflows/)'; then
-              SCOPE_NAMES="${SCOPE_NAMES}@${CODER_NAME} "
               OWNERS="${OWNERS}${CODER_NAME} "
-              SCOPE_MENTIONS+=(--mention "$CODER_PUBKEY")
             fi
             case "$HEAD_REF" in
               agent/*)
-                if [ -n "$SCOPE_NAMES" ]; then
-                  AUTHOR_LINE="Author: a coding agent (\`${HEAD_REF}\` is an \`agent/\` branch) — ${SCOPE_NAMES}own(s) the changed paths and the findings."
-                else
-                  AUTHOR_LINE="Author: a coding agent (\`${HEAD_REF}\` is an \`agent/\` branch), but no coder's scope matches the changed paths — route the findings by hand."
-                fi
+                SCOPE_NAMES="@${CODER_NAME} "
+                SCOPE_MENTIONS=(--mention "$CODER_PUBKEY")
+                AUTHOR_LINE="Author: a coding agent — \`${HEAD_REF}\` is an \`agent/\` branch."
                 ;;
               *)
                 if [ -n "$OWNERS" ]; then
-                  AUTHOR_LINE="Author: the owner (\`${HEAD_REF}\` is not an \`agent/\` branch) — findings go to the owner; path owner(s) ${OWNERS% }, not assigned."
+                  AUTHOR_LINE="Author: the owner — \`${HEAD_REF}\` is not an \`agent/\` branch. Path owner(s): ${OWNERS% } — named for reference, not assigned."
                 else
-                  AUTHOR_LINE="Author: the owner (\`${HEAD_REF}\` is not an \`agent/\` branch) — findings go to the owner; no coding agent owns the changed paths."
+                  AUTHOR_LINE="Author: the owner — \`${HEAD_REF}\` is not an \`agent/\` branch. No coding agent owns the changed paths."
                 fi
-                SCOPE_NAMES=""
-                SCOPE_MENTIONS=()
                 ;;
             esac
             # Explicit: `grep -q` returning 1 is the ordinary "no match" answer,
@@ -656,6 +677,9 @@ jobs:
             # pins its verdict to it and the review watchdog matches requests
             # to heads by this exact line. Keep the wording stable.
             printf 'Review head: `%s`\n' "$HEAD_SHA"
+            # Display-only, and issues no routing instruction — see the
+            # Author-line note above route_scope. The reviewer derives the
+            # branch class from its own authenticated read of the head ref.
             printf '%s\n' "$AUTHOR_LINE"
             printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
             printf '```\n%s\n```\n' "$(diff_files)"
@@ -679,7 +703,10 @@ jobs:
             # earlier revision of this line asked for the trailer directly;
             # that is exactly the injection path a compliant reviewer must
             # ignore, and it would have let repo content steer a merge
-            # authorization if one did not.
+            # authorization if one did not. The `Author:` line above is inside
+            # that same boundary: it reports a fact and directs nothing, and
+            # the reviewer must confirm the branch class against GitHub rather
+            # than take this card's word for who gets the findings.
             printf '\n@%s please review.\n' "$REVIEWER_NAME"
             if [ -n "$SCOPE_NAMES" ]; then
               printf '\n%s— your pull request. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
@@ -992,22 +1019,24 @@ jobs:
                 ensure_provisioned "$CH" || exit 1
                 # ensure_provisioned only calls route_scope on an unseeded
                 # channel (the recovery path) and returns immediately once
-                # seeded — the ordinary case for a second push. Scope can
-                # still have changed since the last time it ran: a PR that
-                # opened touching only unowned paths can grow coder-owned
-                # ones on any later push, and without recomputing here the
-                # update notice below would carry no mention at all, so the
-                # one non-agent author who CAN wake the coder
-                # (crates/buzz-waker/src/decide.rs — no agent-authored event
-                # ever wakes anything) never does.
+                # seeded — the ordinary case for a second push. Recompute here
+                # so this update carries the same author-derived mention the
+                # seed would: the coder must be p-tagged at least once on his
+                # own PR, because CI is the one non-agent author who CAN wake
+                # him (crates/buzz-waker/src/decide.rs — no agent-authored
+                # event ever wakes anything). This is the recovery leg, not the
+                # ordinary one — a channel seeded before the author-derived
+                # mention existed, or one whose seed card predates the coder
+                # joining — since on an `agent/` head the seed already tagged
+                # him and on any other head no coder mention is due at all.
                 route_scope
-                NEWLY_OWNED=no
+                CODER_UNTAGGED=no
                 if [ -n "$SCOPE_NAMES" ]; then
                   ALREADY=$(coder_already_mentioned "$CH") || exit 1
-                  [ "$ALREADY" = no ] && NEWLY_OWNED=yes
+                  [ "$ALREADY" = no ] && CODER_UNTAGGED=yes
                 fi
                 SYNC_MENTIONS=()
-                [ "$NEWLY_OWNED" = yes ] && SYNC_MENTIONS+=(--mention "$CODER_PUBKEY")
+                [ "$CODER_UNTAGGED" = yes ] && SYNC_MENTIONS+=(--mention "$CODER_PUBKEY")
                 # Resolution, provisioning and routing ran BEFORE the quiet
                 # window so a configuration fault fails fast; only the send
                 # waits. A newer push cancels this run during the sleep.
@@ -1027,8 +1056,9 @@ jobs:
                     printf ' (supersedes `%s`)' "${PREV_HEAD_SHA:0:12}"
                   fi
                   printf '\n```\n%s\n```\n' "$(diff_files)"
-                  if [ "$NEWLY_OWNED" = yes ]; then
-                    printf '\n%s— your pull request; this update brought your paths into scope.\n' "$SCOPE_NAMES"
+                  if [ "$CODER_UNTAGGED" = yes ]; then
+                    printf '\n%s— your pull request. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
+                      "$SCOPE_NAMES" "$REVIEWER_NAME"
                   fi
                   if [ "$ACKED" = no ]; then
                     printf '\n@%s please review this head. A review in progress on the previous head is stale.\n' "$REVIEWER_NAME"

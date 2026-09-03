@@ -471,58 +471,23 @@ the only honest record.
   not happen, use the draft.
 - **Hold everything:** `gh workflow disable buzz-pr-auto-merge.yml`.
 - **"Ready for your click":** the sweep maintains an `approved-manual-merge`
-  label. It is applied when **both** halves hold: the reviewer's verdict is an
-  APPROVE or APPROVE-WITH-NITS over the integration that would merge *today*
-  — naming this head **and** this base tip, the same pair gates 3 and 4
-  require — and this sweep is not going to merge it anyway (AUTO-MERGE: no,
-  nits, a high floor, or a refused gate). Head alone is not enough: `main`
-  advancing under an unchanged head makes the verdict stale (gate 4), and a
-  label that ignored the base would advertise an unreviewed integration as
-  ready to merge.
+  label. It is applied when the reviewer's verdict is an APPROVE or
+  APPROVE-WITH-NITS naming the PR's **current head**, and the sweep will not
+  merge it **only because the effective risk is high** — max(reviewer `RISK`,
+  path floor) — the one blocked case a human is expected to resolve by
+  merging. Low-risk approvals the sweep declines for other reasons
+  (`AUTO-MERGE: no`, nits, a refused gate) are not queued; those are the
+  reviewer's or CI's call to revisit. The base tip is deliberately not part
+  of the claim: a manual merge re-checks `main` anyway, and on a busy day
+  every advance of `main` would otherwise strip the label from the whole
+  queue. (Gates 3 and 4 still require both SHAs before anything merges.)
 
-  It is removed as soon as the first half stops holding — a new head, `main`
-  moving, a REQUEST-CHANGES, a verdict withdrawn from the coordinate — and
-  when the merge is handed to the merge job. It is also removed from any open
-  PR that has **left the candidate set** (drafted, `no-auto-merge`, retargeted
-  off `main`, or a fork head), because the sweep no longer evaluates that PR
-  and so can no longer vouch for it; the label is not a place to record an
-  approval the sweep did not just verify. That reconciliation is what makes
-  the label order-independent — the same end state reads the same whether the
-  hold arrived before or after the approval.
-
-  The two directions are deliberately asymmetric. Adding needs the merge
-  question settled, so nothing before the not-requested / blocked / authorized
-  decision points may add it; removing needs only the verdict, so a stale
-  label is cleared even while checks are still running.
-
-  Because of that asymmetry, a PR that **already carries the label** has its
-  claim re-checked before any of the gates that can end a tick early —
-  mergeability still computing, a zero-file view, a failed base or file
-  listing read, no PR channel yet. Without that pass those exits would
-  preserve a claim a push had just invalidated, and they are the *likely*
-  place to land after such a push: GitHub recomputes mergeability on every
-  push, so a PR labelled at H1 and pushed to H2 reports `MERGEABLE=UNKNOWN`
-  for the first tick or two. The pass only ever removes.
-
-  What stays untouched is the genuinely **unprovable**, which is not the same
-  as the disproven: relay weather, and a base tip that could not be read (the
-  head and the verdict kind can still disprove the claim on their own, so
-  those are still checked; only the base comparison is skipped). "We could not
-  tell" is not "not approved", and clearing on the relay's weather would flap
-  the queue. When the label does move, the step summary names the fact that
-  moved it.
-
-  Unprovable in that sense means the relay client's **exit 4** and nothing
-  else. Because this pass is the first thing to read the verdict coordinate,
-  it is also the first thing that can hide a failure to read it: a coordinate
-  whose content arrived and failed a proof (exit 1) or a client called wrong
-  (exit 2) is a bug or an attack, not weather, and the gates this pass runs
-  ahead of would end the tick before anything else classified it. So it runs
-  the same classifier the sweep's own read uses, at the point of failure — a
-  definitive fault fails the run there, with the label left alone, rather than
-  being downgraded into a green tick that keeps advertising evidence known to
-  be unusable.
-
+  It is removed as soon as the claim stops holding — a new head, a
+  REQUEST-CHANGES, a verdict withdrawn from the coordinate, an effective risk
+  that dropped below high — and when the merge is handed to the merge job. It
+  is also removed from any open PR that has **left the candidate set**
+  (drafted, `no-auto-merge`, retargeted off `main`), because the sweep no
+  longer evaluates it and a stale claim would otherwise outlive its evidence.
   Visibility only: it gates nothing, the evaluate job holds no merge
   credential, label writes are best-effort warnings, and dry-run never touches
   labels. Reconciliation covers open PRs only — a PR closed while labelled

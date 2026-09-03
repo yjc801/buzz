@@ -382,11 +382,18 @@ jobs:
           # own, so those are still checked; only the base comparison is
           # skipped, because an unknown base cannot disprove anything.
           #
-          # manual_claim_stale <verdict-kind> <reviewed-head> <head> \
-          #                    <reviewed-base> <base-tip-or-empty>
-          # exit 0 = disproven (reason on stdout), 1 = the claim still holds.
+          # manual_claim_stale <verdict-kind> <reviewed-head> <head> <effective-risk|->
+          #   Prints why the manual-merge claim does not hold and returns 0,
+          #   or returns 1 when it holds. The claim: the reviewer APPROVED
+          #   (with or without nits) THIS head, and the sweep will not merge
+          #   it only because the effective risk — max(reviewer RISK, path
+          #   floor) — is high. Pass "-" for the risk when the floor is not
+          #   known yet (the pre-gate reconciliation): the risk half is then
+          #   left to the main pass, so a label is never dropped on a guess.
+          #   The base tip is deliberately not part of the claim (see the
+          #   MANUAL_WANT block below).
           manual_claim_stale() {
-            local KIND="$1" RHEAD="$2" HEAD="$3" RBASE="$4" BTIP="$5"
+            local KIND="$1" RHEAD="$2" HEAD="$3" EFF="${4:--}"
             if [ "$KIND" = "-" ] || [ -z "$KIND" ]; then
               printf 'no usable verdict at the reviewer coordinate'
               return 0
@@ -399,8 +406,8 @@ jobs:
               printf 'reviewed %s but the head is %s' "$RHEAD" "$HEAD"
               return 0
             fi
-            if [ -n "$BTIP" ] && [ "$RBASE" != "$BTIP" ]; then
-              printf 'reviewed against base %s but the base tip is %s' "$RBASE" "$BTIP"
+            if [ "$EFF" != "-" ] && [ "$EFF" != high ]; then
+              printf 'effective risk is %s, not a manual-merge case' "$EFF"
               return 0
             fi
             return 1
@@ -494,10 +501,9 @@ jobs:
           # comparison stays in manual_claim_stale.
           UNKNOWN_SHA=0000000000000000000000000000000000000000
           reconcile_manual_claim() {
-            # reconcile_manual_claim <pr> <head-sha> <base-ref>
+            # reconcile_manual_claim <pr> <head-sha>
             # Clears HAS_MANUAL (a caller variable) when it drops the label.
-            local N="$1" HEAD="$2" BREF="$3" BTIP NOTE JSON WHY STATUS=0
-            BTIP=$(gh api "repos/$R/git/ref/heads/$BREF" --jq .object.sha) || BTIP=""
+            local N="$1" HEAD="$2" NOTE JSON WHY STATUS=0
             NOTE=$(fetch_verdict "$N") || STATUS=$?
             if [ "$STATUS" -eq 3 ]; then
               # Provably absent: the coordinate was read and holds nothing, so
@@ -534,8 +540,7 @@ jobs:
             fi
             if WHY=$(manual_claim_stale \
               "$(jq -r '.verdict // "-"' <<<"$JSON")" \
-              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" \
-              "$(jq -r '.mergeBase // "-"' <<<"$JSON")" "$BTIP"); then
+              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" -); then
               drop_manual_claim "$N" "$WHY"
             fi
             return 0
@@ -604,7 +609,7 @@ jobs:
             # the PR is a published claim, and the exits below cannot tell a
             # claim that is still good from one a push just invalidated.
             if [ "$HAS_MANUAL" = "true" ]; then
-              reconcile_manual_claim "$N" "$HEAD_SHA" "$BASE_REF"
+              reconcile_manual_claim "$N" "$HEAD_SHA"
             fi
             if [ "$MERGEABLE" = "UNKNOWN" ]; then
               warn_skip "$N" "mergeability still computing"
@@ -699,20 +704,19 @@ jobs:
             EFFECTIVE=$(jq -r '.effectiveRisk // "-"' <<<"$VERDICT_JSON")
             VERDICT_KIND=$(jq -r '.verdict // "-"' <<<"$VERDICT_JSON")
             REVIEWED_HEAD=$(jq -r '.reviewedHead // "-"' <<<"$VERDICT_JSON")
-            REVIEWED_BASE=$(jq -r '.mergeBase // "-"' <<<"$VERDICT_JSON")
-            # "Ready for your click": an APPROVE (with or without nits) over
-            # the integration that would actually merge today. Same predicate
-            # the pre-gate reconciliation used, now with the real base tip in
-            # hand — BOTH SHAS, for the same reason gates 3 and 4 need both.
-            # main can advance under an unchanged head, and the parser then
-            # reports `stale base` and refuses (pr-auto-merge-verdict.js) — an
-            # approval of head-against-B1 says nothing about head-against-B2.
-            # A head-only predicate would keep calling that PR ready to click
-            # and put an unreviewed integration in the owner's manual queue,
-            # which is precisely the state docs/pr-auto-merge.md says an
-            # approval must not survive into.
+            # "Ready for your click": the reviewer APPROVED (with or without
+            # nits) THIS head, and the sweep will not merge it only because
+            # the effective risk — max(reviewer RISK, path floor) — is high.
+            # That is the one blocked case a human is expected to resolve by
+            # merging. Low-risk approvals the sweep declines for other reasons
+            # (AUTO-MERGE: no, nits, a refused gate) are not queued: they
+            # are the reviewer's or CI's call to revisit, not the owner's
+            # click. The base tip is deliberately NOT part of the claim: a
+            # manual merge re-checks main anyway, and on a busy day every
+            # advance of main would otherwise strip the label from the whole
+            # queue. (Gates 3 and 4 still require both SHAs for the merge.)
             if manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" "$HEAD_SHA" \
-              "$REVIEWED_BASE" "$BASE_TIP" >/dev/null; then
+              "$EFFECTIVE" >/dev/null; then
               MANUAL_WANT=off
             else
               MANUAL_WANT=on

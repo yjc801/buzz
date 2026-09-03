@@ -410,39 +410,56 @@ expect_sets "an empty repository produces empty sets" "[]" "[]"
 
 echo "## the sweep's label transitions"
 
+# The claim: approved THIS head, and only a high effective risk keeps the
+# sweep from merging it. Approvals blocked for any other reason are not the
+# owner's click to make.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+expect_label "an approval blocked only by a high reviewer RISK is labelled" add
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+expect_label "and so is one the reviewer marked AUTO-MERGE: no because the risk is high" add
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS high no
+expect_label "nits do not disqualify a high-risk approval" add
+
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
-expect_label "current approval the sweep will not merge (AUTO-MERGE: no) is labelled" add
+expect_label "a low-risk approval the reviewer would not auto-merge is not labelled" none
 
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS low yes
-expect_label "nits are an approval for the queue, never for the sweep" add
-
-reset_fixtures
-verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
-expect_label "a high effective risk is blocked, so it goes to the queue" add
+expect_label "nits on a low-risk approval are the reviewer's call, not the owner's click" none
 
 reset_fixtures
 edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
-expect_label "a refused gate is blocked, so it goes to the queue" add
+expect_label "a refused gate on a low-risk approval is not labelled" none
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+labelled
+expect_label "an unchanged state writes nothing" none
 
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
 labelled
-expect_label "an unchanged state writes nothing" none
+expect_label "a label on a low-risk approval is cleared" remove
 
-# The transition this file exists for: nothing about the PR moved, `main` did.
+# The base tip is not part of the claim: a manual merge re-checks main
+# itself, and a label that tracked main would empty the queue on every merge.
 reset_fixtures
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
 labelled
-expect_label "main advancing under an unchanged head clears the label" remove
+expect_label "main advancing under an unchanged head keeps the label" none
 
 reset_fixtures
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
-expect_label "and never applies it in the first place" none
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
+expect_label "and applies it regardless of the base" add
 
 reset_fixtures
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 labelled
 expect_label "a new head clears the label" remove
 
@@ -462,7 +479,7 @@ expect_label "handing the merge over clears the label" remove
 
 reset_fixtures
 DRY_RUN=true
-verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
 expect_label "dry-run touches nothing" none
 
 echo "## a disproven claim is dropped before the gates that end a tick early"
@@ -474,15 +491,23 @@ echo "## a disproven claim is dropped before the gates that end a tick early"
 # fix that covered only the mergeability one would leave the rest.
 reset_fixtures
 labelled
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_label "a new head is cleared even while mergeability is recomputing" remove
 
 reset_fixtures
 labelled
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
-expect_label "a moved base is too" remove
+expect_label "a moved base is not a reason to drop it" none
+
+# The pre-gate pass does not know the path floor, so it never judges the
+# risk half: a low-RISK label survives until the main pass can see the floor.
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "a low reviewer RISK is not dropped before the floor is known" none
 
 reset_fixtures
 labelled
@@ -498,7 +523,7 @@ expect_label "and a coordinate that provably holds nothing" remove
 
 reset_fixtures
 labelled
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["changedFiles"] = 0'
 expect_label "a zero-file view does not shelter a stale claim either" remove
 
@@ -508,13 +533,13 @@ verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
 STUB_CHANNEL_STATUS=3
 expect_label "nor does a PR whose channel does not exist yet" remove
 
-# The base tip is unreadable, so the base half of the claim cannot be judged —
-# but the head half still can, and on its own it is enough to disprove.
+# The early pass never reads the base tip (the base is not part of the
+# claim); a stub that fails that read must therefore change nothing.
 reset_fixtures
 labelled
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 STUB_BASE_TIP_STATUS=1
-expect_label "a failed base read still clears a claim the head alone disproves" remove
+expect_label "a head-disproved claim is cleared whether or not a base read would work" remove
 
 # Removing early is safe; adding early is not, because whether this sweep
 # will merge the PR is still unknown at that point.
@@ -552,13 +577,13 @@ STUB_VERDICT_STATUS=4
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_label "and that holds even when the claim happens to be stale" none
 
-# Mirror of the head case above: with no readable base tip there is nothing to
-# compare a reviewed base against, so an unknown base disproves nothing.
+# The base is not part of the claim, so a moved base is not judged in the
+# early pass, with or without a readable base tip.
 reset_fixtures
 labelled
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
 STUB_BASE_TIP_STATUS=1
-expect_label "an unreadable base tip cannot disprove the base half" none
+expect_label "a moved base is not judged, readable or not" none
 
 reset_fixtures
 labelled
@@ -642,10 +667,10 @@ expect_summary "a drop names the fact that disproved the claim" \
 reset_fixtures
 DRY_RUN=true
 labelled
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_summary "and says so in the conditional in dry-run" \
-  "reviewed against base ${OLD_BASE} but the base tip is ${BASE_TIP} — would drop"
+  "reviewed ${OLD_HEAD} but the head is ${HEAD_SHA} — would drop"
 
 echo "## reconciling PRs the sweep no longer evaluates"
 
@@ -663,7 +688,7 @@ expect_label "and not in dry-run" none
 echo "## the write itself is best effort"
 
 reset_fixtures
-verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
 STUB_LABEL_WRITE_STATUS=1
 status=$(run_sweep)
 if [ "$status" -eq 0 ] && grep -q "could not add the ${LABEL} label" "$WORK/stdout"; then

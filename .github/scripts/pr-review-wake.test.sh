@@ -608,6 +608,14 @@ for CASE in "agent/testcoder|crates/x.rs" "agent/testcoder|docs/x.md" \
         | grep -qiE 'findings go|route the findings|route (this|it) .*by hand|own\(s\).*findings'; echo $?)"
 done
 
+# The display-only property is a contract on the REVIEWER, not something this
+# workflow can enforce, so the normative statement and its rollout status live
+# in a doc. A comment pointing at a doc that is gone is worse than no comment.
+check "the mirror should cite the routing contract doc" \
+  "$(grep -q 'docs/pr-review-routing.md' "$MIRROR"; echo $?)"
+check "docs/pr-review-routing.md should exist" \
+  "$([ -f docs/pr-review-routing.md ]; echo $?)"
+
 echo
 echo "$PASS assertions passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

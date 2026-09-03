@@ -566,21 +566,28 @@ jobs:
           # this repository every PR to date is owner-authored, so until Will
           # opens one the line always reads "the owner".
           #
-          # THE Author LINE IS DISPLAY-ONLY AND MUST STAY THAT WAY. It is a
-          # human-readable echo, never the reviewer's source of truth for who
-          # gets the findings. This workflow runs on `pull_request`, so it runs
-          # from the PR's OWN head: a PR that edits this file chooses the text
-          # its own review request carries, signed with CI's key — the same
-          # injection path the trust-boundary note in seed_card() closes for
-          # the rest of the card, and the reason the auto-merge trailer is
-          # specified in the reviewer's system prompt instead of here. The
-          # owner-managed reviewer prompt (velvet's tracked
+          # THE Author LINE IS DISPLAY-ONLY, AND THAT IS A CONTRACT ON THE
+          # CONSUMER, NOT A PROPERTY OF THIS LINE. Normative statement and
+          # rollout status: docs/pr-review-routing.md. This workflow runs on
+          # `pull_request`, so it runs from the PR's OWN head: a PR that edits
+          # this file chooses the text its own review request carries, signed
+          # with CI's key — the same injection path the trust-boundary note in
+          # seed_card() closes for the rest of the card, and the reason the
+          # auto-merge trailer is specified in the reviewer's system prompt
+          # instead of here. Being factual and directive-free is necessary and
+          # NOT sufficient: a line that merely states a false fact steers a
+          # consumer that routes on facts just as well as an order does. Only
+          # the consumer can close this, by deriving the branch class from its
+          # own authenticated read of the head ref and treating this line as a
+          # cross-check at most. Keeping the line honest is this file's whole
+          # share of that: no "findings go to", no "route by hand".
+          #
+          # AS DEPLOYED, THAT CONSUMER RULE IS NOT YET IN PLACE — the reviewer
+          # prompt's upstream (velvet's tracked
           # .agents/skills/review-code/SKILL.md, "Deliver the review and hand
-          # off") must therefore DERIVE the branch class from its own
-          # authenticated GitHub read of the head ref and route on that. So
-          # this line states a fact and issues no instruction: no "findings go
-          # to", no "route by hand". If the two ever disagree, the reviewer's
-          # own read wins and this line is the thing that is wrong.
+          # off") still routes on this line. Do not read the paragraph above as
+          # a guarantee the system currently provides; see the rollout status in
+          # docs/pr-review-routing.md for what is and is not true today.
           #
           # WHY CI NAMES THE CODER AND NOT THE REVIEWER. Alex reads the diff
           # and judges ownership better than a path glob can — but a mention
@@ -677,9 +684,9 @@ jobs:
             # pins its verdict to it and the review watchdog matches requests
             # to heads by this exact line. Keep the wording stable.
             printf 'Review head: `%s`\n' "$HEAD_SHA"
-            # Display-only, and issues no routing instruction — see the
-            # Author-line note above route_scope. The reviewer derives the
-            # branch class from its own authenticated read of the head ref.
+            # Factual and directive-free; display-only by contract on the
+            # reviewer, not by anything enforceable here — see the Author-line
+            # note above route_scope and docs/pr-review-routing.md.
             printf '%s\n' "$AUTHOR_LINE"
             printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
             printf '```\n%s\n```\n' "$(diff_files)"
@@ -705,8 +712,10 @@ jobs:
             # ignore, and it would have let repo content steer a merge
             # authorization if one did not. The `Author:` line above is inside
             # that same boundary: it reports a fact and directs nothing, and
-            # the reviewer must confirm the branch class against GitHub rather
-            # than take this card's word for who gets the findings.
+            # the reviewer is required to confirm the branch class against
+            # GitHub rather than take this card's word for who gets the
+            # findings — docs/pr-review-routing.md, which also records that the
+            # deployed reviewer does not do so yet.
             printf '\n@%s please review.\n' "$REVIEWER_NAME"
             if [ -n "$SCOPE_NAMES" ]; then
               printf '\n%s— your pull request. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \

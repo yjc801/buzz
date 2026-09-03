@@ -16,22 +16,18 @@ jobs:
     name: Authorize Security Review
     # This workflow posts an advisory review; its skipped jobs are not a merge
     # gate and must not be configured as required status checks.
-    # MEMBER and OWNER are GitHub's associations for members of the `block`
-    # organization. The trusted prepare step checks the live PR instead of the
-    # event snapshot. Outside contributors require this exact command from one
-    # of those members: @buzz-security-review <full-head-sha>
+    # FORK DIVERGENCE (yjc801/buzz): upstream also authorizes automatic
+    # reviews for every member pull_request_target event; this fork removes
+    # that arm so every billed review traces to an explicit human command —
+    # a MEMBER/OWNER commenting exactly: @buzz-security-review <full-head-sha>
+    # (the same cost/approval model as velvet's security-review label).
+    # pull_request_target still fires the free stale-marking job below.
     if: >-
-      github.repository == 'block/buzz' && (
-        (
-          github.event_name == 'pull_request_target' &&
-          github.event.pull_request.draft == false
-        ) || (
-          github.event_name == 'issue_comment' &&
-          github.event.issue.pull_request &&
-          startsWith(github.event.comment.body, '@buzz-security-review ') &&
-          contains(fromJSON('["MEMBER", "OWNER"]'), github.event.comment.author_association)
-        )
-      )
+      github.repository == 'yjc801/buzz' &&
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '@buzz-security-review ') &&
+      contains(fromJSON('["MEMBER", "OWNER"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -63,7 +59,7 @@ jobs:
   prepare-base-reconciliation:
     name: Find Reviews From the Previous Base
     if: >-
-      github.repository == 'block/buzz' && (
+      github.repository == 'yjc801/buzz' && (
         github.event_name == 'push' ||
         github.event_name == 'repository_dispatch'
       )
@@ -183,7 +179,7 @@ jobs:
   invalidate-previous-review:
     name: Mark Previous Review Stale
     if: >-
-      github.repository == 'block/buzz' &&
+      github.repository == 'yjc801/buzz' &&
       github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -2,14 +2,26 @@
 # Contract test for the `approved-manual-merge` visibility label in
 # .github/workflows/buzz-pr-auto-merge.yml.
 #
-# The label is a CLAIM the sweep publishes on GitHub — "approved, and waiting
-# on you" — and the whole value of the queue it builds is that the claim is
-# still true. Every way a PR's state can move is therefore a transition the
-# sweep has to answer for, and the interesting ones are the ones where the PR
-# does not change at all: `main` advancing under an untouched head makes an
-# approval stale (gate 4), and a draft/hold/retarget removes the PR from the
-# sweep's sight while leaving the label it already wrote behind. Neither shows
-# up in the merge gates, which is why they get their own file.
+# The label is a CLAIM the sweep publishes on GitHub — "approved, and the
+# merge is yours to press" — and the whole value of the queue it builds is
+# that the claim is still true. Every way a PR's state can move is therefore a
+# transition the sweep has to answer for, and the interesting ones are the
+# ones the merge gates never have to name: a draft/hold/retarget removes the
+# PR from the sweep's sight while leaving the label it already wrote behind; a
+# blocker the owner cannot clear by clicking (a conflict, a failing check, no
+# green anchor) must keep a PR OUT of the queue even when the approval itself
+# is perfectly current; and a claim this tick can disprove has to come off
+# even at the exits that end a tick early, checks-still-running included.
+#
+# The base TIP is not part of the claim (a same-head verdict over an older
+# base is the merge gates' business), but base LAG is a hard blocker: main's
+# ruleset has strict required status checks with no bypass actor, so a behind
+# branch has no working button. Both halves are asserted below. AUTO-MERGE: no
+# splits by risk: at high effective risk it is the only permitted value and
+# accompanies every queued PR; at low or medium risk it is the reviewer's
+# refusal and the PR is not queued. A blocker GitHub has already proven comes
+# off before the verdict coordinate is read, so relay weather preserves only
+# a claim nothing has disproved.
 #
 # Both steps under test are EXTRACTED FROM THE WORKFLOW rather than copied, so
 # deleting a transition from the YAML fails this test instead of quietly
@@ -18,8 +30,8 @@
 # GitHub and the relay are stubbed at the process boundary (a `gh` and a
 # `python3` earlier on PATH). Everything else is real: the real jq eligibility
 # filters, the real node risk classifier, and — the point of the exercise —
-# the real .github/scripts/pr-auto-merge-verdict.js deciding staleness, so the
-# stale-base case here is stale for the same reason it would be in production.
+# the real .github/scripts/pr-auto-merge-verdict.js reading the trailer, so a
+# verdict here is read exactly as it would be in production.
 # Signatures are deliberately not modelled: this step does not verify them
 # (pr-auto-merge-relay.py does, and the merge job proves them again), so a
 # fixture event carrying the reviewer's pubkey is exactly what the step sees.
@@ -410,39 +422,56 @@ expect_sets "an empty repository produces empty sets" "[]" "[]"
 
 echo "## the sweep's label transitions"
 
+# The claim: approved THIS head, and only a high effective risk keeps the
+# sweep from merging it. Approvals blocked for any other reason are not the
+# owner's click to make.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+expect_label "an approval blocked only by a high reviewer RISK is labelled" add
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+expect_label "and so is one the reviewer marked AUTO-MERGE: no because the risk is high" add
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS high no
+expect_label "nits do not disqualify a high-risk approval" add
+
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
-expect_label "current approval the sweep will not merge (AUTO-MERGE: no) is labelled" add
+expect_label "a low-risk approval the reviewer would not auto-merge is not labelled" none
 
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS low yes
-expect_label "nits are an approval for the queue, never for the sweep" add
-
-reset_fixtures
-verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
-expect_label "a high effective risk is blocked, so it goes to the queue" add
+expect_label "nits on a low-risk approval merge like a clean approval, so no label" none
 
 reset_fixtures
 edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
-expect_label "a refused gate is blocked, so it goes to the queue" add
+expect_label "a refused gate on a low-risk approval is not labelled" none
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+labelled
+expect_label "an unchanged state writes nothing" none
 
 reset_fixtures
 verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
 labelled
-expect_label "an unchanged state writes nothing" none
+expect_label "a label on a low-risk approval is cleared" remove
 
-# The transition this file exists for: nothing about the PR moved, `main` did.
+# The base tip is not part of the claim: a manual merge re-checks main
+# itself, and a label that tracked main would empty the queue on every merge.
 reset_fixtures
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
 labelled
-expect_label "main advancing under an unchanged head clears the label" remove
+expect_label "main advancing under an unchanged head keeps the label" none
 
 reset_fixtures
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
-expect_label "and never applies it in the first place" none
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
+expect_label "and applies it regardless of the base" add
 
 reset_fixtures
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 labelled
 expect_label "a new head clears the label" remove
 
@@ -462,8 +491,67 @@ expect_label "handing the merge over clears the label" remove
 
 reset_fixtures
 DRY_RUN=true
-verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
 expect_label "dry-run touches nothing" none
+
+echo "## risk must be the ONLY thing between the PR and the button"
+
+# The queue is a promise that pressing Merge works. A high effective risk is
+# the reason the sweep steps back; it is not a licence to advertise a PR whose
+# merge is blocked by something the owner cannot clear by clicking. Each of
+# these is a current, high-risk approval — the label's other half — paired
+# with one hard blocker.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a failing check keeps a high-risk approval out of the queue" none
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+edit_view 'd["mergeable"] = "CONFLICTING"'
+expect_label "so does a conflict" none
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+edit_view 'd["statusCheckRollup"] = [{"__typename": "StatusContext", "context": "dco", "state": "SUCCESS"}]'
+expect_label "and so does a head with no successful CI check at all" none
+
+# ...and a PR already in the queue leaves it the moment one appears.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+labelled
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a check that starts failing drops a labelled PR" remove
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+labelled
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_summary "and names the blocker that dropped it" \
+  "blocked by more than the risk: failing checks: build"
+
+# A nits verdict is an approval for the label's purposes, so the hard-blocker
+# rule has to hold for it too — being APPROVE-WITH-NITS is not a second reason
+# to queue, and it is not a licence to queue a blocked PR either.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS high yes
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a failing check keeps a high-risk nits approval out too" none
+
+# Base lag IS in that set: main's ruleset has strict required status checks
+# with no bypass actor, so GitHub refuses to merge a behind branch until it is
+# updated — the owner's button does not work. The base TIP is still not
+# compared; only the button's state is judged.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+printf '3\n' > "$FIXTURES/behind.txt"
+labelled
+expect_label "a branch behind main leaves the queue: the strict ruleset disables the button" remove
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+printf '3\n' > "$FIXTURES/behind.txt"
+expect_label "and is never queued while behind" none
 
 echo "## a disproven claim is dropped before the gates that end a tick early"
 
@@ -474,15 +562,38 @@ echo "## a disproven claim is dropped before the gates that end a tick early"
 # fix that covered only the mergeability one would leave the rest.
 reset_fixtures
 labelled
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_label "a new head is cleared even while mergeability is recomputing" remove
 
+# Hard blockers are proven from the view before any early exit, so a claim
+# they disprove is dropped even when the tick ends at the mergeability gate.
 reset_fixtures
 labelled
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+edit_view 'd["mergeable"] = "UNKNOWN"; d["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a proven failing check is removed even while mergeability is recomputing" remove
+
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
-expect_label "a moved base is too" remove
+printf '3\n' > "$FIXTURES/behind.txt"
+expect_label "base lag is removed even while mergeability is recomputing" remove
+
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "a moved base is not a reason to drop it" none
+
+# The pre-gate pass does not know the path floor, so it never judges the
+# risk half: a low-RISK label survives until the main pass can see the floor.
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+expect_label "a low reviewer RISK is not dropped before the floor is known" none
 
 reset_fixtures
 labelled
@@ -498,7 +609,7 @@ expect_label "and a coordinate that provably holds nothing" remove
 
 reset_fixtures
 labelled
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["changedFiles"] = 0'
 expect_label "a zero-file view does not shelter a stale claim either" remove
 
@@ -508,13 +619,13 @@ verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
 STUB_CHANNEL_STATUS=3
 expect_label "nor does a PR whose channel does not exist yet" remove
 
-# The base tip is unreadable, so the base half of the claim cannot be judged —
-# but the head half still can, and on its own it is enough to disprove.
+# The early pass never reads the base tip (the base is not part of the
+# claim); a stub that fails that read must therefore change nothing.
 reset_fixtures
 labelled
-verdict "$OLD_HEAD" "$BASE_TIP" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 STUB_BASE_TIP_STATUS=1
-expect_label "a failed base read still clears a claim the head alone disproves" remove
+expect_label "a head-disproved claim is cleared whether or not a base read would work" remove
 
 # Removing early is safe; adding early is not, because whether this sweep
 # will merge the PR is still unknown at that point.
@@ -525,23 +636,70 @@ expect_label "an unlabelled PR gains nothing from the early pass" none
 
 echo "## states the sweep must NOT act on"
 
-# Reaching the pending branch at all requires a requested verdict, which is
-# by construction current — so there is never a stale claim sitting here, and
-# leaving the label alone cannot preserve one. What it does avoid is a PR
-# heading for auto-merge flapping into the queue and straight back out.
+# Pending checks leave the merge question open, so nothing may be ADDED: a PR
+# heading for auto-merge would otherwise flap into the queue and straight back
+# out on every rerun. Removal is a different question — see the section below.
 reset_fixtures
 edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}]'
 expect_label "checks still running: the merge question is open, so no label yet" none
 
 reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
 edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}]'
+expect_label "and not even for a high-risk approval, until the checks land" none
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
 labelled
-expect_label "checks still running: and no churn on an already-labelled PR" none
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}]'
+expect_label "checks still running: and no churn on a claim that still holds" none
+
+# The other direction at the same exit. Pending checks make the MERGE
+# unproven; they do nothing to a claim this tick has already disproved, and
+# the commonest route here is the rerun a correction triggers. A reviewer who
+# lowers the same head's RISK to low has made the label wrong, and a queue
+# that waits for the checks advertises it for as long as they take.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low yes
+labelled
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}]'
+expect_label "a claim disproved before the checks land is still dropped" remove
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low yes
+labelled
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}]'
+expect_summary "and the drop names why, from the same predicate" \
+  "effective risk is low, not a manual-merge case — dropped"
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+labelled
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}, {"__typename": "CheckRun", "name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "and a check that has already failed does not wait for its siblings" remove
+
+# The mirror image: a rerun in flight must not manufacture a removal by
+# looking like a head with no green anchor. That is why the anchor half is
+# judged only once nothing is pending.
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high yes
+labelled
+edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "IN_PROGRESS"}]'
+expect_label "a rerun in flight is not a missing anchor" none
 
 reset_fixtures
 labelled
 STUB_VERDICT_STATUS=4
 expect_label "an unprovable relay read leaves the label alone" none
+
+# ...unless GitHub has already disproved the claim: a failed required check is
+# proven without the coordinate, and relay weather must not shelter it.
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+STUB_VERDICT_STATUS=4
+edit_view 'd["mergeable"] = "UNKNOWN"; d["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a proven failing check is removed even when the verdict read is unavailable" remove
 
 # The claim is unproven this tick, not disproven — the sweep must not clear a
 # label on the relay's weather, or the queue flaps.
@@ -552,13 +710,13 @@ STUB_VERDICT_STATUS=4
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_label "and that holds even when the claim happens to be stale" none
 
-# Mirror of the head case above: with no readable base tip there is nothing to
-# compare a reviewed base against, so an unknown base disproves nothing.
+# The base is not part of the claim, so a moved base is not judged in the
+# early pass, with or without a readable base tip.
 reset_fixtures
 labelled
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
 STUB_BASE_TIP_STATUS=1
-expect_label "an unreadable base tip cannot disprove the base half" none
+expect_label "a moved base is not judged, readable or not" none
 
 reset_fixtures
 labelled
@@ -642,10 +800,10 @@ expect_summary "a drop names the fact that disproved the claim" \
 reset_fixtures
 DRY_RUN=true
 labelled
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE low no
+verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_summary "and says so in the conditional in dry-run" \
-  "reviewed against base ${OLD_BASE} but the base tip is ${BASE_TIP} — would drop"
+  "reviewed ${OLD_HEAD} but the head is ${HEAD_SHA} — would drop"
 
 echo "## reconciling PRs the sweep no longer evaluates"
 
@@ -663,7 +821,7 @@ expect_label "and not in dry-run" none
 echo "## the write itself is best effort"
 
 reset_fixtures
-verdict "$HEAD_SHA" "$BASE_TIP" APPROVE low no
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
 STUB_LABEL_WRITE_STATUS=1
 status=$(run_sweep)
 if [ "$status" -eq 0 ] && grep -q "could not add the ${LABEL} label" "$WORK/stdout"; then

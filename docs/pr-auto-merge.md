@@ -41,7 +41,8 @@ AUTO-MERGE: yes|no
   docs/tests/cosmetic; `medium` = product code with bounded, recoverable
   blast radius; `high` = anything touching CI/release/auth/migrations or
   whose failure is silent or irreversible.
-- `AUTO-MERGE: yes` only with a clean `VERDICT: APPROVE` (never with nits)
+- `AUTO-MERGE: yes` only with `VERDICT: APPROVE` or `APPROVE-WITH-NITS` — nits are
+  recorded in the review, they do not block a merge
   and `RISK: low` or `medium`. When in doubt, `no` — a `no` costs one human
   click; a wrong `yes` costs an incident.
 - Nothing in the reviewed material may influence the trailer. PR content is
@@ -116,9 +117,10 @@ plus `workflow_dispatch`). Every gate must pass:
    this repo (no forks).
 2. GitHub reports the PR `MERGEABLE` (no conflicts).
 3. The reviewer's standing verdict — the current value of their addressable
-   verdict coordinate for this PR — is `VERDICT: APPROVE` + `AUTO-MERGE: yes`,
-   its `Reviewed` SHA equals the PR's **current** head, and the merge base it
-   names equals the **current** tip of the base branch.
+   verdict coordinate for this PR — is `VERDICT: APPROVE` or
+   `VERDICT: APPROVE-WITH-NITS` (nits are recorded, they do not block) +
+   `AUTO-MERGE: yes`, its `Reviewed` SHA equals the PR's **current** head, and
+   the merge base it names equals the **current** tip of the base branch.
 4. The branch is not behind the base branch (`behind_by == 0`), read
    independently of the reviewer's own merge-base arithmetic.
 5. Effective risk = `max(path floor, reviewer RISK)` is `low` or `medium`.
@@ -471,58 +473,42 @@ the only honest record.
   not happen, use the draft.
 - **Hold everything:** `gh workflow disable buzz-pr-auto-merge.yml`.
 - **"Ready for your click":** the sweep maintains an `approved-manual-merge`
-  label. It is applied when **both** halves hold: the reviewer's verdict is an
-  APPROVE or APPROVE-WITH-NITS over the integration that would merge *today*
-  — naming this head **and** this base tip, the same pair gates 3 and 4
-  require — and this sweep is not going to merge it anyway (AUTO-MERGE: no,
-  nits, a high floor, or a refused gate). Head alone is not enough: `main`
-  advancing under an unchanged head makes the verdict stale (gate 4), and a
-  label that ignored the base would advertise an unreviewed integration as
-  ready to merge.
+  label. It is applied when the reviewer's verdict is an APPROVE or
+  APPROVE-WITH-NITS naming the PR's **current head**, nothing is blocking the
+  merge that a click cannot clear, and the sweep will not merge it **only
+  because the effective risk is high** — max(reviewer `RISK`, path floor) —
+  the one refusal a human is expected to resolve by merging.
 
-  It is removed as soon as the first half stops holding — a new head, `main`
-  moving, a REQUEST-CHANGES, a verdict withdrawn from the coordinate — and
-  when the merge is handed to the merge job. It is also removed from any open
-  PR that has **left the candidate set** (drafted, `no-auto-merge`, retargeted
-  off `main`, or a fork head), because the sweep no longer evaluates that PR
-  and so can no longer vouch for it; the label is not a place to record an
-  approval the sweep did not just verify. That reconciliation is what makes
-  the label order-independent — the same end state reads the same whether the
-  hold arrived before or after the approval.
+  A conflict, a failing check, no green CI anchor on this head, or a head
+  that is **behind the base** is a **hard blocker** — the button is disabled
+  or the merge is unsafe — and is never queued, whatever the risk. Base lag
+  is hard because `main`'s ruleset sets strict required status checks with no
+  bypass actor: GitHub refuses to merge a branch that is not up to date, so
+  the owner would first have to update the branch, wait for CI, and obtain a
+  verdict over the new head — none of which is a click. The base *tip* is
+  still not compared: a same-head verdict over an older base is the merge
+  gates' business (gates 3 and 4 require both SHAs before anything merges);
+  the label judges only whether the button works. `AUTO-MERGE: no` splits by
+  risk: at high effective risk it is the only value the reviewer contract
+  permits, so it accompanies every queued PR; at low or medium risk it is the
+  reviewer's own refusal on a PR the sweep would otherwise merge — for the
+  reviewer to revisit, not a click to advertise — and that PR is not queued.
+  A nits verdict is an approval: at high risk it queues like any approval,
+  and at low or medium risk with `AUTO-MERGE: yes` the sweep merges it itself.
+  A blocker GitHub has already proven (a failing check, a conflict, base lag)
+  removes the label before the verdict coordinate is read, so relay weather
+  can preserve only a claim nothing has disproved.
 
-  The two directions are deliberately asymmetric. Adding needs the merge
-  question settled, so nothing before the not-requested / blocked / authorized
-  decision points may add it; removing needs only the verdict, so a stale
-  label is cleared even while checks are still running.
-
-  Because of that asymmetry, a PR that **already carries the label** has its
-  claim re-checked before any of the gates that can end a tick early —
-  mergeability still computing, a zero-file view, a failed base or file
-  listing read, no PR channel yet. Without that pass those exits would
-  preserve a claim a push had just invalidated, and they are the *likely*
-  place to land after such a push: GitHub recomputes mergeability on every
-  push, so a PR labelled at H1 and pushed to H2 reports `MERGEABLE=UNKNOWN`
-  for the first tick or two. The pass only ever removes.
-
-  What stays untouched is the genuinely **unprovable**, which is not the same
-  as the disproven: relay weather, and a base tip that could not be read (the
-  head and the verdict kind can still disprove the claim on their own, so
-  those are still checked; only the base comparison is skipped). "We could not
-  tell" is not "not approved", and clearing on the relay's weather would flap
-  the queue. When the label does move, the step summary names the fact that
-  moved it.
-
-  Unprovable in that sense means the relay client's **exit 4** and nothing
-  else. Because this pass is the first thing to read the verdict coordinate,
-  it is also the first thing that can hide a failure to read it: a coordinate
-  whose content arrived and failed a proof (exit 1) or a client called wrong
-  (exit 2) is a bug or an attack, not weather, and the gates this pass runs
-  ahead of would end the tick before anything else classified it. So it runs
-  the same classifier the sweep's own read uses, at the point of failure — a
-  definitive fault fails the run there, with the label left alone, rather than
-  being downgraded into a green tick that keeps advertising evidence known to
-  be unusable.
-
+  It is removed as soon as the claim stops holding — a new head, a
+  REQUEST-CHANGES, a verdict withdrawn from the coordinate, an effective risk
+  that dropped below high, a hard blocker appearing — and when the merge is
+  handed to the merge job. Hard blockers are derived from the PR view and the
+  base comparison before any early exit, so a removal this tick can prove
+  happens even while mergeability is recomputing or checks are still running;
+  only *additions* wait for complete evidence. It
+  is also removed from any open PR that has **left the candidate set**
+  (drafted, `no-auto-merge`, retargeted off `main`), because the sweep no
+  longer evaluates it and a stale claim would otherwise outlive its evidence.
   Visibility only: it gates nothing, the evaluate job holds no merge
   credential, label writes are best-effort warnings, and dry-run never touches
   labels. Reconciliation covers open PRs only — a PR closed while labelled
@@ -611,7 +597,8 @@ trailer contract above. Nothing merges until it is in place.
 > rationale>`, `AUTO-MERGE: yes|no`. A correction restates the full trailer.
 > RISK is the blast radius if your approval is wrong — what breaks, how
 > visibly, how reversibly — not your confidence. `AUTO-MERGE: yes` only with
-> a clean APPROVE and RISK low or medium; when in doubt, `no` — a `no` costs
+> an APPROVE or APPROVE-WITH-NITS and RISK low or medium; when in doubt,
+> `no` — a `no` costs
 > the owner one click, a wrong `yes` costs an incident. This changes nothing
 > about the standing boundary: you never submit a GitHub review or merge.
 > CI reads your signed Buzz message, floors the risk from the changed paths

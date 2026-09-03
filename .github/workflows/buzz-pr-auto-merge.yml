@@ -318,12 +318,41 @@ jobs:
           }
 
           # Visibility label, not a gate: `approved-manual-merge` marks a PR
-          # whose CURRENT INTEGRATION — this head against this base tip —
-          # carries an APPROVE or APPROVE-WITH-NITS verdict that this sweep
-          # will nevertheless not merge (AUTO-MERGE: no, nits, a high floor,
-          # or a refused gate) — the owner's "ready for your click" queue.
-          # Best-effort: a failed label write warns and never blocks a
-          # decision; dry-run touches nothing.
+          # whose CURRENT HEAD carries an APPROVE or APPROVE-WITH-NITS
+          # verdict, has nothing blocking it that a click cannot clear, and
+          # that this sweep will nevertheless not merge — the owner's "ready
+          # for your click" queue. Best-effort: a failed label write warns and
+          # never blocks a decision; dry-run touches nothing.
+          #
+          # WHAT "READY FOR YOUR CLICK" MEANS, AND WHAT IT EXCLUDES. The queue
+          # is only worth opening if every PR in it can be merged by pressing
+          # the button, so the claim carries the WHOLE blocker set, not just
+          # the risk. One reason keeps an approved head out of this sweep's
+          # merge and is resolved by the owner merging: the effective risk —
+          # max(reviewer RISK, path floor) — is high.
+          #
+          # A conflict, a failing check, no green CI anchor on this head, or
+          # a head that is BEHIND the base is a HARD blocker: the button is
+          # disabled or the merge is unsafe, so queueing it sends the owner to
+          # a page with nothing to press. Base lag is hard because main's
+          # ruleset sets strict_required_status_checks_policy with no bypass
+          # actor: GitHub refuses to merge a branch that is not up to date, so
+          # the owner would first have to update the branch, wait for CI, and
+          # obtain a verdict over the new head — none of which is a click
+          # (#124 round 3). The base TIP is still not compared: a same-head
+          # verdict over an older base is the merge gates' business (gates 3
+          # and 4 require both SHAs for a sweep merge); this label judges only
+          # whether the button works.
+          #
+          # AUTO-MERGE: no splits by risk. At high effective risk it is the
+          # only value the reviewer contract permits, so it accompanies every
+          # entry in the queue and is not a reason against queueing. At low
+          # or medium risk it is the reviewer's own refusal on a PR the sweep
+          # would otherwise merge — to take up with the reviewer, not to
+          # advertise as a click — so that PR is not queued. A nits verdict
+          # is an approval: at high risk it queues like any approval, and at
+          # low or medium risk with AUTO-MERGE: yes the sweep merges it
+          # itself, so it is never stranded between the two.
           #
           # WHEN THE LABEL MOVES, AND WHY THE TWO DIRECTIONS DIFFER. The
           # label is a claim, so the sweep may only write the claim it can
@@ -334,9 +363,11 @@ jobs:
           #        The second half is only settled at the three decision
           #        points below (not requested / blocked / authorized), so
           #        nothing before them may add the label.
-          #   off  needs only the first half to be false, and that is settled
-          #        the moment the verdict is read — a stale head, a moved
-          #        base, a REQUEST-CHANGES, or a provably empty coordinate.
+          #   off  needs only the first half to be false — a stale head, a
+          #        REQUEST-CHANGES, a provably empty coordinate, or a hard
+          #        blocker already proven from the PR view or the base
+          #        comparison (a failing check, a conflict, base lag) — and
+          #        every one of those is settled before the early exits.
           #
           # UNPROVEN IS NOT DISPROVEN, AND THE DIFFERENCE DECIDES THE EARLY
           # EXITS. A tick can end long before the verdict read — mergeability
@@ -377,16 +408,27 @@ jobs:
           # question, so the two can never drift into disagreeing about what
           # the label means.
           #
-          # An empty <base-tip> means the current base could not be read. The
-          # head and the verdict kind can still disprove the claim on their
-          # own, so those are still checked; only the base comparison is
-          # skipped, because an unknown base cannot disprove anything.
-          #
           # manual_claim_stale <verdict-kind> <reviewed-head> <head> \
-          #                    <reviewed-base> <base-tip-or-empty>
-          # exit 0 = disproven (reason on stdout), 1 = the claim still holds.
+          #                    <effective-risk|-> <hard-blockers|->
+          #   Prints why the manual-merge claim does not hold and returns 0,
+          #   or returns 1 when it holds. The claim: the reviewer APPROVED
+          #   (with or without nits) THIS head, no hard blocker stands in the
+          #   way, and the sweep still will not merge it only because the
+          #   effective risk is high — the one refusal the owner resolves by
+          #   merging (see the label comment above).
+          #
+          #   "-" means NOT READ YET, and is how the pre-gate reconciliation
+          #   defers a half it cannot see: it does not know the path floor, so
+          #   it passes "-" for the risk; the blockers it passes are exactly
+          #   the ones already proven from the PR view and the base
+          #   comparison at that point. An EMPTY blocker string is the
+          #   opposite — read, and there are none. Nothing is ever dropped on
+          #   a guess.
+          #
+          #   The base tip is not compared; base lag arrives through the
+          #   hard-blocker string (see the label comment above).
           manual_claim_stale() {
-            local KIND="$1" RHEAD="$2" HEAD="$3" RBASE="$4" BTIP="$5"
+            local KIND="$1" RHEAD="$2" HEAD="$3" EFF="${4--}" OTHER="${5--}"
             if [ "$KIND" = "-" ] || [ -z "$KIND" ]; then
               printf 'no usable verdict at the reviewer coordinate'
               return 0
@@ -399,11 +441,16 @@ jobs:
               printf 'reviewed %s but the head is %s' "$RHEAD" "$HEAD"
               return 0
             fi
-            if [ -n "$BTIP" ] && [ "$RBASE" != "$BTIP" ]; then
-              printf 'reviewed against base %s but the base tip is %s' "$RBASE" "$BTIP"
+            if [ "$OTHER" != "-" ] && [ -n "$OTHER" ]; then
+              printf 'blocked by more than the risk: %s' "$OTHER"
               return 0
             fi
-            return 1
+            if [ "$EFF" = "-" ] || [ "$EFF" = high ]; then
+              # High risk, or a floor this pass cannot see yet.
+              return 1
+            fi
+            printf 'effective risk is %s, not a manual-merge case' "$EFF"
+            return 0
           }
 
           # --- Relay access. Every call below goes through the repository's own
@@ -494,10 +541,17 @@ jobs:
           # comparison stays in manual_claim_stale.
           UNKNOWN_SHA=0000000000000000000000000000000000000000
           reconcile_manual_claim() {
-            # reconcile_manual_claim <pr> <head-sha> <base-ref>
+            # reconcile_manual_claim <pr> <head-sha> <hard-blockers|->
             # Clears HAS_MANUAL (a caller variable) when it drops the label.
-            local N="$1" HEAD="$2" BREF="$3" BTIP NOTE JSON WHY STATUS=0
-            BTIP=$(gh api "repos/$R/git/ref/heads/$BREF" --jq .object.sha) || BTIP=""
+            local N="$1" HEAD="$2" BLK="${3--}" NOTE JSON WHY STATUS=0
+            # A blocker GitHub has already proven does not need the verdict:
+            # the button is known not to work whatever the coordinate says,
+            # so it comes off BEFORE the relay read — relay weather may keep
+            # only a claim nothing has disproved yet (#124 round 4).
+            if [ "$BLK" != "-" ] && [ -n "$BLK" ]; then
+              drop_manual_claim "$N" "blocked by more than the risk: ${BLK}"
+              return 0
+            fi
             NOTE=$(fetch_verdict "$N") || STATUS=$?
             if [ "$STATUS" -eq 3 ]; then
               # Provably absent: the coordinate was read and holds nothing, so
@@ -534,11 +588,24 @@ jobs:
             fi
             if WHY=$(manual_claim_stale \
               "$(jq -r '.verdict // "-"' <<<"$JSON")" \
-              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" \
-              "$(jq -r '.mergeBase // "-"' <<<"$JSON")" "$BTIP"); then
+              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" - "$BLK"); then
               drop_manual_claim "$N" "$WHY"
             fi
             return 0
+          }
+
+          # The main pass's label write. Adding and leaving alone are just
+          # the write; REMOVING goes through drop_manual_claim so that every
+          # drop names the fact that disproved the claim, wherever in the tick
+          # it happened. A queue entry vanishing without a reason in the step
+          # summary is indistinguishable from a bug.
+          apply_manual_label() {
+            local N="$1" WANT="$2" HAS="$3" WHY="$4"
+            if [ "$WANT" = off ] && [ "$HAS" = "true" ]; then
+              drop_manual_claim "$N" "$WHY"
+              return 0
+            fi
+            sync_manual_label "$N" "$WANT" "$HAS"
           }
 
           drop_manual_claim() {
@@ -600,12 +667,68 @@ jobs:
               continue
             fi
 
-            # Before any gate that can end this tick early: a label already on
-            # the PR is a published claim, and the exits below cannot tell a
-            # claim that is still good from one a push just invalidated.
-            if [ "$HAS_MANUAL" = "true" ]; then
-              reconcile_manual_claim "$N" "$HEAD_SHA" "$BASE_REF"
+            # HARD BLOCKERS ARE DERIVED FROM THE VIEW ALREADY IN HAND, BEFORE
+            # ANY EARLY EXIT, and a labelled PR is reconciled against them at
+            # once. A failing required check is proven by the rollup alone;
+            # nothing that follows — mergeability still computing, a zero-file
+            # view, a failed base or file read — may keep a disproven claim in
+            # the queue (#124 round 3). Additions still wait for complete
+            # evidence at the decision points below. A missing CI anchor only
+            # counts once nothing is pending: a check that has not finished
+            # cannot yet have produced the green anchor, and calling that a
+            # blocker would strip the label from every PR with a rerun in
+            # flight. A check that has already failed is proven whatever else
+            # is still running.
+            ROLLUP=$(jq '.statusCheckRollup // []' <<<"$VIEW")
+            PENDING=$(jq '[.[] | select((.__typename == "CheckRun" and .status != "COMPLETED")
+              or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$ROLLUP")
+            FAILING=$(jq -r '[.[] | select((.__typename == "CheckRun" and .status == "COMPLETED"
+                and ((.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED")) | not))
+              or (.__typename == "StatusContext" and (.state | IN("FAILURE","ERROR"))))
+              | (.name // .context)] | join(", ")' <<<"$ROLLUP")
+            ANCHOR=$(jq '[.[] | select(.__typename == "CheckRun" and .workflowName == "CI"
+              and .conclusion == "SUCCESS")] | length' <<<"$ROLLUP")
+            HARD_BLOCKED=""
+            if [ "$MERGEABLE" = "CONFLICTING" ]; then
+              HARD_BLOCKED="conflicts with ${BASE_REF}"
             fi
+            if [ -n "$FAILING" ]; then
+              HARD_BLOCKED="${HARD_BLOCKED:+${HARD_BLOCKED}; }failing checks: ${FAILING}"
+            fi
+            if [ "$PENDING" -eq 0 ] && [ "$ANCHOR" -eq 0 ]; then
+              HARD_BLOCKED="${HARD_BLOCKED:+${HARD_BLOCKED}; }no successful CI check on this head"
+            fi
+            # A label already on the PR is a published claim, and the exits
+            # below cannot tell a claim that is still good from one a push or
+            # a failed check just invalidated — so it is reconciled here.
+            if [ "$HAS_MANUAL" = "true" ]; then
+              reconcile_manual_claim "$N" "$HEAD_SHA" "$HARD_BLOCKED"
+            fi
+
+            # The base comparison does not depend on mergeability, so it is
+            # read before the exits too: under main's strict ruleset a behind
+            # branch has no working button, and that proof must reach a
+            # labelled PR before this tick can end. `behind_by` is also the
+            # merge gate's fact, read independently of the reviewer's
+            # arithmetic — the reviewer could misreport a merge base, and
+            # then only this catches it.
+            BEHIND=$(gh api "repos/$R/compare/$BASE_REF...$HEAD_SHA" --jq .behind_by) || {
+              warn_skip "$N" "base comparison failed"
+              continue
+            }
+            case "$BEHIND" in
+              ''|*[!0-9]*)
+                warn_skip "$N" "base comparison returned '${BEHIND}', not a commit count"
+                continue
+                ;;
+            esac
+            if [ "$BEHIND" -ne 0 ]; then
+              HARD_BLOCKED="${HARD_BLOCKED:+${HARD_BLOCKED}; }${BEHIND} commit(s) behind ${BASE_REF} (the strict ruleset requires an up-to-date branch)"
+              if [ "$HAS_MANUAL" = "true" ]; then
+                reconcile_manual_claim "$N" "$HEAD_SHA" "$HARD_BLOCKED"
+              fi
+            fi
+
             if [ "$MERGEABLE" = "UNKNOWN" ]; then
               warn_skip "$N" "mergeability still computing"
               continue
@@ -618,23 +741,11 @@ jobs:
             # What the merge will actually integrate. A verdict names the base
             # it was reviewed against; requiring that to be the CURRENT tip is
             # what stops an approval of head-against-B1 from authorizing a
-            # squash onto B2. `behind_by` is the same fact read independently
-            # of the reviewer's arithmetic — the reviewer could misreport a
-            # merge base, and then only this catches it.
+            # squash onto B2.
             BASE_TIP=$(gh api "repos/$R/git/ref/heads/$BASE_REF" --jq .object.sha) || {
               warn_skip "$N" "base ref read failed"
               continue
             }
-            BEHIND=$(gh api "repos/$R/compare/$BASE_REF...$HEAD_SHA" --jq .behind_by) || {
-              warn_skip "$N" "base comparison failed"
-              continue
-            }
-            case "$BEHIND" in
-              ''|*[!0-9]*)
-                warn_skip "$N" "base comparison returned '${BEHIND}', not a commit count"
-                continue
-                ;;
-            esac
 
             # Deterministic path-risk floor. previous_filename rides along so
             # both sides of a rename are classified; a fetched-vs-reported
@@ -674,7 +785,8 @@ jobs:
               # Exit 3 is provably absent, not weather: the coordinate was
               # read and holds nothing. A label claiming an approval is then
               # known to be wrong, so it comes off (see sync_manual_label).
-              sync_manual_label "$N" off "$HAS_MANUAL"
+              apply_manual_label "$N" off "$HAS_MANUAL" \
+                "the reviewer has published no verdict for this PR"
               decision "$N" "SKIP (the reviewer has published no verdict for this PR)"
               continue
             fi
@@ -699,27 +811,20 @@ jobs:
             EFFECTIVE=$(jq -r '.effectiveRisk // "-"' <<<"$VERDICT_JSON")
             VERDICT_KIND=$(jq -r '.verdict // "-"' <<<"$VERDICT_JSON")
             REVIEWED_HEAD=$(jq -r '.reviewedHead // "-"' <<<"$VERDICT_JSON")
-            REVIEWED_BASE=$(jq -r '.mergeBase // "-"' <<<"$VERDICT_JSON")
-            # "Ready for your click": an APPROVE (with or without nits) over
-            # the integration that would actually merge today. Same predicate
-            # the pre-gate reconciliation used, now with the real base tip in
-            # hand — BOTH SHAS, for the same reason gates 3 and 4 need both.
-            # main can advance under an unchanged head, and the parser then
-            # reports `stale base` and refuses (pr-auto-merge-verdict.js) — an
-            # approval of head-against-B1 says nothing about head-against-B2.
-            # A head-only predicate would keep calling that PR ready to click
-            # and put an unreviewed integration in the owner's manual queue,
-            # which is precisely the state docs/pr-auto-merge.md says an
-            # approval must not survive into.
-            if manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" "$HEAD_SHA" \
-              "$REVIEWED_BASE" "$BASE_TIP" >/dev/null; then
+            # "Ready for your click", decided by the one predicate the
+            # pre-gate pass also uses, so the two can never disagree about
+            # what the label means. Everything it needs is now known: the
+            # verdict, this head, the effective risk, and the hard blockers.
+            MANUAL_WHY=""
+            if MANUAL_WHY=$(manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" \
+              "$HEAD_SHA" "$EFFECTIVE" "$HARD_BLOCKED"); then
               MANUAL_WANT=off
             else
               MANUAL_WANT=on
             fi
 
             if [ "$FOUND" != "true" ] || [ "$REQUESTED" != "true" ]; then
-              sync_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL"
+              apply_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL" "$MANUAL_WHY"
               decision "$N" "SKIP (${REASON}; floor ${FLOOR})"
               continue
             fi
@@ -736,29 +841,24 @@ jobs:
             if [ "$BEHIND" -ne 0 ]; then
               BLOCKED="${BLOCKED}- branch is ${BEHIND} commit(s) behind ${BASE_REF} — rebase, then re-review the combined state\n"
             fi
-            ROLLUP=$(jq '.statusCheckRollup // []' <<<"$VIEW")
-            PENDING=$(jq '[.[] | select((.__typename == "CheckRun" and .status != "COMPLETED")
-              or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$ROLLUP")
-            FAILING=$(jq -r '[.[] | select((.__typename == "CheckRun" and .status == "COMPLETED"
-                and ((.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED")) | not))
-              or (.__typename == "StatusContext" and (.state | IN("FAILURE","ERROR"))))
-              | (.name // .context)] | join(", ")' <<<"$ROLLUP")
-            ANCHOR=$(jq '[.[] | select(.__typename == "CheckRun" and .workflowName == "CI"
-              and .conclusion == "SUCCESS")] | length' <<<"$ROLLUP")
             if [ "$PENDING" -gt 0 ]; then
               # Transient by construction — checks resolve on their own, and a
               # "blocked: still running" notice would be pure noise.
               #
-              # The label is left exactly as it is, in either direction.
-              # Adding is wrong because whether this sweep will merge is still
-              # open — a PR heading for auto-merge would flap into the queue
-              # and straight back out every time checks are in flight. Nor is
-              # there a stale claim to clear: reaching this line at all
-              # required REQUESTED, so the verdict already covers this head
-              # against this base tip. A pushed-to or overtaken PR never gets
-              # here — it is dropped by the pre-gate reconciliation, or it
-              # leaves the loop at the not-requested branch above, and its
-              # label comes off at whichever it reaches first.
+              # Adding the label here would be wrong: whether this sweep will
+              # merge is still open, so a PR heading for auto-merge would flap
+              # into the queue and straight back out every time checks are in
+              # flight. REMOVING it is a different question, and the answer is
+              # yes. Pending checks make the merge unproven; they do not make
+              # a published claim any less DISPROVEN. The claim can fail here
+              # on facts this tick has already established — the reviewer
+              # corrected the same head's RISK down to low, or a check has
+              # already failed — and the anchor half is excluded from
+              # HARD_BLOCKED precisely so that a rerun in flight cannot
+              # manufacture one of these removals.
+              if [ "$MANUAL_WANT" = off ]; then
+                apply_manual_label "$N" off "$HAS_MANUAL" "$MANUAL_WHY"
+              fi
               decision "$N" "SKIP (checks still running; will re-evaluate)"
               continue
             fi
@@ -770,7 +870,7 @@ jobs:
             fi
 
             if [ -n "$BLOCKED" ]; then
-              sync_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL"
+              apply_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL" "$MANUAL_WHY"
               REASONS=$(printf '%b' "$BLOCKED")
               decision "$N" "BLOCKED: $(printf '%s' "$REASONS" | tr '\n' '; ')"
               if [ "$DRY" != "true" ]; then
@@ -804,8 +904,8 @@ jobs:
               continue
             fi
 
-            printf '⏩ auto-merge authorized for %s — verdict event %s: VERDICT APPROVE, RISK %s, floor %s, effective %s. Merging now if the final gates still hold.\n%s\n' \
-              "$HEAD_SHA" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$PR_URL" \
+            printf '⏩ auto-merge authorized for %s — verdict event %s: VERDICT %s, RISK %s, floor %s, effective %s. Merging now if the final gates still hold.\n%s\n' \
+              "$HEAD_SHA" "$EVENT_ID" "$VERDICT_KIND" "$RISK" "$FLOOR" "$EFFECTIVE" "$PR_URL" \
               | relay send --channel "$CH" >/dev/null || {
               warn_skip "$N" "intent message send failed"
               continue
@@ -990,6 +1090,11 @@ jobs:
             || contradiction "verdict parser failed"
           [ "$(jq -r .authorized <<<"$VERDICT_JSON")" = "true" ] \
             || contradiction "verdict no longer authorizes: $(jq -r .reason <<<"$VERDICT_JSON")"
+          # The audit comment names the verdict the merge actually ran on. Two
+          # kinds authorize now, so a hardcoded "APPROVE" would misreport a
+          # nits approval in the permanent record. Derived here, from this
+          # job's own re-read, rather than carried over from evaluate.
+          echo "verdict=$(jq -r '.verdict' <<<"$VERDICT_JSON")" >> "$GITHUB_OUTPUT"
 
           # 5. Checks, re-read. A non-required check rerun after the sweep can
           #    go pending or red without moving the head, and the pinned `sha`
@@ -1070,6 +1175,9 @@ jobs:
           RISK: ${{ needs.evaluate.outputs.risk }}
           EFFECTIVE: ${{ needs.evaluate.outputs.effective }}
           EVENT_ID: ${{ needs.evaluate.outputs.event_id }}
+          # From the revalidate step's own re-read of the coordinate, not from
+          # the evaluate job — this job trusts nothing that one concluded.
+          VERDICT_KIND: ${{ steps.revalidate.outputs.verdict }}
           CHANNEL: ${{ needs.evaluate.outputs.channel }}
           BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
           BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
@@ -1328,8 +1436,8 @@ jobs:
           echo "the verdict still stands after the merge"
 
           # shellcheck disable=SC2016  # backticks are markdown, not command substitution
-          if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: APPROVE by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
-            "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
+          if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$(printf '🤖 Auto-merged on the reviewer'"'"'s verdict.\n\n- Verdict: %s by %s (Buzz event `%s`, signature verified in the merge job, still standing before and after the write)\n- Risk: %s (path floor %s, effective %s)\n- Head: %s\n- Run: %s/%s/actions/runs/%s\n' \
+            "$VERDICT_KIND" "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
             "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")" >/dev/null; then
             echo "::error::PR #$PR merged but the audit comment failed — the record is incomplete"
             exit 1

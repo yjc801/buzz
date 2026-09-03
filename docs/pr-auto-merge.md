@@ -472,19 +472,26 @@ the only honest record.
 - **Hold everything:** `gh workflow disable buzz-pr-auto-merge.yml`.
 - **"Ready for your click":** the sweep maintains an `approved-manual-merge`
   label. It is applied when the reviewer's verdict is an APPROVE or
-  APPROVE-WITH-NITS naming the PR's **current head**, and the sweep will not
-  merge it **only because the effective risk is high** — max(reviewer `RISK`,
-  path floor) — the one blocked case a human is expected to resolve by
-  merging. Low-risk approvals the sweep declines for other reasons
-  (`AUTO-MERGE: no`, nits, a refused gate) are not queued; those are the
-  reviewer's or CI's call to revisit. The base tip is deliberately not part
-  of the claim: a manual merge re-checks `main` anyway, and on a busy day
-  every advance of `main` would otherwise strip the label from the whole
-  queue. (Gates 3 and 4 still require both SHAs before anything merges.)
+  APPROVE-WITH-NITS naming the PR's **current head**, nothing is blocking the
+  merge that a click cannot clear, and the sweep will not merge it **only
+  because the effective risk is high** — max(reviewer `RISK`, path floor) —
+  the one refusal a human is expected to resolve by merging.
+
+  A conflict, a failing check, or no green CI anchor on this head is a **hard
+  blocker** — the button is disabled or the merge is unsafe — and is never
+  queued, whatever the risk. An `AUTO-MERGE: no`, and a nits verdict, are the
+  reviewer's own refusals on a PR the owner *could* merge; those are for the
+  reviewer or CI to revisit, not a click to advertise. Neither base lag nor
+  the base tip is judged: behind-by-N with no conflict still merges from the
+  button onto the current `main`, and judging either would strip the label
+  from the whole queue on every advance of `main`. (Gates 3 and 4 still
+  require both SHAs before anything merges.)
 
   It is removed as soon as the claim stops holding — a new head, a
   REQUEST-CHANGES, a verdict withdrawn from the coordinate, an effective risk
-  that dropped below high — and when the merge is handed to the merge job. It
+  that dropped below high, a hard blocker appearing — and when the merge is
+  handed to the merge job. A removal that this tick can prove happens even
+  while checks are still running; only *additions* wait for them. It
   is also removed from any open PR that has **left the candidate set**
   (drafted, `no-auto-merge`, retargeted off `main`), because the sweep no
   longer evaluates it and a stale claim would otherwise outlive its evidence.

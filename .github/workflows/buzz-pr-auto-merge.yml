@@ -318,12 +318,34 @@ jobs:
           }
 
           # Visibility label, not a gate: `approved-manual-merge` marks a PR
-          # whose CURRENT INTEGRATION — this head against this base tip —
-          # carries an APPROVE or APPROVE-WITH-NITS verdict that this sweep
-          # will nevertheless not merge (AUTO-MERGE: no, nits, a high floor,
-          # or a refused gate) — the owner's "ready for your click" queue.
-          # Best-effort: a failed label write warns and never blocks a
-          # decision; dry-run touches nothing.
+          # whose CURRENT HEAD carries an APPROVE or APPROVE-WITH-NITS
+          # verdict, has nothing blocking it that a click cannot clear, and
+          # that this sweep will nevertheless not merge — the owner's "ready
+          # for your click" queue. Best-effort: a failed label write warns and
+          # never blocks a decision; dry-run touches nothing.
+          #
+          # WHAT "READY FOR YOUR CLICK" MEANS, AND WHAT IT EXCLUDES. The queue
+          # is only worth opening if every PR in it can be merged by pressing
+          # the button, so the claim carries the WHOLE blocker set, not just
+          # the risk. One reason keeps an approved head out of this sweep's
+          # merge and is resolved by the owner merging: the effective risk —
+          # max(reviewer RISK, path floor) — is high.
+          #
+          # A conflict, a failing check, or no green CI anchor on this head is
+          # a HARD blocker: the button is disabled or the merge is unsafe, so
+          # queueing it sends the owner to a page with nothing to press. An
+          # AUTO-MERGE: no, and a nits verdict, are the reviewer's own
+          # refusals on a PR the owner could merge — to take up with the
+          # reviewer, not to advertise as a click. None of those are queued,
+          # whatever the risk.
+          #
+          # Base lag is deliberately NOT in the hard set, and neither is the
+          # base tip. Behind-by-N with no conflict still merges from the
+          # button, GitHub squashes onto the current main, and the owner
+          # re-checks main as part of deciding. Judging either would mean
+          # every advance of main strips the label from the whole queue on a
+          # busy day. (Gates 3 and 4 still require both SHAs for a sweep
+          # merge; this is only about what the owner is shown.)
           #
           # WHEN THE LABEL MOVES, AND WHY THE TWO DIRECTIONS DIFFER. The
           # label is a claim, so the sweep may only write the claim it can
@@ -382,18 +404,26 @@ jobs:
           # own, so those are still checked; only the base comparison is
           # skipped, because an unknown base cannot disprove anything.
           #
-          # manual_claim_stale <verdict-kind> <reviewed-head> <head> <effective-risk|->
+          # manual_claim_stale <verdict-kind> <reviewed-head> <head> \
+          #                    <effective-risk|-> <hard-blockers|->
           #   Prints why the manual-merge claim does not hold and returns 0,
           #   or returns 1 when it holds. The claim: the reviewer APPROVED
-          #   (with or without nits) THIS head, and the sweep will not merge
-          #   it only because the effective risk — max(reviewer RISK, path
-          #   floor) — is high. Pass "-" for the risk when the floor is not
-          #   known yet (the pre-gate reconciliation): the risk half is then
-          #   left to the main pass, so a label is never dropped on a guess.
-          #   The base tip is deliberately not part of the claim (see the
-          #   MANUAL_WANT block below).
+          #   (with or without nits) THIS head, no hard blocker stands in the
+          #   way, and the sweep still will not merge it only because the
+          #   effective risk is high — the one refusal the owner resolves by
+          #   merging (see the label comment above).
+          #
+          #   "-" means NOT READ YET, and is how the pre-gate reconciliation
+          #   defers a half it cannot see: it knows neither the path floor nor
+          #   the check rollup, so it passes "-" for both and judges only the
+          #   verdict kind and the head. An EMPTY blocker string is the
+          #   opposite — read, and there are none. Nothing is ever dropped on
+          #   a guess.
+          #
+          #   The base tip is deliberately not part of the claim, and nor is
+          #   base lag (see the label comment above).
           manual_claim_stale() {
-            local KIND="$1" RHEAD="$2" HEAD="$3" EFF="${4:--}"
+            local KIND="$1" RHEAD="$2" HEAD="$3" EFF="${4--}" OTHER="${5--}"
             if [ "$KIND" = "-" ] || [ -z "$KIND" ]; then
               printf 'no usable verdict at the reviewer coordinate'
               return 0
@@ -406,11 +436,16 @@ jobs:
               printf 'reviewed %s but the head is %s' "$RHEAD" "$HEAD"
               return 0
             fi
-            if [ "$EFF" != "-" ] && [ "$EFF" != high ]; then
-              printf 'effective risk is %s, not a manual-merge case' "$EFF"
+            if [ "$OTHER" != "-" ] && [ -n "$OTHER" ]; then
+              printf 'blocked by more than the risk: %s' "$OTHER"
               return 0
             fi
-            return 1
+            if [ "$EFF" = "-" ] || [ "$EFF" = high ]; then
+              # High risk, or a floor this pass cannot see yet.
+              return 1
+            fi
+            printf 'effective risk is %s, not a manual-merge case' "$EFF"
+            return 0
           }
 
           # --- Relay access. Every call below goes through the repository's own
@@ -540,10 +575,24 @@ jobs:
             fi
             if WHY=$(manual_claim_stale \
               "$(jq -r '.verdict // "-"' <<<"$JSON")" \
-              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" -); then
+              "$(jq -r '.reviewedHead // "-"' <<<"$JSON")" "$HEAD" - -); then
               drop_manual_claim "$N" "$WHY"
             fi
             return 0
+          }
+
+          # The main pass's label write. Adding and leaving alone are just
+          # the write; REMOVING goes through drop_manual_claim so that every
+          # drop names the fact that disproved the claim, wherever in the tick
+          # it happened. A queue entry vanishing without a reason in the step
+          # summary is indistinguishable from a bug.
+          apply_manual_label() {
+            local N="$1" WANT="$2" HAS="$3" WHY="$4"
+            if [ "$WANT" = off ] && [ "$HAS" = "true" ]; then
+              drop_manual_claim "$N" "$WHY"
+              return 0
+            fi
+            sync_manual_label "$N" "$WANT" "$HAS"
           }
 
           drop_manual_claim() {
@@ -641,6 +690,39 @@ jobs:
                 ;;
             esac
 
+            # The check rollup is read here rather than at the merge gates
+            # below because the manual-merge label needs it too, and needs it
+            # BEFORE the not-requested branch: a PR the owner cannot merge by
+            # clicking may not be queued as if they could.
+            ROLLUP=$(jq '.statusCheckRollup // []' <<<"$VIEW")
+            PENDING=$(jq '[.[] | select((.__typename == "CheckRun" and .status != "COMPLETED")
+              or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$ROLLUP")
+            FAILING=$(jq -r '[.[] | select((.__typename == "CheckRun" and .status == "COMPLETED"
+                and ((.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED")) | not))
+              or (.__typename == "StatusContext" and (.state | IN("FAILURE","ERROR"))))
+              | (.name // .context)] | join(", ")' <<<"$ROLLUP")
+            ANCHOR=$(jq '[.[] | select(.__typename == "CheckRun" and .workflowName == "CI"
+              and .conclusion == "SUCCESS")] | length' <<<"$ROLLUP")
+
+            # Blockers that are not the owner's click to clear, insofar as
+            # THIS tick can prove them. A missing CI anchor only counts once
+            # nothing is pending: a check that has not finished cannot yet
+            # have produced the green anchor, and calling that a blocker would
+            # strip the label from every PR with a rerun in flight. A check
+            # that has already failed is proven whatever else is still
+            # running. Base lag is deliberately absent (see the label comment
+            # above); it is still a merge gate below.
+            HARD_BLOCKED=""
+            if [ "$MERGEABLE" = "CONFLICTING" ]; then
+              HARD_BLOCKED="conflicts with ${BASE_REF}"
+            fi
+            if [ -n "$FAILING" ]; then
+              HARD_BLOCKED="${HARD_BLOCKED:+${HARD_BLOCKED}; }failing checks: ${FAILING}"
+            fi
+            if [ "$PENDING" -eq 0 ] && [ "$ANCHOR" -eq 0 ]; then
+              HARD_BLOCKED="${HARD_BLOCKED:+${HARD_BLOCKED}; }no successful CI check on this head"
+            fi
+
             # Deterministic path-risk floor. previous_filename rides along so
             # both sides of a rename are classified; a fetched-vs-reported
             # count mismatch (API caps at 3000 files) floors high.
@@ -679,7 +761,8 @@ jobs:
               # Exit 3 is provably absent, not weather: the coordinate was
               # read and holds nothing. A label claiming an approval is then
               # known to be wrong, so it comes off (see sync_manual_label).
-              sync_manual_label "$N" off "$HAS_MANUAL"
+              apply_manual_label "$N" off "$HAS_MANUAL" \
+                "the reviewer has published no verdict for this PR"
               decision "$N" "SKIP (the reviewer has published no verdict for this PR)"
               continue
             fi
@@ -704,26 +787,20 @@ jobs:
             EFFECTIVE=$(jq -r '.effectiveRisk // "-"' <<<"$VERDICT_JSON")
             VERDICT_KIND=$(jq -r '.verdict // "-"' <<<"$VERDICT_JSON")
             REVIEWED_HEAD=$(jq -r '.reviewedHead // "-"' <<<"$VERDICT_JSON")
-            # "Ready for your click": the reviewer APPROVED (with or without
-            # nits) THIS head, and the sweep will not merge it only because
-            # the effective risk — max(reviewer RISK, path floor) — is high.
-            # That is the one blocked case a human is expected to resolve by
-            # merging. Low-risk approvals the sweep declines for other reasons
-            # (AUTO-MERGE: no, nits, a refused gate) are not queued: they
-            # are the reviewer's or CI's call to revisit, not the owner's
-            # click. The base tip is deliberately NOT part of the claim: a
-            # manual merge re-checks main anyway, and on a busy day every
-            # advance of main would otherwise strip the label from the whole
-            # queue. (Gates 3 and 4 still require both SHAs for the merge.)
-            if manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" "$HEAD_SHA" \
-              "$EFFECTIVE" >/dev/null; then
+            # "Ready for your click", decided by the one predicate the
+            # pre-gate pass also uses, so the two can never disagree about
+            # what the label means. Everything it needs is now known: the
+            # verdict, this head, the effective risk, and the hard blockers.
+            MANUAL_WHY=""
+            if MANUAL_WHY=$(manual_claim_stale "$VERDICT_KIND" "$REVIEWED_HEAD" \
+              "$HEAD_SHA" "$EFFECTIVE" "$HARD_BLOCKED"); then
               MANUAL_WANT=off
             else
               MANUAL_WANT=on
             fi
 
             if [ "$FOUND" != "true" ] || [ "$REQUESTED" != "true" ]; then
-              sync_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL"
+              apply_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL" "$MANUAL_WHY"
               decision "$N" "SKIP (${REASON}; floor ${FLOOR})"
               continue
             fi
@@ -740,29 +817,24 @@ jobs:
             if [ "$BEHIND" -ne 0 ]; then
               BLOCKED="${BLOCKED}- branch is ${BEHIND} commit(s) behind ${BASE_REF} — rebase, then re-review the combined state\n"
             fi
-            ROLLUP=$(jq '.statusCheckRollup // []' <<<"$VIEW")
-            PENDING=$(jq '[.[] | select((.__typename == "CheckRun" and .status != "COMPLETED")
-              or (.__typename == "StatusContext" and (.state == "PENDING" or .state == "EXPECTED")))] | length' <<<"$ROLLUP")
-            FAILING=$(jq -r '[.[] | select((.__typename == "CheckRun" and .status == "COMPLETED"
-                and ((.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED")) | not))
-              or (.__typename == "StatusContext" and (.state | IN("FAILURE","ERROR"))))
-              | (.name // .context)] | join(", ")' <<<"$ROLLUP")
-            ANCHOR=$(jq '[.[] | select(.__typename == "CheckRun" and .workflowName == "CI"
-              and .conclusion == "SUCCESS")] | length' <<<"$ROLLUP")
             if [ "$PENDING" -gt 0 ]; then
               # Transient by construction — checks resolve on their own, and a
               # "blocked: still running" notice would be pure noise.
               #
-              # The label is left exactly as it is, in either direction.
-              # Adding is wrong because whether this sweep will merge is still
-              # open — a PR heading for auto-merge would flap into the queue
-              # and straight back out every time checks are in flight. Nor is
-              # there a stale claim to clear: reaching this line at all
-              # required REQUESTED, so the verdict already covers this head
-              # against this base tip. A pushed-to or overtaken PR never gets
-              # here — it is dropped by the pre-gate reconciliation, or it
-              # leaves the loop at the not-requested branch above, and its
-              # label comes off at whichever it reaches first.
+              # Adding the label here would be wrong: whether this sweep will
+              # merge is still open, so a PR heading for auto-merge would flap
+              # into the queue and straight back out every time checks are in
+              # flight. REMOVING it is a different question, and the answer is
+              # yes. Pending checks make the merge unproven; they do not make
+              # a published claim any less DISPROVEN. The claim can fail here
+              # on facts this tick has already established — the reviewer
+              # corrected the same head's RISK down to low, or a check has
+              # already failed — and the anchor half is excluded from
+              # HARD_BLOCKED precisely so that a rerun in flight cannot
+              # manufacture one of these removals.
+              if [ "$MANUAL_WANT" = off ]; then
+                apply_manual_label "$N" off "$HAS_MANUAL" "$MANUAL_WHY"
+              fi
               decision "$N" "SKIP (checks still running; will re-evaluate)"
               continue
             fi
@@ -774,7 +846,7 @@ jobs:
             fi
 
             if [ -n "$BLOCKED" ]; then
-              sync_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL"
+              apply_manual_label "$N" "$MANUAL_WANT" "$HAS_MANUAL" "$MANUAL_WHY"
               REASONS=$(printf '%b' "$BLOCKED")
               decision "$N" "BLOCKED: $(printf '%s' "$REASONS" | tr '\n' '; ')"
               if [ "$DRY" != "true" ]; then
@@ -808,8 +880,8 @@ jobs:
               continue
             fi
 
-            printf '⏩ auto-merge authorized for %s — verdict event %s: VERDICT APPROVE, RISK %s, floor %s, effective %s. Merging now if the final gates still hold.\n%s\n' \
-              "$HEAD_SHA" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$PR_URL" \
+            printf '⏩ auto-merge authorized for %s — verdict event %s: VERDICT %s, RISK %s, floor %s, effective %s. Merging now if the final gates still hold.\n%s\n' \
+              "$HEAD_SHA" "$EVENT_ID" "$VERDICT_KIND" "$RISK" "$FLOOR" "$EFFECTIVE" "$PR_URL" \
               | relay send --channel "$CH" >/dev/null || {
               warn_skip "$N" "intent message send failed"
               continue

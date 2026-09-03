@@ -13,10 +13,15 @@
 # is perfectly current; and a claim this tick can disprove has to come off
 # even at the exits that end a tick early, checks-still-running included.
 #
-# `main` advancing under an untouched head is the deliberate NON-transition:
-# neither the base tip nor base lag is part of the claim, because a manual
-# merge re-checks main anyway and judging either would empty the queue on
-# every merge. It is asserted here for exactly that reason.
+# The base TIP is not part of the claim (a same-head verdict over an older
+# base is the merge gates' business), but base LAG is a hard blocker: main's
+# ruleset has strict required status checks with no bypass actor, so a behind
+# branch has no working button. Both halves are asserted below. AUTO-MERGE: no
+# splits by risk: at high effective risk it is the only permitted value and
+# accompanies every queued PR; at low or medium risk it is the reviewer's
+# refusal and the PR is not queued. A blocker GitHub has already proven comes
+# off before the verdict coordinate is read, so relay weather preserves only
+# a claim nothing has disproved.
 #
 # Both steps under test are EXTRACTED FROM THE WORKFLOW rather than copied, so
 # deleting a transition from the YAML fails this test instead of quietly
@@ -686,6 +691,15 @@ reset_fixtures
 labelled
 STUB_VERDICT_STATUS=4
 expect_label "an unprovable relay read leaves the label alone" none
+
+# ...unless GitHub has already disproved the claim: a failed required check is
+# proven without the coordinate, and relay weather must not shelter it.
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+STUB_VERDICT_STATUS=4
+edit_view 'd["mergeable"] = "UNKNOWN"; d["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a proven failing check is removed even when the verdict read is unavailable" remove
 
 # The claim is unproven this tick, not disproven — the sweep must not clear a
 # label on the relay's weather, or the queue flaps.

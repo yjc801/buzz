@@ -344,9 +344,12 @@ jobs:
           # and 4 require both SHAs for a sweep merge); this label judges only
           # whether the button works.
           #
-          # An AUTO-MERGE: no is the reviewer's own refusal on a PR the owner
-          # could merge — to take up with the reviewer, not to advertise as a
-          # click — so it is never queued, whatever the risk. A nits verdict
+          # AUTO-MERGE: no splits by risk. At high effective risk it is the
+          # only value the reviewer contract permits, so it accompanies every
+          # entry in the queue and is not a reason against queueing. At low
+          # or medium risk it is the reviewer's own refusal on a PR the sweep
+          # would otherwise merge — to take up with the reviewer, not to
+          # advertise as a click — so that PR is not queued. A nits verdict
           # is an approval: at high risk it queues like any approval, and at
           # low or medium risk with AUTO-MERGE: yes the sweep merges it
           # itself, so it is never stranded between the two.
@@ -541,6 +544,14 @@ jobs:
             # reconcile_manual_claim <pr> <head-sha> <hard-blockers|->
             # Clears HAS_MANUAL (a caller variable) when it drops the label.
             local N="$1" HEAD="$2" BLK="${3--}" NOTE JSON WHY STATUS=0
+            # A blocker GitHub has already proven does not need the verdict:
+            # the button is known not to work whatever the coordinate says,
+            # so it comes off BEFORE the relay read — relay weather may keep
+            # only a claim nothing has disproved yet (#124 round 4).
+            if [ "$BLK" != "-" ] && [ -n "$BLK" ]; then
+              drop_manual_claim "$N" "blocked by more than the risk: ${BLK}"
+              return 0
+            fi
             NOTE=$(fetch_verdict "$N") || STATUS=$?
             if [ "$STATUS" -eq 3 ]; then
               # Provably absent: the coordinate was read and holds nothing, so

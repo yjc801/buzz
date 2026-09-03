@@ -488,11 +488,16 @@ the only honest record.
   verdict over the new head — none of which is a click. The base *tip* is
   still not compared: a same-head verdict over an older base is the merge
   gates' business (gates 3 and 4 require both SHAs before anything merges);
-  the label judges only whether the button works. An `AUTO-MERGE: no` is the
-  reviewer's own refusal on a PR the owner *could* merge — for the reviewer
-  to revisit, not a click to advertise — and is never queued. A nits verdict
-  is an approval: at high risk it queues like any approval, and at low or
-  medium risk with `AUTO-MERGE: yes` the sweep merges it itself.
+  the label judges only whether the button works. `AUTO-MERGE: no` splits by
+  risk: at high effective risk it is the only value the reviewer contract
+  permits, so it accompanies every queued PR; at low or medium risk it is the
+  reviewer's own refusal on a PR the sweep would otherwise merge — for the
+  reviewer to revisit, not a click to advertise — and that PR is not queued.
+  A nits verdict is an approval: at high risk it queues like any approval,
+  and at low or medium risk with `AUTO-MERGE: yes` the sweep merges it itself.
+  A blocker GitHub has already proven (a failing check, a conflict, base lag)
+  removes the label before the verdict coordinate is read, so relay weather
+  can preserve only a claim nothing has disproved.
 
   It is removed as soon as the claim stops holding — a new head, a
   REQUEST-CHANGES, a verdict withdrawn from the coordinate, an effective risk

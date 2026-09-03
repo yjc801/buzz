@@ -356,7 +356,10 @@ check "must not claim the PR moved" "$(! grep -q 'PR moved or closed' "$WORK/std
 #        send — the one ordering no preflight can catch. The notice therefore
 #        goes out, and the property under test is that it is HARMLESS when it
 #        does: it must defer to the PR's live head rather than steer the
-#        reviewer onto the head this sweep happened to see.
+#        reviewer onto the head this sweep happened to see, and it must
+#        disclaim itself for a PR that is closed, merged or draft — those two
+#        transitions can leave the head unchanged, so deferring to the current
+#        head is not on its own enough to stop the reviewer working.
 for CASE in moved closed draft; do
   scenario "PR $CASE between the preflight read and the send → notice defers"
   ci_events 1200
@@ -375,6 +378,8 @@ for CASE in moved closed draft; do
     "$(grep -q "current head" "$SENDS"; echo $?)"
   check "$CASE: the nudge must not command a review of this head" \
     "$(! grep -qE "please review \`?$HEAD_SHA" "$SENDS"; echo $?)"
+  check "$CASE: the nudge must waive itself for a closed/merged/draft PR" \
+    "$(grep -q "closed, merged or a draft, no review is owed" "$SENDS"; echo $?)"
 done
 
 # 9f. Every reviewer-facing notice carries the deferral, on both nudge paths;
@@ -386,6 +391,8 @@ ci_events 1200
 run_sweep >/dev/null 2>&1
 check "silent nudge should defer to the current head" \
   "$(grep -q "current head" "$SENDS"; echo $?)"
+check "silent nudge should waive itself on a closed/merged/draft PR" \
+  "$(grep -q "closed, merged or a draft, no review is owed" "$SENDS"; echo $?)"
 
 scenario "acked-path nudge carries the deferral"
 ci_events 3600
@@ -394,6 +401,8 @@ run_sweep >/dev/null 2>&1
 check "acked nudge should post" "$([ "$(sent_count)" = 1 ]; echo $?)"
 check "acked nudge should defer to the current head" \
   "$(grep -q "current head" "$SENDS"; echo $?)"
+check "acked nudge should waive itself on a closed/merged/draft PR" \
+  "$(grep -q "closed, merged or a draft, no review is owed" "$SENDS"; echo $?)"
 
 scenario "owner stall notice carries the staleness note"
 ci_events 3000 "$(nudge_marker 1000)"

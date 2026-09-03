@@ -213,14 +213,19 @@ jobs:
           # that no longer needs one. So every notice this sweep sends defers
           # to the PR's live state in its own body — it asks for a review of
           # whatever head is current, naming this head only as the observation
-          # that prompted it. Under the residual race the worst outcome is a
-          # redundant re-check of a head the reviewer would have re-checked
-          # anyway (his own contract re-reads the ref before reviewing), not a
-          # review pinned to a dead head.
+          # that prompted it, and it disclaims itself outright if the live PR
+          # is closed, merged or a draft. That last clause matters because a
+          # close or a draft conversion can keep the very same head, so
+          # "review the current head" would still be an instruction to do work
+          # the watchdog's own eligibility rules say is not owed. Under the
+          # residual race the worst outcome is a redundant re-check of a head
+          # the reviewer would have re-checked anyway (his own contract
+          # re-reads the ref before reviewing), not a review pinned to a dead
+          # head or to a PR that no longer wants one.
           #
           # Failing to read is NOT "still owed": a GitHub blip must not become
           # a wake, so still_owed returns 1 and the caller records an error.
-          DEFER='Review the PR'\''s current head; that sha is what this sweep last saw, not an instruction to review it if the PR has moved on.'
+          DEFER='Review the PR'\''s current head; that sha is what this sweep last saw, not an instruction to review it if the PR has moved on. If the PR is now closed, merged or a draft, no review is owed — ignore this notice.'
           STALE='If the PR has moved, closed or been drafted since this sweep read it, this notice is stale — ignore it, and the next sweep will re-evaluate the live head.'
           still_owed() {
             # $1 PR number, $2 head. 0 = unchanged, 1 = read failed, 2 = moved.

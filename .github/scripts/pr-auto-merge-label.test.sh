@@ -533,15 +533,20 @@ verdict "$HEAD_SHA" "$BASE_TIP" APPROVE-WITH-NITS high yes
 edit_view 'd["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
 expect_label "a failing check keeps a high-risk nits approval out too" none
 
-# Base lag is NOT in that set, and this is the assertion that says so: main
-# moving under an untouched head must not empty the queue. `behind` is still a
-# merge gate — the sweep will not merge it — but the owner's button works, and
-# the owner re-checks main as part of deciding.
+# Base lag IS in that set: main's ruleset has strict required status checks
+# with no bypass actor, so GitHub refuses to merge a behind branch until it is
+# updated — the owner's button does not work. The base TIP is still not
+# compared; only the button's state is judged.
 reset_fixtures
-verdict "$HEAD_SHA" "$OLD_BASE" APPROVE high no
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
 printf '3\n' > "$FIXTURES/behind.txt"
 labelled
-expect_label "a branch behind main keeps its place in the queue" none
+expect_label "a branch behind main leaves the queue: the strict ruleset disables the button" remove
+
+reset_fixtures
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+printf '3\n' > "$FIXTURES/behind.txt"
+expect_label "and is never queued while behind" none
 
 echo "## a disproven claim is dropped before the gates that end a tick early"
 
@@ -555,6 +560,21 @@ labelled
 verdict "$OLD_HEAD" "$BASE_TIP" APPROVE high no
 edit_view 'd["mergeable"] = "UNKNOWN"'
 expect_label "a new head is cleared even while mergeability is recomputing" remove
+
+# Hard blockers are proven from the view before any early exit, so a claim
+# they disprove is dropped even when the tick ends at the mergeability gate.
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+edit_view 'd["mergeable"] = "UNKNOWN"; d["statusCheckRollup"] = [{"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}]'
+expect_label "a proven failing check is removed even while mergeability is recomputing" remove
+
+reset_fixtures
+labelled
+verdict "$HEAD_SHA" "$BASE_TIP" APPROVE high no
+edit_view 'd["mergeable"] = "UNKNOWN"'
+printf '3\n' > "$FIXTURES/behind.txt"
+expect_label "base lag is removed even while mergeability is recomputing" remove
 
 reset_fixtures
 labelled

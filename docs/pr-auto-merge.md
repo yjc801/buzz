@@ -479,21 +479,28 @@ the only honest record.
   because the effective risk is high** — max(reviewer `RISK`, path floor) —
   the one refusal a human is expected to resolve by merging.
 
-  A conflict, a failing check, or no green CI anchor on this head is a **hard
-  blocker** — the button is disabled or the merge is unsafe — and is never
-  queued, whatever the risk. An `AUTO-MERGE: no`, and a nits verdict, are the
-  reviewer's own refusals on a PR the owner *could* merge; those are for the
-  reviewer or CI to revisit, not a click to advertise. Neither base lag nor
-  the base tip is judged: behind-by-N with no conflict still merges from the
-  button onto the current `main`, and judging either would strip the label
-  from the whole queue on every advance of `main`. (Gates 3 and 4 still
-  require both SHAs before anything merges.)
+  A conflict, a failing check, no green CI anchor on this head, or a head
+  that is **behind the base** is a **hard blocker** — the button is disabled
+  or the merge is unsafe — and is never queued, whatever the risk. Base lag
+  is hard because `main`'s ruleset sets strict required status checks with no
+  bypass actor: GitHub refuses to merge a branch that is not up to date, so
+  the owner would first have to update the branch, wait for CI, and obtain a
+  verdict over the new head — none of which is a click. The base *tip* is
+  still not compared: a same-head verdict over an older base is the merge
+  gates' business (gates 3 and 4 require both SHAs before anything merges);
+  the label judges only whether the button works. An `AUTO-MERGE: no` is the
+  reviewer's own refusal on a PR the owner *could* merge — for the reviewer
+  to revisit, not a click to advertise — and is never queued. A nits verdict
+  is an approval: at high risk it queues like any approval, and at low or
+  medium risk with `AUTO-MERGE: yes` the sweep merges it itself.
 
   It is removed as soon as the claim stops holding — a new head, a
   REQUEST-CHANGES, a verdict withdrawn from the coordinate, an effective risk
   that dropped below high, a hard blocker appearing — and when the merge is
-  handed to the merge job. A removal that this tick can prove happens even
-  while checks are still running; only *additions* wait for them. It
+  handed to the merge job. Hard blockers are derived from the PR view and the
+  base comparison before any early exit, so a removal this tick can prove
+  happens even while mergeability is recomputing or checks are still running;
+  only *additions* wait for complete evidence. It
   is also removed from any open PR that has **left the candidate set**
   (drafted, `no-auto-merge`, retargeted off `main`), because the sweep no
   longer evaluates it and a stale claim would otherwise outlive its evidence.

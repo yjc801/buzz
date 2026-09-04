@@ -266,11 +266,13 @@ or a republished approval a changed authorization would be a false report:
   at all.
 
 All three go **red**, post the reason to the PR, and best-effort tell the PR
-channel (best-effort because the mirror archives that channel seconds after a
-merge; the PR comment is the durable record). All three are "after state
-changed", which is the one category this workflow's failure philosophy reserves
-red for rather than degrading to a warning. Prevention was impossible. Silence
-was not.
+channel (best-effort because the mirror archives that channel after the merge
+— once the reviewer's post-merge summary has settled, or after its grace
+window, see [Post-merge review summary](#post-merge-review-summary) — and this
+send does not wait on it; the PR comment is the durable record). All three
+are "after state changed", which is the one category this workflow's failure
+philosophy reserves red for rather than degrading to a warning. Prevention was
+impossible. Silence was not.
 
 The first two are **not** interchangeable, and only the first and the third
 carry a copy-pasteable `git revert <squash commit>`. Every replacement at a
@@ -436,11 +438,13 @@ together (`just auto-merge-check`, wired into CI's contract steps).
 
 - Before merging, CI posts an intent message into the PR channel
   (`⏩ auto-merge authorized for <sha> — verdict event <id> … Merging now if
-  the final gates still hold.`) — *before*, because the mirror archives the
-  channel right after the merge. If the announcement cannot be published, the
-  merge does not happen this tick. The wording is hedged on purpose: the
-  message is written by `evaluate`, and the isolated `merge` job re-checks
-  every gate afterwards and may still refuse.
+  the final gates still hold.`) — *before*: the merge is the point of no
+  return, and nothing here waits on the mirror, which archives the channel
+  once the reviewer's post-merge summary has settled (see [Post-merge review
+  summary](#post-merge-review-summary)). If the announcement cannot be
+  published, the merge does not happen this tick. The wording is hedged on
+  purpose: the message is written by `evaluate`, and the isolated `merge` job
+  re-checks every gate afterwards and may still refuse.
 - After merging, CI adds the `auto-merged` label to the PR — the moment the
   write lands, before the post-merge verdict read, so a sweep merge that read
   later flags carries it too — and leaves a GitHub PR comment naming the
@@ -450,6 +454,100 @@ together (`just auto-merge-check`, wired into CI's contract steps).
   the run and leaves a repair note on the PR; see the runbook below.
 - When the reviewer requested auto-merge but a gate refused, CI posts one
   `⛔ auto-merge blocked at <sha>` notice per head naming every failed gate.
+
+## Post-merge review summary
+
+A merged PR's room is not archived by its `closed` event. The mirror
+(`.github/workflows/buzz-pr-mirror.yml`) posts the merge notice and then, as
+the last thing it writes into the room, a request to the reviewer — a
+CI-authored p-tag, the only kind that wakes an agent
+(`crates/buzz-waker/src/decide.rs`: no agent-authored event ever wakes
+anything) — asking for a review summary: what the review found, what was
+fixed, and anything left open. The room stays live for it, because the relay
+refuses every write into an archived room, and because the room is meant to
+archive *into* the record of why the code exists (VISION.md, "Branches are
+channels") with the reviewer's account as its last line.
+
+Those are two messages on purpose. `buzz messages send --mention` refuses any
+mentioned pubkey that is not on the channel roster
+(`crates/buzz-cli/src/commands/messages.rs`), so on a room whose `opened` run
+was cancelled between creating the channel and adding its members, a
+mention-bearing send fails. The mention-free merge notice is the pass's first
+write and its fence — the relay refuses it pre-storage on an archived room, so
+sending it proves the room is live — and only then does the mirror recover the
+roster, annotate the PR's cross-channel references, and ask. The recovery card
+posted on that path carries no `@name` and no mention: the CLI resolves an
+`@name` in message content into a p-tag exactly as `--mention` does, so an
+ordinary seed card ending in "please review" would be a second wake steering
+the turn the request starts.
+
+The request is recorded in the mirror's close marker
+(`summary-requested:<unix time>`) once it is out, but **the published request,
+not the marker, is what proves the reviewer was asked.** They are two writes,
+and a runner killed between them — or a lost CLI response, or a failed note
+write — leaves a later pass reading "not requested yet" over a request that is
+already in the room, whose remedy would be a second p-tag. So a pass with no
+marker searches the room for a request this CI identity published, adopts that
+message's own timestamp as the request time, and repairs the marker instead of
+asking again.
+
+That search recognises the request by **reconstructing its whole shape**, not
+by finding a phrase inside a CI-authored message. The seed card republishes the
+PR's title, body and changed paths verbatim under the same CI key, so anything
+matched loosely is text a PR can write for itself: a PR whose title carried the
+phrase would have its own card adopted as the request, the real p-tag skipped,
+and — the card being old — the grace window found already elapsed and the room
+archived on the spot. PR-controlled text is only ever *embedded* in a card, so
+what it cannot forge is the whole message: the request is a single line that
+starts with the reviewer's `@name` and ends with the exact generated tail,
+while every card is multi-line and opens with its own `**PR #N —` prefix.
+
+The mirror repeats that search in full immediately before its own send, because
+the scheduled sweep and an event run sit in different concurrency groups and
+can both reach this path on one PR. In full, and not as a window onto what
+appeared since the first walk: `--since` filters `created_at`, which is not
+publication order. The relay accepts an event stamped up to
+`MAX_TIMESTAMP_DRIFT_SECS` (900s, `crates/buzz-core/src/relay.rs`) either side
+of server time, so a competing runner's request can be published a moment from
+now and still carry a timestamp fifteen minutes behind any cursor this run
+could pick — a narrow window silently excludes it and the pass sends the very
+duplicate the probe exists to prevent, while a window wide enough for the full
+drift is a bounded page that can truncate instead. Walking is complete by
+construction. That narrows the duplicate-wake window to the send itself; it does
+not close it, because there is no compare-and-set spanning the marker and the
+room.
+
+The mirror's scheduled sweep (`1,31 * * * *`) then finishes the close on
+facts, with a timer only as a backstop. The room is archived once **both** are
+true:
+
+- `SUMMARY_GRACE_SECS` (60 minutes) have passed since the request, and
+- the reviewer has been quiet for `SUMMARY_SETTLE_SECS` (10 minutes).
+
+The grace window is a floor and reviewer activity only ever extends the hold.
+Treating any reviewer message as the fact that ends the wait made reporting
+progress *shorten* the protection: a pickup posted seconds after the request
+("On it — reading the rounds now") is already older than the settle window by
+the first sweep that can act, so the room was archived while the summary was
+still being written and the relay then refused the summary itself — while
+saying nothing at all would have held the room for the full hour. CI cannot
+tell a pickup from the summary it promises; that is the reviewer's own text
+and CI reads no meaning into it.
+
+The archive notice states only what CI observed — `Archiving this channel —
+the reviewer's last message here was N minutes ago.`, or, with no message at
+all, `Archiving this channel — no message from the reviewer has appeared here
+in the N minutes since the review summary was requested.` Whether the reviewer
+never woke, is mid-turn, or answered somewhere else is not something the sweep
+can know. Neither notice names the reviewer, for the `@name` reason above.
+
+The earliest archive is therefore one grace window plus one sweep interval
+after the request. PRs closed without merging are archived by their `closed`
+event as before. The reviewer is asked, not configured: the request carries no
+verdict, trailer, or `Review head:` line, and the reviewer's own prompt
+(upstream — see the canonical copy below) decides what a summary contains.
+Contract test: `.github/scripts/pr-mirror-close.test.sh`,
+run by `just auto-merge-check`.
 
 ## Failure philosophy
 

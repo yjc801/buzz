@@ -23,7 +23,11 @@
 #     nothing else ever will;
 #   * a reopen that lands while the sweep is closing the same PR ends with
 #     the room restored, not archived under an open PR;
-#   * the closed-PR window is enumerated completely or the sweep is red;
+#   * the closed-PR window is enumerated completely or the sweep is red — and
+#     it is enumerated from the REST pulls listing, paged past the window's
+#     start, never from the search index, which omits the PRs GitHub closed
+#     itself on base-branch deletion (buzz#128, velvet#210 — the very class
+#     the sweep is for);
 #   * a close inside the settle window, a PR reopened between the listing
 #     and the write, a fork head, and a close outside the window are all
 #     left alone;
@@ -111,6 +115,8 @@ check "the sweep should be allowed to list PRs" \
   "$(grep -qE '^  pull-requests: read' "$WORKFLOW"; echo $?)"
 check "the listing cap should be configured, so completeness can be checked against it" \
   "$(grep -qE '^          SWEEP_LIST_LIMIT:' "$WORKFLOW"; echo $?)"
+check "the listing page size should be configured, so the paging can be exercised" \
+  "$(grep -qE '^          SWEEP_PAGE_SIZE:' "$WORKFLOW"; echo $?)"
 
 # --- test identity ---------------------------------------------------------
 # A real key so the fence's real derivation runs; the workflow's pin is
@@ -130,9 +136,12 @@ export FIXTURES LOG CI_PUB
 cat > "$WORK/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo "PR_LIST $*" >> "$LOG"
-    cat "$FIXTURES/pr_list.json" ;;
+  "api repos/"*"/pulls?state=closed"*)
+    # The REST listing, one page per fixture (pr_list.pN.json); a page with
+    # no fixture is the end of the listing.
+    P=$(printf '%s' "$2" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p')
+    echo "PR_LIST page=${P:-1} $2" >> "$LOG"
+    if [ -f "$FIXTURES/pr_list.p${P:-1}.json" ]; then cat "$FIXTURES/pr_list.p${P:-1}.json"; else echo '[]'; fi ;;
   "api repos/"*"/pulls/"*)
     N="${2##*/}"
     echo "PR_READ $N" >> "$LOG"
@@ -262,21 +271,24 @@ chmod +x "$WORK/bin/gh" "$WORK/bin/buzz" "$WORK/bin/git"
 NOW=$(date +%s)
 as_iso() { "$REAL_PYTHON3" -c 'import sys,time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(sys.argv[1]))))' "$1"; }
 
-listed() { # listed <number> <closed-age-secs> <merged:true|false> [head-owner] [head-repo]
+listed() { # listed <number> <closed-age-secs> <merged:true|false> [head-owner] [head-repo] [updated-age-secs]
+  # One REST pulls record. updated_at defaults to the close, as a close bumps it.
   local MERGED_AT=null
   [ "$3" = true ] && MERGED_AT="\"$(as_iso $((NOW - $2)))\""
-  printf '{"number":%s,"closedAt":"%s","mergedAt":%s,"headRepositoryOwner":{"login":"%s"},"headRepository":{"name":"%s"}}' \
-    "$1" "$(as_iso $((NOW - $2)))" "$MERGED_AT" "${4:-yjc801}" "${5:-buzz}"
+  printf '{"number":%s,"closed_at":"%s","merged_at":%s,"updated_at":"%s","head":{"repo":{"owner":{"login":"%s"},"name":"%s"}}}' \
+    "$1" "$(as_iso $((NOW - $2)))" "$MERGED_AT" "$(as_iso $((NOW - ${6:-$2})))" "${4:-yjc801}" "${5:-buzz}"
 }
-listing() { # listing [listed-json...] → the sweep's `gh pr list` result
-  local OUT="[" FIRST=1 E
+listing_page() { # listing_page <n> [listed-json...] → page <n> of the REST listing
+  local N="$1" OUT="[" FIRST=1 E
+  shift
   for E in "$@"; do
     [ $FIRST -eq 1 ] || OUT="$OUT,"
     FIRST=0
     OUT="$OUT$E"
   done
-  printf '%s]\n' "$OUT" > "$FIXTURES/pr_list.json"
+  printf '%s]\n' "$OUT" > "$FIXTURES/pr_list.p$N.json"
 }
+listing() { listing_page 1 "$@"; }
 pr_record() { # pr_record <number> <state:open|closed> <merged:true|false> → the re-read
   printf '{"state":"%s","merged":%s,"title":"PR %s","html_url":"https://github.com/%s/pull/%s","body":"","user":{"login":"yjc801"},"head":{"ref":"claude/x","sha":"%s"},"base":{"ref":"main","sha":"%s"}}\n' \
     "$2" "$3" "$1" "$REPO" "$1" "$HEAD40" "$BASE40" > "$FIXTURES/pr_$1.json"
@@ -318,7 +330,6 @@ reset_fixtures() {
   rm -rf "$FIXTURES"; mkdir -p "$FIXTURES"
   : > "$LOG"
   echo '[]' > "$FIXTURES/channels_list.json"
-  echo '[]' > "$FIXTURES/pr_list.json"
 }
 
 run_step() { # run_step <event-name> [pr-action] [pr-number]
@@ -352,6 +363,7 @@ run_step() { # run_step <event-name> [pr-action] [pr-number]
   EXPECTED_CI_PUBKEY="$CI_PUB" \
   SWEEP_DAYS="${SWEEP_DAYS_INPUT:-7}" \
   SWEEP_LIST_LIMIT="${SWEEP_LIST_LIMIT_INPUT:-1000}" \
+  SWEEP_PAGE_SIZE="${SWEEP_PAGE_SIZE_INPUT:-100}" \
   SWEEP_SETTLE_SECS=1800 \
     bash -eo pipefail "$WORK/step.sh" > "$WORK/stdout" 2>&1
 }
@@ -459,8 +471,8 @@ check "should prove the archive" "$(said 'proved by the relay refusing'; echo $?
 check "should say why it acted" "$(said 'GitHub scheduled no close run; archived it now'; echo $?)"
 check "should record the completed close" \
   "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
-check "should bound the listing by close date, not by a page of the newest" \
-  "$(grep -q '^PR_LIST .*closed:>=[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "$LOG"; echo $?)"
+check "should walk the REST pulls listing by updated_at — the search index omits base-deleted closes" \
+  "$(grep -q "^PR_LIST page=1 repos/$REPO/pulls?state=closed&sort=updated&direction=desc" "$LOG"; echo $?)"
 check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
 
 scenario "sweep: a room already archived with the close on record → one refused send, nothing else"
@@ -546,6 +558,31 @@ SWEEP_DAYS_INPUT=30 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should reconcile the older close" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
 
+# The listing is paged until it passes the window's start; a candidate on a
+# later page is a candidate.
+scenario "sweep: a close on the second page of the listing is found"
+listing_page 1 "$(listed 4243 3600 true)"
+listing_page 2 "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should fetch pages until a short one ends the listing" "$([ "$(count "PR_LIST page=3")" = 1 ]; echo $?)"
+check "should reconcile the second-page close" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled'; echo $?)"
+
+# Sorted by updated_at, and a close bumps updated_at: once a full page reaches
+# past the window's start, nothing on a later page can be a candidate.
+scenario "sweep: paging stops once a page reaches past the window's start"
+listing_page 1 "$(listed 4243 $((40 * 86400)) false yjc801 "${REPO#*/}" $((40 * 86400)))"
+listing_page 2 "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not fetch past the window" "$([ "$(count "PR_LIST")" = 1 ]; echo $?)"
+check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
+
 # THE PRE-WRITE RE-READ IS A SNAPSHOT, NOT A FENCE. Sweep and event runs are
 # in different concurrency groups, and no later sweep would ever revisit an
 # open PR, so the sweep has to converge with the reopen itself.
@@ -627,13 +664,14 @@ check "should say the lifecycle is still moving" "$(said 'lifecycle still changi
 check "should not claim the repair" "$(said 'left to the next sweep rather than reported as repaired'; echo $?)"
 check "should stop reading rather than loop forever" "$([ "$(count "PR_READ 4242")" = 5 ]; echo $?)"
 
-# A truncated listing hides candidates from THIS sweep and from every later
-# one, because only closed PRs are ever listed.
-scenario "sweep: a listing that fills its cap is red, not a warning"
+# A listing that reaches the cap before passing the window's start hides
+# candidates from THIS sweep and from every later one, because only closed
+# PRs are ever listed.
+scenario "sweep: a listing that reaches its cap inside the window is red, not a warning"
 listing "$(listed 4242 7200 false)"
 bind 4242 "$CH_A"
 pr_record 4242 closed false
-SWEEP_LIST_LIMIT_INPUT=1 run_step schedule; RC=$?
+SWEEP_LIST_LIMIT_INPUT=1 SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
 check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
 check "should say the window was not enumerated completely" "$(said 'not enumerated completely'; echo $?)"
 check "should archive nothing on an incomplete window" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"

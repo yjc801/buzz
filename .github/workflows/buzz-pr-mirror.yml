@@ -268,11 +268,14 @@ jobs:
           # backfill. An event run reads neither.
           SWEEP_DAYS: ${{ github.event.inputs.sweep_days || '7' }}
           SWEEP_SETTLE_SECS: "1800"
-          # Ceiling on the closed-PR listing. The query is bounded by close
-          # date, so this is a completeness check rather than a page size: a
-          # window that fills it fails the sweep instead of being examined in
-          # part. 1000 is the search API's own hard ceiling.
+          # Ceiling on how many closed PRs the sweep pages through looking for
+          # the window's start — a completeness check, not a page size: reaching
+          # it before passing the window fails the sweep instead of examining
+          # part of the window.
           SWEEP_LIST_LIMIT: "1000"
+          # Page size of that listing — the REST maximum. Exposed only so the
+          # contract test can exercise the paging with tiny pages.
+          SWEEP_PAGE_SIZE: "100"
           PR_ACTION: ${{ github.event.action }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -1422,7 +1425,8 @@ jobs:
             # One PR's failure fails the sweep but not its siblings: each is
             # independent, the cron retries, and a red run is the honest
             # outcome for a room this identity could not resolve or close.
-            local NOW OLDEST OLDEST_DATE NEWEST PRS CANDIDATES LISTED NUM CLOSED_AT PR_JSON
+            local NOW OLDEST NEWEST CANDIDATES NUM CLOSED_AT PR_JSON
+            local PAGES PAGE FETCHED CHUNK N PAGE_OLDEST
             local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 RECLOSED=0 FAILED=0
             local LIFECYCLE_WRITTEN=""
             printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
@@ -1433,66 +1437,96 @@ jobs:
               echo "SWEEP_LIST_LIMIT must be a small integer, got '${SWEEP_LIST_LIMIT}'" >&2
               return 1
             }
+            printf '%s' "$SWEEP_PAGE_SIZE" | grep -qE '^[0-9]{1,3}$' || {
+              echo "SWEEP_PAGE_SIZE must be a small integer, got '${SWEEP_PAGE_SIZE}'" >&2
+              return 1
+            }
             # Base 10, explicitly: bash arithmetic reads a leading zero as
             # octal, so a hand-typed `sweep_days=008` would pass the digit
             # check above and then abort the whole sweep at the window
             # calculation with "value too great for base".
             SWEEP_DAYS=$((10#$SWEEP_DAYS))
             SWEEP_LIST_LIMIT=$((10#$SWEEP_LIST_LIMIT))
+            SWEEP_PAGE_SIZE=$((10#$SWEEP_PAGE_SIZE))
             [ "$SWEEP_DAYS" -gt 0 ] || {
               echo "SWEEP_DAYS must be at least 1, got '${SWEEP_DAYS}'" >&2
               return 1
             }
+            if [ "$SWEEP_PAGE_SIZE" -lt 1 ] || [ "$SWEEP_PAGE_SIZE" -gt 100 ]; then
+              echo "SWEEP_PAGE_SIZE must be 1..100, got '${SWEEP_PAGE_SIZE}'" >&2
+              return 1
+            fi
             NOW=$(date +%s)
             NEWEST=$((NOW - SWEEP_SETTLE_SECS))
             OLDEST=$((NOW - SWEEP_DAYS * 86400))
-            # THE WINDOW IS BOUNDED SERVER-SIDE, NOT BY A PREFIX OF THE
-            # LISTING. A bare newest-first page filtered afterwards silently
-            # drops any in-window close sitting behind a page's worth of
-            # fork PRs, older PRs touched since, or simply more closes than
-            # the page holds — and because the sweep only ever lists closed
-            # PRs, a candidate hidden that way is hidden from every later
-            # sweep too, until it ages out unreconciled while every run
-            # reports green. `closed:>=` is UTC-day granularity, so it is a
-            # superset of the window and the exact bounds are still applied
-            # below. python3 rather than `date -d`: BSD date has no -d.
-            # Fork heads never got a room (the job condition skips them) and
-            # are not candidates; that filter stays client-side, because
-            # search has no head-repository qualifier.
-            OLDEST_DATE=$(python3 -c 'import sys,time; print(time.strftime("%Y-%m-%d", time.gmtime(int(sys.argv[1]))))' "$OLDEST") || {
-              echo "window start could not be formatted as a search bound" >&2
-              return 1
-            }
-            PRS=$(gh pr list -R "$GITHUB_REPOSITORY" --state closed --limit "$SWEEP_LIST_LIMIT" \
-              --search "sort:updated-desc closed:>=${OLDEST_DATE}" \
-              --json number,closedAt,mergedAt,headRepositoryOwner,headRepository) || {
-              echo "closed-PR listing failed — failing so the next sweep retries" >&2
-              return 1
-            }
+            # THE LISTING IS THE REST PULLS INDEX, WALKED PAST THE WINDOW'S
+            # START — not the search index, and not a prefix of anything. Two
+            # ways to lose exactly the PRs this sweep exists for were paid for
+            # here:
+            #   * a bare newest-first page filtered afterwards silently drops
+            #     any in-window close sitting behind a page's worth of other
+            #     PRs — and because only closed PRs are ever listed, a
+            #     candidate hidden that way is hidden from every later sweep
+            #     too, ageing out unreconciled while every run reports green;
+            #   * the search index (`gh pr list --search`, the `closed:`
+            #     qualifier) OMITS PRs GitHub closed itself on the deletion of
+            #     their base branch. Verified 2026-09-04: buzz#128 and
+            #     velvet#210 are absent from `closed:>=` results and present
+            #     in the REST list. Those are the base-deleted stacked PRs
+            #     whose close never got a run — the sweep's whole reason to
+            #     exist — so a search-bounded sweep examined every close in
+            #     the window except the ones it was for.
+            # So this pages `pulls?state=closed` sorted by updated_at
+            # descending until a full page reaches past the window's start.
+            # That is complete: a close bumps updated_at, so every PR closed
+            # within the window has updated_at >= its closed_at >= OLDEST and
+            # sits before that point; a short page is the end of the listing.
+            # The cap is a completeness check, not a page size: reaching it
+            # before the boundary means the window was NOT enumerated, and
+            # reporting green on an incomplete repair is exactly the silence
+            # this sweep exists to end — the remedy is a narrower dispatch
+            # window. Fork heads never got a room (the job condition skips
+            # them) and are not candidates; nor is a head whose repository
+            # is gone.
+            PAGES=$(mktemp)
+            PAGE=1
+            FETCHED=0
+            while :; do
+              CHUNK=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=closed&sort=updated&direction=desc&per_page=${SWEEP_PAGE_SIZE}&page=${PAGE}") || {
+                echo "closed-PR listing failed on page ${PAGE} — failing so the next sweep retries" >&2
+                return 1
+              }
+              N=$(printf '%s' "$CHUNK" | jq 'length') || return 1
+              printf '%s\n' "$CHUNK" >> "$PAGES"
+              FETCHED=$((FETCHED + N))
+              if [ "$N" -lt "$SWEEP_PAGE_SIZE" ]; then
+                break   # a short page is the end of the listing
+              fi
+              PAGE_OLDEST=$(printf '%s' "$CHUNK" \
+                | jq '[.[] | .updated_at | fromdateiso8601] | min') || return 1
+              if [ "$PAGE_OLDEST" -lt "$OLDEST" ]; then
+                break   # past the window's start: everything after is older still
+              fi
+              if [ "$FETCHED" -ge "$SWEEP_LIST_LIMIT" ]; then
+                echo "closed-PR listing reached its ${SWEEP_LIST_LIMIT}-result cap without passing the ${SWEEP_DAYS}-day window's start" >&2
+                echo "— the window was not enumerated completely; re-run with a narrower sweep_days" >&2
+                return 1
+              fi
+              PAGE=$((PAGE + 1))
+            done
             CANDIDATES=$(mktemp)
-            printf '%s' "$PRS" | jq -r \
+            jq -s -r \
               --arg owner "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" \
               --argjson oldest "$OLDEST" --argjson newest "$NEWEST" \
-              '.[]
-               | select(.headRepositoryOwner.login == $owner and .headRepository.name == $repo)
-               | select(.closedAt != null)
-               | (.closedAt | fromdateiso8601) as $t
+              'add // []
+               | .[]
+               | select(.head.repo != null and .head.repo.owner.login == $owner and .head.repo.name == $repo)
+               | select(.closed_at != null)
+               | (.closed_at | fromdateiso8601) as $t
                | select($t >= $oldest and $t <= $newest)
-               | [.number, .closedAt]
-               | @tsv' > "$CANDIDATES" || return 1
-            LISTED=$(printf '%s' "$PRS" | jq 'length') || return 1
-            # A full result set means the query was truncated, so the window
-            # was NOT enumerated completely and any candidate beyond the cap
-            # is invisible to this sweep and to every later one. That is a
-            # failure, not a warning: reporting green on an incomplete repair
-            # is exactly the silence this whole sweep exists to end. The
-            # remedy is a narrower dispatch window (or a higher cap, up to
-            # the search API's own 1000-result ceiling).
-            if [ "$LISTED" -ge "$SWEEP_LIST_LIMIT" ]; then
-              echo "closed-PR listing filled its ${SWEEP_LIST_LIMIT}-result cap inside the ${SWEEP_DAYS}-day window" >&2
-              echo "— the window was not enumerated completely; re-run with a narrower sweep_days" >&2
-              return 1
-            fi
+               | [.number, .closed_at]
+               | @tsv' "$PAGES" > "$CANDIDATES" || return 1
+            echo "examining PRs closed within ${SWEEP_DAYS} day(s) and settled for ${SWEEP_SETTLE_SECS}s"
             echo "examining PRs closed within ${SWEEP_DAYS} day(s) and settled for ${SWEEP_SETTLE_SECS}s"
             while IFS=$'\t' read -r NUM CLOSED_AT; do
               [ -n "$NUM" ] || continue

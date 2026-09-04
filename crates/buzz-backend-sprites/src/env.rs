@@ -102,6 +102,11 @@ const CODEX_ADAPTER_COMMAND: &str = "codex-acp";
 /// access (approvals never — the Claude realization already grants shell and
 /// network); off maps to read-only, where every edit/exec asks and the
 /// harness's denial makes the agent effectively converse-only.
+///
+/// That last property belongs to the *pinned* adapter, not to the id: a later
+/// codex-acp keeps `read-only` but gives it a workspace-write sandbox, under
+/// which edits no longer ask. `config::CODEX_ADAPTER_VERSION` documents the
+/// constraint and a test there guards the pin.
 const CODEX_MODE_FULL_ACCESS: &str = "agent-full-access";
 const CODEX_MODE_READ_ONLY: &str = "read-only";
 

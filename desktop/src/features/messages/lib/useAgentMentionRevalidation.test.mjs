@@ -51,6 +51,10 @@ afterEach(async () => {
 
 after(() => dom.window.close());
 
+const { AgentMentionAuthorizationError } = await import(
+  "./agentMentionRevalidation.ts"
+);
+
 async function renderRevalidator(initialDirectory) {
   const { renderHook } = await import("@testing-library/react");
   const { useAgentMentionRevalidation } = await import(
@@ -83,7 +87,10 @@ test("send denies an agent revoked after the directory cache refreshed to empty"
   // before Send, dropping AGENT from the live directory view.
   rerender({ directoryAgentPubkeys: new Set() });
 
-  assert.deepEqual(await result.current([HUMAN, AGENT]), [HUMAN]);
+  await assert.rejects(
+    result.current([HUMAN, AGENT]),
+    AgentMentionAuthorizationError,
+  );
 });
 
 test("send still admits a member agent the directory never listed", async () => {
@@ -113,5 +120,8 @@ test("a targeted revalidation's evidence survives into the next revalidation", a
   // returns empty. That is a revocation, not a never-listed member, and only
   // the first call's result proves the difference.
   relayAgentsResponse = [];
-  assert.deepEqual(await result.current([HUMAN, AGENT]), [HUMAN]);
+  await assert.rejects(
+    result.current([HUMAN, AGENT]),
+    AgentMentionAuthorizationError,
+  );
 });

@@ -1,5 +1,4 @@
 import {
-  filterAdmittedMentionPubkeys,
   getAgentMentionAdmission,
   getMentionableAgentPubkeys,
   type AgentEligibilityScope,
@@ -12,6 +11,20 @@ import type {
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import * as React from "react";
+
+export type MentionRevalidationOptions = {
+  phase?: "prepare" | "publish";
+  intendedAgentPubkeys?: readonly string[];
+};
+
+export class AgentMentionAuthorizationError extends Error {
+  constructor() {
+    super(
+      "Could not authorize a mentioned agent. Check its access and channel membership, then retry or remove the mention.",
+    );
+    this.name = "AgentMentionAuthorizationError";
+  }
+}
 
 type DirectoryResult<T> = {
   data: T | undefined;
@@ -46,7 +59,9 @@ export async function revalidateAgentMentionPubkeys({
   sharedChannelIds,
   refetchManagedAgents,
   fetchRelayAgents,
+  phase = "publish",
 }: {
+  phase?: "prepare" | "publish";
   pubkeys: readonly string[];
   agentPubkeys: ReadonlySet<string>;
   /**
@@ -84,7 +99,7 @@ export async function revalidateAgentMentionPubkeys({
   // no channel yet) has no roster to fetch — requiring one would fail-close
   // a valid managed-agent mention before the channel even exists.
   const [managedResult, relayAgents, membersResult] = await Promise.all([
-    refetchManagedAgents(),
+    refetchManagedAgents().catch(() => null),
     fetchRelayAgents([...requestedAgentPubkeys]).catch(() => null),
     eligibilityScope.type === "channel"
       ? refetchMembers()
@@ -94,31 +109,33 @@ export async function revalidateAgentMentionPubkeys({
         }),
   ]);
   const relayDirectoryReady = relayAgents !== null;
-  if (
-    managedResult.error !== null ||
-    managedResult.data === undefined ||
-    membersResult.error !== null ||
-    membersResult.data === undefined
-  ) {
-    return filterAdmittedMentionPubkeys(pubkeys, agentPubkeys, new Set());
-  }
-
+  // Each directory proves only its own identities. A failed local runtime
+  // query must neither veto fresh relay evidence nor admit stale local data.
+  const managedAgentRecords =
+    managedResult?.error === null ? (managedResult.data ?? []) : [];
   const managedPubkeys = new Set(
-    managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
+    managedAgentRecords.map((agent) => normalizePubkey(agent.pubkey)),
   );
   const relayDirectoryAgents = relayAgents ?? [];
   const directoryAgentPubkeys = new Set([
     ...[...knownDirectoryAgentPubkeys].map(normalizePubkey),
     ...relayDirectoryAgents.map((agent) => normalizePubkey(agent.pubkey)),
   ]);
+  // An unproven roster grants no leniency. Upstream now *throws* on a denied
+  // mention rather than silently filtering it, so an unresolved roster falls
+  // through to the strict admission path and surfaces as an authorization
+  // error instead of a blanket, silent drop of every agent mention.
   const memberPubkeys = new Set(
-    membersResult.data.map((member) => normalizePubkey(member.pubkey)),
+    (membersResult.error === null ? (membersResult.data ?? []) : []).map(
+      (member) => normalizePubkey(member.pubkey),
+    ),
   );
   const mentionablePubkeys = getMentionableAgentPubkeys({
     activeCommunityRelayUrl,
     currentPubkey,
     eligibilityScope,
-    managedAgents: managedResult.data,
+    phase,
+    managedAgents: managedAgentRecords,
     relayAgents: relayDirectoryAgents,
     sharedChannelIds,
   });
@@ -139,7 +156,12 @@ export async function revalidateAgentMentionPubkeys({
       );
     }),
   );
-  return filterAdmittedMentionPubkeys(pubkeys, agentPubkeys, admittedPubkeys);
+  if (
+    [...requestedAgentPubkeys].some((pubkey) => !admittedPubkeys.has(pubkey))
+  ) {
+    throw new AgentMentionAuthorizationError();
+  }
+  return [...pubkeys];
 }
 
 export function useAgentMentionRevalidation({
@@ -179,23 +201,38 @@ export function useAgentMentionRevalidation({
     knownDirectoryAgentPubkeys,
   );
   return React.useCallback(
-    (pubkeys: readonly string[]) =>
-      revalidateAgentMentionPubkeys({
+    (
+      pubkeys: readonly string[],
+      destinationChannelId?: string | null,
+      options: MentionRevalidationOptions = {},
+    ) => {
+      // A new DM can acquire its channel during preparation. Validate the
+      // actual destination at publication, not the composer's original null id.
+      const scope: AgentEligibilityScope = destinationChannelId
+        ? {
+            type: eligibilityScope.type === "owned" ? "owned" : "channel",
+            channelId: destinationChannelId,
+          }
+        : eligibilityScope;
+      return revalidateAgentMentionPubkeys({
         pubkeys,
-        agentPubkeys: new Set([...agentPubkeys, ...getSelectedAgentPubkeys()]),
+        agentPubkeys: new Set([
+          ...agentPubkeys,
+          ...getSelectedAgentPubkeys(),
+          ...(options.intendedAgentPubkeys ?? []).map(normalizePubkey),
+        ]),
+        phase: options.phase,
         knownDirectoryAgentPubkeys: rememberedDirectoryAgentPubkeys,
         refetchMembers,
         activeCommunityRelayUrl,
         currentPubkey,
-        eligibilityScope,
+        eligibilityScope: scope,
         sharedChannelIds,
         refetchManagedAgents,
         fetchRelayAgents: async (requestedPubkeys) => {
           const relayAgents = await revalidateRelayAgents(
             requestedPubkeys,
-            eligibilityScope.type === "channel"
-              ? eligibilityScope.channelId
-              : undefined,
+            "channelId" in scope ? (scope.channelId ?? undefined) : undefined,
           );
           // A targeted revalidation can be the first directory view to observe
           // an agent, while the full polled cache is still empty or up to a
@@ -216,7 +253,8 @@ export function useAgentMentionRevalidation({
           );
           return relayAgents;
         },
-      }),
+      });
+    },
     [
       activeCommunityRelayUrl,
       agentPubkeys,

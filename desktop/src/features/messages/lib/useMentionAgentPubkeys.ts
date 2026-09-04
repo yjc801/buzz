@@ -4,7 +4,11 @@ import {
   getMentionableAgentPubkeys,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import type { ManagedAgentScopeInput } from "@/features/agents/lib/agentAutocompleteEligibility";
-import type { ChannelMember, RelayAgent } from "@/shared/api/types";
+import type {
+  ChannelMember,
+  ChannelType,
+  RelayAgent,
+} from "@/shared/api/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
@@ -24,6 +28,8 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
  */
 export function useMentionAgentPubkeys({
   activeCommunityRelayUrl,
+  channelId,
+  channelType,
   currentPubkey,
   isArchived,
   managedAgentNamesByPubkey,
@@ -36,6 +42,8 @@ export function useMentionAgentPubkeys({
   sharedChannelIds,
 }: {
   activeCommunityRelayUrl: string | null;
+  channelId: string | null;
+  channelType: ChannelType | null;
   currentPubkey: string | null;
   isArchived: (pubkey: string) => boolean;
   managedAgentNamesByPubkey: ReadonlyMap<string, string>;
@@ -57,15 +65,20 @@ export function useMentionAgentPubkeys({
       getMentionableAgentPubkeys({
         activeCommunityRelayUrl,
         currentPubkey,
+        phase: "prepare",
         eligibilityScope: mentionChannelId
           ? { type: "channel", channelId: mentionChannelId }
-          : { type: "managed-only" },
+          : channelType === "dm"
+            ? { type: "owned", channelId }
+            : { type: "managed-only" },
         managedAgents: managedAgents ?? [],
         relayAgents,
         sharedChannelIds,
       }),
     [
       activeCommunityRelayUrl,
+      channelId,
+      channelType,
       currentPubkey,
       managedAgents,
       mentionChannelId,

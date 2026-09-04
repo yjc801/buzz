@@ -261,7 +261,30 @@ case "$SUB" in
     # read in the same scenario sees what was written.
     case "$SLUG" in
       *-closed)
+        # The relay's NIP-33 tie-break, which shell call order cannot model:
+        # `notes set` stamps created_at in whole SECONDS and the loser of a
+        # same-second tie is rejected as dominated, exit 5. `marker.dominate`
+        # counts down how many writes lose that tie; a dominated write is NOT
+        # persisted, exactly as on the relay.
+        D=$(cat "$FIXTURES/marker.dominate" 2>/dev/null || echo 0)
+        if [ "$D" -gt 0 ]; then
+          printf '%s\n' "$((D - 1))" > "$FIXTURES/marker.dominate"
+          echo "MARKER_DOMINATED $SLUG $BODY" >> "$LOG"
+          echo '{"error":"conflict","message":"duplicate: dominated"}' >&2
+          exit 5
+        fi
+        F=$(cat "$FIXTURES/marker.fail" 2>/dev/null || echo 0)
+        if [ "$F" -gt 0 ]; then
+          printf '%s\n' "$((F - 1))" > "$FIXTURES/marker.fail"
+          echo "MARKER_REFUSED $SLUG $BODY" >> "$LOG"
+          echo '{"error":"internal","message":"relay unreachable"}' >&2
+          exit 2
+        fi
         echo "MARKER_WRITE $SLUG $BODY" >> "$LOG"
+        # The wall-clock second the write landed in, so a transition can be
+        # asserted to occupy two DISTINCT seconds — the property that keeps
+        # the second write from losing the tie-break above.
+        echo "MARKER_AT $(date -u +%s)" >> "$LOG"
         printf '%s\n' "$BODY" > "$FIXTURES/binding.$SLUG" ;;
       *) echo "BINDING_WRITE" >> "$LOG" ;;
     esac ;;
@@ -428,6 +451,14 @@ open_listing() { # open_listing [listed-json...] → page 1 of the open listing
 }
 marker_is() { # marker_is <number> <token> — the close marker's current content
   printf '%s\n' "$2" > "$FIXTURES/binding.${SLUG}-$1-closed"
+}
+marker_dominated() { # marker_dominated <n> — the next <n> marker writes lose the
+  # created_at tie-break to a concurrent writer (relay exit 5, not persisted)
+  printf '%s\n' "$1" > "$FIXTURES/marker.dominate"
+}
+marker_write_fails() { # marker_write_fails <n> — the next <n> marker writes fail
+  # for a reason that is NOT the tie-break
+  printf '%s\n' "$1" > "$FIXTURES/marker.fail"
 }
 referenced_from() { # referenced_from <number> <channel> — a CI-authored
   # mention of the PR in another room, carrying whatever banner was last
@@ -791,6 +822,56 @@ check "should reverse the banners" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
 check "should complete the reopen" "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopened" ]; echo $?)"
 check "should send nothing — there is no room, and the sweep creates none" "$([ "$(count SEND)" = 0 ]; echo $?)"
 check "should account for it" "$(said '1 reopened without a room'; echo $?)"
+
+# THE MARKER'S OWN CREATED_AT. A transition is two writes to ONE
+# parameterized-replaceable coordinate, and `buzz notes set` stamps
+# created_at in whole seconds; on a tie the relay keeps the lower event id
+# and rejects the other. So a transition whose two writes share a second
+# loses its SECOND write — the run goes red with the marker stuck on the
+# retry state, and every later sweep redoes the reopen and posts another
+# notice. The roomless path is the fastest one there is: no room, and with
+# no search hits nothing between the two writes at all.
+scenario "sweep: a reopen's two marker writes land in distinct seconds, so the second cannot be dominated"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should write both states" "$([ "$(count MARKER_WRITE)" = 2 ]; echo $?)"
+check "the two writes must not share a created_at second" \
+  "$([ "$(grep '^MARKER_AT' "$LOG" | head -1)" != "$(grep '^MARKER_AT' "$LOG" | tail -1)" ]; echo $?)"
+
+scenario "sweep: a marker write dominated by a concurrent writer is retried, not left on the retry state"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+marker_dominated 1
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should have lost one write to the tie-break" "$([ "$(count MARKER_DOMINATED)" = 1 ]; echo $?)"
+check "should still end on the completed reopen" \
+  "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopened" ]; echo $?)"
+check "should account for it" "$(said '1 reopened without a room'; echo $?)"
+
+scenario "sweep: a marker write that keeps losing the tie-break is red, not an endless retry"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+marker_dominated 9
+run_step schedule; RC=$?
+check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
+check "should stop at the attempt cap" "$([ "$(count MARKER_DOMINATED)" = 3 ]; echo $?)"
+check "should say why" "$(said 'lost its created_at tie-break'; echo $?)"
+
+scenario "sweep: a marker write that fails for any other reason is not retried"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+marker_write_fails 1
+run_step schedule; RC=$?
+check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
+check "should not retry an unexplained failure" "$([ "$(count MARKER_REFUSED)" = 1 ]; echo $?)"
+check "should leave the reopen unfinished" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
 
 scenario "sweep: an open-side candidate closed again since the listing is left to the closed side"
 open_listing "$(listed 4242 7200 false)"

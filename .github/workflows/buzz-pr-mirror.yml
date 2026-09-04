@@ -573,6 +573,20 @@ jobs:
           CLOSE_MARKER_DONE=closed
           CLOSE_MARKER_REOPENING=reopening
           CLOSE_MARKER_REOPENED=reopened
+          # `buzz notes set` stamps created_at in whole Unix SECONDS, and on a
+          # tie the relay keeps the LOWER event id and rejects the other as
+          # dominated (crates/buzz-db/src/store/replaceable.rs), which the CLI
+          # surfaces as `duplicate:` and exit 5. Every marker TRANSITION is two
+          # writes from one run a fraction of a second apart — `reopening` then
+          # `reopened` — so without a fence the second write loses the
+          # tie-break about half the time: the run goes red with the durable
+          # marker stuck at the retry state, and every later sweep redoes the
+          # reopen and posts another notice. This records the second in which
+          # this run last wrote the marker so the next write can wait it out.
+          CLOSE_MARKER_LAST_WRITE_SECOND=""
+          # A marker write that keeps losing the tie-break to some other run
+          # is left unfinished rather than retried forever.
+          MARKER_WRITE_ATTEMPTS=3
 
           read_close_marker() {
             # Prints the marker's content, or nothing when it is PROVABLY
@@ -595,13 +609,57 @@ jobs:
             return 1
           }
 
+          fence_marker_second() {
+            # Block until the wall clock leaves the second this run last wrote
+            # the close marker in, so the next write's created_at is strictly
+            # later than the one it supersedes. A no-op for a run's first
+            # write, and for any write far enough behind the previous one.
+            local NOW
+            while :; do
+              NOW=$(date -u +%s) || return 1
+              [ "$NOW" = "$CLOSE_MARKER_LAST_WRITE_SECOND" ] || return 0
+              sleep 1
+            done
+          }
+
           write_close_marker() {
             # $1 is the state token — CLOSE_MARKER_DONE, or anything else to
             # invalidate. Output is redirected because callers may run inside
             # a command substitution capturing something else.
-            printf '%s\n' "$1" | buzz notes set --name "$CLOSE_MARKER_SLUG" \
-              --title "PR mirror close marker: ${GITHUB_REPOSITORY}#${PR_NUMBER}" \
-              --tag pr-mirror --content - >/dev/null
+            #
+            # Fenced onto a second this run has not already written in (see
+            # CLOSE_MARKER_LAST_WRITE_SECOND). The second is recorded AFTER
+            # the CLI returns, so it is never EARLIER than the created_at the
+            # CLI actually stamped — a slow call widens the fence rather than
+            # escaping it.
+            #
+            # The fence cannot see a CONCURRENT run writing this same marker
+            # in the same second. Exit 5 is exactly that outcome and only that
+            # one (`duplicate:` / dominated), so it is retried on the next
+            # second; every other exit is a real failure and is not retried,
+            # because a marker write that failed for an unknown reason is
+            # unfinished work, which is the safe reading of every state
+            # written here.
+            local ATTEMPT=0 STATUS
+            while :; do
+              fence_marker_second || return 1
+              STATUS=0
+              printf '%s\n' "$1" | buzz notes set --name "$CLOSE_MARKER_SLUG" \
+                --title "PR mirror close marker: ${GITHUB_REPOSITORY}#${PR_NUMBER}" \
+                --tag pr-mirror --content - >/dev/null || STATUS=$?
+              CLOSE_MARKER_LAST_WRITE_SECOND=$(date -u +%s) || return 1
+              [ "$STATUS" -eq 0 ] && return 0
+              if [ "$STATUS" -ne 5 ]; then
+                echo "close-marker write of '$1' failed (exit $STATUS)" >&2
+                return 1
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+              if [ "$ATTEMPT" -ge "$MARKER_WRITE_ATTEMPTS" ]; then
+                echo "close-marker write of '$1' lost its created_at tie-break ${ATTEMPT}x running — giving up" >&2
+                return 1
+              fi
+              echo "close-marker write of '$1' was dominated by a same-second write — retrying on the next second" >&2
+            done
           }
 
           channel_roster() {

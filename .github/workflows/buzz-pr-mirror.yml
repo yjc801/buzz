@@ -11,10 +11,12 @@ name: buzz-pr-mirror
 #                 ever wakes anything), so a coder's "@Alex pushed the fix"
 #                 alone leaves him asleep
 #   closed      → 🚫 Closed without merge: post the notice, then archive.
-#                 ✅ Merged: post the notice with a review-summary request
-#                 to Alex and leave the room LIVE — the sweep archives it
-#                 once his last reply has settled, or after a grace window
-#                 under a notice that states only what CI saw (see below)
+#                 ✅ Merged: the same, on this repo — the post-merge
+#                 review-summary request is switched OFF (POST_MERGE_SUMMARY
+#                 below). Switched on, the notice carries a review-summary
+#                 request to Alex and the room is left LIVE — the sweep
+#                 archives it once his last reply has settled, or after a
+#                 grace window under a notice that states only what CI saw
 #   reopened    → unarchive, and reverse the close annotations everywhere
 #   schedule    → archive the room of any PR whose close GitHub never
 #                 announced (sweep_missed_closes — see below), finish the
@@ -105,6 +107,21 @@ name: buzz-pr-mirror
 # banners still have to be reversed. A lifecycle still flipping after
 # CONVERGE_MAX_PASSES is red: the sweep says so and leaves the PR to the next
 # one, rather than reporting a repair it cannot show.
+#
+# THE POST-MERGE SUMMARY REQUEST IS SWITCHED OFF ON THIS REPO. With
+# POST_MERGE_SUMMARY=off (the env below) a merged PR's close is the close a
+# not-merged PR gets: one mention-free notice, the annotation sweep, the
+# archive, the marker — and nobody is asked for anything. Two things survive
+# the switch, because it governs only whether a NEW request is made. A room
+# that already holds a request — the close marker says `summary-requested:`,
+# or the room holds a request this CI identity published and the marker
+# write was lost — is finished by the hold below exactly as before: the
+# reviewer was p-tagged, a summary may be mid-turn, and an archive now would
+# refuse it; the hold is bounded, so such rooms drain within one grace
+# window of the switch flipping. And the mechanism itself is kept and tested
+# under `on` (.github/scripts/pr-mirror-close.test.sh), so flipping the
+# value back restores it without a rewrite. The paragraphs that follow
+# describe that mechanism.
 #
 # A MERGED PR'S ROOM IS HELD OPEN FOR THE REVIEW SUMMARY. The room is meant
 # to archive into the record of why the code exists (VISION.md, "Branches
@@ -375,6 +392,14 @@ jobs:
           # the protection. See close_after_summary. Seconds, both.
           SUMMARY_GRACE_SECS: "3600"
           SUMMARY_SETTLE_SECS: "600"
+          # Whether a merged PR's close ASKS the reviewer for a post-merge
+          # review summary and holds the room open for it (`on`), or archives
+          # the room at once like a close without a merge (`off`). Off on
+          # this repo — see the header. A room already holding a request is
+          # finished by the hold regardless, so the windows above still
+          # apply to it. Exactly `on` or `off`; anything else is refused
+          # before any write.
+          POST_MERGE_SUMMARY: "off"
           PR_ACTION: ${{ github.event.action }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -481,6 +506,11 @@ jobs:
           done
           SUMMARY_GRACE_SECS=$((10#$SUMMARY_GRACE_SECS))
           SUMMARY_SETTLE_SECS=$((10#$SUMMARY_SETTLE_SECS))
+          case "$POST_MERGE_SUMMARY" in
+            on|off) ;;
+            *) echo "POST_MERGE_SUMMARY must be 'on' or 'off', got '${POST_MERGE_SUMMARY}'" >&2
+               exit 1 ;;
+          esac
 
           # CI's own pubkey — authenticates the seed marker (only a
           # CI-authored card proves provisioning; the channel is open, so
@@ -1549,9 +1579,12 @@ jobs:
             # Shared by the `closed` event and by sweep_missed_closes, so a
             # close GitHub never announced gets exactly the treatment an
             # announced one does. Sets CLOSE_OUTCOME:
-            #   "reconciled"           this call closed a not-merged PR's room
-            #   "summary-requested"    merged: the reviewer was asked for the
-            #                          summary and the room stays live
+            #   "reconciled"           this call closed the room at once: a
+            #                          not-merged PR, or a merged one with the
+            #                          summary request off
+            #   "summary-requested"    merged, summary on: the reviewer was
+            #                          asked for the summary and the room
+            #                          stays live
             #   "awaiting-reply"       merged: asked earlier, nothing decided
             #                          yet, nothing written
             #   "closed-after-reply"   merged: his last reply settled; archived
@@ -1589,7 +1622,16 @@ jobs:
             # is not proof the reviewer was never asked, though — the marker
             # and the request are two writes — so request_summary reconciles
             # against the published request before it asks anything.
-            local CH="$1" FORCE="${2:-}" MARKER REQUESTED_AT
+            #
+            # WITH THE SUMMARY REQUEST OFF (POST_MERGE_SUMMARY, see the
+            # header) a merged PR takes the not-merged path below — one
+            # notice, then finish_close — unless the reviewer HAS been asked:
+            # a `summary-requested:` marker, or a request published under a
+            # lost marker write, is honoured by the hold regardless, because
+            # the p-tag is out and an archive now would refuse the summary it
+            # asked for. The switch decides whether to ask, never whether to
+            # keep a promise already made.
+            local CH="$1" FORCE="${2:-}" MARKER REQUESTED_AT PUBLISHED
             CLOSE_OUTCOME=""
             # Whether this pass put anything durable into the world. The
             # OUTCOME names what was decided; this names whether there is
@@ -1611,8 +1653,19 @@ jobs:
                   close_after_summary "$CH" "$FORCE" "$REQUESTED_AT" || return 1
                   return 0 ;;
               esac
-              request_summary "$CH" "$FORCE" || return 1
-              return 0
+              if [ "$POST_MERGE_SUMMARY" = on ]; then
+                request_summary "$CH" "$FORCE" || return 1
+                return 0
+              fi
+              # Off. The probe is the same full walk request_summary opens
+              # with, for the same reason: the marker's absence does not
+              # prove nobody asked.
+              PUBLISHED=$(summary_request_at "$CH") || return 1
+              if [ -n "$PUBLISHED" ]; then
+                adopt_published_request "$CH" "$PUBLISHED" "$FORCE" || return 1
+                return 0
+              fi
+              echo "#${NAME}: merged, and the summary request is off — archiving at once"
             fi
             if ! printf '%s — archiving this channel.\n%s\n' "$STATUS" "$PR_URL" \
                 | buzz messages send --channel "$CH" --content - 2>"$ERRFILE"; then
@@ -2193,10 +2246,13 @@ jobs:
             # it under an open PR.
             #
             # A merged PR comes through here on every sweep inside the window
-            # until its close is complete: first to request the review summary
-            # if no run has yet, then to archive the room once the reviewer's
-            # reply has settled or the grace window has passed (see the
-            # header). Passes that decide nothing write nothing.
+            # until its close is complete. With the summary request on: first
+            # to request the review summary if no run has yet, then to archive
+            # the room once the reviewer's reply has settled or the grace
+            # window has passed (see the header). With it off, as on this
+            # repo: once, to archive the room like any other close — unless
+            # the room already holds a request, which the hold finishes.
+            # Passes that decide nothing write nothing.
             #
             # One PR's failure fails the sweep but not its siblings: each is
             # independent, the cron retries, and a red run is the honest

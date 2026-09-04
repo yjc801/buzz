@@ -124,6 +124,10 @@ check "the listing cap should be configured, so completeness can be checked agai
   "$(grep -qE '^          SWEEP_LIST_LIMIT:' "$WORKFLOW"; echo $?)"
 check "the listing page size should be configured, so the paging can be exercised" \
   "$(grep -qE '^          SWEEP_PAGE_SIZE:' "$WORKFLOW"; echo $?)"
+check "the summary grace window should be configured — the backstop has to exist" \
+  "$(grep -qE '^          SUMMARY_GRACE_SECS:' "$WORKFLOW"; echo $?)"
+check "the summary settle window should be configured — a reply is not the end of the reply" \
+  "$(grep -qE '^          SUMMARY_SETTLE_SECS:' "$WORKFLOW"; echo $?)"
 
 # --- test identity ---------------------------------------------------------
 # A real key so the fence's real derivation runs; the workflow's pin is
@@ -251,8 +255,26 @@ case "$SUB" in
   "channels list") cat "$FIXTURES/channels_list.json" ;;
   "channels members") printf '[{"pubkey":"%s","role":"owner"}]\n' "$CI_PUB" ;;
   "messages get")
-    # Every room is fully provisioned: a CI-authored seed card for each PR
-    # number a scenario uses. Partial-room recovery is not under test here.
+    C=$(arg --channel "$@"); SINCE=$(arg --since "$@")
+    if [ -n "$SINCE" ]; then
+      # The reviewer-reply read: the room's messages since the request,
+      # served from the per-room fixture reviewer_said builds and filtered
+      # by --since exactly as the relay would. A broken read is a knob.
+      echo "REPLY_READ $C $SINCE" >> "$LOG"
+      if [ -f "$FIXTURES/messages.$C.rc" ]; then
+        echo '{"error":"internal","message":"relay unreachable"}' >&2
+        exit "$(cat "$FIXTURES/messages.$C.rc")"
+      fi
+      if [ -f "$FIXTURES/messages.$C.json" ]; then
+        jq -c --argjson s "$SINCE" '[.[] | select(.created_at >= $s)]' "$FIXTURES/messages.$C.json"
+      else
+        echo '[]'
+      fi
+      exit 0
+    fi
+    # The provisioning walk (no --since). Every room is fully provisioned: a
+    # CI-authored seed card for each PR number a scenario uses. Partial-room
+    # recovery is not under test here.
     printf '[{"pubkey":"%s","content":"**PR #4242 — t","created_at":1},' "$CI_PUB"
     printf '{"pubkey":"%s","content":"**PR #4243 — t","created_at":1}]\n' "$CI_PUB" ;;
   "messages search")
@@ -275,7 +297,13 @@ case "$SUB" in
     C=$(arg --channel "$@")
     BODY=$(cat)
     refuse_if_archived "$C"
-    { echo "SEND $C"; printf '%s\n' "$BODY"; echo "--- end send ---"; } >> "$LOG" ;;
+    { echo "SEND $C"; printf '%s\n' "$BODY"; echo "--- end send ---"; } >> "$LOG"
+    # A p-tag is the one thing that can wake the reviewer, so every one that
+    # goes out is on the record.
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--mention" ] && echo "MENTION ${2:-}" >> "$LOG"
+      shift
+    done ;;
   "channels archive")
     C=$(arg --channel "$@")
     echo "ARCHIVE $C" >> "$LOG"
@@ -376,6 +404,22 @@ close_lands_at_annotation() { # close_lands_at_annotation <number> <channel> <se
     > "$FIXTURES/inject_close_at_search.$3"
 }
 
+reviewer_said() { # reviewer_said <channel> <age-secs> <text> — a message from the reviewer in the room
+  local F="$FIXTURES/messages.$1.json"
+  [ -f "$F" ] || echo '[]' > "$F"
+  jq -c --arg p "$REVIEWER_PUB" --argjson t "$((NOW - $2))" --arg c "$3" \
+    '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+}
+summary_requested() { # summary_requested <number> <age-secs> — the review summary was asked for
+  printf 'summary-requested:%s\n' "$((NOW - $2))" > "$FIXTURES/binding.pr-mirror-yjc801-buzz-$1-closed"
+}
+reply_read_broken() { # reply_read_broken <channel> — the reviewer-reply read fails
+  printf '2\n' > "$FIXTURES/messages.$1.rc"
+}
+send_body() { # send_body <channel> — the body of the first notice sent into <channel>
+  awk -v c="SEND $1" '$0 == c {on=1; next} on && $0 == "--- end send ---" {exit} on' "$LOG"
+}
+
 reset_fixtures() {
   rm -rf "$FIXTURES"; mkdir -p "$FIXTURES"
   : > "$LOG"
@@ -415,6 +459,8 @@ run_step() { # run_step <event-name> [pr-action] [pr-number]
   SWEEP_LIST_LIMIT="${SWEEP_LIST_LIMIT_INPUT:-1000}" \
   SWEEP_PAGE_SIZE="${SWEEP_PAGE_SIZE_INPUT:-100}" \
   SWEEP_SETTLE_SECS=1800 \
+  SUMMARY_GRACE_SECS="${SUMMARY_GRACE_SECS_INPUT:-3600}" \
+  SUMMARY_SETTLE_SECS="${SUMMARY_SETTLE_SECS_INPUT:-600}" \
     bash -eo pipefail "$WORK/step.sh" > "$WORK/stdout" 2>&1
 }
 
@@ -425,12 +471,13 @@ scenario() { echo "--- $1"; reset_fixtures; }
 
 # ===========================================================================
 # THE CLOSED EVENT.
-scenario "closed event, live room → notice, annotation, archive, and the archive proven"
+scenario "closed event (not merged), live room → notice, annotation, archive, and the archive proven"
 bind 4242 "$CH_A"
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should post the close notice into the room" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
-check "the notice should name the outcome" "$(grep -q '✅ \*\*Merged\*\* — archiving' "$LOG"; echo $?)"
+check "the notice should name the outcome" "$(grep -q '🚫 \*\*Closed without merge\*\* — archiving' "$LOG"; echo $?)"
+check "a close without a merge asks nobody for anything" "$([ "$(count MENTION)" = 0 ]; echo $?)"
 check "should annotate the cross-channel references" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
 check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
 check "should prove the archive by the relay's refusal" "$(said 'proved by the relay refusing'; echo $?)"
@@ -523,7 +570,7 @@ check "should record the completed close" \
   "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
 check "should walk the REST pulls listing by updated_at — the search index omits base-deleted closes" \
   "$(grep -q "^PR_LIST page=1 repos/$REPO/pulls?state=closed&sort=updated&direction=desc" "$LOG"; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 summaries requested, 0 awaiting a reply, 0 archived after a reply, 0 archived with no reply, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
 
 scenario "sweep: a room already archived with the close on record → one refused send, nothing else"
 listing "$(listed 4242 7200 true)"
@@ -568,17 +615,17 @@ check "should hand the room to the reopened run" "$(said 'reopened since the lis
 # that breaks must not read as "no room", and must not take the sweep's
 # other PRs down with it.
 scenario "sweep: a failed binding read archives nothing, fails the sweep, and spares its siblings"
-listing "$(listed 4242 7200 false)" "$(listed 4243 7200 true)"
+listing "$(listed 4242 7200 false)" "$(listed 4243 7200 false)"
 binding_broken 4242
 bind 4243 "$CH_B"
-pr_record 4243 closed true
+pr_record 4243 closed false
 run_step schedule; RC=$?
 check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
 check "should not archive the PR it could not resolve" "$([ "$(count "ARCHIVE $CH_A")" = 0 ]; echo $?)"
 check "should not fall through to the membership scan on a broken read" "$([ "$(count BINDING_WRITE)" = 0 ]; echo $?)"
 check "should still reconcile the other PR" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
 check "should report the failure" "$(said 'room resolution failed'; echo $?)"
-check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 1 failed'; echo $?)"
+check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 summaries requested, 0 awaiting a reply, 0 archived after a reply, 0 archived with no reply, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 1 failed'; echo $?)"
 
 # No binding and no room of ours among this identity's channels: provably
 # none. The sweep neither creates one nor posts a fallback notice it could
@@ -588,7 +635,7 @@ listing "$(listed 4242 7200 false)"
 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 1 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 1 without a room, 0 summaries requested, 0 awaiting a reply, 0 archived after a reply, 0 archived with no reply, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
 
 scenario "sweep: fork heads and closes outside the window are not candidates"
 listing "$(listed 4242 7200 false someone-else buzz)" "$(listed 4243 $((8 * 86400)) false)"
@@ -810,5 +857,227 @@ check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
 check "should touch nothing" "$([ "$(count PR_LIST)" = 0 ] && [ "$(count SEND)" = 0 ]; echo $?)"
 
 echo
+# ===========================================================================
+# THE MERGED CLOSE — the room is held open for the review summary.
+# Only a CI or human p-tag can wake the reviewer, and the relay refuses every
+# write into an archived room, so the request has to go out with the merge
+# notice and the archive has to wait. The request is recorded the instant it
+# is out; the archive is decided by a settled reply, or by the grace window
+# as a backstop whose notice claims only the absence CI observed.
+scenario "closed event (merged), live room → notice with the reviewer p-tagged, request on record, no archive"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+T0=$(date +%s)
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should post exactly one notice into the room" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should open with the merge banner" "$(send_body "$CH_A" | head -1 | grep -q '^✅ \*\*Merged\*\*$'; echo $?)"
+check "the notice should ask for the review summary" "$(send_body "$CH_A" | grep -q 'please post a review summary'; echo $?)"
+check "the request must not sit on a banner line, or the annotation edit strips it" \
+  "$(send_body "$CH_A" | grep -vE '^(✅|🚫|♻️) ' | grep -q 'please post a review summary'; echo $?)"
+check "the reviewer should be p-tagged exactly once — the only thing that wakes him" \
+  "$([ "$(count "MENTION $REVIEWER_PUB")" = 1 ] && [ "$(count MENTION)" = 1 ]; echo $?)"
+check "the request must not read as a review request or configure the verdict" \
+  "$(! send_body "$CH_A" | grep -qiE 'Review head:|verdict|auto-merge|trailer'; echo $?)"
+check "should NOT archive the room" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should record the request with its time" \
+  "$(grep -qE '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+$' "$LOG"; echo $?)"
+TS=$(grep -oE 'summary-requested:[0-9]+' "$LOG" | head -1 | cut -d: -f2)
+check "the recorded time should be this run's clock, less the allowance" \
+  "$([ -n "$TS" ] && [ "$TS" -ge $((T0 - 6)) ] && [ "$TS" -le $((T0 + 60)) ]; echo $?)"
+check "the record must follow the notice — it means the request is out" \
+  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line MARKER_WRITE)" ]; echo $?)"
+check "the record must precede the annotation sweep — a failure there must not re-mention" \
+  "$([ "$(first_line MARKER_WRITE)" -lt "$(first_line SEARCH)" ]; echo $?)"
+check "should still annotate the cross-channel references with the merge" \
+  "$([ "$(grep '^EDIT' "$LOG" | tail -1)" = 'EDIT ✅ **Merged**' ]; echo $?)"
+check "an event run must not touch GitHub" "$([ "$(count PR_)" = 0 ]; echo $?)"
+check "should say the room stays live" "$(said 'the room stays live until it settles'; echo $?)"
+
+scenario "sweep: a merged close GitHub never announced → the summary is requested, the room stays live"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should re-read the PR at the write, and again after it" "$([ "$(count "PR_READ 4242")" = 2 ]; echo $?)"
+check "should post the request" "$(send_body "$CH_A" | grep -q 'please post a review summary'; echo $?)"
+check "should p-tag the reviewer once" "$([ "$(count MENTION)" = 1 ]; echo $?)"
+check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should record the request" "$(grep -qE '^MARKER_WRITE .*summary-requested:[0-9]+$' "$LOG"; echo $?)"
+check "should say why it acted" "$(said 'no summary requested — asked for one now'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 1 summaries requested, 0 awaiting a reply, 0 archived after a reply, 0 archived with no reply, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
+
+# A rerun of the closed event, or the event run and the sweep meeting after
+# the request went out: the record is what keeps the second p-tag in.
+scenario "closed event (merged) rerun with the request on record → nothing sent, nobody re-mentioned"
+bind 4242 "$CH_A"
+summary_requested 4242 300
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "must not p-tag the reviewer again — a second mention steers a running turn" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should not rewrite the record" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
+check "should read the room for a reply since the request" "$([ "$(count "REPLY_READ $CH_A")" = 1 ]; echo $?)"
+check "should say it is inside the grace window" "$(said 'into the grace window'; echo $?)"
+
+scenario "sweep: summary requested, no reply yet, grace window open → nothing written"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 1800
+reviewer_said "$CH_A" 4000 "Reviewed ${HEAD40} against merge base ${BASE40}"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should read the room since the request, not since forever" \
+  "$(grep -q "^REPLY_READ $CH_A $((NOW - 1800))\$" "$LOG"; echo $?)"
+check "a verdict from before the request is not a reply to it" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "a pass that wrote nothing has nothing to reconcile" "$([ "$(count "PR_READ 4242")" = 1 ]; echo $?)"
+check "should account for it" "$(said '0 summaries requested, 1 awaiting a reply, 0 archived after a reply, 0 archived with no reply'; echo $?)"
+
+# An acknowledgement usually precedes the message it promises.
+scenario "sweep: the reviewer replied moments ago → wait for the summary to settle"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 3000
+reviewer_said "$CH_A" 2000 "On it."
+reviewer_said "$CH_A" 120 "Review summary: the rounds found a stale fence; fixed in the second push."
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should not archive under a reply still landing" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should say it is waiting for the reply to settle" "$(said 'waiting for the summary to settle'; echo $?)"
+check "should account for it" "$(said '1 awaiting a reply'; echo $?)"
+
+scenario "sweep: the reviewer's last reply has settled → archive under a notice that says so"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 3000
+reviewer_said "$CH_A" 2500 "On it."
+reviewer_said "$CH_A" 1500 "Review summary: the rounds found a stale fence; fixed in the second push."
+SUMMARY_SETTLE_SECS_INPUT=0600 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "a leading-zero settle window is decimal, not octal" "$(! said 'value too great for base'; echo $?)"
+check "should post one archive notice" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should state the observed fact" \
+  "$(send_body "$CH_A" | grep -qE "reviewer's last message here was 2[5-7] minutes ago"; echo $?)"
+check "the notice must not name the reviewer — an @name in the content becomes a p-tag" \
+  "$(! send_body "$CH_A" | grep -q '@'; echo $?)"
+check "must not p-tag anyone" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should prove the archive by the relay's refusal" "$(said 'proved by the relay refusing'; echo $?)"
+check "the notice must precede the archive — it is the fence" \
+  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line "ARCHIVE $CH_A")" ]; echo $?)"
+check "should record the completed close, after the archive" \
+  "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG" && [ "$(first_line "ARCHIVE $CH_A")" -lt "$(first_line MARKER_WRITE)" ]; echo $?)"
+check "should re-read GitHub after writing" "$([ "$(count "PR_READ 4242")" = 2 ]; echo $?)"
+check "should account for it" "$(said '0 awaiting a reply, 1 archived after a reply, 0 archived with no reply'; echo $?)"
+
+# The backstop. CI saw no message from the reviewer and does not know why;
+# the notice says the first and nothing about the second.
+scenario "sweep: the grace window passed with no reply → archive under a notice that claims only the absence"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 4000
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should post one archive notice" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should say what CI saw" \
+  "$(send_body "$CH_A" | grep -qE 'no message from the reviewer has appeared here in the 6[6-8] minutes since the review summary was requested'; echo $?)"
+check "the notice must not guess why" \
+  "$(! send_body "$CH_A" | grep -qiE 'fail|down|asleep|crash|unavailab|ignor|dead|stuck|refus|no summary'; echo $?)"
+check "the notice must not name the reviewer" "$(! send_body "$CH_A" | grep -q '@'; echo $?)"
+check "must not p-tag anyone" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "the notice must precede the archive" \
+  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line "ARCHIVE $CH_A")" ]; echo $?)"
+check "should record the completed close" "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
+check "should say what it did" "$(said 'grace window passed with no reply — archived'; echo $?)"
+check "should account for it" "$(said '0 archived after a reply, 1 archived with no reply'; echo $?)"
+
+# A failed read is an error, never "none": either guess archives wrongly.
+scenario "sweep: the reviewer-reply read fails → red, nothing written"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 4000
+reply_read_broken "$CH_A"
+run_step schedule; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should not touch the record" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
+check "should say what failed" "$(said 'reviewer reply lookup failed'; echo $?)"
+
+# Archived by hand while it waited: the summary can no longer land here, and
+# the cross-channel half is finished where it still can be.
+scenario "sweep: room archived by hand while the summary was pending → the close is finished outside the room"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 4000
+referenced_from 4242 "$CH_B"
+touch "$FIXTURES/archived.$CH_A"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not write into the archived room" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should annotate the references" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should say what it found" "$(said 'archived while its review summary was pending'; echo $?)"
+check "should record the close so the next sweep is silent" \
+  "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
+check "should not archive an archived room" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should account for it" "$(said '1 annotated outside an archived room'; echo $?)"
+
+# A merged PR cannot be reopened, but a closed one can be reopened and then
+# merged: the reopen's record is "not requested", and the merge asks.
+scenario "closed without merge, reopened, then merged → the request goes out on the merge"
+bind 4242 "$CH_A"
+run_step pull_request closed 4242; RC1=$?
+run_step pull_request reopened 4242; RC2=$?
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC3=$?
+check "all three runs should be green, got $RC1/$RC2/$RC3" "$([ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ] && [ "$RC3" -eq 0 ]; echo $?)"
+check "the first close should have archived" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "the reopen should have unarchived" "$([ "$(count "UNARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "the merge should ask the reviewer, once" "$([ "$(count MENTION)" = 1 ]; echo $?)"
+check "the merge must leave the room live" "$([ "$(count ARCHIVE)" = 1 ]; echo $?)"
+check "the record should end on the request" \
+  "$(grep '^MARKER_WRITE' "$LOG" | tail -1 | grep -qE 'summary-requested:[0-9]+$'; echo $?)"
+
+# The forced re-close inside the convergence loop can itself be a merge: it
+# asks for the summary rather than archiving under one that cannot land.
+scenario "sweep: a PR merged while the sweep was restoring its room → the request goes out, not an archive"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+pr_read_at 4242 1 closed
+pr_read_at 4242 2 open
+pr_read_at 4242 3 closed true
+pr_read_at 4242 4 closed true
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should notice the newer close" "$(said 'closed again while this sweep was restoring it'; echo $?)"
+check "the re-close should ask for the summary" "$([ "$(count MENTION)" = 1 ]; echo $?)"
+check "the room must end live, not archived under a pending summary" \
+  "$([ "$(count "ARCHIVE $CH_A")" = 1 ] && [ "$(count "UNARCHIVE $CH_A")" = 1 ] && [ "$(first_line "ARCHIVE $CH_A")" -lt "$(first_line "UNARCHIVE $CH_A")" ]; echo $?)"
+check "the cross-channel banner must end on the merge" \
+  "$([ "$(grep '^EDIT' "$LOG" | tail -1)" = 'EDIT ✅ **Merged**' ]; echo $?)"
+check "the record must end on the request" \
+  "$(grep '^MARKER_WRITE' "$LOG" | tail -1 | grep -qE 'summary-requested:[0-9]+$'; echo $?)"
+check "the last read must follow the last write and agree with it" "$([ "$(count "PR_READ 4242")" = 4 ]; echo $?)"
+check "should account for both compensations" \
+  "$(said '1 restored after a concurrent reopen, 1 re-closed after a concurrent close, 0 failed'; echo $?)"
+
+scenario "a summary window that is not a small integer is refused before any write"
+bind 4242 "$CH_A"
+SUMMARY_GRACE_SECS_INPUT="7; rm -rf /" PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should say what is wrong" "$(said 'SUMMARY_GRACE_SECS must be a small integer'; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+
 echo "$PASS assertions passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

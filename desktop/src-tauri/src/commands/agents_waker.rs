@@ -197,18 +197,103 @@ pub(crate) fn revoke_waker_bundle_pending(
     )
 }
 
+/// NIP-44 v2's plaintext ceiling as the `nostr` crate enforces it
+/// (`MAX_SUPPORTED_PLAINTEXT_SIZE`, private there): 65536 − 128 bytes. Past
+/// it `nip44::encrypt` fails with the bare "message too long", naming neither
+/// the agent nor a number. `the_plaintext_cap_matches_the_crate` pins this
+/// constant to the crate's real behaviour, so a crate bump that moves the
+/// ceiling fails a test here instead of drifting the error silently.
+pub(crate) const NIP44_MAX_PLAINTEXT_BYTES: usize = 65_536 - 128;
+
+/// The launch-env key `build_launch_block_for_policy` (`agents_deploy.rs`)
+/// writes the effective system prompt under — the copy the harness inside
+/// the sprite actually reads.
+const SYSTEM_PROMPT_ENV_KEY: &str = "BUZZ_ACP_SYSTEM_PROMPT";
+
+/// `build_deploy_payload` carries the effective system prompt twice: as the
+/// bookkeeping field `system_prompt`, which no provider reads (the sprites and
+/// kubernetes wire tests pin that fields they do not consume are ignored), and
+/// as `launch.policy_env["BUZZ_ACP_SYSTEM_PROMPT"]`, which is what runs.
+/// Inside a bundle that duplication decides whether it fits under
+/// [`NIP44_MAX_PLAINTEXT_BYTES`]: a 31 KB prompt sent twice, plus the record
+/// and env, came to ~67 KB, which is exactly how the reviewer agent's
+/// enrolment failed on 2026-09-04. Drop the copy nothing downstream looks at.
+///
+/// Only when it *is* a copy. The two values come from one resolution in
+/// `build_deploy_payload`, so a divergence would mean a bug upstream of here,
+/// and stripping one side would hide that bug rather than the duplicate.
+/// Returns whether anything was removed.
+fn strip_duplicated_system_prompt(agent_json: &mut serde_json::Value) -> bool {
+    let Some(env_prompt) = launch_env_system_prompt(agent_json).map(str::to_owned) else {
+        return false;
+    };
+    let duplicated = agent_json
+        .get("system_prompt")
+        .and_then(serde_json::Value::as_str)
+        == Some(env_prompt.as_str());
+    if !duplicated {
+        return false;
+    }
+    agent_json
+        .as_object_mut()
+        .is_some_and(|fields| fields.remove("system_prompt").is_some())
+}
+
+fn launch_env_system_prompt(agent_json: &serde_json::Value) -> Option<&str> {
+    agent_json
+        .get("launch")?
+        .get("policy_env")?
+        .get(SYSTEM_PROMPT_ENV_KEY)?
+        .as_str()
+}
+
+/// Refuse what `nip44::encrypt` would refuse, but say why: which agent, how
+/// big, what the ceiling is, and how much of it is the prompt — the one input
+/// an owner can shorten from the settings pane. Everything else in the
+/// bundle (the record, the env, the provider envelope) is a few kilobytes.
+fn oversized_bundle_error(
+    agent_name: &str,
+    agent_pubkey: &str,
+    plaintext_bytes: usize,
+    prompt_bytes: Option<usize>,
+) -> String {
+    let over = plaintext_bytes.saturating_sub(NIP44_MAX_PLAINTEXT_BYTES);
+    let short_pubkey = agent_pubkey.get(..8).unwrap_or(agent_pubkey);
+    let remedy = match prompt_bytes {
+        Some(n) => {
+            format!("the system prompt is {n} bytes of that; shorten it by at least {over} bytes")
+        }
+        None => format!(
+            "it carries no system prompt, so the agent's record or env vars must shrink by at \
+             least {over} bytes"
+        ),
+    };
+    format!(
+        "launch bundle for {agent_name} ({short_pubkey}…) is {plaintext_bytes} bytes; NIP-44 \
+         encrypts at most {NIP44_MAX_PLAINTEXT_BYTES}. {remedy}"
+    )
+}
+
 /// The pure half of [`retain_waker_bundle_pending`]: reserve a version, sign,
 /// NIP-44-encrypt to the agent, and retain the resulting envelope event —
 /// everything after `agent_json` is resolved. Split out so it is unit-testable
 /// against a tempdir ledger/retention db without a Tauri `AppHandle`, mirroring
 /// `commands::personas::pending::prepare_persona_publication_at`.
+///
+/// Two size guards sit in front of the encryption, both because NIP-44 v2
+/// caps plaintext at [`NIP44_MAX_PLAINTEXT_BYTES`]: the prompt's bookkeeping
+/// duplicate is dropped ([`strip_duplicated_system_prompt`]), and a bundle
+/// still over the cap is refused with the numbers ([`oversized_bundle_error`])
+/// rather than the crate's bare "message too long". A refusal here still
+/// consumes a ledger version — the same as a failed encrypt always did — which
+/// the monotonic ledger makes harmless.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_and_retain_waker_bundle_at(
     db_path: &std::path::Path,
     owner_keys: &Keys,
     ledger: &crate::managed_agents::waker_bundle::IssuanceLedger,
     agent_pubkey: &str,
-    agent_json: serde_json::Value,
+    mut agent_json: serde_json::Value,
     provider_id: String,
     provider_config: serde_json::Value,
     provider_binary_sha256_by_target: std::collections::BTreeMap<String, String>,
@@ -222,6 +307,14 @@ pub(crate) fn sign_and_retain_waker_bundle_at(
     };
     use buzz_core_pkg::kind::KIND_WAKER_BUNDLE_ENVELOPE;
     use nostr::{nips::nip44, JsonUtil, PublicKey, Tag};
+
+    strip_duplicated_system_prompt(&mut agent_json);
+    let agent_name = agent_json
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("this agent")
+        .to_owned();
+    let prompt_bytes = launch_env_system_prompt(&agent_json).map(str::len);
 
     let bundle_version = ledger.reserve(agent_pubkey)?;
 
@@ -243,6 +336,14 @@ pub(crate) fn sign_and_retain_waker_bundle_at(
 
     let plaintext = serde_json::to_string(&signed)
         .map_err(|e| format!("failed to serialize launch bundle: {e}"))?;
+    if plaintext.len() > NIP44_MAX_PLAINTEXT_BYTES {
+        return Err(oversized_bundle_error(
+            &agent_name,
+            agent_pubkey,
+            plaintext.len(),
+            prompt_bytes,
+        ));
+    }
     let agent_pk =
         PublicKey::from_hex(agent_pubkey).map_err(|e| format!("invalid agent pubkey: {e}"))?;
     let ciphertext = nip44::encrypt(
@@ -517,6 +618,194 @@ mod tests {
         assert_eq!(
             body.bundle_version, 2,
             "revoking still consumes a version from the same monotonic ledger"
+        );
+    }
+
+    /// Pins [`NIP44_MAX_PLAINTEXT_BYTES`] to what the `nostr` crate actually
+    /// enforces, so the numbers in [`oversized_bundle_error`] can never drift
+    /// from the refusal they explain.
+    #[test]
+    fn the_plaintext_cap_matches_the_crate() {
+        use nostr::nips::nip44::{encrypt, Version};
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let at_cap = "a".repeat(NIP44_MAX_PLAINTEXT_BYTES);
+        encrypt(
+            owner.secret_key(),
+            &agent.public_key(),
+            &at_cap,
+            Version::V2,
+        )
+        .expect("exactly the cap must still encrypt");
+        let err = encrypt(
+            owner.secret_key(),
+            &agent.public_key(),
+            format!("{at_cap}a"),
+            Version::V2,
+        )
+        .expect_err("one byte over the cap must be refused");
+        assert!(
+            err.to_string().contains("message too long"),
+            "unexpected crate error: {err}"
+        );
+    }
+
+    /// The 2026-09-04 regression, at the production seam: a prompt that fits
+    /// once but not twice. Without the strip the plaintext is over the cap and
+    /// issuance fails; with it the bundle the waker decrypts carries the prompt
+    /// in the launch env only.
+    #[test]
+    fn the_system_prompt_rides_in_the_bundle_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_pubkey = agent.public_key().to_hex();
+        let db_path = dir.path().join("retention.sqlite");
+
+        let prompt = "You review pull requests.\n".repeat(1_400);
+        assert!(
+            2 * prompt.len() > NIP44_MAX_PLAINTEXT_BYTES,
+            "the fixture must not fit twice, or this test proves nothing"
+        );
+        assert!(prompt.len() + 4_096 < NIP44_MAX_PLAINTEXT_BYTES);
+
+        sign_and_retain_waker_bundle_at(
+            &db_path,
+            &owner,
+            &ledger(dir.path()),
+            &agent_pubkey,
+            serde_json::json!({
+                "name": "Alex",
+                "system_prompt": prompt,
+                "launch": {
+                    "command": "codex-acp",
+                    "policy_env": { SYSTEM_PROMPT_ENV_KEY: prompt, "BUZZ_ACP_AGENTS": "3" },
+                },
+            }),
+            "sprites".to_string(),
+            serde_json::json!({"org": "buzz-team"}),
+            std::collections::BTreeMap::from([(
+                "x86_64-unknown-linux-musl".to_string(),
+                "b".repeat(64),
+            )]),
+            1_000,
+            false,
+        )
+        .expect("a prompt that fits once must issue");
+
+        let conn = open_retention_db(&db_path).expect("open db");
+        let retained = get_retained_event(
+            &conn,
+            KIND_WAKER_BUNDLE_ENVELOPE,
+            &owner.public_key().to_hex(),
+            &agent_pubkey,
+        )
+        .expect("query")
+        .expect("a launch bundle row was retained");
+        let plaintext =
+            nostr::nips::nip44::decrypt(agent.secret_key(), &owner.public_key(), &retained.content)
+                .expect("decrypt");
+        let signed: buzz_waker_pkg::SignedLaunchBundle =
+            serde_json::from_str(&plaintext).expect("parse signed bundle");
+        let body = signed
+            .verify(&owner.public_key().to_hex(), 2_000)
+            .expect("verify");
+        assert!(
+            body.agent_json.get("system_prompt").is_none(),
+            "the bookkeeping copy must not ride in the bundle"
+        );
+        assert_eq!(
+            body.agent_json["launch"]["policy_env"][SYSTEM_PROMPT_ENV_KEY].as_str(),
+            Some(prompt.as_str()),
+            "the copy the harness reads must be intact"
+        );
+    }
+
+    /// A divergent bookkeeping prompt is a bug somewhere upstream of the
+    /// bundle; stripping either side would hide it. Both must survive.
+    #[test]
+    fn a_divergent_bookkeeping_prompt_is_left_for_the_reader_to_notice() {
+        let mut agent_json = serde_json::json!({
+            "system_prompt": "what the record says",
+            "launch": { "policy_env": { SYSTEM_PROMPT_ENV_KEY: "what will run" } },
+        });
+        assert!(!strip_duplicated_system_prompt(&mut agent_json));
+        assert_eq!(agent_json["system_prompt"], "what the record says");
+        assert_eq!(
+            agent_json["launch"]["policy_env"][SYSTEM_PROMPT_ENV_KEY],
+            "what will run"
+        );
+
+        let mut no_launch = serde_json::json!({ "system_prompt": "alone" });
+        assert!(!strip_duplicated_system_prompt(&mut no_launch));
+        assert_eq!(no_launch["system_prompt"], "alone");
+
+        let mut revocation = serde_json::Value::Null;
+        assert!(!strip_duplicated_system_prompt(&mut revocation));
+    }
+
+    /// Over the cap even sent once: refused before encryption, naming the
+    /// agent, the size, the ceiling and the prompt's share, and retaining
+    /// nothing — the previous bundle must stay in force, not be replaced by a
+    /// half-issued one.
+    #[test]
+    fn an_oversized_bundle_is_refused_with_the_numbers_before_encryption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_pubkey = agent.public_key().to_hex();
+        let db_path = dir.path().join("retention.sqlite");
+        let prompt = "b".repeat(70_000);
+
+        let err = sign_and_retain_waker_bundle_at(
+            &db_path,
+            &owner,
+            &ledger(dir.path()),
+            &agent_pubkey,
+            serde_json::json!({
+                "name": "Alex",
+                "launch": { "policy_env": { SYSTEM_PROMPT_ENV_KEY: prompt } },
+            }),
+            "sprites".to_string(),
+            serde_json::json!({}),
+            std::collections::BTreeMap::new(),
+            1_000,
+            false,
+        )
+        .expect_err("70 KB of prompt cannot be encrypted");
+
+        assert!(
+            err.starts_with(&format!(
+                "launch bundle for Alex ({}…) is ",
+                &agent_pubkey[..8]
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("at most {NIP44_MAX_PLAINTEXT_BYTES}")),
+            "{err}"
+        );
+        assert!(
+            err.contains("the system prompt is 70000 bytes of that"),
+            "{err}"
+        );
+        assert!(err.contains("shorten it by at least "), "{err}");
+        assert!(
+            !err.contains("message too long"),
+            "must explain, not relay: {err}"
+        );
+
+        let conn = open_retention_db(&db_path).expect("open db");
+        assert!(
+            get_retained_event(
+                &conn,
+                KIND_WAKER_BUNDLE_ENVELOPE,
+                &owner.public_key().to_hex(),
+                &agent_pubkey,
+            )
+            .expect("query")
+            .is_none(),
+            "a refused bundle must leave nothing retained"
         );
     }
 }

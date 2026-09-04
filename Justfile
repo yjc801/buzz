@@ -506,6 +506,9 @@ test-unit:
         cargo test -p buzz-auth --doc
         cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-cli
+        # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
+        # forged relay events cannot regain a path into agent routing unnoticed.
+        cargo nextest run -p buzz-acp
         # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
         # They guard the embedded-migrator invariant (the complete checked-in
         # additive migration set; legacy cutover/backfill remains an operator

@@ -140,7 +140,7 @@ CI_PUB=$(NOSTR_SECRET="$CI_SECRET" "$REAL_PYTHON3" scripts/buzz-mint-auth-tag.py
 mkdir -p "$WORK/bin"
 FIXTURES="$WORK/fixtures"
 LOG="$WORK/calls.log"
-export FIXTURES LOG CI_PUB
+export FIXTURES LOG CI_PUB REVIEWER_PUB OWNER_PUB CODER_PUB
 
 # gh: the sweep's listing and its per-PR re-read at the write. An event run
 # must never reach GitHub; an unhandled request is a failure, not a pass.
@@ -223,6 +223,34 @@ arg() { # arg <flag> "$@" → the value after <flag>
     shift
   done
 }
+# A room the fixtures have not spoken about is a NORMAL room: fully
+# provisioned (a CI-authored seed card for each PR number the scenarios use,
+# and the three required members on its roster). `unprovisioned <channel>`
+# is the create-then-cancel partial — no card, and nobody but CI on the
+# roster — which is the state ensure_provisioned exists to recover.
+history_file() {
+  local H="$FIXTURES/messages.$1.json"
+  if [ ! -f "$H" ]; then
+    if [ -f "$FIXTURES/unprovisioned.$1" ]; then
+      echo '[]' > "$H"
+    else
+      printf '[{"pubkey":"%s","content":"**PR #4242 — t","created_at":1},{"pubkey":"%s","content":"**PR #4243 — t","created_at":1}]\n' \
+        "$CI_PUB" "$CI_PUB" > "$H"
+    fi
+  fi
+  printf '%s' "$H"
+}
+roster_file() {
+  local R="$FIXTURES/roster.$1"
+  if [ ! -f "$R" ]; then
+    if [ -f "$FIXTURES/unprovisioned.$1" ]; then
+      : > "$R"
+    else
+      printf '%s\n%s\n%s\n' "$OWNER_PUB" "$REVIEWER_PUB" "$CODER_PUB" > "$R"
+    fi
+  fi
+  printf '%s' "$R"
+}
 refuse_if_archived() {
   if [ -f "$FIXTURES/archived.$1" ]; then
     echo '{"error":"invalid","message":"invalid: channel is archived"}' >&2
@@ -253,30 +281,37 @@ case "$SUB" in
       *) echo "BINDING_WRITE" >> "$LOG" ;;
     esac ;;
   "channels list") cat "$FIXTURES/channels_list.json" ;;
-  "channels members") printf '[{"pubkey":"%s","role":"owner"}]\n' "$CI_PUB" ;;
+  "channels members")
+    # The roster the production CLI's --mention preflight and verify_members
+    # both read. CI owns every room it made; the three provisioned pubkeys are
+    # present unless a scenario says the room is a create-then-cancel partial.
+    C=$(arg --channel "$@")
+    ROSTER=$(roster_file "$C")
+    { printf '[{"pubkey":"%s","role":"owner"}' "$CI_PUB"
+      while read -r P; do [ -n "$P" ] && printf ',{"pubkey":"%s","role":"member"}' "$P"; done < "$ROSTER"
+      printf ']\n'; } ;;
   "messages get")
+    # ONE ordered history per room, sliced the way the relay slices it:
+    # --since is a lower bound, --before an inclusive upper one, and a page is
+    # the NEWEST --limit messages inside those bounds. Serving the no-since
+    # read as a fixed page instead made every backward walk over a room the
+    # fixtures did not name loop forever; it also made a create-then-cancel
+    # partial — the state ensure_provisioned exists for — impossible to model.
     C=$(arg --channel "$@"); SINCE=$(arg --since "$@")
+    BEFORE=$(arg --before "$@"); LIMIT=$(arg --limit "$@"); LIMIT="${LIMIT:-100}"
     if [ -n "$SINCE" ]; then
-      # The reviewer-reply read: the room's messages since the request,
-      # served from the per-room fixture reviewer_said builds and filtered
-      # by --since exactly as the relay would. A broken read is a knob.
       echo "REPLY_READ $C $SINCE" >> "$LOG"
-      if [ -f "$FIXTURES/messages.$C.rc" ]; then
-        echo '{"error":"internal","message":"relay unreachable"}' >&2
-        exit "$(cat "$FIXTURES/messages.$C.rc")"
-      fi
-      if [ -f "$FIXTURES/messages.$C.json" ]; then
-        jq -c --argjson s "$SINCE" '[.[] | select(.created_at >= $s)]' "$FIXTURES/messages.$C.json"
-      else
-        echo '[]'
-      fi
-      exit 0
+    else
+      echo "HISTORY_READ $C ${BEFORE:-newest}" >> "$LOG"
     fi
-    # The provisioning walk (no --since). Every room is fully provisioned: a
-    # CI-authored seed card for each PR number a scenario uses. Partial-room
-    # recovery is not under test here.
-    printf '[{"pubkey":"%s","content":"**PR #4242 — t","created_at":1},' "$CI_PUB"
-    printf '{"pubkey":"%s","content":"**PR #4243 — t","created_at":1}]\n' "$CI_PUB" ;;
+    if [ -f "$FIXTURES/messages.$C.rc" ]; then
+      echo '{"error":"internal","message":"relay unreachable"}' >&2
+      exit "$(cat "$FIXTURES/messages.$C.rc")"
+    fi
+    H=$(history_file "$C")
+    jq -c --argjson s "${SINCE:-0}" --argjson b "${BEFORE:-99999999999}" --argjson n "$LIMIT" \
+      '[.[] | select(.created_at >= $s) | select(.created_at <= $b)]
+       | sort_by(.created_at) | .[-$n:]' "$H" ;;
   "messages search")
     N=$(( $(cat "$FIXTURES/search.n" 2>/dev/null || echo 0) + 1 ))
     printf '%s\n' "$N" > "$FIXTURES/search.n"
@@ -292,14 +327,49 @@ case "$SUB" in
       printf 'closed\n' > "$FIXTURES/binding.$SLUG"
       echo "INJECTED_CLOSE $C" >> "$LOG"
     fi
+    # A COMPETING PUBLISHER, landing between this run's history walk and its
+    # own send: the sweep and an event run sit in different concurrency
+    # groups, so both can reach the request path on one PR. Injected at the
+    # annotation search because that is inside the window the last-instant
+    # re-probe covers.
+    if [ -f "$FIXTURES/inject_request_at_search.$N" ]; then
+      read -r C < "$FIXTURES/inject_request_at_search.$N"
+      H=$(history_file "$C")
+      jq -c --arg p "$CI_PUB" --argjson t "$(date +%s)" \
+        --arg c "@Alex please post a review summary here: what the review found, what was fixed, and anything left open." \
+        '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$H" > "$H.tmp" && mv "$H.tmp" "$H"
+      echo "INJECTED_REQUEST $C" >> "$LOG"
+    fi
     if [ -f "$FIXTURES/search_hits.json" ]; then cat "$FIXTURES/search_hits.json"; else echo '[]'; fi ;;
   "messages send")
     C=$(arg --channel "$@")
     BODY=$(cat)
     refuse_if_archived "$C"
+    # THE PRODUCTION MENTION PREFLIGHT (crates/buzz-cli/src/commands/
+    # messages.rs): the CLI refuses the whole send when a mentioned pubkey is
+    # not on the channel roster. Modelled here because a merged PR's close
+    # carries a mention, and a room whose provisioning was interrupted is
+    # exactly where that refusal bites.
+    ROSTER=$(roster_file "$C")
+    SEEN_MENTION=0
+    for A in "$@"; do
+      [ "$SEEN_MENTION" = 1 ] && { SEEN_MENTION=0
+        if ! grep -qx "$A" "$ROSTER" && [ "$A" != "$CI_PUB" ]; then
+          echo "{\"error\":\"invalid\",\"message\":\"mentioned pubkey ${A} is not a member of this channel\"}" >&2
+          exit 1
+        fi
+      }
+      [ "$A" = "--mention" ] && SEEN_MENTION=1
+    done
     { echo "SEND $C"; printf '%s\n' "$BODY"; echo "--- end send ---"; } >> "$LOG"
     # A p-tag is the one thing that can wake the reviewer, so every one that
-    # goes out is on the record.
+    # goes out is on the record. The message itself is appended to the room's
+    # history: a later pass reconciling against the published request has to
+    # be able to find one this run put there.
+    TS=$(date +%s)
+    H=$(history_file "$C")
+    jq -c --arg p "$CI_PUB" --argjson t "$TS" --arg c "$BODY" \
+      '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$H" > "$H.tmp" && mv "$H.tmp" "$H"
     while [ $# -gt 0 ]; do
       [ "$1" = "--mention" ] && echo "MENTION ${2:-}" >> "$LOG"
       shift
@@ -322,7 +392,14 @@ case "$SUB" in
     # The banner is the first line of the rewritten body — the durable state
     # a reader of another room actually sees.
     echo "EDIT $(arg --content "$@" | head -1)" >> "$LOG" ;;
-  "channels add-member"|"reactions add"|"reactions remove")
+  "channels add-member")
+    C=$(arg --channel "$@"); P=$(arg --pubkey "$@")
+    refuse_if_archived "$C"
+    echo "OTHER $SUB" >> "$LOG"
+    echo "ADD_MEMBER $C $P" >> "$LOG"
+    ROSTER=$(roster_file "$C")
+    grep -qx "$P" "$ROSTER" || printf '%s\n' "$P" >> "$ROSTER" ;;
+  "reactions add"|"reactions remove")
     echo "OTHER $SUB" >> "$LOG" ;;
   *) echo "stub buzz: unhandled: $SUB $*" >&2; exit 9 ;;
 esac
@@ -404,9 +481,33 @@ close_lands_at_annotation() { # close_lands_at_annotation <number> <channel> <se
     > "$FIXTURES/inject_close_at_search.$3"
 }
 
-reviewer_said() { # reviewer_said <channel> <age-secs> <text> — a message from the reviewer in the room
+history_of() { # history_of <channel> — the room's history file, defaulted as the stub defaults it
   local F="$FIXTURES/messages.$1.json"
-  [ -f "$F" ] || echo '[]' > "$F"
+  if [ ! -f "$F" ]; then
+    if [ -f "$FIXTURES/unprovisioned.$1" ]; then
+      echo '[]' > "$F"
+    else
+      printf '[{"pubkey":"%s","content":"**PR #4242 — t","created_at":1},{"pubkey":"%s","content":"**PR #4243 — t","created_at":1}]\n' \
+        "$CI_PUB" "$CI_PUB" > "$F"
+    fi
+  fi
+  printf '%s' "$F"
+}
+unprovisioned() { # unprovisioned <channel> — a create-then-cancel partial: no seed card, no members
+  touch "$FIXTURES/unprovisioned.$1"
+}
+ci_said() { # ci_said <channel> <age-secs> <text> — a message CI itself published into the room
+  local F; F=$(history_of "$1")
+  jq -c --arg p "$CI_PUB" --argjson t "$((NOW - $2))" --arg c "$3" \
+    '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+}
+request_lands_at_annotation() { # request_lands_at_annotation <channel> <search-index>
+  # Another publisher posts the summary request at the <n>th reference search
+  # of the run under test — after its history walk, before its own send.
+  printf '%s\n' "$1" > "$FIXTURES/inject_request_at_search.$2"
+}
+reviewer_said() { # reviewer_said <channel> <age-secs> <text> — a message from the reviewer in the room
+  local F; F=$(history_of "$1")
   jq -c --arg p "$REVIEWER_PUB" --argjson t "$((NOW - $2))" --arg c "$3" \
     '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 }
@@ -417,7 +518,16 @@ reply_read_broken() { # reply_read_broken <channel> — the reviewer-reply read 
   printf '2\n' > "$FIXTURES/messages.$1.rc"
 }
 send_body() { # send_body <channel> — the body of the first notice sent into <channel>
-  awk -v c="SEND $1" '$0 == c {on=1; next} on && $0 == "--- end send ---" {exit} on' "$LOG"
+  send_body_n "$1" 1
+}
+send_body_n() { # send_body_n <channel> <n> — the body of the nth message sent into <channel>
+  awk -v c="SEND $1" -v want="$2" '
+    $0 == c {seen++; if (seen == want) {on=1}; next}
+    on && $0 == "--- end send ---" {exit}
+    on' "$LOG"
+}
+nth_line() { # nth_line <log-prefix> <n> — line number of the nth matching log entry
+  grep -n "^$1" "$LOG" | sed -n "${2}p" | cut -d: -f1
 }
 
 reset_fixtures() {
@@ -864,52 +974,90 @@ echo
 # notice and the archive has to wait. The request is recorded the instant it
 # is out; the archive is decided by a settled reply, or by the grace window
 # as a backstop whose notice claims only the absence CI observed.
-scenario "closed event (merged), live room → notice with the reviewer p-tagged, request on record, no archive"
+scenario "closed event (merged), live room → mention-free fence, then the request, then the record"
 bind 4242 "$CH_A"
 referenced_from 4242 "$CH_B"
 T0=$(date +%s)
 PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should post exactly one notice into the room" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
-check "the notice should open with the merge banner" "$(send_body "$CH_A" | head -1 | grep -q '^✅ \*\*Merged\*\*$'; echo $?)"
-check "the notice should ask for the review summary" "$(send_body "$CH_A" | grep -q 'please post a review summary'; echo $?)"
+check "should post the merge notice and then the request" "$([ "$(count "SEND $CH_A")" = 2 ]; echo $?)"
+check "the fence should open with the merge banner" "$(send_body_n "$CH_A" 1 | head -1 | grep -q '^✅ \*\*Merged\*\*$'; echo $?)"
+check "the fence must carry no mention — it has to be sendable before provisioning is recovered" \
+  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line MENTION)" ] && ! send_body_n "$CH_A" 1 | grep -q '@'; echo $?)"
+check "the request should ask for the review summary" "$(send_body_n "$CH_A" 2 | grep -q 'please post a review summary here'; echo $?)"
 check "the request must not sit on a banner line, or the annotation edit strips it" \
-  "$(send_body "$CH_A" | grep -vE '^(✅|🚫|♻️) ' | grep -q 'please post a review summary'; echo $?)"
+  "$(send_body_n "$CH_A" 2 | grep -vE '^(✅|🚫|♻️) ' | grep -q 'please post a review summary'; echo $?)"
 check "the reviewer should be p-tagged exactly once — the only thing that wakes him" \
   "$([ "$(count "MENTION $REVIEWER_PUB")" = 1 ] && [ "$(count MENTION)" = 1 ]; echo $?)"
 check "the request must not read as a review request or configure the verdict" \
-  "$(! send_body "$CH_A" | grep -qiE 'Review head:|verdict|auto-merge|trailer'; echo $?)"
+  "$(! send_body_n "$CH_A" 2 | grep -qiE 'Review head:|verdict|auto-merge|trailer'; echo $?)"
 check "should NOT archive the room" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 check "should record the request with its time" \
   "$(grep -qE '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+$' "$LOG"; echo $?)"
 TS=$(grep -oE 'summary-requested:[0-9]+' "$LOG" | head -1 | cut -d: -f2)
 check "the recorded time should be this run's clock, less the allowance" \
   "$([ -n "$TS" ] && [ "$TS" -ge $((T0 - 6)) ] && [ "$TS" -le $((T0 + 60)) ]; echo $?)"
-check "the record must follow the notice — it means the request is out" \
-  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line MARKER_WRITE)" ]; echo $?)"
-check "the record must precede the annotation sweep — a failure there must not re-mention" \
-  "$([ "$(first_line MARKER_WRITE)" -lt "$(first_line SEARCH)" ]; echo $?)"
+check "the record must follow the request — it means the wake is out" \
+  "$([ "$(nth_line "SEND $CH_A" 2)" -lt "$(first_line MARKER_WRITE)" ]; echo $?)"
+check "the annotation sweep must precede the request — the wake is the last write" \
+  "$([ "$(first_line SEARCH)" -lt "$(nth_line "SEND $CH_A" 2)" ]; echo $?)"
 check "should still annotate the cross-channel references with the merge" \
   "$([ "$(grep '^EDIT' "$LOG" | tail -1)" = 'EDIT ✅ **Merged**' ]; echo $?)"
-check "an event run must not touch GitHub" "$([ "$(count PR_)" = 0 ]; echo $?)"
-check "should say the room stays live" "$(said 'the room stays live until it settles'; echo $?)"
 
-scenario "sweep: a merged close GitHub never announced → the summary is requested, the room stays live"
-listing "$(listed 4242 7200 true)"
+# The finding that started this: `buzz messages send --mention` refuses any
+# pubkey that is not on the roster, so a room whose `opened` run was cancelled
+# between the create and provision_members cannot be mentioned into. When the
+# mention was also the pass's FIRST write, the pass died there, every sweep
+# repeated it, and the room stayed live for good.
+scenario "closed event (merged), room provisioned only halfway → recovered, then asked, exactly once"
 bind 4242 "$CH_A"
-pr_record 4242 closed true
-run_step schedule; RC=$?
+unprovisioned "$CH_A"
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should re-read the PR at the write, and again after it" "$([ "$(count "PR_READ 4242")" = 2 ]; echo $?)"
-check "should post the request" "$(send_body "$CH_A" | grep -q 'please post a review summary'; echo $?)"
-check "should p-tag the reviewer once" "$([ "$(count MENTION)" = 1 ]; echo $?)"
+check "should put the reviewer on the roster before mentioning him" \
+  "$([ "$(first_line "ADD_MEMBER $CH_A $REVIEWER_PUB")" -lt "$(first_line MENTION)" ]; echo $?)"
+check "should p-tag the reviewer exactly once — the recovery card must not wake him too" \
+  "$([ "$(count MENTION)" = 1 ] && [ "$(count "MENTION $REVIEWER_PUB")" = 1 ]; echo $?)"
+check "the recovery card must not ask for a review of a merged PR, and must carry no @name" \
+  "$(! send_body_n "$CH_A" 2 | grep -qE '@|please review'; echo $?)"
+check "the recovery card should still seal the room's provisioning" \
+  "$(send_body_n "$CH_A" 2 | head -1 | grep -q '^\*\*PR #4242'; echo $?)"
+check "should record the request" \
+  "$(grep -qE '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+$' "$LOG"; echo $?)"
 check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
-check "should record the request" "$(grep -qE '^MARKER_WRITE .*summary-requested:[0-9]+$' "$LOG"; echo $?)"
-check "should say why it acted" "$(said 'no summary requested — asked for one now'; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 1 summaries requested, 0 awaiting a reply, 0 archived after a reply, 0 archived with no reply, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
+
+# The marker and the request are two writes. A pass that reads no marker must
+# reconcile against the room before it reaches for a second p-tag.
+scenario "closed event (merged), request published but the marker write was lost → repaired, nobody re-mentioned"
+bind 4242 "$CH_A"
+ci_said "$CH_A" 300 "@Alex please post a review summary here: what the review found, what was fixed, and anything left open."
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "must not p-tag the reviewer again — a second mention steers a running turn" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "must not post a second merge notice" "$([ "$(count "SEND $CH_A")" = 0 ]; echo $?)"
+check "should repair the marker from the request's own timestamp" \
+  "$(grep -qE "^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:$((NOW - 300))\$" "$LOG"; echo $?)"
+check "should say what it found" "$(said 'already requested here'; echo $?)"
+check "should not archive — the hold runs from the published request" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 
 # A rerun of the closed event, or the event run and the sweep meeting after
 # the request went out: the record is what keeps the second p-tag in.
+# Two publishers, one PR. The walk before the fence said nothing had been
+# asked; by the time this pass is ready to ask, the other one has asked.
+scenario "closed event (merged), another publisher asks first → the last-instant re-probe keeps the second p-tag in"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+request_lands_at_annotation "$CH_A" 1
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "the competing request should have landed" "$([ "$(count "INJECTED_REQUEST $CH_A")" = 1 ]; echo $?)"
+check "must not p-tag the reviewer — the other publisher already woke him" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should post its merge notice and nothing more" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "should adopt the published request rather than ask again" "$(said 'already requested here'; echo $?)"
+check "should record the request it adopted" \
+  "$(grep -qE '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+$' "$LOG"; echo $?)"
+check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+
 scenario "closed event (merged) rerun with the request on record → nothing sent, nobody re-mentioned"
 bind 4242 "$CH_A"
 summary_requested 4242 300
@@ -920,7 +1068,7 @@ check "must not p-tag the reviewer again — a second mention steers a running t
 check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 check "should not rewrite the record" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
 check "should read the room for a reply since the request" "$([ "$(count "REPLY_READ $CH_A")" = 1 ]; echo $?)"
-check "should say it is inside the grace window" "$(said 'into the grace window'; echo $?)"
+check "should say it is inside the grace window" "$(said 'of the grace window left'; echo $?)"
 
 scenario "sweep: summary requested, no reply yet, grace window open → nothing written"
 listing "$(listed 4242 7200 true)"
@@ -942,7 +1090,7 @@ scenario "sweep: the reviewer replied moments ago → wait for the summary to se
 listing "$(listed 4242 7200 true)"
 bind 4242 "$CH_A"
 pr_record 4242 closed true
-summary_requested 4242 3000
+summary_requested 4242 4000
 reviewer_said "$CH_A" 2000 "On it."
 reviewer_said "$CH_A" 120 "Review summary: the rounds found a stale fence; fixed in the second push."
 run_step schedule; RC=$?
@@ -952,11 +1100,55 @@ check "should not archive under a reply still landing" "$([ "$(count ARCHIVE)" =
 check "should say it is waiting for the reply to settle" "$(said 'waiting for the summary to settle'; echo $?)"
 check "should account for it" "$(said '1 awaiting a reply'; echo $?)"
 
-scenario "sweep: the reviewer's last reply has settled → archive under a notice that says so"
+# THE FINDING: an acknowledgement must not shorten the hold. Settling on the
+# settle window alone archived the room 10 minutes after a pickup posted
+# seconds into a 60-minute grace window — so reporting progress bought LESS
+# protection than saying nothing, and the summary the pickup promised was
+# refused by the archived room.
+scenario "sweep: a pickup posted right after the request does not shorten the hold"
 listing "$(listed 4242 7200 true)"
 bind 4242 "$CH_A"
 pr_record 4242 closed true
-summary_requested 4242 3000
+summary_requested 4242 2400
+reviewer_said "$CH_A" 2395 "On it — reading the rounds now."
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "the pickup is 39 minutes old and settled, and must still not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should say the hold is what is holding it" "$(said 'holding the room another'; echo $?)"
+check "should account for it" "$(said '1 awaiting a reply'; echo $?)"
+
+# The same room one grace window later, with the reviewer still quiet: the
+# floor is a floor, not a second chance to wait forever.
+scenario "sweep: the pickup was all there was, and the grace floor has passed → archived"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 4000
+reviewer_said "$CH_A" 3995 "On it — reading the rounds now."
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should account for it as a reply, not an absence" "$(said '1 archived after a reply, 0 archived with no reply'; echo $?)"
+
+# Late activity extends past the floor: a reviewer still posting when the
+# grace window ends is not cut off mid-summary.
+scenario "sweep: the reviewer is still posting as the grace floor passes → held for the settle window"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 4000
+reviewer_said "$CH_A" 60 "Review summary, part one of two:"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not archive under a reply still landing" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should say it is waiting for the reply to settle" "$(said 'waiting for the summary to settle'; echo $?)"
+
+scenario "sweep: the grace floor passed and the reviewer's last reply has settled → archive under a notice that says so"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+summary_requested 4242 4200
 reviewer_said "$CH_A" 2500 "On it."
 reviewer_said "$CH_A" 1500 "Review summary: the rounds found a stale fence; fixed in the second push."
 SUMMARY_SETTLE_SECS_INPUT=0600 run_step schedule; RC=$?

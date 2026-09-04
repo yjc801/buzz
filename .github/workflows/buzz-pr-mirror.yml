@@ -93,29 +93,58 @@ name: buzz-pr-mirror
 # archive: the relay refuses every channel-scoped write on an archived room
 # (the fence everything below relies on), and only a CI or human p-tag can
 # wake the reviewer at all (crates/buzz-waker/src/decide.rs). So on a MERGED
-# PR the close notice carries that p-tag and a request for the summary, and
-# is the last thing the event run writes into the room — no archive. The
-# request is recorded in the close marker (`summary-requested:<unix-ts>`)
-# the instant it is out, so that a rerun, the sweep and the event run
-# meeting on one PR, or a failure later in the same run never send a second
-# p-tag (a mention steers a turn already running). The sweep finishes the
-# close: FACTS DECIDE AND THE TIMER IS A BACKSTOP
-# (docs/welcome-kickoff-silent-failures.md) — once the reviewer's newest
-# message in the room since the request is SUMMARY_SETTLE_SECS old the room
-# is archived (an acknowledgement usually precedes the message it promises,
-# so a reply is not the end of the reply); with no message at all, nothing
-# is decided until SUMMARY_GRACE_SECS have passed, and then the room is
-# archived under a notice that says exactly that — CI saw no message, and
-# does not know why. Neither archive notice names the reviewer: the CLI
-# turns an @name in the content into a p-tag. The earliest archive is
-# therefore the first sweep at least SWEEP_SETTLE_SECS after the merge; the
-# backstop lands one grace window plus one sweep interval after the request.
-# Closed-without-merge PRs are archived at once, as before. What this does
-# not close: an event run delayed past the sweep's settle window can meet
-# the sweep on a live room and post a second request (the marker read is
-# CI's own record, not a fence on the room), and a room archived by hand
-# while it waits is noticed only when the sweep's archive pass tries its
-# first write.
+# PR the room gets a merge notice and then, as the LAST thing written into
+# it, a request for the summary carrying that p-tag — and no archive.
+#
+# THE REQUEST IS THE LAST WRITE BECAUSE THE MENTION IS THE LAST WRITE. The
+# CLI refuses any --mention pubkey that is not on the channel roster
+# (crates/buzz-cli/src/commands/messages.rs), so on a room whose `opened` run
+# was cancelled between the create and provision_members the mention fails —
+# and if the mention is also the pass's first write, the pass exits before
+# the recovery that would have fixed it and every later sweep repeats that,
+# leaving a merged room live for good with neither a request nor an archive.
+# So the mention-free merge notice is the fence, ensure_provisioned recovers
+# the roster on the room it proved live, the annotation sweep runs, and only
+# then does the ask go out. That recovery is `quiet`: an ordinary seed card
+# ends in "@Alex please review", and the CLI turns an @name in the content
+# into a p-tag just as --mention does, so it would be a second wake steering
+# the turn the request starts.
+#
+# AND THE PUBLISHED REQUEST, NOT THE CLOSE MARKER, IS WHAT PROVES HE WAS
+# ASKED. The marker (`summary-requested:<unix-ts>`) is CI's own note at its
+# own coordinate; the request is a message in the room. They are two writes,
+# and everything between them is a window in which a killed runner, a lost
+# CLI response or a failed `notes set` leaves a later pass reading "not
+# requested yet" over a request already published — and its remedy is a
+# second p-tag, which steers (cancels and re-prompts) the turn the first one
+# started. So a pass with no marker RECONCILES AGAINST THE ROOM first
+# (summary_request_at), adopts the published request's own created_at as the
+# request time, and repairs the marker rather than asking again. The probe is
+# repeated, bounded to what could have appeared since, immediately before the
+# send, because the sweep and an event run sit in different concurrency
+# groups and can both reach this path on one PR. That narrows the
+# duplicate-wake window to the send itself; it does not close it — there is
+# no compare-and-set spanning the marker and the room, the same limit
+# converge_lifecycle works around above.
+#
+# THE SWEEP FINISHES THE CLOSE, ON FACTS, WITH THE TIMER AS A BACKSTOP
+# (docs/welcome-kickoff-silent-failures.md). The room is archived once
+# SUMMARY_GRACE_SECS have passed since the request AND the reviewer has been
+# quiet for SUMMARY_SETTLE_SECS. Both, not either: CI cannot tell a pickup
+# from the summary it promises — that is the reviewer's own text and CI reads
+# no meaning into it — so ACTIVITY ONLY EXTENDS THE HOLD. Settling on the
+# settle window alone made reporting progress shorten the protection, because
+# a pickup posted seconds after the request is already older than the settle
+# window by the first sweep that can act, and the room would be archived
+# under a summary still being written while silence would have held it for
+# the full grace window. The archive notice states what CI observed and no
+# more — a last message N minutes ago, or no message at all since the
+# request; never why. Neither notice names the reviewer: the CLI turns an
+# @name in the content into a p-tag. The earliest archive is therefore one
+# grace window plus one sweep interval after the request. Closed-without-
+# merge PRs are archived at once, as before. What this does not close: the
+# duplicate-request window above, and a room archived by hand while it waits,
+# which is noticed only when the archive pass tries its first write.
 #
 # CHANNEL NAMES CARRY THE PROJECT PREFIX: `buzz-pr-N`, never bare `pr-N`.
 # Every repo that mirrors into openvelvet prefixes with its own project name
@@ -314,10 +343,12 @@ jobs:
           # contract test can exercise the paging with tiny pages.
           SWEEP_PAGE_SIZE: "100"
           # A merged PR's room is held open for the reviewer's summary. The
-          # sweep archives it once his newest reply is SUMMARY_SETTLE_SECS
-          # old (an acknowledgement often precedes the real message), or
-          # after SUMMARY_GRACE_SECS with no reply at all — see
-          # close_after_summary. Seconds, both.
+          # sweep archives it once BOTH have passed: SUMMARY_GRACE_SECS since
+          # the request, and SUMMARY_SETTLE_SECS since his newest message in
+          # the room. The grace window is a floor and activity only extends
+          # the hold — an acknowledgement often precedes the real message, and
+          # settling on the settle window alone would make posting one shorten
+          # the protection. See close_after_summary. Seconds, both.
           SUMMARY_GRACE_SECS: "3600"
           SUMMARY_SETTLE_SECS: "600"
           PR_ACTION: ${{ github.event.action }}
@@ -939,6 +970,19 @@ jobs:
             # GitHub rather than take this card's word for who gets the
             # findings — docs/pr-review-routing.md, which also records that the
             # deployed reviewer does not do so yet.
+            # QUIET drops both requests and every @name with them. It is set
+            # on the close paths, where this card exists only to seal an
+            # unprovisioned room's provisioning: the PR is already closed, so
+            # asking for a review is wrong on the facts, and the ask is also a
+            # WAKE — the CLI turns an @name in the content into a p-tag just
+            # as --mention does. On a merged PR that wake would land either
+            # side of the review-summary request and steer the turn the
+            # request starts; on a not-merged one it would land in a room
+            # being archived in the same pass.
+            if [ "${SEED_QUIET:-}" = quiet ]; then
+              printf '\nThis card is a late record of a pull request that is already closed. No review is being requested.\n'
+              return 0
+            fi
             printf '\n@%s please review.\n' "$REVIEWER_NAME"
             if [ -n "$SCOPE_NAMES" ]; then
               printf '\n%s— your pull request. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
@@ -1104,7 +1148,10 @@ jobs:
             # synchronize/reopened/closed run can be the first to arrive
             # after a create-then-cancel partial, and skipping recovery
             # there would launder an owner-less channel into green forever.
-            local CH="$1" STATE
+            # $2 is "quiet" when the recovery card must wake nobody — see
+            # seed_card. The seeded path reads and writes nothing either way,
+            # so this is safe to call before a fence.
+            local CH="$1" QUIET="${2:-}" STATE
             if ! STATE=$(channel_seed_state "$CH"); then
               echo "seed-marker lookup failed — failing so the rerun re-probes instead of guessing" >&2
               return 1
@@ -1116,6 +1163,10 @@ jobs:
             echo "channel $NAME exists but is unseeded — resuming provisioning"
             route_scope
             provision_members "$CH" || return 1
+            if [ "$QUIET" = quiet ]; then
+              SEED_QUIET=quiet seed_card | buzz messages send --channel "$CH" --content -
+              return
+            fi
             seed_card | buzz messages send --channel "$CH" --content - \
               --mention "$REVIEWER_PUBKEY" "${SCOPE_MENTIONS[@]}"
           }
@@ -1302,6 +1353,7 @@ jobs:
                   echo "#${NAME} is archived with no close on record — finishing the close outside the room" ;;
               esac
             fi
+            CLOSE_WROTE=yes
             annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
             write_close_marker "$CLOSE_MARKER_DONE" || return 1
             CLOSE_OUTCOME=annotated
@@ -1331,7 +1383,13 @@ jobs:
             # so the seed card it may post lands in a room proven live — and
             # before the annotation sweep, so that card gets its banner too.
             local CH="$1" OUTCOME="$2"
-            ensure_provisioned "$CH" || return 1
+            CLOSE_WROTE=yes
+            # `quiet`: a close never asks for a review. The recovery card
+            # seals an unprovisioned room's provisioning, but the ordinary
+            # card ends in "@Alex please review", and the CLI turns an @name
+            # in the content into a p-tag — waking the reviewer to review a
+            # PR that is closed, in a room this call is about to archive.
+            ensure_provisioned "$CH" quiet || return 1
             annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
             archive_channel "$CH" || return 1
             # LAST, and only on the path that finished: the marker means
@@ -1382,10 +1440,20 @@ jobs:
             # one this call is comes from CI's own close marker, read before
             # the first write. That read is not the snapshot the fence exists
             # to avoid: it is this workflow's note at its own coordinate, and a
-            # broken read is red rather than "not requested yet" — the
-            # alternative is a second p-tag on the reviewer.
+            # broken read is red rather than "not requested yet". Its ABSENCE
+            # is not proof the reviewer was never asked, though — the marker
+            # and the request are two writes — so request_summary reconciles
+            # against the published request before it asks anything.
             local CH="$1" FORCE="${2:-}" MARKER REQUESTED_AT
             CLOSE_OUTCOME=""
+            # Whether this pass put anything durable into the world. The
+            # OUTCOME names what was decided; this names whether there is
+            # anything to converge with a racing run (see converge_lifecycle),
+            # and those two are not the same question — a "force" pass that
+            # decides nothing still reverses its own reopen banners, and a
+            # request repaired from an already-published one still posts the
+            # merge notice that proved the room live.
+            CLOSE_WROTE=""
             if [ "$PR_MERGED" = "true" ]; then
               MARKER=$(read_close_marker) || return 1
               case "$MARKER" in
@@ -1409,46 +1477,160 @@ jobs:
             finish_close "$CH" reconciled
           }
 
+          # The sentence that makes a message a summary REQUEST rather than
+          # any other CI notice carrying a reviewer p-tag (the seed card and
+          # every synchronize notice carry one too). It is matched literally
+          # against messages this CI identity authored, so keep the wording
+          # and the request text below identical, and do not let a banner
+          # glyph or the PR URL into it — annotate_references rewrites the
+          # first line of any CI message that names the PR.
+          SUMMARY_REQUEST_MARK='please post a review summary here'
+
+          summary_request_at() {
+            # Prints the created_at of the NEWEST summary request THIS CI
+            # identity has published into channel $1, or nothing when it has
+            # published none. A failed read is an error, never "none".
+            #
+            # THIS, NOT THE CLOSE MARKER, IS WHAT PROVES THE REVIEWER WAS
+            # ASKED. The marker is CI's note at its own coordinate and the
+            # request is a message in the room: two writes, and everything
+            # between them is a window. A runner killed after the send and
+            # before the marker, a lost CLI response, a failed `notes set` —
+            # each leaves a pass reading "not requested yet" over a request
+            # that is already published, and the remedy it reaches for is a
+            # second p-tag, which steers (cancels and re-prompts) the turn
+            # the first one started. The published request is the durable
+            # state both publishers share, so it is what a pass reconciles
+            # against, and its own created_at is the request time the marker
+            # is then repaired with.
+            #
+            # $2 bounds the read to messages at or after that unix time — the
+            # form used for the last-instant re-check, where anything that
+            # could have been published since the full walk is newer than it.
+            # Without it this walks the whole history backward, like
+            # coder_already_mentioned and for the same reason: the request is
+            # not pinned to any position in a room the reviewer keeps
+            # posting into, and a bounded newest-page probe would eventually
+            # false-negative and re-ask.
+            local CH="$1" SINCE="${2:-}" BEFORE="" PAGE FOUND OLDEST COUNT
+            if [ -n "$SINCE" ]; then
+              PAGE=$(buzz messages get --channel "$CH" --since "$SINCE" --limit 200) || return 1
+              printf '%s' "$PAGE" | jq -r --arg ci "$CI_PUB" --arg m "$SUMMARY_REQUEST_MARK" \
+                '[(.messages? // .)[]? | select(.pubkey == $ci)
+                  | select(.content | contains($m)) | .created_at] | max // empty' || return 1
+              return 0
+            fi
+            while :; do
+              if [ -z "$BEFORE" ]; then
+                PAGE=$(buzz messages get --channel "$CH" --limit 100) || return 1
+              else
+                PAGE=$(buzz messages get --channel "$CH" --limit 100 --before "$BEFORE") || return 1
+              fi
+              COUNT=$(printf '%s' "$PAGE" | jq '[(.messages? // .)[]?] | length') || return 1
+              if [ "$COUNT" -eq 0 ]; then
+                return 0   # walked past the start of history: never asked
+              fi
+              FOUND=$(printf '%s' "$PAGE" | jq -r --arg ci "$CI_PUB" --arg m "$SUMMARY_REQUEST_MARK" \
+                '[(.messages? // .)[]? | select(.pubkey == $ci)
+                  | select(.content | contains($m)) | .created_at] | max // empty') || return 1
+              # Newest page first, so the first page holding one holds the
+              # newest one — the wake whose turn is running.
+              if [ -n "$FOUND" ]; then
+                printf '%s' "$FOUND"
+                return 0
+              fi
+              OLDEST=$(printf '%s' "$PAGE" \
+                | jq -r '[(.messages? // .)[]?.created_at] | min') || return 1
+              if [ -n "$BEFORE" ] && [ "$OLDEST" -ge "$BEFORE" ]; then
+                BEFORE=$((OLDEST - 1))
+              else
+                BEFORE="$OLDEST"
+              fi
+            done
+          }
+
+          adopt_published_request() {
+            # A request is already in the room ($2, its created_at) but this
+            # PR's close marker does not say so — repair the marker from the
+            # request itself and hand the room straight to the archive pass.
+            # NOTHING IS SENT: the reviewer has been asked.
+            local CH="$1" AT="$2" FORCE="${3:-}"
+            echo "#${NAME}: a review summary is already requested here (published $(( $(date +%s) - AT ))s ago) — recording it rather than asking again"
+            write_close_marker "${CLOSE_MARKER_REQUESTED}${AT}" || return 1
+            close_after_summary "$CH" "$FORCE" "$AT"
+          }
+
           request_summary() {
             # The first half of a merged PR's close — $1 is the room, $2 is
-            # "force" (see close_epilogue). The merge notice is the first
-            # write and the fence, exactly as the close notice is on the
-            # other path, and it carries the one p-tag that can wake the
-            # reviewer: only a CI or human mention wakes anything
-            # (crates/buzz-waker/src/decide.rs). The room is then left LIVE.
-            # The relay refuses every write into an archived room, so the
-            # summary can only land while the archive waits.
+            # "force" (see close_epilogue). The room is left LIVE: the relay
+            # refuses every write into an archived room, so the summary can
+            # only land while the archive waits. The p-tag on the request is
+            # the one thing that can wake the reviewer at all
+            # (crates/buzz-waker/src/decide.rs).
             #
-            # THE REQUEST IS RECORDED THE INSTANT IT IS OUT — before the
-            # provisioning check and the annotation sweep, both of which the
-            # archive pass repeats. A failure after the send must not leave
-            # the marker unset: the rerun or the sweep would then send a
-            # second p-tag, and a mention steers (cancels and re-prompts) a
-            # turn already running — see buzz-pr-review-watchdog.yml.
+            # THE ORDER IS: PROBE, FENCE, RECOVER, ANNOTATE, ASK, RECORD.
             #
-            # The first line is banner-shaped on purpose: annotate_references
-            # strips every line matching BANNER_RE from a CI-authored message
-            # that names the PR and prepends the current banner, so the
-            # request below must not start with one of those glyphs or the
-            # edit would take it with the old banner. The reviewer is asked,
-            # not configured (see the injection boundary above seed_card):
-            # no verdict, no trailer, and no `Review head:` line for the
-            # watchdog to match. The clock is read with the same 5s
-            # allowance as PUSHED_AT, so a reply stamped a moment before this
-            # run's clock counts as one.
-            local CH="$1" FORCE="${2:-}" REQUESTED_AT
-            REQUESTED_AT=$(( $(date +%s) - 5 ))
+            # The probe is summary_request_at — a read, so it is safe before
+            # the fence, and it is what makes this replay-safe: see there.
+            #
+            # The FENCE is the merge notice, and it carries NO mention.
+            # Making the mention-bearing send the fence made this path
+            # unrecoverable on a room whose provisioning was interrupted: the
+            # production CLI refuses any --mention pubkey that is not on the
+            # channel roster (crates/buzz-cli/src/commands/messages.rs), so a
+            # room created by an `opened` run that was cancelled before
+            # provision_members would fail the send, exit before the recovery
+            # that would have fixed it, and fail exactly the same way on every
+            # later sweep — a merged room left live for good with neither a
+            # request nor an archive. So the mention goes out only after
+            # ensure_provisioned has put the reviewer on the roster, on a room
+            # the fence has already proven live.
+            #
+            # Recovery is `quiet` (see seed_card): a recovery card ending in
+            # "@Alex please review" would be a second wake, and the CLI turns
+            # an @name in the content into a p-tag exactly as --mention does.
+            # The annotation sweep runs before the ask for the same reason
+            # everything else does — the ask is the LAST thing written, so
+            # nothing after it can fail and leave a wake with no record.
+            local CH="$1" FORCE="${2:-}" REQUESTED_AT PROBE_AT PUBLISHED
+            PROBE_AT=$(( $(date +%s) - 5 ))
+            PUBLISHED=$(summary_request_at "$CH") || return 1
+            if [ -n "$PUBLISHED" ]; then
+              adopt_published_request "$CH" "$PUBLISHED" "$FORCE" || return 1
+              return 0
+            fi
             if ! {
                 printf '%s\n%s\n\n' "$STATUS" "$PR_URL"
                 printf 'This channel stays open for a review summary and is archived afterwards.\n'
-                printf '@%s please post a review summary here: what the review found, what was fixed, and anything left open.\n' "$REVIEWER_NAME"
-              } | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY" 2>"$ERRFILE"; then
+              } | buzz messages send --channel "$CH" --content - 2>"$ERRFILE"; then
               first_write_refused "merge notice" "$FORCE" || return 1
               return 0
             fi
-            write_close_marker "${CLOSE_MARKER_REQUESTED}${REQUESTED_AT}" || return 1
-            ensure_provisioned "$CH" || return 1
+            CLOSE_WROTE=yes
+            ensure_provisioned "$CH" quiet || return 1
             annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
+            # LAST INSTANT, and bounded to what could have appeared since the
+            # walk above: another publisher — the sweep and an event run sit
+            # in different concurrency groups — may have published the
+            # request while this pass was provisioning and annotating. This
+            # narrows the duplicate-wake window to the send itself; it does
+            # not close it, because there is no compare-and-set spanning the
+            # marker and the room.
+            PUBLISHED=$(summary_request_at "$CH" "$PROBE_AT") || return 1
+            if [ -n "$PUBLISHED" ]; then
+              adopt_published_request "$CH" "$PUBLISHED" "$FORCE" || return 1
+              return 0
+            fi
+            # The clock is read with the same 5s allowance as PUSHED_AT, so a
+            # reply stamped a moment before this run's clock counts as one.
+            REQUESTED_AT=$(( $(date +%s) - 5 ))
+            if ! printf '@%s %s: what the review found, what was fixed, and anything left open.\n' \
+                "$REVIEWER_NAME" "$SUMMARY_REQUEST_MARK" \
+                | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"; then
+              echo "the review-summary request was rejected — failing so the rerun re-probes and re-asks" >&2
+              return 1
+            fi
+            write_close_marker "${CLOSE_MARKER_REQUESTED}${REQUESTED_AT}" || return 1
             echo "#${NAME}: asked the reviewer for a review summary — the room stays live until it settles"
             CLOSE_OUTCOME=summary-requested
           }
@@ -1473,17 +1655,42 @@ jobs:
             # When nothing is decided nothing is written, with one exception:
             # under "force" this run's own reopen banners are still standing
             # in every other room, and those are reversed now regardless.
-            local CH="$1" FORCE="${2:-}" REQUESTED_AT="$3" NOW LAST AGE NOTICE OUTCOME
+            local CH="$1" FORCE="${2:-}" REQUESTED_AT="$3" NOW LAST AGE HELD NOTICE OUTCOME
             NOW=$(date +%s)
             LAST=$(reviewer_last_reply_since "$CH" "$REQUESTED_AT") || {
               echo "#${NAME}: reviewer reply lookup failed — failing so the rerun re-probes" >&2
               return 1
             }
+            # THE GRACE WINDOW IS A FLOOR, NOT AN ALTERNATIVE. Activity can
+            # only EXTEND the hold, never shorten it. Read the other way
+            # round — settle the moment any reviewer message is
+            # SUMMARY_SETTLE_SECS old — reporting progress made the
+            # protection SHORTER than saying nothing: a pickup posted seconds
+            # after the request ("On it, reading the rounds now") is already
+            # older than the settle window by the first sweep that can act,
+            # so the room is archived while the summary is still being
+            # written and the relay then refuses the summary itself. Silence
+            # would have held the room for the full grace window. Neither
+            # window can tell a pickup from the summary it promises — that is
+            # the reviewer's own text, and CI reads no meaning into it — so
+            # the two compose instead: hold until the grace window has passed
+            # AND the reviewer has been quiet for the settle window.
+            HELD=$((REQUESTED_AT + SUMMARY_GRACE_SECS - NOW))
+            if [ "$HELD" -gt 0 ]; then
+              if [ -n "$LAST" ]; then
+                echo "#${NAME}: the reviewer has posted since the request; holding the room another ${HELD}s"
+              else
+                echo "#${NAME}: no reply from the reviewer yet, ${HELD}s of the grace window left"
+              fi
+              [ "$FORCE" != force ] || { CLOSE_WROTE=yes; annotate_references "$STATUS" "$EMOJI" "♻️" || return 1; }
+              CLOSE_OUTCOME=awaiting-reply
+              return 0
+            fi
             if [ -n "$LAST" ]; then
               AGE=$((NOW - LAST))
               if [ "$AGE" -lt "$SUMMARY_SETTLE_SECS" ]; then
                 echo "#${NAME}: the reviewer posted ${AGE}s ago — waiting for the summary to settle"
-                [ "$FORCE" != force ] || annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
+                [ "$FORCE" != force ] || { CLOSE_WROTE=yes; annotate_references "$STATUS" "$EMOJI" "♻️" || return 1; }
                 CLOSE_OUTCOME=awaiting-reply
                 return 0
               fi
@@ -1491,12 +1698,6 @@ jobs:
               OUTCOME=closed-after-reply
             else
               AGE=$((NOW - REQUESTED_AT))
-              if [ "$AGE" -lt "$SUMMARY_GRACE_SECS" ]; then
-                echo "#${NAME}: no reply from the reviewer yet, ${AGE}s into the grace window"
-                [ "$FORCE" != force ] || annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
-                CLOSE_OUTCOME=awaiting-reply
-                return 0
-              fi
               NOTICE="Archiving this channel — no message from the reviewer has appeared here in the $((AGE / 60)) minutes since the review summary was requested."
               OUTCOME=closed-without-reply
             fi
@@ -1911,14 +2112,19 @@ jobs:
               esac
               # THE PRE-WRITE RE-READ IS NOT A FENCE, so the writes are
               # reconciled afterwards — see converge_lifecycle. Only a pass
-              # that WROTE something has anything to reconcile.
-              case "$CLOSE_OUTCOME" in
-                reconciled|annotated|summary-requested|closed-after-reply|closed-without-reply)
-                  LIFECYCLE_WRITTEN=closed
-                  if ! converge_lifecycle "$NUM" "$CH"; then
-                    FAILED=$((FAILED + 1))
-                  fi ;;
-              esac
+              # that WROTE something has anything to reconcile, and that is
+              # CLOSE_WROTE rather than a list of outcomes: the outcome names
+              # what was DECIDED, and the two diverge in both directions — a
+              # "force" pass that decides nothing still reverses its own
+              # reopen banners, and a pass that adopts an already-published
+              # request still posted the merge notice that proved the room
+              # live. An outcome list left both of those unreconciled.
+              if [ "$CLOSE_WROTE" = yes ]; then
+                LIFECYCLE_WRITTEN=closed
+                if ! converge_lifecycle "$NUM" "$CH"; then
+                  FAILED=$((FAILED + 1))
+                fi
+              fi
             done < "$CANDIDATES"
             echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ANNOTATED} annotated outside an archived room, ${ARCHIVED} already archived, ${NOROOM} without a room, ${REQUESTED} summaries requested, ${AWAITING} awaiting a reply, ${REPLIED} archived after a reply, ${UNREPLIED} archived with no reply, ${RESTORED} restored after a concurrent reopen, ${RECLOSED} re-closed after a concurrent close, ${FAILED} failed"
             [ "$FAILED" -eq 0 ]

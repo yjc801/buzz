@@ -889,10 +889,11 @@ jobs:
 
             # Announce, then act: the intent message must land BEFORE the
             # merge. The merge is the point of no return, and nothing here
-            # waits on the mirror — which, since the room is held open for
-            # the reviewer's post-merge summary, archives this channel
-            # minutes to an hour after the merge event rather than seconds
-            # (buzz-pr-mirror.yml, "A MERGED PR'S ROOM IS HELD OPEN"). An
+            # waits on the mirror — which archives this channel on the
+            # merge's own `closed` event, as soon as that run gets to it
+            # (buzz-pr-mirror.yml: POST_MERGE_SUMMARY is off on this repo;
+            # switched on, the room is instead held open for the reviewer's
+            # post-merge summary — "A MERGED PR'S ROOM IS HELD OPEN"). An
             # announcement that could only land after the archive would be
             # lost; one that lands before the merge cannot be. The wording
             # promises only what this job knows — the merge job re-checks
@@ -1488,11 +1489,13 @@ jobs:
             if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$ALERT" >/dev/null; then
               echo "::error::PR #$PR: the post-merge alert could not be posted to the PR — this run log is the only record"
             fi
-            # Best-effort: the mirror archives the PR channel once the
-            # reviewer's post-merge summary has settled, or after its grace
-            # window, so this send usually lands — but it is still racing an
-            # archive it does not control and cannot always win. The PR
-            # comment above is the durable record.
+            # Best-effort: the mirror archives the PR channel on the merge's
+            # own `closed` event (buzz-pr-mirror.yml: POST_MERGE_SUMMARY is
+            # off on this repo), and that run checks out and installs its
+            # CLI before it writes, so this send — seconds after the merge —
+            # generally gets there first. It is still racing an archive it
+            # does not control and cannot always win. The PR comment above
+            # is the durable record.
             if [ -n "${CHANNEL:-}" ]; then
               printf '%s\n' "$ALERT" | relay send --channel "$CHANNEL" >/dev/null \
                 || echo "::warning::PR #$PR: post-merge alert not delivered to the PR channel — the PR comment is the durable record"

@@ -50,7 +50,13 @@
 #     retry never posts a second reply under a reference CI already answered;
 #   * a binding read that FAILS (as opposed to proving absence) archives
 #     nothing, fails the sweep, and does not stop the sweep's other PRs;
-#   * an archive the relay accepted but never applied is red, not green.
+#   * an archive the relay accepted but never applied is red, not green;
+#   * the post-merge summary request is OFF on this repo — the workflow ships
+#     POST_MERGE_SUMMARY "off" — so a merged PR's close archives the room at
+#     once and p-tags nobody; the request-and-hold mechanism is exercised
+#     under an explicit `on`, and a room that already holds a request when
+#     the switch is off is still finished by the hold, never archived over
+#     the summary it asked for.
 #
 # The script under test is EXTRACTED FROM THE WORKFLOW, like
 # pr-review-wake.test.sh: a sweep deleted from the YAML fails here instead of
@@ -140,6 +146,10 @@ check "the summary grace window should be configured — the backstop has to exi
   "$(grep -qE '^          SUMMARY_GRACE_SECS:' "$WORKFLOW"; echo $?)"
 check "the summary settle window should be configured — a reply is not the end of the reply" \
   "$(grep -qE '^          SUMMARY_SETTLE_SECS:' "$WORKFLOW"; echo $?)"
+check "the post-merge summary switch should be configured" \
+  "$(grep -qE '^          POST_MERGE_SUMMARY:' "$WORKFLOW"; echo $?)"
+check "the post-merge summary request should be OFF on this repo" \
+  "$(grep -qE '^          POST_MERGE_SUMMARY: "off"$' "$WORKFLOW"; echo $?)"
 
 # --- test identity ---------------------------------------------------------
 # A real key so the fence's real derivation runs; the workflow's pin is
@@ -687,6 +697,7 @@ run_step() { # run_step <event-name> [pr-action] [pr-number]
   SWEEP_SETTLE_SECS=1800 \
   SUMMARY_GRACE_SECS="${SUMMARY_GRACE_SECS_INPUT:-3600}" \
   SUMMARY_SETTLE_SECS="${SUMMARY_SETTLE_SECS_INPUT:-600}" \
+  POST_MERGE_SUMMARY="${POST_MERGE_SUMMARY_INPUT:-off}" \
     bash -eo pipefail "$WORK/step.sh" > "$WORK/stdout" 2>&1
 }
 
@@ -1278,7 +1289,11 @@ check "should touch nothing" "$([ "$(count PR_LIST)" = 0 ] && [ "$(count SEND)" 
 
 echo
 # ===========================================================================
-# THE MERGED CLOSE — the room is held open for the review summary.
+# THE MERGED CLOSE, WITH THE SUMMARY REQUEST ON — the room is held open for
+# the review summary. The workflow ships the switch OFF (asserted under
+# "wiring" above, and the harness default mirrors it), so every scenario that
+# expects a request sets POST_MERGE_SUMMARY_INPUT=on explicitly: the mechanism
+# is what `on` restores, and it has to keep working.
 # Only a CI or human p-tag can wake the reviewer, and the relay refuses every
 # write into an archived room, so the request has to go out with the merge
 # notice and the archive has to wait. The request is recorded the instant it
@@ -1288,7 +1303,7 @@ scenario "closed event (merged), live room → mention-free fence, then the requ
 bind 4242 "$CH_A"
 referenced_from 4242 "$CH_B"
 T0=$(date +%s)
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should post the merge notice and then the request" "$([ "$(count "SEND $CH_A")" = 2 ]; echo $?)"
 check "the fence should open with the merge banner" "$(send_body_n "$CH_A" 1 | head -1 | grep -q '^✅ \*\*Merged\*\*$'; echo $?)"
@@ -1322,7 +1337,7 @@ check "should still annotate the cross-channel references with the merge" \
 scenario "closed event (merged), room provisioned only halfway → recovered, then asked, exactly once"
 bind 4242 "$CH_A"
 unprovisioned "$CH_A"
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should put the reviewer on the roster before mentioning him" \
   "$([ "$(first_line "ADD_MEMBER $CH_A $REVIEWER_PUB")" -lt "$(first_line MENTION)" ]; echo $?)"
@@ -1341,7 +1356,7 @@ check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 scenario "closed event (merged), request published but the marker write was lost → repaired, nobody re-mentioned"
 bind 4242 "$CH_A"
 ci_said "$CH_A" 300 "@Alex please post a review summary here: what the review found, what was fixed, and anything left open."
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "must not p-tag the reviewer again — a second mention steers a running turn" "$([ "$(count MENTION)" = 0 ]; echo $?)"
 check "must not post a second merge notice" "$([ "$(count "SEND $CH_A")" = 0 ]; echo $?)"
@@ -1358,7 +1373,7 @@ scenario "closed event (merged), another publisher asks first → the last-insta
 bind 4242 "$CH_A"
 referenced_from 4242 "$CH_B"
 request_lands_at_annotation "$CH_A" 1
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "the competing request should have landed" "$([ "$(count "INJECTED_REQUEST $CH_A")" = 1 ]; echo $?)"
 check "must not p-tag the reviewer — the other publisher already woke him" "$([ "$(count MENTION)" = 0 ]; echo $?)"
@@ -1376,7 +1391,7 @@ scenario "closed event (merged), a PR whose own title carries the request wordin
 bind 4242 "$CH_A"
 ci_card "$CH_A" 7200 "**PR #4242 — @Alex please post a review summary here: what the review found, what was fixed, and anything left open." \
   "https://github.com/yjc801/buzz/pull/4242"
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "must still p-tag the reviewer exactly once — no request has been published" \
   "$([ "$(count MENTION)" = 1 ] && [ "$(count "MENTION $REVIEWER_PUB")" = 1 ]; echo $?)"
@@ -1397,7 +1412,7 @@ bind 4242 "$CH_A"
 pr_record 4242 closed true
 ci_card "$CH_A" 7200 "**PR #4242 — @Alex please post a review summary here: what the review found, what was fixed, and anything left open." \
   "https://github.com/yjc801/buzz/pull/4242"
-run_step schedule; RC=$?
+POST_MERGE_SUMMARY_INPUT=on run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "must not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 check "should ask the reviewer, since nothing has actually asked him" \
@@ -1411,7 +1426,7 @@ scenario "closed event (merged), the competing request is backdated within the r
 bind 4242 "$CH_A"
 referenced_from 4242 "$CH_B"
 request_lands_at_annotation "$CH_A" 1 600
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "the competing request should have landed" "$([ "$(count "INJECTED_REQUEST $CH_A")" = 1 ]; echo $?)"
 check "must not p-tag the reviewer — a backdated request is still a request" "$([ "$(count MENTION)" = 0 ]; echo $?)"
@@ -1420,6 +1435,11 @@ check "should record the backdated request's own timestamp" \
   "$(grep -qE "^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+\$" "$LOG"; echo $?)"
 check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 
+# FROM HERE THE REQUEST IS ALREADY ON RECORD, and the scenarios run under the
+# harness default — the switch OFF, as the workflow ships it. That is
+# deliberate: a room holding a request when the switch flips is exactly this
+# state, and the hold that finishes it must not consult the switch. The code
+# path is the same under `on`; the switch is read only before a NEW request.
 scenario "closed event (merged) rerun with the request on record → nothing sent, nobody re-mentioned"
 bind 4242 "$CH_A"
 summary_requested 4242 300
@@ -1593,7 +1613,7 @@ scenario "closed without merge, reopened, then merged → the request goes out o
 bind 4242 "$CH_A"
 run_step pull_request closed 4242; RC1=$?
 run_step pull_request reopened 4242; RC2=$?
-PR_MERGED_INPUT=true run_step pull_request closed 4242; RC3=$?
+POST_MERGE_SUMMARY_INPUT=on PR_MERGED_INPUT=true run_step pull_request closed 4242; RC3=$?
 check "all three runs should be green, got $RC1/$RC2/$RC3" "$([ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ] && [ "$RC3" -eq 0 ]; echo $?)"
 check "the first close should have archived" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
 check "the reopen should have unarchived" "$([ "$(count "UNARCHIVE $CH_A")" = 1 ]; echo $?)"
@@ -1612,7 +1632,7 @@ pr_read_at 4242 1 closed
 pr_read_at 4242 2 open
 pr_read_at 4242 3 closed true
 pr_read_at 4242 4 closed true
-run_step schedule; RC=$?
+POST_MERGE_SUMMARY_INPUT=on run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should notice the newer close" "$(said 'closed again while this sweep was restoring it'; echo $?)"
 check "the re-close should ask for the summary" "$([ "$(count MENTION)" = 1 ]; echo $?)"
@@ -1631,6 +1651,103 @@ bind 4242 "$CH_A"
 SUMMARY_GRACE_SECS_INPUT="7; rm -rf /" PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
 check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
 check "should say what is wrong" "$(said 'SUMMARY_GRACE_SECS must be a small integer'; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+
+echo
+# ===========================================================================
+# THE MERGED CLOSE, WITH THE SUMMARY REQUEST OFF — as this repo ships it.
+# A merged PR gets the close a not-merged one gets: one mention-free notice,
+# annotation, archive, marker. Nobody is asked, nothing is held. The switch
+# governs only whether a NEW request is made: a request already in the room
+# is honoured by the hold, because the p-tag is out and an archive now would
+# refuse the summary it asked for.
+scenario "closed event (merged), summary off, live room → notice, annotation, archive, and nobody asked"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should post exactly one notice into the room" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should name the merge and the archive" \
+  "$(send_body "$CH_A" | head -1 | grep -q '^✅ \*\*Merged\*\* — archiving this channel\.$'; echo $?)"
+check "the notice must not promise a summary the room will not wait for" \
+  "$(! send_body "$CH_A" | grep -qi 'summary'; echo $?)"
+check "the notice must carry no @name — it would become a p-tag" "$(! send_body "$CH_A" | grep -q '@'; echo $?)"
+check "must p-tag nobody" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should look for a request already in the room BEFORE the fence — the marker's absence proves nothing" \
+  "$([ -n "$(first_line "HISTORY_READ $CH_A")" ] && [ "$(first_line "HISTORY_READ $CH_A")" -lt "$(first_line "SEND $CH_A")" ]; echo $?)"
+check "should annotate the cross-channel references with the merge" \
+  "$([ "$(grep '^EDIT' "$LOG" | tail -1)" = 'EDIT ✅ **Merged**' ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should prove the archive by the relay's refusal" "$(said 'proved by the relay refusing'; echo $?)"
+check "the notice must precede the archive — it is the fence" \
+  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line "ARCHIVE $CH_A")" ]; echo $?)"
+check "should record the completed close, after the archive" \
+  "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG" && [ "$(first_line "ARCHIVE $CH_A")" -lt "$(first_line MARKER_WRITE)" ]; echo $?)"
+check "must not record a request" "$(! grep -q 'summary-requested' "$LOG"; echo $?)"
+check "should say the switch decided it" "$(said 'summary request is off'; echo $?)"
+check "an event run must not touch GitHub" "$([ "$(count PR_)" = 0 ]; echo $?)"
+
+scenario "sweep: merged, live room, nothing on record, summary off → archived now, nobody asked"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should post one notice" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should name the merge" "$(send_body "$CH_A" | head -1 | grep -q '^✅ \*\*Merged\*\* — archiving'; echo $?)"
+check "must p-tag nobody" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should record the completed close" "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
+check "should re-read GitHub after writing" "$([ "$(count "PR_READ 4242")" = 2 ]; echo $?)"
+check "should account for it as a close, not a request" \
+  "$(said '1 closed examined, 1 reconciled' && said '0 summaries requested, 0 awaiting a reply'; echo $?)"
+
+# The marker and the request are two writes, whatever the switch says. A
+# request already in the room is a p-tag already out; archiving over it would
+# refuse the summary it asked for.
+scenario "closed event (merged), summary off, but a request is already in the room → honoured, not archived over"
+bind 4242 "$CH_A"
+ci_said "$CH_A" 300 "@Alex please post a review summary here: what the review found, what was fixed, and anything left open."
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "must not p-tag the reviewer — he has been asked" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "must write nothing into the room" "$([ "$(count "SEND $CH_A")" = 0 ]; echo $?)"
+check "must not archive — the summary can only land while the room is live" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should repair the marker from the request's own timestamp" \
+  "$(grep -qE "^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:$((NOW - 300))\$" "$LOG"; echo $?)"
+check "should say what it found" "$(said 'already requested here'; echo $?)"
+check "should say it is inside the grace window" "$(said 'of the grace window left'; echo $?)"
+
+# The forced re-close inside the convergence loop, on a merge, with the
+# switch off: archived like any other close — not held for a summary nobody
+# will be asked for.
+scenario "sweep: a PR merged while the sweep was restoring its room, summary off → re-closed and archived"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+pr_read_at 4242 1 closed
+pr_read_at 4242 2 open
+pr_read_at 4242 3 closed true
+pr_read_at 4242 4 closed true
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should notice the newer close" "$(said 'closed again while this sweep was restoring it'; echo $?)"
+check "must p-tag nobody" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "the room must end archived: closed, restored, closed again" \
+  "$([ "$(count "ARCHIVE $CH_A")" = 2 ] && [ "$(count "UNARCHIVE $CH_A")" = 1 ] && [ "$(first_line "UNARCHIVE $CH_A")" -lt "$(nth_line "ARCHIVE $CH_A" 2)" ]; echo $?)"
+check "the cross-channel banner must end on the merge" \
+  "$([ "$(grep '^EDIT' "$LOG" | tail -1)" = 'EDIT ✅ **Merged**' ]; echo $?)"
+check "the record must end closed" \
+  "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = 'MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed' ]; echo $?)"
+check "the last read must follow the last write and agree with it" "$([ "$(count "PR_READ 4242")" = 4 ]; echo $?)"
+check "should account for both compensations" \
+  "$(said '1 restored after a concurrent reopen, 1 re-closed after a concurrent close, 0 failed'; echo $?)"
+
+scenario "a post-merge summary switch that is neither on nor off is refused before any write"
+bind 4242 "$CH_A"
+POST_MERGE_SUMMARY_INPUT=yes PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should say what is wrong" "$(said "POST_MERGE_SUMMARY must be 'on' or 'off'"; echo $?)"
 check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
 
 echo "$PASS assertions passed, $FAILED failed"

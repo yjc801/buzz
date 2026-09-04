@@ -38,6 +38,16 @@
 #   * a close inside the settle window, a PR reopened between the listing
 #     and the write, a fork head, and a close outside the window are all
 #     left alone;
+#   * a close whose PR has no room still annotates the references, posts the
+#     fallback notice, and records itself, once — the event arm and the sweep
+#     share that path, and the marker makes reruns silent;
+#   * an open PR whose close is on record — a reopen GitHub never announced,
+#     because pull_request activity is suppressed while the PR conflicts —
+#     gets the reopen epilogue from the sweep; one whose marker says its
+#     reopen completed, or that never had a close on record, is untouched;
+#   * an annotation write that fails ambiguously withholds the completion
+#     marker so the pass is retried, a definitive refusal does not, and a
+#     retry never posts a second reply under a reference CI already answered;
 #   * a binding read that FAILS (as opposed to proving absence) archives
 #     nothing, fails the sweep, and does not stop the sweep's other PRs;
 #   * an archive the relay accepted but never applied is red, not green.
@@ -67,6 +77,8 @@ if [ ! -f "$WORKFLOW" ]; then
   echo "run from the repository root" >&2
   exit 2
 fi
+
+SLUG="pr-mirror-${REPO//\//-}"   # the binding-note slug prefix for $REPO
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -143,6 +155,11 @@ export FIXTURES LOG CI_PUB
 cat > "$WORK/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
+  "api repos/"*"/pulls?state=open"*)
+    # The open listing the sweep's open side walks: pr_open.pN.json.
+    P=$(printf '%s' "$2" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p')
+    echo "PR_LIST page=${P:-1} $2" >> "$LOG"
+    if [ -f "$FIXTURES/pr_open.p${P:-1}.json" ]; then cat "$FIXTURES/pr_open.p${P:-1}.json"; else echo '[]'; fi ;;
   "api repos/"*"/pulls?state=closed"*)
     # The REST listing. It is ONE ordered list and a page is an offset slice
     # of it, exactly as on GitHub — so a page the sweep asks for twice can
@@ -244,7 +261,30 @@ case "$SUB" in
     # read in the same scenario sees what was written.
     case "$SLUG" in
       *-closed)
+        # The relay's NIP-33 tie-break, which shell call order cannot model:
+        # `notes set` stamps created_at in whole SECONDS and the loser of a
+        # same-second tie is rejected as dominated, exit 5. `marker.dominate`
+        # counts down how many writes lose that tie; a dominated write is NOT
+        # persisted, exactly as on the relay.
+        D=$(cat "$FIXTURES/marker.dominate" 2>/dev/null || echo 0)
+        if [ "$D" -gt 0 ]; then
+          printf '%s\n' "$((D - 1))" > "$FIXTURES/marker.dominate"
+          echo "MARKER_DOMINATED $SLUG $BODY" >> "$LOG"
+          echo '{"error":"conflict","message":"duplicate: dominated"}' >&2
+          exit 5
+        fi
+        F=$(cat "$FIXTURES/marker.fail" 2>/dev/null || echo 0)
+        if [ "$F" -gt 0 ]; then
+          printf '%s\n' "$((F - 1))" > "$FIXTURES/marker.fail"
+          echo "MARKER_REFUSED $SLUG $BODY" >> "$LOG"
+          echo '{"error":"internal","message":"relay unreachable"}' >&2
+          exit 2
+        fi
         echo "MARKER_WRITE $SLUG $BODY" >> "$LOG"
+        # The wall-clock second the write landed in, so a transition can be
+        # asserted to occupy two DISTINCT seconds — the property that keeps
+        # the second write from losing the tie-break above.
+        echo "MARKER_AT $(date -u +%s)" >> "$LOG"
         printf '%s\n' "$BODY" > "$FIXTURES/binding.$SLUG" ;;
       *) echo "BINDING_WRITE" >> "$LOG" ;;
     esac ;;
@@ -273,8 +313,19 @@ case "$SUB" in
     if [ -f "$FIXTURES/search_hits.json" ]; then cat "$FIXTURES/search_hits.json"; else echo '[]'; fi ;;
   "messages send")
     C=$(arg --channel "$@")
-    BODY=$(cat)
+    CONTENT=$(arg --content "$@")
+    if [ "$CONTENT" = "-" ]; then BODY=$(cat); else BODY="$CONTENT"; fi
+    PARENT=$(arg --reply-to "$@")
     refuse_if_archived "$C"
+    if [ -n "$PARENT" ]; then
+      echo "REPLY $PARENT" >> "$LOG"
+      # A reply that fails for no definitive reason — the relay blip the
+      # annotation pass must not launder into a completed close.
+      if [ -f "$FIXTURES/reply_fail" ]; then
+        echo '{"error":"relay_error","message":"relay error 502: upstream unavailable","retryable":true}' >&2
+        exit 2
+      fi
+    fi
     { echo "SEND $C"; printf '%s\n' "$BODY"; echo "--- end send ---"; } >> "$LOG" ;;
   "channels archive")
     C=$(arg --channel "$@")
@@ -291,10 +342,30 @@ case "$SUB" in
     echo "UNARCHIVE $C" >> "$LOG"
     rm -f "$FIXTURES/archived.$C" ;;
   "messages edit")
+    if [ -f "$FIXTURES/edit_fail" ]; then
+      echo '{"error":"relay_error","message":"relay error 502: upstream unavailable","retryable":true}' >&2
+      exit 2
+    fi
+    if [ -f "$FIXTURES/edit_refused_archived" ]; then
+      echo '{"error":"relay_error","message":"relay error 400: invalid: channel is archived","retryable":false}' >&2
+      exit 1
+    fi
     # The banner is the first line of the rewritten body — the durable state
     # a reader of another room actually sees.
     echo "EDIT $(arg --content "$@" | head -1)" >> "$LOG" ;;
-  "channels add-member"|"reactions add"|"reactions remove")
+  "reactions add")
+    echo "OTHER $SUB" >> "$LOG"
+    if [ -f "$FIXTURES/react_duplicate" ]; then
+      echo '{"error":"relay_error","message":"relay error 400: duplicate: reaction already exists","retryable":false}' >&2
+      exit 1
+    fi ;;
+  "reactions remove")
+    echo "OTHER $SUB" >> "$LOG"
+    # The relay's answer when there is nothing to remove — every first
+    # annotation of a reference hits this, and it must not count as failure.
+    echo '{"error":"error","message":"no reaction with emoji found for your pubkey","retryable":false}' >&2
+    exit 1 ;;
+  "channels add-member")
     echo "OTHER $SUB" >> "$LOG" ;;
   *) echo "stub buzz: unhandled: $SUB $*" >&2; exit 9 ;;
 esac
@@ -358,6 +429,36 @@ pr_reopened_after() { # pr_reopened_after <number> — the re-read AFTER the wri
 }
 pr_reread_broken() { # pr_reread_broken <number> — the post-write re-read fails
   printf '1\n' > "$FIXTURES/pr_$1.next.rc"
+}
+referenced_by_other() { # referenced_by_other <number> <channel> — someone
+  # else's mention of the PR in another room: a reaction and a threaded reply
+  # are the only annotations the bot can give it.
+  printf '[{"id":"e1","pubkey":"%s","content":"look at https://github.com/%s/pull/%s","tags":[["h","%s"]]}]\n' \
+    "$OWNER_PUB" "$REPO" "$1" "$2" > "$FIXTURES/search_hits.json"
+}
+referenced_by_other_and_answered() { # … plus CI's earlier threaded reply under it
+  printf '[{"id":"e1","pubkey":"%s","content":"look at https://github.com/%s/pull/%s","tags":[["h","%s"]]},{"id":"e2","pubkey":"%s","content":"🚫 **Closed without merge** — PR #%s\\nhttps://github.com/%s/pull/%s","tags":[["h","%s"],["e","e1","","root"],["e","e1","","reply"]]}]\n' \
+    "$OWNER_PUB" "$REPO" "$1" "$2" "$CI_PUB" "$1" "$REPO" "$1" "$2" > "$FIXTURES/search_hits.json"
+}
+open_listing() { # open_listing [listed-json...] → page 1 of the open listing
+  local OUT="[" FIRST=1 E
+  for E in "$@"; do
+    [ $FIRST -eq 1 ] || OUT="$OUT,"
+    FIRST=0
+    OUT="$OUT$E"
+  done
+  printf '%s]\n' "$OUT" > "$FIXTURES/pr_open.p1.json"
+}
+marker_is() { # marker_is <number> <token> — the close marker's current content
+  printf '%s\n' "$2" > "$FIXTURES/binding.${SLUG}-$1-closed"
+}
+marker_dominated() { # marker_dominated <n> — the next <n> marker writes lose the
+  # created_at tie-break to a concurrent writer (relay exit 5, not persisted)
+  printf '%s\n' "$1" > "$FIXTURES/marker.dominate"
+}
+marker_write_fails() { # marker_write_fails <n> — the next <n> marker writes fail
+  # for a reason that is NOT the tie-break
+  printf '%s\n' "$1" > "$FIXTURES/marker.fail"
 }
 referenced_from() { # referenced_from <number> <channel> — a CI-authored
   # mention of the PR in another room, carrying whatever banner was last
@@ -486,12 +587,74 @@ check "should reverse the banners" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
 check "the record must be invalidated before the banners are reversed" \
   "$([ "$(first_line MARKER_WRITE)" -lt "$(first_line SEARCH)" ]; echo $?)"
 
-scenario "closed event, no room and no fallback → the references still get their banner"
+scenario "closed event, no room and no fallback → the references still get their banner, once"
 run_step pull_request closed 4242; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should annotate" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
 check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
 check "should archive nothing" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should record the close so a rerun is silent" \
+  "$(grep -q "^MARKER_WRITE ${SLUG}-4242-closed closed\$" "$LOG"; echo $?)"
+run_step pull_request closed 4242; RC=$?
+check "a rerun should be green" "$([ "$RC" -eq 0 ]; echo $?)"
+check "a rerun should not re-annotate" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "a rerun should say the close is on record" "$(said 'this close is on record'; echo $?)"
+
+# ANNOTATION FAILURES STAY RETRY WORK. A reply that fails for no definitive
+# reason must not be laundered into a completed close by the marker.
+scenario "closed event, a reference reply that fails ambiguously → red, close not recorded, retry replies once"
+bind 4242 "$CH_A"
+referenced_by_other 4242 "$CH_B"
+touch "$FIXTURES/reply_fail"
+run_step pull_request closed 4242; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should have attempted the reply" "$([ "$(count "REPLY e1")" = 1 ]; echo $?)"
+check "should say the pass is retry work" "$(said 'failed ambiguously'; echo $?)"
+check "should not record the close" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
+check "should not archive a room whose references are not annotated" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+rm -f "$FIXTURES/reply_fail"
+run_step pull_request closed 4242; RC=$?
+check "the retry should be green" "$([ "$RC" -eq 0 ]; echo $?)"
+check "the retry should reply exactly once more" "$([ "$(count "REPLY e1")" = 2 ]; echo $?)"
+check "the retry should record the close" \
+  "$(grep -q "^MARKER_WRITE ${SLUG}-4242-closed closed\$" "$LOG"; echo $?)"
+
+scenario "closed event, definitive refusals in the annotation pass are not failures"
+bind 4242 "$CH_A"
+referenced_by_other 4242 "$CH_B"
+touch "$FIXTURES/react_duplicate"
+run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should say what was refused" "$(said 'refused definitively'; echo $?)"
+check "should record the close" "$(grep -q "^MARKER_WRITE ${SLUG}-4242-closed closed\$" "$LOG"; echo $?)"
+check "should still archive" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+
+scenario "closed event, an edit refused because that room is archived is not a failure either"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+touch "$FIXTURES/edit_refused_archived"
+run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should record the close" "$(grep -q "^MARKER_WRITE ${SLUG}-4242-closed closed\$" "$LOG"; echo $?)"
+
+scenario "closed event, an edit that fails ambiguously → red, close not recorded"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+touch "$FIXTURES/edit_fail"
+run_step pull_request closed 4242; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should not record the close" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
+
+# A retry, or a second close after a reopen, must not stack replies: a
+# reference CI already answered has its reply edited, not duplicated.
+scenario "closed event, a reference CI already replied under gets its reply edited, not a second one"
+bind 4242 "$CH_A"
+referenced_by_other_and_answered 4242 "$CH_B"
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not reply again" "$([ "$(count REPLY)" = 0 ]; echo $?)"
+check "should edit the existing reply to the new banner" "$(grep -q '^EDIT ✅ \*\*Merged\*\*$' "$LOG"; echo $?)"
+check "should still react on the reference" "$([ "$(count "OTHER reactions add")" = 1 ]; echo $?)"
 
 # ACCEPTED IS NOT APPLIED: `channels archive` exits 0 on storage. Only the
 # relay refusing a follow-up write proves the room is closed.
@@ -523,7 +686,7 @@ check "should record the completed close" \
   "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
 check "should walk the REST pulls listing by updated_at — the search index omits base-deleted closes" \
   "$(grep -q "^PR_LIST page=1 repos/$REPO/pulls?state=closed&sort=updated&direction=desc" "$LOG"; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 closed examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 closed without a room, 0 already closed without a room, 0 open examined, 0 restored after a suppressed reopen, 0 reopened without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
 
 scenario "sweep: a room already archived with the close on record → one refused send, nothing else"
 listing "$(listed 4242 7200 true)"
@@ -538,7 +701,7 @@ check "should not archive again" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 check "should not re-annotate" "$([ "$(count SEARCH)" = 0 ]; echo $?)"
 check "should not re-read the PR after a run that wrote nothing" \
   "$([ "$(count "PR_READ 4242")" = 1 ]; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 1 already archived'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 closed examined, 0 reconciled, 0 annotated outside an archived room, 1 already archived'; echo $?)"
 
 # The close run for a fresh close may be queued or still running; the sweep
 # leaves it alone until the settle window has passed.
@@ -550,7 +713,7 @@ run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should not even resolve the room" "$([ "$(count BINDING_READ)" = 0 ]; echo $?)"
 check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
-check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
+check "should examine nothing" "$(said 'sweep: 0 closed examined'; echo $?)"
 
 # The listing is a snapshot; the write is fenced on a fresh read.
 scenario "sweep: reopened between the listing and the write → untouched"
@@ -578,17 +741,148 @@ check "should not archive the PR it could not resolve" "$([ "$(count "ARCHIVE $C
 check "should not fall through to the membership scan on a broken read" "$([ "$(count BINDING_WRITE)" = 0 ]; echo $?)"
 check "should still reconcile the other PR" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
 check "should report the failure" "$(said 'room resolution failed'; echo $?)"
-check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 1 failed'; echo $?)"
+check "should account for both" "$(said 'sweep: 2 closed examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 closed without a room, 0 already closed without a room, 0 open examined, 0 restored after a suppressed reopen, 0 reopened without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 1 failed'; echo $?)"
 
 # No binding and no room of ours among this identity's channels: provably
-# none. The sweep neither creates one nor posts a fallback notice it could
-# not deduplicate.
-scenario "sweep: a PR without a room is left alone"
+# none. The close it never got still owes its references a banner, once —
+# the same no-room close the event arm performs, one-shot through the marker.
+scenario "sweep: a PR without a room gets the no-room close, once"
 listing "$(listed 4242 7200 false)"
+pr_record 4242 closed false
 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 1 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
+check "should annotate its references" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should create no room" "$([ "$(count SEND)" = 0 ] && [ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should record the close" "$(grep -q "^MARKER_WRITE ${SLUG}-4242-closed closed\$" "$LOG"; echo $?)"
+check "should account for it" "$(said 'sweep: 1 closed examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 1 closed without a room, 0 already closed without a room'; echo $?)"
+run_step schedule; RC=$?
+check "the next sweep should be green" "$([ "$RC" -eq 0 ]; echo $?)"
+check "the next sweep should not re-annotate" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "the next sweep should account for it as done" "$(said '0 closed without a room, 1 already closed without a room'; echo $?)"
+
+# THE OPEN SIDE. GitHub suppresses pull_request activity — `reopened`
+# included — while a PR has a merge conflict, so a PR the sweep archived and
+# that is reopened while still conflicting gets no reopened run, and the
+# closed listing never shows it again. The marker is what finds it.
+scenario "sweep: an open PR whose close is on record and whose room is archived → restored"
+open_listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+closed_on_record 4242
+touch "$FIXTURES/archived.$CH_A"
+pr_record 4242 open false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should list open PRs too" "$(grep -q "^PR_LIST page=1 repos/$REPO/pulls?state=open" "$LOG"; echo $?)"
+check "should re-read the PR at the write, and again after it" "$([ "$(count "PR_READ 4242")" = 2 ]; echo $?)"
+check "should unarchive the room" "$([ "$(count "UNARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should post the reopen notice" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "should reverse the banners" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should mark the reopen begun before touching the banners, and complete after" \
+  "$([ "$(grep '^MARKER_WRITE' "$LOG" | head -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopening" ] && [ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopened" ]; echo $?)"
+check "should say why it acted" "$(said 'GitHub scheduled no reopened run; restored'; echo $?)"
+check "should account for it" "$(said '1 open examined, 1 restored after a suppressed reopen, 0 reopened without a room'; echo $?)"
+
+scenario "sweep: a reopen that began and never finished is finished"
+open_listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+marker_is 4242 reopening
+pr_record 4242 open false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should reverse the banners" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should complete the reopen" "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopened" ]; echo $?)"
+
+scenario "sweep: an open PR with no close on record, or a completed reopen, is left alone"
+open_listing "$(listed 4242 7200 false)" "$(listed 4243 7200 false)"
+bind 4242 "$CH_A"
+bind 4243 "$CH_B"
+marker_is 4243 reopened
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should read the markers and nothing else" "$([ "$(count "PR_READ")" = 0 ] && [ "$(count SEND)" = 0 ] && [ "$(count UNARCHIVE)" = 0 ]; echo $?)"
+check "should account for them" "$(said '2 open examined, 0 restored after a suppressed reopen'; echo $?)"
+
+scenario "sweep: an open PR updated inside the settle window is left to its own run"
+open_listing "$(listed 4242 600 false)"
+bind 4242 "$CH_A"
+closed_on_record 4242
+touch "$FIXTURES/archived.$CH_A"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not even read its marker" "$([ "$(count BINDING_READ)" = 0 ]; echo $?)"
+check "should examine nothing" "$(said '0 open examined'; echo $?)"
+
+scenario "sweep: an open PR closed by us that has no room → banners back, no room created"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should reverse the banners" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should complete the reopen" "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopened" ]; echo $?)"
+check "should send nothing — there is no room, and the sweep creates none" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should account for it" "$(said '1 reopened without a room'; echo $?)"
+
+# THE MARKER'S OWN CREATED_AT. A transition is two writes to ONE
+# parameterized-replaceable coordinate, and `buzz notes set` stamps
+# created_at in whole seconds; on a tie the relay keeps the lower event id
+# and rejects the other. So a transition whose two writes share a second
+# loses its SECOND write — the run goes red with the marker stuck on the
+# retry state, and every later sweep redoes the reopen and posts another
+# notice. The roomless path is the fastest one there is: no room, and with
+# no search hits nothing between the two writes at all.
+scenario "sweep: a reopen's two marker writes land in distinct seconds, so the second cannot be dominated"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should write both states" "$([ "$(count MARKER_WRITE)" = 2 ]; echo $?)"
+check "the two writes must not share a created_at second" \
+  "$([ "$(grep '^MARKER_AT' "$LOG" | head -1)" != "$(grep '^MARKER_AT' "$LOG" | tail -1)" ]; echo $?)"
+
+scenario "sweep: a marker write dominated by a concurrent writer is retried, not left on the retry state"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+marker_dominated 1
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should have lost one write to the tie-break" "$([ "$(count MARKER_DOMINATED)" = 1 ]; echo $?)"
+check "should still end on the completed reopen" \
+  "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = "MARKER_WRITE ${SLUG}-4242-closed reopened" ]; echo $?)"
+check "should account for it" "$(said '1 reopened without a room'; echo $?)"
+
+scenario "sweep: a marker write that keeps losing the tie-break is red, not an endless retry"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+marker_dominated 9
+run_step schedule; RC=$?
+check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
+check "should stop at the attempt cap" "$([ "$(count MARKER_DOMINATED)" = 3 ]; echo $?)"
+check "should say why" "$(said 'lost its created_at tie-break'; echo $?)"
+
+scenario "sweep: a marker write that fails for any other reason is not retried"
+open_listing "$(listed 4242 7200 false)"
+closed_on_record 4242
+pr_record 4242 open false
+marker_write_fails 1
+run_step schedule; RC=$?
+check "expected rc 1, got $RC" "$([ "$RC" -eq 1 ]; echo $?)"
+check "should not retry an unexplained failure" "$([ "$(count MARKER_REFUSED)" = 1 ]; echo $?)"
+check "should leave the reopen unfinished" "$([ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
+
+scenario "sweep: an open-side candidate closed again since the listing is left to the closed side"
+open_listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+closed_on_record 4242
+touch "$FIXTURES/archived.$CH_A"
+pr_record 4242 closed false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should touch nothing" "$([ "$(count SEND)" = 0 ] && [ "$(count UNARCHIVE)" = 0 ] && [ "$(count MARKER_WRITE)" = 0 ]; echo $?)"
+check "should say so" "$(said 'closed again since the listing'; echo $?)"
 
 scenario "sweep: fork heads and closes outside the window are not candidates"
 listing "$(listed 4242 7200 false someone-else buzz)" "$(listed 4243 $((8 * 86400)) false)"
@@ -597,7 +891,7 @@ bind 4243 "$CH_B"
 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should not resolve either room" "$([ "$(count BINDING_READ)" = 0 ]; echo $?)"
-check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
+check "should examine nothing" "$(said 'sweep: 0 closed examined'; echo $?)"
 
 # The dispatch input widens the window for a one-off backfill.
 scenario "sweep: a wider window from the dispatch input reaches an older close"
@@ -608,32 +902,6 @@ SWEEP_DAYS_INPUT=30 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should reconcile the older close" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
 
-# The listing is paged until it passes the window's start; a candidate on a
-# later page is a candidate.
-scenario "sweep: a close on the second page of the listing is found"
-listing_page 1 "$(listed 4243 3600 true)"
-listing_page 2 "$(listed 4242 7200 false)"
-bind 4242 "$CH_A"
-pr_record 4242 closed false
-SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
-check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-# Page 3 is read twice: once by the walk, once by the prefix re-read.
-check "should fetch pages until a short one ends the listing" "$([ "$(count "PR_LIST page=3")" = 2 ]; echo $?)"
-check "should reconcile the second-page close" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
-check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled'; echo $?)"
-
-# Sorted by updated_at, and a close bumps updated_at: once a full page reaches
-# past the window's start, nothing on a later page can be a candidate.
-scenario "sweep: paging stops once a page reaches past the window's start"
-listing_page 1 "$(listed 4243 $((40 * 86400)) false yjc801 "${REPO#*/}" $((40 * 86400)))"
-listing_page 2 "$(listed 4242 7200 false)"
-bind 4242 "$CH_A"
-pr_record 4242 closed false
-SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
-check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should not fetch past the window" "$([ "$(count "PR_LIST")" = 2 ]; echo $?)"   # the page, and its re-read
-check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
-
 # A PAGE NUMBER IS AN OFFSET INTO A LIST THAT MOVES. `sort=updated` is a
 # mutable order and GitHub freezes nothing between two page requests: a PR
 # reopened while the walk is running leaves `state=closed`, and every record
@@ -642,7 +910,7 @@ check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
 # oldest-page check is still satisfied, so the sweep would report green over
 # exactly the live room it exists to archive.
 scenario "sweep: a listing that shifts mid-walk is re-enumerated, not silently skipped"
-listing_page 1 "$(listed 4241 3600 false someone-else buzz)"
+listing_page 1 "$(listed 4241 3600 false someone-else "${REPO#*/}")"
 listing_page 2 "$(listed 4242 7200 false)"
 listing_page 3 "$(listed 4243 $((40 * 86400)) false yjc801 "${REPO#*/}" $((40 * 86400)))"
 listing_drops 4241
@@ -652,7 +920,7 @@ SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should notice the shift at the page boundary" "$(said 'shifted under the walk'; echo $?)"
 check "should archive the close the shifted walk skipped" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
-check "should account for the settled walk only" "$(said 'sweep: 1 examined, 1 reconciled'; echo $?)"
+check "should account for the settled walk only" "$(said 'sweep: 1 closed examined, 1 reconciled'; echo $?)"
 
 # A BALANCED PAIR OF MOVEMENTS SHOWS AT NO SINGLE PAGE BOUNDARY. One record
 # leaving the front (reopened) while a later one moves up to the front
@@ -664,10 +932,10 @@ check "should account for the settled walk only" "$(said 'sweep: 1 examined, 1 r
 # missing from a green sweep. Only re-reading the WHOLE accepted prefix sees
 # it.
 scenario "sweep: a balanced shift behind the walk is caught by the prefix re-read"
-listing_page 1 "$(listed 4241 3600 false someone-else buzz)"
-listing_page 2 "$(listed 4243 3700 false someone-else buzz)"
-listing_page 3 "$(listed 4244 3800 false someone-else buzz)"
-listing_page 4 "$(listed 4246 3900 false someone-else buzz)"
+listing_page 1 "$(listed 4241 3600 false someone-else "${REPO#*/}")"
+listing_page 2 "$(listed 4243 3700 false someone-else "${REPO#*/}")"
+listing_page 3 "$(listed 4244 3800 false someone-else "${REPO#*/}")"
+listing_page 4 "$(listed 4246 3900 false someone-else "${REPO#*/}")"
 listing_page 5 "$(listed 4242 4000 false)"
 listing_balanced 4241 4242 4
 bind 4242 "$CH_A"
@@ -677,7 +945,7 @@ check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "no page boundary should see this shift" \
   "$(said 'no longer holds the records the walk read there'; echo $?)"
 check "should archive the close the balanced shift hid" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
-check "should account for the re-enumerated walk" "$(said 'sweep: 1 examined, 1 reconciled'; echo $?)"
+check "should account for the re-enumerated walk" "$(said 'sweep: 1 closed examined, 1 reconciled'; echo $?)"
 
 # Re-enumerating is bounded. A walk that may have skipped is not a walk to
 # archive from, so an unsettleable listing is red and left to the next sweep.
@@ -690,6 +958,33 @@ SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
 check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
 check "should say the window was not enumerated completely" "$(said 'not enumerated completely'; echo $?)"
 check "should archive nothing from a walk that may have skipped" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+
+# The listing is paged until it passes the window's start; a candidate on a
+# later page is a candidate.
+scenario "sweep: a close on the second page of the listing is found"
+listing_page 1 "$(listed 4243 3600 true)"
+listing_page 2 "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+pr_record 4243 closed true
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+# Page 3 is read twice: once by the walk, once by the prefix re-read.
+check "should fetch pages until a short one ends the listing" "$([ "$(count "PR_LIST page=3")" = 2 ]; echo $?)"
+check "should reconcile the second-page close" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should account for both" "$(said 'sweep: 2 closed examined, 1 reconciled'; echo $?)"
+
+# Sorted by updated_at, and a close bumps updated_at: once a full page reaches
+# past the window's start, nothing on a later page can be a candidate.
+scenario "sweep: paging stops once a page reaches past the window's start"
+listing_page 1 "$(listed 4243 $((40 * 86400)) false yjc801 "${REPO#*/}" $((40 * 86400)))"
+listing_page 2 "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not fetch past the window" "$([ "$(count "PR_LIST page=[0-9]* repos/$REPO/pulls?state=closed")" = 2 ]; echo $?)"   # the page, and its re-read
+check "should examine nothing" "$(said 'sweep: 0 closed examined'; echo $?)"
 
 # THE PRE-WRITE RE-READ IS A SNAPSHOT, NOT A FENCE. Sweep and event runs are
 # in different concurrency groups, and no later sweep would ever revisit an

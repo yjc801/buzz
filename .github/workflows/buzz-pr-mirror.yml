@@ -41,9 +41,29 @@ name: buzz-pr-mirror
 # membership listing anyway, and the snapshot can lag the archive). The settle
 # window keeps the sweep off a PR whose own close run may still be queued or
 # running; if the two do meet, the later one's notice is refused and it exits
-# clean. The sweep never creates a room and never posts a fallback notice (it
-# has no durable record that one went out, so it would repeat every half
-# hour).
+# clean. The sweep never creates a room. A close whose PR has no room — one
+# that predates the mirror, or whose `opened` run never got as far as a room —
+# still gets the no-room close the event arm performs (references annotated,
+# the one-line fallback notice), made one-shot by the close marker below.
+#
+# THE OPEN SIDE IS SWEPT TOO. GitHub suppresses `pull_request` activity —
+# `reopened` included — while a PR has a merge conflict, so a PR whose room
+# this workflow closed and which is then reopened while still conflicting
+# gets no `reopened` run, and the closed listing never shows it again. Every
+# open same-repo PR whose close marker still reads `closed` (or `reopening`,
+# a reopen that began and did not finish) is put through the reopen epilogue
+# by the sweep. The marker is what makes that read cheap and exact: one note
+# per open PR, and nothing written unless it says so.
+#
+# ANNOTATION FAILURES STAY RETRY WORK. Every cross-channel edit, reaction and
+# reply is classified. A refusal no retry can change — a write into an
+# archived room, un-reacting a reaction that was never there, re-adding one
+# that is — is definitive and logged. Anything else fails the pass, the
+# completion marker is withheld, and the rerun or the next sweep does the pass
+# again. That retry is safe because the pass is idempotent: banners are
+# replaced, reactions set, and a reply is posted only under a reference that
+# has no CI reply among the hits yet (an existing one is edited like any
+# other CI-authored hit).
 #
 # THAT REFUSAL PROVES THE ROOM IS ARCHIVED, NOT THAT ITS CLOSE RAN. A room
 # archived by hand while its PR was open refuses the notice exactly the same
@@ -544,10 +564,29 @@ jobs:
           }
 
           # The only marker content that means "this PR's close epilogue
-          # completed". A reopen overwrites it with something else rather
-          # than deleting it, so "present but not this" and "absent" are one
-          # case to every reader.
+          # completed". A reopen overwrites it rather than deleting it —
+          # `reopening` the moment it begins (so a concurrent close does its
+          # work instead of taking the silent path) and `reopened` once its
+          # banners are down — so "present but not `closed`" and "absent" are
+          # one case to the close, and `reopening` is unfinished work to the
+          # sweep's open side.
           CLOSE_MARKER_DONE=closed
+          CLOSE_MARKER_REOPENING=reopening
+          CLOSE_MARKER_REOPENED=reopened
+          # `buzz notes set` stamps created_at in whole Unix SECONDS, and on a
+          # tie the relay keeps the LOWER event id and rejects the other as
+          # dominated (crates/buzz-db/src/store/replaceable.rs), which the CLI
+          # surfaces as `duplicate:` and exit 5. Every marker TRANSITION is two
+          # writes from one run a fraction of a second apart — `reopening` then
+          # `reopened` — so without a fence the second write loses the
+          # tie-break about half the time: the run goes red with the durable
+          # marker stuck at the retry state, and every later sweep redoes the
+          # reopen and posts another notice. This records the second in which
+          # this run last wrote the marker so the next write can wait it out.
+          CLOSE_MARKER_LAST_WRITE_SECOND=""
+          # A marker write that keeps losing the tie-break to some other run
+          # is left unfinished rather than retried forever.
+          MARKER_WRITE_ATTEMPTS=3
 
           read_close_marker() {
             # Prints the marker's content, or nothing when it is PROVABLY
@@ -570,13 +609,57 @@ jobs:
             return 1
           }
 
+          fence_marker_second() {
+            # Block until the wall clock leaves the second this run last wrote
+            # the close marker in, so the next write's created_at is strictly
+            # later than the one it supersedes. A no-op for a run's first
+            # write, and for any write far enough behind the previous one.
+            local NOW
+            while :; do
+              NOW=$(date -u +%s) || return 1
+              [ "$NOW" = "$CLOSE_MARKER_LAST_WRITE_SECOND" ] || return 0
+              sleep 1
+            done
+          }
+
           write_close_marker() {
             # $1 is the state token — CLOSE_MARKER_DONE, or anything else to
             # invalidate. Output is redirected because callers may run inside
             # a command substitution capturing something else.
-            printf '%s\n' "$1" | buzz notes set --name "$CLOSE_MARKER_SLUG" \
-              --title "PR mirror close marker: ${GITHUB_REPOSITORY}#${PR_NUMBER}" \
-              --tag pr-mirror --content - >/dev/null
+            #
+            # Fenced onto a second this run has not already written in (see
+            # CLOSE_MARKER_LAST_WRITE_SECOND). The second is recorded AFTER
+            # the CLI returns, so it is never EARLIER than the created_at the
+            # CLI actually stamped — a slow call widens the fence rather than
+            # escaping it.
+            #
+            # The fence cannot see a CONCURRENT run writing this same marker
+            # in the same second. Exit 5 is exactly that outcome and only that
+            # one (`duplicate:` / dominated), so it is retried on the next
+            # second; every other exit is a real failure and is not retried,
+            # because a marker write that failed for an unknown reason is
+            # unfinished work, which is the safe reading of every state
+            # written here.
+            local ATTEMPT=0 STATUS
+            while :; do
+              fence_marker_second || return 1
+              STATUS=0
+              printf '%s\n' "$1" | buzz notes set --name "$CLOSE_MARKER_SLUG" \
+                --title "PR mirror close marker: ${GITHUB_REPOSITORY}#${PR_NUMBER}" \
+                --tag pr-mirror --content - >/dev/null || STATUS=$?
+              CLOSE_MARKER_LAST_WRITE_SECOND=$(date -u +%s) || return 1
+              [ "$STATUS" -eq 0 ] && return 0
+              if [ "$STATUS" -ne 5 ]; then
+                echo "close-marker write of '$1' failed (exit $STATUS)" >&2
+                return 1
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+              if [ "$ATTEMPT" -ge "$MARKER_WRITE_ATTEMPTS" ]; then
+                echo "close-marker write of '$1' lost its created_at tie-break ${ATTEMPT}x running — giving up" >&2
+                return 1
+              fi
+              echo "close-marker write of '$1' was dominated by a same-second write — retrying on the next second" >&2
+            done
           }
 
           channel_roster() {
@@ -1121,13 +1204,55 @@ jobs:
           # replaces the previous state instead of stacking on top of it.
           BANNER_RE='^(✅|🚫|♻️) '
 
+          annotation_definitive() {
+            # A refusal no retry can change, so it must not withhold the
+            # completion marker: a write into an archived room (its own seed
+            # card and close notice are refused until a reopen unarchives it,
+            # and a reopen re-annotates), un-reacting a reaction that was never
+            # there, re-adding one that is. Everything else is ambiguous.
+            case "$1" in
+              *"channel is archived"*|*"no reaction with emoji"*|*"reaction already exists"*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          annotate_write() {
+            # annotate_write <what> <command...>: one write of the annotation
+            # pass. Success and definitive refusals are fine; an ambiguous
+            # failure — a transport blip, a relay error — is counted, and the
+            # pass as a whole then fails so the caller withholds its
+            # completion marker and the rerun or the next sweep repeats the
+            # pass. Never aborts the pass: the remaining references still
+            # get their banner this run.
+            local WHAT="$1"
+            shift
+            if "$@" >/dev/null 2>"$ERRFILE"; then
+              return 0
+            fi
+            if annotation_definitive "$(cat "$ERRFILE")"; then
+              echo "${WHAT}: refused definitively — $(tr -d '\n' < "$ERRFILE")" >&2
+              return 0
+            fi
+            echo "${WHAT}: failed — $(tr -d '\n' < "$ERRFILE")" >&2
+            ANNOTATE_FAILED=$((ANNOTATE_FAILED + 1))
+            return 0
+          }
+
           annotate_references() {
             # $1    banner line ("" strips any existing banner and adds none)
             # $2    emoji to react with on other authors' messages ("" for none)
             # $3... emoji to un-react first (may be empty)
-            local BANNER="$1" ADD_EMOJI="$2" HITS
+            # Returns non-zero when the search failed or any write failed
+            # ambiguously — see annotate_write. IDEMPOTENT, which is what
+            # makes that retry safe: banners are replaced (BANNER_RE), not
+            # stacked; reactions are set, not counted; and a reply goes only
+            # under a reference that has no CI reply among the hits — an
+            # existing CI reply carries the PR URL, so it is a hit of its own
+            # and gets the new banner by edit.
+            local BANNER="$1" ADD_EMOJI="$2" HITS HITS_FILE REPLIED HIT MID MAUTHOR MCH BODY NEW E
             shift 2
             local DROP_EMOJI=("$@")
+            ANNOTATE_FAILED=0
             # A failed search fails the job rather than reading as "nothing to
             # annotate": a silent skip leaves every cross-channel reference
             # stuck on the previous state with nothing to correct it.
@@ -1135,38 +1260,52 @@ jobs:
               echo "reference search failed — failing so the rerun re-annotates" >&2
               return 1
             }
-            printf '%s' "$HITS" \
-              | jq -c '(.messages? // .)[]?' \
-              | while read -r HIT; do
-                  MID=$(printf '%s' "$HIT" | jq -r '.id // empty')
-                  [ -z "$MID" ] && continue
-                  printf '%s' "$HIT" | jq -e --arg p "$PR_PATH" \
-                    '.content | contains($p)' >/dev/null || continue
-                  MAUTHOR=$(printf '%s' "$HIT" | jq -r '.pubkey // empty')
-                  MCH=$(printf '%s' "$HIT" | jq -r \
-                    '[.tags[]? | select(.[0]=="h" or .[0]=="channel") | .[1]][0] // empty')
-                  if [ "$MAUTHOR" = "$CI_PUB" ]; then
-                    BODY=$(printf '%s' "$HIT" | jq -r '.content' \
-                      | grep -vE "$BANNER_RE" | sed '/./,$!d' || true)
-                    if [ -n "$BANNER" ]; then
-                      NEW=$(printf '%s\n\n%s' "$BANNER" "$BODY")
-                    else
-                      NEW="$BODY"
-                    fi
-                    buzz messages edit --event "$MID" --content "$NEW" || true
-                  else
-                    for E in "${DROP_EMOJI[@]}"; do
-                      buzz reactions remove --event "$MID" --emoji "$E" || true
-                    done
-                    if [ -n "$ADD_EMOJI" ]; then
-                      buzz reactions add --event "$MID" --emoji "$ADD_EMOJI" || true
-                    fi
-                    if [ -n "$MCH" ] && [ -n "$BANNER" ]; then
-                      printf '%s — PR #%s\n%s\n' "$BANNER" "$PR_NUMBER" "$PR_URL" \
-                        | buzz messages send --channel "$MCH" --content - --reply-to "$MID" || true
-                    fi
-                  fi
+            HITS_FILE=$(mktemp)
+            printf '%s' "$HITS" | jq -c '(.messages? // .)[]?' > "$HITS_FILE" || return 1
+            # Every event a CI-authored hit replies to (its `e` tags — the
+            # parent, and the thread root). Bounded by the same 100-hit window
+            # as the pass itself.
+            REPLIED=$(printf '%s' "$HITS" | jq -r --arg ci "$CI_PUB" \
+              '[(.messages? // .)[]? | select(.pubkey == $ci) | (.tags // [])[]? | select(.[0] == "e") | .[1]] | .[]') || return 1
+            # Not a pipeline: the failure count has to survive the loop.
+            while read -r HIT; do
+              MID=$(printf '%s' "$HIT" | jq -r '.id // empty')
+              [ -z "$MID" ] && continue
+              printf '%s' "$HIT" | jq -e --arg p "$PR_PATH" \
+                '.content | contains($p)' >/dev/null || continue
+              MAUTHOR=$(printf '%s' "$HIT" | jq -r '.pubkey // empty')
+              MCH=$(printf '%s' "$HIT" | jq -r \
+                '[.tags[]? | select(.[0]=="h" or .[0]=="channel") | .[1]][0] // empty')
+              if [ "$MAUTHOR" = "$CI_PUB" ]; then
+                BODY=$(printf '%s' "$HIT" | jq -r '.content' \
+                  | grep -vE "$BANNER_RE" | sed '/./,$!d' || true)
+                if [ -n "$BANNER" ]; then
+                  NEW=$(printf '%s\n\n%s' "$BANNER" "$BODY")
+                else
+                  NEW="$BODY"
+                fi
+                annotate_write "edit of ${MID}" buzz messages edit --event "$MID" --content "$NEW"
+              else
+                for E in "${DROP_EMOJI[@]}"; do
+                  annotate_write "un-react ${E} on ${MID}" buzz reactions remove --event "$MID" --emoji "$E"
                 done
+                if [ -n "$ADD_EMOJI" ]; then
+                  annotate_write "react ${ADD_EMOJI} on ${MID}" buzz reactions add --event "$MID" --emoji "$ADD_EMOJI"
+                fi
+                if [ -n "$MCH" ] && [ -n "$BANNER" ]; then
+                  if printf '%s\n' "$REPLIED" | grep -qxF "$MID"; then
+                    : # CI already replied under this reference; that reply is a hit of its own
+                  else
+                    annotate_write "reply under ${MID}" buzz messages send --channel "$MCH" --reply-to "$MID" \
+                      --content "$(printf '%s — PR #%s\n%s\n' "$BANNER" "$PR_NUMBER" "$PR_URL")"
+                  fi
+                fi
+              fi
+            done < "$HITS_FILE"
+            if [ "$ANNOTATE_FAILED" -gt 0 ]; then
+              echo "${ANNOTATE_FAILED} annotation write(s) failed ambiguously — withholding completion so the rerun or the next sweep repeats the pass" >&2
+              return 1
+            fi
           }
 
           set_close_status() {
@@ -1262,6 +1401,37 @@ jobs:
             CLOSE_OUTCOME=reconciled
           }
 
+          roomless_close_epilogue() {
+            # The close for a PR that has no room — one that predates the
+            # mirror, or whose `opened` run never got as far as a room. Its
+            # cross-channel references still get their banner, a pre-feature
+            # PR gets its one-line notice in the fallback room, and the close
+            # marker makes the whole thing one-shot: a rerun of the event, or
+            # every later sweep, is silent. Sets CLOSE_OUTCOME "roomless" when
+            # this call did the work, "archived" when the close was already on
+            # record. The notice and the marker are two writes, so a run that
+            # dies between them repeats the notice once; the marker is written
+            # LAST on purpose — written first, a failed pass would be a
+            # permanent silence.
+            local MARKER
+            CLOSE_OUTCOME=""
+            MARKER=$(read_close_marker) || return 1
+            if [ "$MARKER" = "$CLOSE_MARKER_DONE" ]; then
+              echo "no #${NAME} room, and this close is on record — nothing left to do"
+              CLOSE_OUTCOME=archived
+              return 0
+            fi
+            annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
+            if [ -n "$FALLBACK_CHANNEL" ]; then
+              printf '%s — PR #%s: %s\n%s\n' "$STATUS" "$PR_NUMBER" "$PR_TITLE" "$PR_URL" \
+                | buzz messages send --channel "$FALLBACK_CHANNEL" --content - || return 1
+            else
+              echo "no #${NAME} room and no fallback room configured — references annotated, nothing to archive"
+            fi
+            write_close_marker "$CLOSE_MARKER_DONE" || return 1
+            CLOSE_OUTCOME=roomless
+          }
+
           reopen_epilogue() {
             # The whole reopen for a PR whose room is known — $1 is its UUID.
             # Shared by the `reopened` event and by the sweep's post-write
@@ -1270,8 +1440,10 @@ jobs:
             local CH="$1"
             # Invalidated FIRST: while this marker still reads "closed" a
             # later close would take the silent path on an archived room and
-            # skip the annotations this reopen is about to reverse.
-            write_close_marker reopened || return 1
+            # skip the annotations this reopen is about to reverse. It reads
+            # `reopening` until the banners are down — an unfinished reopen
+            # is retry work for the sweep's open side, not a completed one.
+            write_close_marker "$CLOSE_MARKER_REOPENING" || return 1
             # Restoration is driven by write outcomes, not the discovery
             # snapshot (the reaper commits archived_at before its discovery
             # emission, so snapshots can be stale). Unarchive is
@@ -1300,6 +1472,8 @@ jobs:
             # Runs after the unarchive fence so writes into this channel are
             # accepted.
             annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" || return 1
+            # LAST: the reopen is complete only once every reference says so.
+            write_close_marker "$CLOSE_MARKER_REOPENED" || return 1
           }
 
           hydrate_pr() {
@@ -1410,9 +1584,9 @@ jobs:
             done
           }
 
-          list_closed_page() { # list_closed_page <page> → one REST page of closed PRs
-            gh api "repos/${GITHUB_REPOSITORY}/pulls?state=closed&sort=updated&direction=desc&per_page=${SWEEP_PAGE_SIZE}&page=${1}" || {
-              echo "closed-PR listing failed on page ${1} — failing so the next sweep retries" >&2
+          list_page() { # list_page <state> <page> → one REST page of PRs in <state>
+            gh api "repos/${GITHUB_REPOSITORY}/pulls?state=${1}&sort=updated&direction=desc&per_page=${SWEEP_PAGE_SIZE}&page=${2}" || {
+              echo "${1}-PR listing failed on page ${2} — failing so the next sweep retries" >&2
               return 1
             }
           }
@@ -1421,6 +1595,113 @@ jobs:
           # PR numbers on a page: two reads of one page agree on this exactly
           # when nothing entered or left the listing ahead of it.
           page_offsets() { printf '%s' "$1" | jq -c '[.[] | .number]'; }
+
+          # A listing that will not hold still for this many whole walks is
+          # left to the next sweep rather than archived from.
+          SWEEP_LIST_ATTEMPTS=3
+
+          page_pulls() {
+            # page_pulls <state> <window-start-unix-time|"">: pages the REST
+            # pulls listing for <state>, sorted by updated_at descending, into
+            # PAGES (one JSON array per line) until a short page ends the
+            # listing or, given a window start, a full page reaches past it —
+            # complete for closes, because a close bumps updated_at. Reaching
+            # SWEEP_LIST_LIMIT first is an incompletely enumerated listing and
+            # a failure, never a partial result.
+            #
+            # AND EACH PAGE BOUNDARY IS VERIFIED, because a page number is an
+            # offset into a list that moves. `sort=updated` orders by a
+            # mutable field and GitHub hands out no frozen listing: every page
+            # is an independent offset slice of whatever the list holds at the
+            # moment it is asked for. Between two of these requests a PR can
+            # be updated (it moves toward the front) or change state (it
+            # leaves this listing altogether), and every record after it lands
+            # at a different offset. Shifted back, the next page merely repeats
+            # records already read — harmless. Shifted forward, the next page
+            # begins PAST one record, dropping it from the walk with the
+            # oldest-page check below still satisfied and the sweep still
+            # green: the same silent miss this whole change is undoing, on the
+            # same rooms.
+            # So a walk is trusted only if the offsets it was taken at still
+            # hold — and that takes two checks, because they fail on different
+            # movements. Each page's predecessor is re-read at the boundary,
+            # which catches a shift that has already reverted by the end of
+            # the walk. But a BALANCED pair of movements — one record leaving
+            # the front while a later one moves up to the front — leaves every
+            # offset between them untouched, so no boundary sees anything at
+            # all while the record that moved up is skipped from a stretch the
+            # walk has already passed. So the WHOLE accepted prefix is re-read
+            # once the walk ends, page 1 upward, before a single candidate is
+            # processed: every page still holding the records the walk read at
+            # that offset. A walk whose offsets moved is enumerated again from
+            # page 1. One that will not hold still for a whole walk is red,
+            # not green — nothing is archived from a walk that may have
+            # skipped, and the next sweep tries again. The residual is a shift
+            # that reverts before the re-read that would have caught it; that
+            # costs one sweep interval, not the window.
+            local STATE="$1" BOUNDARY="$2" ATTEMPT=0 PAGE FETCHED CHUNK N PAGE_OLDEST
+            local MOVED PREV_OFFSETS RECHECK PREFIX RE_PAGE WALKED
+            PAGES=$(mktemp)
+            PREFIX=$(mktemp)
+            while :; do
+              ATTEMPT=$((ATTEMPT + 1))
+              : > "$PAGES"
+              : > "$PREFIX"
+              PAGE=1
+              FETCHED=0
+              MOVED=""
+              PREV_OFFSETS=""
+              while :; do
+                CHUNK=$(list_page "$STATE" "$PAGE") || return 1
+                if [ "$PAGE" -gt 1 ]; then
+                  RECHECK=$(list_page "$STATE" "$((PAGE - 1))") || return 1
+                  RECHECK=$(page_offsets "$RECHECK") || return 1
+                  if [ "$RECHECK" != "$PREV_OFFSETS" ]; then
+                    MOVED="the ${STATE}-PR listing shifted under the walk: page $((PAGE - 1)) no longer holds the records page ${PAGE} was read after"
+                    break
+                  fi
+                fi
+                N=$(printf '%s' "$CHUNK" | jq 'length') || return 1
+                printf '%s\n' "$CHUNK" >> "$PAGES"
+                page_offsets "$CHUNK" >> "$PREFIX" || return 1
+                FETCHED=$((FETCHED + N))
+                if [ "$N" -lt "$SWEEP_PAGE_SIZE" ]; then
+                  break   # a short page is the end of the listing
+                fi
+                if [ -n "$BOUNDARY" ]; then
+                  PAGE_OLDEST=$(printf '%s' "$CHUNK" \
+                    | jq '[.[] | .updated_at | fromdateiso8601] | min') || return 1
+                  if [ "$PAGE_OLDEST" -lt "$BOUNDARY" ]; then
+                    break   # past the window's start: everything after is older still
+                  fi
+                fi
+                if [ "$FETCHED" -ge "$SWEEP_LIST_LIMIT" ]; then
+                  echo "${STATE}-PR listing reached its ${SWEEP_LIST_LIMIT}-result cap${BOUNDARY:+ before reaching the start of the ${SWEEP_DAYS}-day window}" >&2
+                  echo "— the listing was not enumerated completely; re-run with a narrower sweep_days" >&2
+                  return 1
+                fi
+                PREV_OFFSETS=$(page_offsets "$CHUNK") || return 1
+                PAGE=$((PAGE + 1))
+              done
+              if [ -z "$MOVED" ]; then
+                RE_PAGE=0
+                while IFS= read -r WALKED; do
+                  RE_PAGE=$((RE_PAGE + 1))
+                  RECHECK=$(list_page "$STATE" "$RE_PAGE") || return 1
+                  RECHECK=$(page_offsets "$RECHECK") || return 1
+                  [ "$RECHECK" = "$WALKED" ] && continue
+                  MOVED="the ${STATE}-PR listing shifted under the walk: page ${RE_PAGE} no longer holds the records the walk read there"
+                  break
+                done < "$PREFIX"
+              fi
+              [ -n "$MOVED" ] || break
+              echo "${MOVED} — enumerating it again" >&2
+              if [ "$ATTEMPT" -ge "$SWEEP_LIST_ATTEMPTS" ]; then
+                echo "the ${STATE}-PR listing moved under all ${SWEEP_LIST_ATTEMPTS} enumerations; it was not enumerated completely — leaving it to the next sweep" >&2
+                return 1
+              fi
+            done
+          }
 
           sweep_missed_closes() {
             # Reconcile closes GitHub never announced — see the header. Every
@@ -1437,11 +1718,9 @@ jobs:
             # One PR's failure fails the sweep but not its siblings: each is
             # independent, the cron retries, and a red run is the honest
             # outcome for a room this identity could not resolve or close.
-            local NOW OLDEST NEWEST CANDIDATES NUM CLOSED_AT PR_JSON
-            local PAGES PAGE FETCHED CHUNK N PAGE_OLDEST
-            local ATTEMPT MOVED PREV_OFFSETS RECHECK PREFIX RE_PAGE WALKED
-            local SWEEP_LIST_ATTEMPTS=3
-            local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 RECLOSED=0 FAILED=0
+            local NOW OLDEST NEWEST CANDIDATES OPEN_CANDIDATES NUM CLOSED_AT UPDATED_AT PR_JSON PAGES MARKER
+            local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM_CLOSED=0 NOROOM_DONE=0
+            local OPEN_EXAMINED=0 REOPENED=0 REOPENED_ROOMLESS=0 RESTORED=0 RECLOSED=0 FAILED=0
             local LIFECYCLE_WRITTEN=""
             printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
               echo "SWEEP_DAYS must be a small integer, got '${SWEEP_DAYS}'" >&2
@@ -1502,95 +1781,7 @@ jobs:
             # window. Fork heads never got a room (the job condition skips
             # them) and are not candidates; nor is a head whose repository
             # is gone.
-            # AND EACH PAGE BOUNDARY IS VERIFIED, because a page number is an
-            # offset into a list that moves. `sort=updated` orders by a
-            # mutable field and GitHub hands out no frozen listing: every page
-            # is an independent offset slice of whatever the list holds at the
-            # moment it is asked for. Between two of these requests a PR can
-            # be updated (it moves toward the front) or reopened (it leaves
-            # `state=closed` altogether), and every record after it lands at a
-            # different offset. Shifted back, the next page merely repeats
-            # records already read — harmless. Shifted forward, the next page
-            # begins PAST one record, dropping it from the walk with the
-            # oldest-page check below still satisfied and the sweep still
-            # green: the same silent miss this whole change is undoing, on the
-            # same rooms.
-            # So a walk is trusted only if the offsets it was taken at still
-            # hold — and that takes two checks, because they fail on different
-            # movements. Each page's predecessor is re-read at the boundary,
-            # which catches a shift that has already reverted by the end of
-            # the walk. But a BALANCED pair of movements — one record leaving
-            # the front while a later one moves up to the front — leaves every
-            # offset between them untouched, so no boundary sees anything at
-            # all while the record that moved up is skipped from a stretch the
-            # walk has already passed. So the WHOLE accepted prefix is re-read
-            # once the walk ends, page 1 upward, before a single candidate is
-            # processed: every page still holding the records the walk read at
-            # that offset. A walk whose offsets moved is enumerated again from
-            # page 1. One that will not hold still for a whole walk is red,
-            # not green — nothing is archived from a walk that may have
-            # skipped, and the next sweep tries again. The residual is a shift
-            # that reverts before the re-read that would have caught it; that
-            # costs one sweep interval, not the window.
-            PAGES=$(mktemp)
-            PREFIX=$(mktemp)
-            ATTEMPT=0
-            while :; do
-              ATTEMPT=$((ATTEMPT + 1))
-              : > "$PAGES"
-              : > "$PREFIX"
-              PAGE=1
-              FETCHED=0
-              MOVED=""
-              PREV_OFFSETS=""
-              while :; do
-                CHUNK=$(list_closed_page "$PAGE") || return 1
-                if [ "$PAGE" -gt 1 ]; then
-                  RECHECK=$(list_closed_page "$((PAGE - 1))") || return 1
-                  RECHECK=$(page_offsets "$RECHECK") || return 1
-                  if [ "$RECHECK" != "$PREV_OFFSETS" ]; then
-                    MOVED="the closed-PR listing shifted under the walk: page $((PAGE - 1)) no longer holds the records page ${PAGE} was read after"
-                    break
-                  fi
-                fi
-                N=$(printf '%s' "$CHUNK" | jq 'length') || return 1
-                printf '%s\n' "$CHUNK" >> "$PAGES"
-                page_offsets "$CHUNK" >> "$PREFIX" || return 1
-                FETCHED=$((FETCHED + N))
-                if [ "$N" -lt "$SWEEP_PAGE_SIZE" ]; then
-                  break   # a short page is the end of the listing
-                fi
-                PAGE_OLDEST=$(printf '%s' "$CHUNK" \
-                  | jq '[.[] | .updated_at | fromdateiso8601] | min') || return 1
-                if [ "$PAGE_OLDEST" -lt "$OLDEST" ]; then
-                  break   # past the window's start: everything after is older still
-                fi
-                if [ "$FETCHED" -ge "$SWEEP_LIST_LIMIT" ]; then
-                  echo "closed-PR listing reached its ${SWEEP_LIST_LIMIT}-result cap without passing the ${SWEEP_DAYS}-day window's start" >&2
-                  echo "— the window was not enumerated completely; re-run with a narrower sweep_days" >&2
-                  return 1
-                fi
-                PREV_OFFSETS=$(page_offsets "$CHUNK") || return 1
-                PAGE=$((PAGE + 1))
-              done
-              if [ -z "$MOVED" ]; then
-                RE_PAGE=0
-                while IFS= read -r WALKED; do
-                  RE_PAGE=$((RE_PAGE + 1))
-                  RECHECK=$(list_closed_page "$RE_PAGE") || return 1
-                  RECHECK=$(page_offsets "$RECHECK") || return 1
-                  [ "$RECHECK" = "$WALKED" ] && continue
-                  MOVED="the closed-PR listing shifted under the walk: page ${RE_PAGE} no longer holds the records the walk read there"
-                  break
-                done < "$PREFIX"
-              fi
-              [ -n "$MOVED" ] || break
-              echo "${MOVED} — enumerating it again" >&2
-              if [ "$ATTEMPT" -ge "$SWEEP_LIST_ATTEMPTS" ]; then
-                echo "the closed-PR listing moved under all ${SWEEP_LIST_ATTEMPTS} enumerations; the window was not enumerated completely — leaving it to the next sweep" >&2
-                return 1
-              fi
-            done
+            page_pulls closed "$OLDEST" || return 1
             CANDIDATES=$(mktemp)
             jq -s -r \
               --arg owner "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" \
@@ -1614,11 +1805,6 @@ jobs:
                 echo "#${NUM}: room resolution failed" >&2
                 FAILED=$((FAILED + 1)); continue
               fi
-              if [ -z "$CH" ]; then
-                # A PR that predates the mirror, or whose `opened` run never
-                # got as far as a room. Nothing to archive.
-                NOROOM=$((NOROOM + 1)); continue
-              fi
               # Re-read at the side-effect boundary, and take the PR's facts
               # from this read rather than the listing: the close notice and
               # a recovery seed card are built from them.
@@ -1627,13 +1813,34 @@ jobs:
                 FAILED=$((FAILED + 1)); continue
               fi
               if [ "$(printf '%s' "$PR_JSON" | jq -r '.state // empty')" != closed ]; then
-                echo "#${NUM}: reopened since the listing — the reopened run owns its room"
+                echo "#${NUM}: reopened since the listing — the reopened run, or the open side of this sweep, owns its room"
                 continue
               fi
               if ! hydrate_pr "$PR_JSON"; then
                 FAILED=$((FAILED + 1)); continue
               fi
               set_close_status
+              if [ -z "$CH" ]; then
+                # No room — a PR that predates the mirror, or whose `opened`
+                # run never got as far as one. The close it never got still
+                # owes its references a banner and the fallback room its
+                # notice: the same no-room close the event arm performs, made
+                # one-shot across sweeps by the marker. No convergence loop
+                # here — there is no room to converge — so a flip between
+                # this read and these writes is corrected by the next sweep's
+                # opposite side rather than by this run.
+                if ! roomless_close_epilogue; then
+                  echo "#${NUM}: no-room close failed" >&2
+                  FAILED=$((FAILED + 1)); continue
+                fi
+                case "$CLOSE_OUTCOME" in
+                  roomless)
+                    echo "#${NUM}: closed ${CLOSED_AT} with no room — GitHub scheduled no close run; annotated its references and recorded the close"
+                    NOROOM_CLOSED=$((NOROOM_CLOSED + 1)) ;;
+                  *) NOROOM_DONE=$((NOROOM_DONE + 1)) ;;
+                esac
+                continue
+              fi
               if ! close_epilogue "$CH"; then
                 echo "#${NUM}: close epilogue failed — #${NAME} may still be live" >&2
                 FAILED=$((FAILED + 1)); continue
@@ -1657,7 +1864,87 @@ jobs:
                   fi ;;
               esac
             done < "$CANDIDATES"
-            echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ANNOTATED} annotated outside an archived room, ${ARCHIVED} already archived, ${NOROOM} without a room, ${RESTORED} restored after a concurrent reopen, ${RECLOSED} re-closed after a concurrent close, ${FAILED} failed"
+
+            # THE OPEN SIDE — reopens GitHub never announced; see the header.
+            # An open same-repo PR whose close marker reads `closed` was
+            # closed by this workflow and never reopened by it: GitHub
+            # suppresses every `pull_request` run, `reopened` included, while
+            # the PR has a merge conflict, so the reopen epilogue runs here.
+            # `reopening` is a reopen that began and did not finish — the same
+            # work. Open PRs are few and never age out of relevance, so this
+            # listing has no time bound, only the cap; a PR updated inside the
+            # settle window is left to its own run.
+            page_pulls open "" || return 1
+            OPEN_CANDIDATES=$(mktemp)
+            jq -s -r \
+              --arg owner "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" \
+              --argjson newest "$NEWEST" \
+              'add // []
+               | .[]
+               | select(.head.repo != null and .head.repo.owner.login == $owner and .head.repo.name == $repo)
+               | select((.updated_at | fromdateiso8601) <= $newest)
+               | [.number, .updated_at]
+               | @tsv' "$PAGES" > "$OPEN_CANDIDATES" || return 1
+            while IFS=$'\t' read -r NUM UPDATED_AT; do
+              [ -n "$NUM" ] || continue
+              OPEN_EXAMINED=$((OPEN_EXAMINED + 1))
+              if ! bind_pr "$NUM"; then
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if ! MARKER=$(read_close_marker); then
+                echo "#${NUM}: close-marker read failed" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              case "$MARKER" in
+                "$CLOSE_MARKER_DONE"|"$CLOSE_MARKER_REOPENING") ;;
+                *) continue ;;
+              esac
+              # Closed by this workflow, open on GitHub, no completed reopen on
+              # record: the suppressed `reopened` run. Re-read at the write.
+              if ! PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}"); then
+                echo "#${NUM}: PR re-read failed" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if [ "$(printf '%s' "$PR_JSON" | jq -r '.state // empty')" != open ]; then
+                echo "#${NUM}: closed again since the listing — the closed side owns it"
+                continue
+              fi
+              if ! hydrate_pr "$PR_JSON"; then
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if ! CH=$(resolve_channel); then
+                echo "#${NUM}: room resolution failed" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if [ -z "$CH" ]; then
+                # The marker and the banners come back; the room does not —
+                # the sweep never creates one, and the PR's next `synchronize`
+                # (the push that resolves the conflict) does, through the
+                # ordinary create_and_seed. `reopening` first, so a concurrent
+                # close does its work; `reopened` only once the banners are
+                # down, so a failed pass stays retry work.
+                if ! write_close_marker "$CLOSE_MARKER_REOPENING" \
+                  || ! annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" \
+                  || ! write_close_marker "$CLOSE_MARKER_REOPENED"; then
+                  echo "#${NUM}: no-room reopen failed" >&2
+                  FAILED=$((FAILED + 1)); continue
+                fi
+                echo "#${NUM}: reopened on GitHub with its close on record and no room — GitHub scheduled no reopened run; reversed the banners, and the next push seeds a room"
+                REOPENED_ROOMLESS=$((REOPENED_ROOMLESS + 1))
+                continue
+              fi
+              if ! reopen_epilogue "$CH"; then
+                echo "#${NUM}: reopen epilogue failed — #${NAME} may still be archived" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              echo "#${NUM}: reopened on GitHub with its close on record — GitHub scheduled no reopened run; restored #${NAME}"
+              REOPENED=$((REOPENED + 1))
+              LIFECYCLE_WRITTEN=open
+              if ! converge_lifecycle "$NUM" "$CH"; then
+                FAILED=$((FAILED + 1))
+              fi
+            done < "$OPEN_CANDIDATES"
+            echo "sweep: ${EXAMINED} closed examined, ${RECONCILED} reconciled, ${ANNOTATED} annotated outside an archived room, ${ARCHIVED} already archived, ${NOROOM_CLOSED} closed without a room, ${NOROOM_DONE} already closed without a room, ${OPEN_EXAMINED} open examined, ${REOPENED} restored after a suppressed reopen, ${REOPENED_ROOMLESS} reopened without a room, ${RESTORED} restored after a concurrent reopen, ${RECLOSED} re-closed after a concurrent close, ${FAILED} failed"
             [ "$FAILED" -eq 0 ]
           }
 
@@ -1737,10 +2024,12 @@ jobs:
               CH=$(resolve_channel) || exit 1
               if [ -z "$CH" ]; then
                 # No room to restore, but the close marker still has to be
-                # invalidated and the cross-channel references reversed.
-                write_close_marker reopened || exit 1
+                # invalidated and the cross-channel references reversed —
+                # `reopening` first, `reopened` once they are.
+                write_close_marker "$CLOSE_MARKER_REOPENING" || exit 1
                 create_and_seed || exit 1
                 annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" || exit 1
+                write_close_marker "$CLOSE_MARKER_REOPENED" || exit 1
               else
                 reopen_epilogue "$CH" || exit 1
               fi
@@ -1749,15 +2038,9 @@ jobs:
               set_close_status
               CH=$(resolve_channel) || exit 1
               if [ -z "$CH" ]; then
-                # No room to close; the cross-channel references still get
-                # their banner.
-                annotate_references "$STATUS" "$EMOJI" "♻️" || exit 1
-                if [ -z "$FALLBACK_CHANNEL" ]; then
-                  echo "no #${NAME} channel and no BUZZ_FALLBACK_CHANNEL set — nothing to archive"
-                  exit 0
-                fi
-                printf '%s — PR #%s: %s\n%s\n' "$STATUS" "$PR_NUMBER" "$PR_TITLE" "$PR_URL" \
-                  | buzz messages send --channel "$FALLBACK_CHANNEL" --content -
+                # No room to close — the references, the fallback notice and
+                # the marker are roomless_close_epilogue's.
+                roomless_close_epilogue || exit 1
                 exit 0
               fi
               close_epilogue "$CH" || exit 1

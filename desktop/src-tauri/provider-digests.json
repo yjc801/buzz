@@ -14,16 +14,16 @@
     "one side alone means every wake fails with a digest mismatch. Values come",
     "from the release's published .sha256 assets:",
     "",
-    "  gh release download buzz-backend-sprites-v0.1.1 --pattern '*.sha256'",
+    "  gh release download buzz-backend-sprites-v0.1.2 --pattern '*.sha256'",
     "",
     "Bumping invalidates bundles issued under the old version: reissue by",
     "toggling Remote wake off and on, or by any config change."
   ],
   "sprites": {
-    "release": "buzz-backend-sprites-v0.1.1",
+    "release": "buzz-backend-sprites-v0.1.2",
     "targets": {
-      "aarch64-unknown-linux-musl": "487b6127125873fccfc7fc5b4b658c8ba37e799b855bf4536418ef9c4a5ba0d0",
-      "x86_64-unknown-linux-musl": "91d693a615871e5619b5c315443c85972d6ec654629400e3b44c1d3fafb493d6"
+      "aarch64-unknown-linux-musl": "78ff7a670aa9b312f55a6dc1d3a28586407a2f3f5f3321e75bc22f70b2388666",
+      "x86_64-unknown-linux-musl": "ca4f9b1177e3adbfd1502a8e4e23cb07d2e0ef44c28404f190aea497a0a18c5a"
     }
   }
 }

@@ -45,7 +45,7 @@
 # target. Bump this deliberately, and expect issued bundles to need reissuing
 # when you do.
 ARG PROVIDER_SPRITES_REPO=yjc801/buzz
-ARG PROVIDER_SPRITES_TAG=buzz-backend-sprites-v0.1.1
+ARG PROVIDER_SPRITES_TAG=buzz-backend-sprites-v0.1.2
 
 # Fetched, not compiled. Building it here made its bytes a function of the
 # source revision and toolchain at image build time, so the digest drifted on

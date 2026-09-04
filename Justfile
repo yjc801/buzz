@@ -105,13 +105,20 @@ security-review-check:
 # verification, the relay client, the CI aggregate contract, the merge job's
 # revalidation fence, the freshness check at the write itself, the sweep's
 # approved-manual-merge label transitions, the reviewer wake path (the
-# mirror's acknowledgement cutoff and the review watchdog's sweep), and the
-# workflow file that wires them together. This — not `just gate` — is the gate
-# that covers a change to any of
-# them: `gate` maps .github/**, scripts/** and docs/** to "nothing to run".
+# mirror's acknowledgement cutoff and the review watchdog's sweep), the
+# mirror's close path (the `closed` event's epilogue and the sweep that
+# repeats it for closes GitHub never announced), and the workflow files that
+# wire them together. This — not `just gate` — is the gate that covers a
+# change to any of them: `gate` maps .github/**, scripts/** and docs/** to
+# "nothing to run".
 auto-merge-check:
     actionlint .github/workflows/buzz-pr-auto-merge.yml
     actionlint .github/workflows/buzz-pr-review-watchdog.yml
+    # -shellcheck=: this workflow's step is one long shell script full of
+    # jq programs, and shellcheck reads every '...' jq filter as a shell
+    # expansion that failed to expand (SC2016). The YAML, expression and
+    # action checks are the ones that matter here.
+    actionlint -shellcheck= .github/workflows/buzz-pr-mirror.yml
     node --check .github/scripts/pr-auto-merge-risk.js
     node --check .github/scripts/pr-auto-merge-verdict.js
     node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js
@@ -122,6 +129,7 @@ auto-merge-check:
     bash .github/scripts/pr-auto-merge-write.test.sh
     bash .github/scripts/pr-auto-merge-label.test.sh
     bash .github/scripts/pr-review-wake.test.sh
+    bash .github/scripts/pr-mirror-close.test.sh
 
 # Run the repository-wide differential file-size ratchet and its policy tests.
 # The ratchet inspects only files changed from the merge base, so this stays

@@ -6,6 +6,7 @@ import type {
   PresenceStatus,
   RelayAgent,
 } from "@/shared/api/types";
+import type { AgentAvailabilityReader } from "./useAgentAvailability";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 type DeleteManagedAgentInput = {
@@ -24,7 +25,7 @@ type ManagedAgentChannelContext = {
 };
 
 type ManagedAgentActionContext = ManagedAgentChannelContext & {
-  presenceLookup?: PresenceLookup | null;
+  getAvailability: AgentAvailabilityReader;
 };
 
 export type ManagedAgentActionResult = {
@@ -38,7 +39,8 @@ export type ManagedAgentActionResult = {
 /// `backend_agent_id`, and nothing ever clears it — there is no undeploy
 /// operation, and the remote VM deliberately outlives the harness process.
 /// So this answers "is there something out there", never "is it running".
-/// Grouping, sorting and session panels want exactly that.
+/// Lifecycle action routing only; `deployed` is a retained receipt, not
+/// presence. Grouping, sorting and session panels want exactly that.
 export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
   return agent.status === "running" || agent.status === "deployed";
 }
@@ -47,10 +49,15 @@ export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
 ///
 /// For a remote agent this is presence and only presence — the same signal
 /// the backend documents as the live axis, and the only one a remote
-/// harness can report. Using the control-plane axis here is what made a
-/// dead remote agent unrecoverable: its status stayed `deployed` forever,
-/// so the controls offered Shutdown for an agent that was not running and
-/// never offered Deploy.
+/// harness can report.
+///
+/// NOT the axis the lifecycle controls route on. Offline presence is not
+/// proof the harness is gone, so deploying off it can start a SECOND body
+/// against a live one; the control therefore reads the retained deployment
+/// receipt (`isManagedAgentActive`) and a dead remote agent is recovered by
+/// requesting shutdown and then deploying. This axis is for the wake path
+/// (`agentWake.ts`), which asks a different question: is there a harness
+/// there to receive this mention, or must one be started?
 ///
 /// A local agent has no presence requirement — the desktop owns its
 /// process, and `running` is first-hand knowledge.
@@ -71,12 +78,9 @@ export function isManagedAgentLive(
 /// instance and treats an already-running agent as a strict no-op that
 /// returns the existing id. Offering it costs one round trip in the worst
 /// case; withholding it strands the agent.
-export function getManagedAgentPrimaryActionLabel(
-  agent: ManagedAgent,
-  presence?: PresenceStatus | null,
-) {
+export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
   if (agent.backend.type === "provider") {
-    return isManagedAgentLive(agent, presence) ? "Shutdown" : "Deploy";
+    return isManagedAgentActive(agent) ? "Shutdown" : "Deploy";
   }
 
   if (isManagedAgentActive(agent)) {
@@ -346,7 +350,8 @@ export async function stopManagedAgentWithRules({
       agent.pubkey,
     ]);
     return {
-      noticeMessage: "Shutdown command sent. Agent will stop shortly.",
+      noticeMessage:
+        "Shutdown requested. This does not confirm the agent has stopped.",
     };
   }
 
@@ -359,7 +364,7 @@ export async function deleteManagedAgentWithRules({
   channels,
   deleteManagedAgent,
   preferredChannelId,
-  presenceLookup,
+  getAvailability,
   relayAgents,
   skipRemoteDeleteConfirm = false,
 }: {
@@ -368,7 +373,7 @@ export async function deleteManagedAgentWithRules({
   skipRemoteDeleteConfirm?: boolean;
 } & ManagedAgentActionContext): Promise<ManagedAgentActionResult> {
   if (agent.backend.type === "provider" && agent.backendAgentId) {
-    const presence = presenceLookup?.[normalizePubkey(agent.pubkey)];
+    const availability = getAvailability(agent.pubkey);
     const channelId = resolveManagedAgentChannelId(agent, {
       channels,
       preferredChannelId,
@@ -376,14 +381,19 @@ export async function deleteManagedAgentWithRules({
     });
 
     if (channelId) {
-      if (presence === "online" || presence === "away") {
+      // Only established Offline preserves the intentional no-request path.
+      // Unknown is not evidence that shutdown can safely be skipped.
+      if (availability !== "offline") {
         await sendChannelMessage(channelId, "!shutdown", undefined, undefined, [
           agent.pubkey,
         ]);
 
         if (!skipRemoteDeleteConfirm) {
           const confirmed = window.confirm(
-            "Shutdown command sent, but the agent may still be running. " +
+            (availability === undefined
+              ? "This agent’s availability is unknown. "
+              : "") +
+              "Shutdown requested, but the agent may still be running. " +
               "Deleting now removes the local record — the remote deployment " +
               "will be orphaned if shutdown hasn't completed. Continue?",
           );
@@ -406,7 +416,7 @@ export async function deleteManagedAgentWithRules({
       if (!skipRemoteDeleteConfirm) {
         const confirmed = window.confirm(
           "This agent is deployed but not in any channel. " +
-            "Deleting will orphan the remote deployment (it will keep running). Continue?",
+            "Deleting removes the local management record; the remote deployment may still be running. Continue?",
         );
         if (!confirmed) {
           return { cancelled: true };

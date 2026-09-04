@@ -434,20 +434,29 @@ test("a local agent's liveness ignores presence — the desktop owns its process
   );
 });
 
-test("a dead remote agent offers Deploy, a live one offers Shutdown", () => {
+// The control routes off the retained deployment receipt, never presence
+// (upstream #7127/#7129). Offline presence is not proof the harness is gone,
+// so deploying off it could start a second body against a live one; recovery
+// from a dead remote agent is request-shutdown-then-deploy. `isManagedAgentLive`
+// remains the presence axis for the wake path, which asks a different question.
+test("a remote agent's label follows its deployment receipt, not presence", () => {
+  for (const presence of ["offline", undefined, "online", "away"]) {
+    assert.equal(
+      getManagedAgentPrimaryActionLabel(remote()),
+      "Shutdown",
+      `deployed receipt keeps Shutdown regardless of presence (${presence})`,
+    );
+  }
   assert.equal(
-    getManagedAgentPrimaryActionLabel(remote(), "offline"),
+    getManagedAgentPrimaryActionLabel(remote({ status: "stopped" })),
     "Deploy",
   );
   assert.equal(
-    getManagedAgentPrimaryActionLabel(remote(), undefined),
+    getManagedAgentPrimaryActionLabel(
+      remote({ status: "stopped", backendAgentId: null }),
+    ),
     "Deploy",
   );
-  assert.equal(
-    getManagedAgentPrimaryActionLabel(remote(), "online"),
-    "Shutdown",
-  );
-  assert.equal(getManagedAgentPrimaryActionLabel(remote(), "away"), "Shutdown");
 });
 
 test("local agent labels are Stop/Start agent regardless of prior status", () => {

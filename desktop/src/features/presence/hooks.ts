@@ -46,7 +46,8 @@ function normalizePubkeys(pubkeys: string[]) {
     .sort();
 }
 
-function presenceQueryKey(pubkeys: string[]) {
+/** Canonical normalized key shared by observers and action-time readers. */
+export function presenceQueryKey(pubkeys: string[]) {
   return ["presence", ...normalizePubkeys(pubkeys)] as const;
 }
 
@@ -145,7 +146,10 @@ export function usePresenceSubscription() {
       queryClient.setQueriesData<PresenceLookup>(
         {
           queryKey: ["presence"],
+          // A single live author cannot heal a failed aggregate snapshot:
+          // setQueriesData would mark every cached sibling successful again.
           predicate: (query) =>
+            query.state.status === "success" &&
             presenceQueryWantsPubkey(query.queryKey, pubkey),
         },
         (old) => mergePresenceUpdate(old, pubkey, status),
@@ -216,7 +220,9 @@ export function useSetPresenceMutation(pubkey?: string) {
       queryClient.setQueriesData<PresenceLookup>(
         {
           queryKey: ["presence"],
+          // A successful self heartbeat is not a fresh roster snapshot.
           predicate: (query) =>
+            query.state.status === "success" &&
             presenceQueryWantsPubkey(query.queryKey, normalizedPubkey),
         },
         (old) => mergePresenceUpdate(old, normalizedPubkey, status),

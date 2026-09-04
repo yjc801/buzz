@@ -140,82 +140,6 @@ fn emit_runtime_lifecycle(
 /// Two copies would let one drift silently past the other.
 use buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS;
 
-/// Floor the startup watermark to a wake deploy's trigger timestamp.
-///
-/// A wake deploy sets `BUZZ_ACP_REPLAY_FLOOR` to the `created_at` of the
-/// mention that caused it. The watermark normally starts at process start,
-/// and the first REQ subtracts only a 5s skew — less than routine cold-start
-/// latency, so without the floor the mention that woke this harness would
-/// fall outside the replay window and never be answered. Unparseable or
-/// future values leave the watermark unchanged.
-fn apply_replay_floor(startup_watermark: u64, floor: Option<&str>) -> u64 {
-    let Some(floor) = floor.and_then(|raw| raw.trim().parse::<u64>().ok()) else {
-        return startup_watermark;
-    };
-    if floor >= startup_watermark {
-        return startup_watermark;
-    }
-    floor.max(startup_watermark.saturating_sub(REPLAY_FLOOR_MAX_AGE_SECS))
-}
-
-#[cfg(test)]
-mod replay_floor_tests {
-    use super::{apply_replay_floor, REPLAY_FLOOR_MAX_AGE_SECS};
-    use buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS as RELAY_ACCEPTED_PAST_SKEW_SECS;
-
-    const NOW: u64 = 1_700_000_000;
-
-    #[test]
-    fn a_trigger_at_the_relay_age_limit_survives_wake_latency() {
-        // Accepted by the relay at its maximum past skew, then aged further
-        // by the fence/evidence/deploy/boot pipeline — the cap must still
-        // admit it so the first REQ replays the trigger that caused this
-        // very start.
-        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 300;
-        assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
-    }
-
-    #[test]
-    fn the_budget_covers_every_enforced_bound_stacked() {
-        // Worst legitimate case: max relay past skew, then the full
-        // evidence window, the provider info probe, and the full deploy
-        // invocation timeout back to back (~1,645s) — the budget is a sum
-        // of those enforced bounds plus margin, so the trigger survives.
-        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 135 - 10 - 600;
-        assert_eq!(apply_replay_floor(NOW, Some(&floor.to_string())), floor);
-    }
-
-    #[test]
-    fn recent_floor_wins() {
-        assert_eq!(
-            apply_replay_floor(NOW, Some(&(NOW - 90).to_string())),
-            NOW - 90
-        );
-    }
-
-    #[test]
-    fn missing_or_garbage_floor_is_ignored() {
-        assert_eq!(apply_replay_floor(NOW, None), NOW);
-        assert_eq!(apply_replay_floor(NOW, Some("")), NOW);
-        assert_eq!(apply_replay_floor(NOW, Some("not-a-number")), NOW);
-        assert_eq!(apply_replay_floor(NOW, Some("-5")), NOW);
-    }
-
-    #[test]
-    fn future_floor_is_ignored() {
-        assert_eq!(apply_replay_floor(NOW, Some(&(NOW + 60).to_string())), NOW);
-        assert_eq!(apply_replay_floor(NOW, Some(&NOW.to_string())), NOW);
-    }
-
-    #[test]
-    fn ancient_floor_is_clamped_to_the_age_bound() {
-        assert_eq!(
-            apply_replay_floor(NOW, Some(&(NOW - 86_400).to_string())),
-            NOW - REPLAY_FLOOR_MAX_AGE_SECS,
-        );
-    }
-}
-
 /// Resolve the agent's owner pubkey at startup.
 ///
 /// Priority:
@@ -2678,6 +2602,83 @@ mod idle_pool_sleep_tests {
     }
 }
 
+/// Resolve the startup watermark from process-start time and an optional
+/// replay floor (`--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR`).
+///
+/// A publish-first mention send publishes the triggering message BEFORE this
+/// harness spawns, so the watermark must reach back to the send timestamp for
+/// the first REQ (`since = watermark − 5s`) to replay that message. Floors
+/// older than [`REPLAY_FLOOR_MAX_AGE_SECS`] clamp to that bound; floors in
+/// the future clamp to `now` (a skewed sender must not push the watermark
+/// forward past startup and re-open the blind spot the watermark closes).
+///
+/// The cap itself lives in `buzz-core` because it is a cross-crate contract:
+/// this harness enforces it and `buzz-waker` needs the same number to know
+/// when a recovery gap has outgrown what a woken agent could still be shown.
+fn startup_watermark_with_floor(now_unix: u64, replay_floor: Option<u64>) -> u64 {
+    match replay_floor {
+        Some(floor) => floor.clamp(now_unix.saturating_sub(REPLAY_FLOOR_MAX_AGE_SECS), now_unix),
+        None => now_unix,
+    }
+}
+
+#[cfg(test)]
+mod replay_floor_tests {
+    use super::{startup_watermark_with_floor, REPLAY_FLOOR_MAX_AGE_SECS};
+    use buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS as RELAY_ACCEPTED_PAST_SKEW_SECS;
+
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn a_trigger_at_the_relay_age_limit_survives_wake_latency() {
+        // Accepted by the relay at its maximum past skew, then aged further
+        // by the fence/evidence/deploy/boot pipeline — the cap must still
+        // admit it so the first REQ replays the trigger that caused this
+        // very start.
+        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 300;
+        assert_eq!(startup_watermark_with_floor(NOW, Some(floor)), floor);
+    }
+
+    #[test]
+    fn the_budget_covers_every_enforced_bound_stacked() {
+        // Worst legitimate case: max relay past skew, then the full
+        // evidence window, the provider info probe, and the full deploy
+        // invocation timeout back to back (~1,645s) — the budget is a sum
+        // of those enforced bounds plus margin, so the trigger survives.
+        let floor = NOW - RELAY_ACCEPTED_PAST_SKEW_SECS - 135 - 10 - 600;
+        assert_eq!(startup_watermark_with_floor(NOW, Some(floor)), floor);
+    }
+
+    #[test]
+    fn no_floor_keeps_startup_time() {
+        assert_eq!(startup_watermark_with_floor(NOW, None), NOW);
+    }
+
+    #[test]
+    fn recent_floor_moves_watermark_back_to_the_send_timestamp() {
+        // The publish-first case: message sent 4s before the harness booted.
+        assert_eq!(startup_watermark_with_floor(NOW, Some(NOW - 4)), NOW - 4);
+    }
+
+    #[test]
+    fn stale_floor_clamps_to_the_max_age_bound() {
+        assert_eq!(
+            startup_watermark_with_floor(NOW, Some(NOW - REPLAY_FLOOR_MAX_AGE_SECS - 1)),
+            NOW - REPLAY_FLOOR_MAX_AGE_SECS
+        );
+    }
+
+    #[test]
+    fn future_floor_is_ignored() {
+        assert_eq!(startup_watermark_with_floor(NOW, Some(NOW + 60)), NOW);
+    }
+
+    #[test]
+    fn early_epoch_now_does_not_underflow() {
+        assert_eq!(startup_watermark_with_floor(10, Some(0)), 0);
+    }
+}
+
 pub fn run() -> Result<()> {
     config::propagate_legacy_env_vars();
     tokio_main()
@@ -2775,20 +2776,24 @@ async fn tokio_main() -> Result<()> {
     // the initial subscribe_since for channels discovered at startup. The Subscribe
     // handler falls back to subscribe_since when last_seen is None, closing the
     // blind spot between "agents ready" and "first REQ sent".
-    let startup_watermark: u64 = std::time::SystemTime::now()
+    //
+    // A publish-first mention send passes the triggering message's send
+    // timestamp as a replay floor (`--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR`):
+    // the message is already on the relay when this process spawns, so the
+    // watermark must reach back to it for the first REQ to replay it — however
+    // long the spawn took.
+    let now_unix: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // A wake deploy passes the triggering mention's timestamp as
-    // BUZZ_ACP_REPLAY_FLOOR (via the provider launch contract). Cold-start
-    // latency routinely exceeds the 5s resubscribe skew, so without this
-    // floor the first REQ would start *after* the very message that woke the
-    // harness and the agent would never answer it. Bounded so a stale or
-    // corrupted floor cannot replay hours of history.
-    let startup_watermark = apply_replay_floor(
-        startup_watermark,
-        std::env::var("BUZZ_ACP_REPLAY_FLOOR").ok().as_deref(),
-    );
+    let startup_watermark = startup_watermark_with_floor(now_unix, config.replay_floor_unix);
+    if let Some(floor) = config.replay_floor_unix {
+        tracing::info!(
+            floor,
+            startup_watermark,
+            "applying replay floor to startup watermark"
+        );
+    }
 
     let pubkey_hex = config.keys.public_key().to_hex();
 
@@ -9541,6 +9546,7 @@ mod build_mcp_servers_tests {
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
+            replay_floor_unix: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -9766,6 +9772,7 @@ mod error_outcome_emission_tests {
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
+            replay_floor_unix: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

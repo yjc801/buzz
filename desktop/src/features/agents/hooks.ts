@@ -577,6 +577,7 @@ export function useStartManagedAgentMutation() {
             wakeReplayFloorTs?: number;
             expectedRelayUrl?: string;
             expectedSignerPubkey?: string;
+            replayFloorUnix?: number;
           },
     ) =>
       typeof input === "string"
@@ -585,6 +586,7 @@ export function useStartManagedAgentMutation() {
             wakeReplayFloorTs: input.wakeReplayFloorTs,
             expectedRelayUrl: input.expectedRelayUrl,
             expectedSignerPubkey: input.expectedSignerPubkey,
+            replayFloorUnix: input.replayFloorUnix,
           }),
     onSuccess: ({ agent: updated }) => {
       queryClient.setQueryData<ManagedAgent[]>(

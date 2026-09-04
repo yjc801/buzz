@@ -1,3 +1,7 @@
+import {
+  agentPresenceStartBlockReason,
+  type AgentAvailabilityReader,
+} from "@/features/agents/lib/useAgentAvailability";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -32,6 +36,7 @@ import type {
 
 type UseMembersSidebarActionsOptions = {
   channelId: string | null;
+  getAvailability: AgentAvailabilityReader;
   controllableManagedBots: readonly ManagedAgent[];
   removableManagedBots: readonly ManagedAgent[];
   currentPubkey?: string;
@@ -57,6 +62,7 @@ const BULK_RESPAWN_CONCURRENCY = 4;
 
 export function useMembersSidebarActions({
   channelId,
+  getAvailability,
   controllableManagedBots,
   removableManagedBots,
   currentPubkey,
@@ -64,6 +70,16 @@ export function useMembersSidebarActions({
   relayUrl,
 }: UseMembersSidebarActionsOptions) {
   const queryClient = useQueryClient();
+  function assertStartNotBlockedByPresence(
+    agent: ManagedAgent,
+    lifecycleActive: boolean,
+  ) {
+    const reason = agentPresenceStartBlockReason(
+      lifecycleActive,
+      getAvailability(agent.pubkey),
+    );
+    if (reason) throw new Error(reason);
+  }
   const removeMemberMutation = useRemoveChannelMemberMutation(channelId);
   const startManagedAgentMutation = useStartManagedAgentMutation();
   const stopManagedAgentMutation = useStopManagedAgentMutation();
@@ -167,6 +183,7 @@ export function useMembersSidebarActions({
       // agent-wide deploy/!shutdown flow below.
       if (agent.backend.type === "local" && relayUrl) {
         const action = managedAgentPairAction(runtime);
+        assertStartNotBlockedByPresence(agent, action === "stop");
         await runtimeActionMutation.mutateAsync({
           action,
           pubkey: agent.pubkey,
@@ -200,6 +217,7 @@ export function useMembersSidebarActions({
         return;
       }
 
+      assertStartNotBlockedByPresence(agent, false);
       await startManagedAgentWithRules({
         agent,
         startManagedAgent: startManagedAgentMutation.mutateAsync,
@@ -227,15 +245,21 @@ export function useMembersSidebarActions({
       const results = await mapWithConcurrency(
         controllableManagedBots,
         BULK_RESPAWN_CONCURRENCY,
-        (agent) =>
-          respawnManagedAgentWithRules({
+        // `async` so the fence below rejects this agent's lane rather than
+        // throwing synchronously out of the concurrency mapper.
+        async (agent) => {
+          // Upstream's start fence: positive relay presence blocks starting a
+          // second body, and a bulk respawn is a start for every agent in it.
+          assertStartNotBlockedByPresence(agent, isManagedAgentActive(agent));
+          return respawnManagedAgentWithRules({
             agent,
             ...EMPTY_AGENT_CONTEXT,
             preferredChannelId: channelId,
             startManagedAgent: startManagedAgentMutation.mutateAsync,
             stopManagedAgent: stopManagedAgentMutation.mutateAsync,
             onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),
-          }),
+          });
+        },
       );
 
       const failures = results.flatMap((result, index) =>

@@ -102,6 +102,7 @@ pub(crate) async fn reconcile_on_workspace_apply(
             cached_binary_path.as_deref(),
             None,
             None,
+            None,
         )
         .await
         {

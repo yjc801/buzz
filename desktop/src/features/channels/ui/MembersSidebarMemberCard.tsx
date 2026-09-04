@@ -1,3 +1,4 @@
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import {
   Activity,
   Ban,
@@ -17,9 +18,8 @@ import {
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
-  isManagedAgentLive,
 } from "@/features/agents/lib/managedAgentControlActions";
-import { OtherSetupAgentMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
+import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import {
@@ -75,10 +75,9 @@ type MembersSidebarMemberCardProps = {
   onViewActivity?: (pubkey: string) => void;
   /** False until the member presence query has resolved — see
    * MemberActionsMenu; gates provider lifecycle actions only. */
-  presenceResolved?: boolean;
   presenceStatus?: PresenceStatus | null;
   profileAvatarUrl?: string | null;
-  showOtherSetupMarker?: boolean;
+  profileOwnerPubkey?: string | null;
   viewerIsOwner: boolean;
 };
 
@@ -145,10 +144,9 @@ export function MembersSidebarMemberCard({
   onUnban,
   onUntimeout,
   onViewActivity,
-  presenceResolved,
   presenceStatus,
   profileAvatarUrl,
-  showOtherSetupMarker = false,
+  profileOwnerPubkey,
   viewerIsOwner,
 }: MembersSidebarMemberCardProps) {
   const roleLabel = formatRoleLabel(member, memberIsBot);
@@ -203,11 +201,11 @@ export function MembersSidebarMemberCard({
                 </span>
               </span>
             </div>
-            {showOtherSetupMarker ? (
-              <OtherSetupAgentMarker
-                testId={`sidebar-member-agent-provenance-${member.pubkey}`}
-              />
-            ) : null}
+            <AgentManagementMarker
+              pubkey={member.pubkey}
+              ownerPubkey={profileOwnerPubkey}
+              testId={`sidebar-member-agent-provenance-${member.pubkey}`}
+            />
           </div>
         ) : (
           <div className="flex min-w-0 items-center gap-2">
@@ -286,8 +284,6 @@ export function MembersSidebarMemberCard({
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
-          presenceResolved={presenceResolved}
-          presenceStatus={presenceStatus}
           memberIsBot={memberIsBot}
           moderationState={moderationState}
           onBan={onBan}
@@ -300,6 +296,7 @@ export function MembersSidebarMemberCard({
           onUntimeout={onUntimeout}
           onViewActivity={onViewActivity}
           pairAction={pairAction}
+          availability={presenceStatus ?? undefined}
         />
       ) : null}
     </div>
@@ -309,6 +306,7 @@ export function MembersSidebarMemberCard({
 const PEOPLE_ROLES = ["admin", "member", "guest"] as const;
 
 function MemberActionsMenu({
+  availability,
   canChangeRole,
   canModerateMember,
   canRemoveMember,
@@ -318,8 +316,6 @@ function MemberActionsMenu({
   member,
   memberIsBot,
   moderationState,
-  presenceResolved,
-  presenceStatus,
   onBan,
   onChangeRole,
   onEditRespondTo,
@@ -332,6 +328,7 @@ function MemberActionsMenu({
   pairAction,
 }: {
   canChangeRole: boolean;
+  availability: PresenceStatus | undefined;
   canModerateMember: boolean;
   canRemoveMember: boolean;
   canViewActivity: boolean;
@@ -340,12 +337,6 @@ function MemberActionsMenu({
   member: ChannelMember;
   memberIsBot: boolean;
   moderationState?: MemberModerationState;
-  /** False until the presence query has RESOLVED. Unresolved renders
-   * exactly like offline, and a provider lifecycle action taken on it
-   * would offer (and no-op) Deploy against a live agent. */
-  presenceResolved?: boolean;
-  /** Live axis for a remote agent — its status alone cannot report it. */
-  presenceStatus?: PresenceStatus | null;
   onBan: (member: ChannelMember) => void;
   onChangeRole: (member: ChannelMember, role: string) => void;
   onEditRespondTo?: (agent: ManagedAgent) => void;
@@ -361,6 +352,13 @@ function MemberActionsMenu({
     canChangeRole && !memberIsBot && member.role !== "owner";
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
+
+  const startBlockReason = managedAgent
+    ? agentPresenceStartBlockReason(
+        pairAction ? pairAction === "stop" : isManagedAgentActive(managedAgent),
+        availability,
+      )
+    : undefined;
 
   return (
     <DropdownMenu modal={false}>
@@ -391,22 +389,18 @@ function MemberActionsMenu({
             {canViewActivity ? <DropdownMenuSeparator /> : null}
             <DropdownMenuItem
               data-testid={`sidebar-agent-action-${member.pubkey}`}
-              disabled={
-                disabled ||
-                (managedAgent.backend.type === "provider" &&
-                  presenceResolved === false)
-              }
-              onClick={() => onManagedAgentAction(managedAgent)}
+              disabled={disabled || Boolean(startBlockReason)}
+              title={startBlockReason}
+              onClick={() => {
+                if (!startBlockReason) onManagedAgentAction(managedAgent);
+              }}
             >
               {pairAction
                 ? getPairActionIcon(pairAction)
-                : getManagedAgentActionIcon(managedAgent, presenceStatus)}
+                : getManagedAgentActionIcon(managedAgent)}
               {pairAction
                 ? MANAGED_AGENT_PAIR_ACTION_LABELS[pairAction]
-                : getManagedAgentPrimaryActionLabel(
-                    managedAgent,
-                    presenceStatus,
-                  )}
+                : getManagedAgentPrimaryActionLabel(managedAgent)}
             </DropdownMenuItem>
             {onEditRespondTo ? (
               <DropdownMenuItem
@@ -537,14 +531,10 @@ function getPairActionIcon(action: ManagedAgentPairAction) {
   return <Play className="h-4 w-4" />;
 }
 
-/// The icon must answer from the same live axis as the label and the click
-/// handler: a deployed-but-dead remote agent whose label reads Deploy must
-/// not carry a stop icon.
-function getManagedAgentActionIcon(
-  agent: ManagedAgent,
-  presence?: PresenceStatus | null,
-) {
-  if (isManagedAgentLive(agent, presence)) {
+/// The icon must answer from the same axis as the label and the click
+/// handler — the retained deployment receipt, not presence.
+function getManagedAgentActionIcon(agent: ManagedAgent) {
+  if (isManagedAgentActive(agent)) {
     return <Square className="h-4 w-4" />;
   }
 

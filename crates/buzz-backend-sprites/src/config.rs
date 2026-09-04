@@ -33,7 +33,22 @@ pub const DEFAULT_SPRIG_VERSION: &str = "sprig-latest";
 /// Pinned npm versions of the ACP adapters provisioned when the corresponding
 /// `install_*_adapter` flag is on. Baked provider state, like the sprig pins.
 pub const CLAUDE_ADAPTER_VERSION: &str = "0.73.0";
-pub const CODEX_ADAPTER_VERSION: &str = "1.8.0";
+
+/// Held at 1.1.7 deliberately: `env.rs` realizes
+/// `provider_config.preapprove_agent_tools = false` as
+/// `INITIAL_AGENT_MODE=read-only`, and converse-only depends on what that mode
+/// *means* to the adapter, not on the id existing. In 1.1.7 `read-only` carries
+/// the `readOnly` sandbox, so every edit and exec asks and the harness's denial
+/// makes the agent converse-only. 1.8.0 keeps the id but redefines it as the
+/// `workspaceWrite` sandbox ("Ask for approval" — asks only for external files
+/// and network), so ordinary workspace edits would run unasked under a setting
+/// that is supposed to prohibit tool actions.
+///
+/// Bumping this pin therefore requires re-reading the adapter's `AgentMode`
+/// definitions and re-mapping `CODEX_MODE_READ_ONLY` in `env.rs` to a mode that
+/// is genuinely no-tools — the id alone proves nothing. The tripwire test below
+/// fails the build to force that read.
+pub const CODEX_ADAPTER_VERSION: &str = "1.1.7";
 
 /// The agent's HOME and working directory inside the sprite (§Launch data:
 /// cwd = HOME, mirroring the local spawn's agent-workdir convention). The
@@ -257,6 +272,23 @@ pub fn config_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tripwire, not a behavioural check: nothing in this crate can observe
+    /// what a mode id means to the adapter, so the pin's converse-only property
+    /// is only ever established by reading the release. Moving the pin without
+    /// doing that read is the failure this guards — see the constant's doc.
+    #[test]
+    fn codex_pin_matches_converse_only_mode_semantics() {
+        assert_eq!(
+            CODEX_ADAPTER_VERSION, "1.1.7",
+            "`INITIAL_AGENT_MODE=read-only` is how a converse-only Codex agent \
+             is realized. Before moving this pin, read the new release's \
+             `AgentMode` definitions and confirm the mode `env.rs` sends still \
+             prohibits tool actions: 1.8.0 kept the `read-only` id but gave it \
+             the `workspaceWrite` sandbox, which permits workspace edits \
+             unasked. Re-map `CODEX_MODE_READ_ONLY` first if it moved."
+        );
+    }
 
     #[test]
     fn applies_defaults_to_an_empty_config() {

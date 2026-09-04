@@ -3,7 +3,6 @@ import { toast } from "sonner";
 
 import {
   isManagedAgentActive,
-  isManagedAgentLive,
   respawnManagedAgentWithRules,
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
@@ -22,8 +21,6 @@ export function useAgentLifecycleActions({
   channels,
   refetchChannels,
   managedAgent,
-  presenceResolved = true,
-  presenceStatus,
   relayAgents,
   startManagedAgent,
   stopManagedAgent,
@@ -35,14 +32,6 @@ export function useAgentLifecycleActions({
    * that is plainly in one. */
   refetchChannels: () => Promise<{ data?: readonly Channel[] }>;
   managedAgent: ManagedAgent | undefined;
-  /** False while the presence query has NOT resolved. Unresolved renders
-   * exactly like offline, so acting on it would offer (and no-op) Deploy
-   * against a live provider agent; error-with-cached-data counts as
-   * resolved (stale beats unknown), and a resolved empty map is a valid
-   * offline answer. Local agents never depend on presence. */
-  presenceResolved?: boolean;
-  /** Live axis for a remote agent — its control plane cannot report it. */
-  presenceStatus?: PresenceStatus | null;
   relayAgents: readonly RelayAgent[] | undefined;
   startManagedAgent: (pubkey: string) => Promise<unknown>;
   stopManagedAgent: (pubkey: string) => Promise<unknown>;
@@ -51,13 +40,11 @@ export function useAgentLifecycleActions({
   // !shutdown send and the presence wait), so mutation isPending alone
   // leaves the controls clickable mid-restart — free to bypass the fence
   // or launch a concurrent deploy. This flag spans each handler's whole
-  // run; together with the unresolved-presence hold it forms
-  // `lifecycleActionsBlocked`, which the panel folds into its pending
-  // computation and the handlers themselves refuse to run under.
+  // run and is what `lifecycleActionsBlocked` reports, which the panel folds
+  // into its pending computation and the handlers themselves refuse to run
+  // under.
   const [isActionInFlight, setActionInFlight] = React.useState(false);
-  const lifecycleActionsBlocked =
-    isActionInFlight ||
-    (managedAgent?.backend.type === "provider" && !presenceResolved);
+  const lifecycleActionsBlocked = isActionInFlight;
 
   const resolveChannels = React.useCallback(async () => {
     if (channels) {
@@ -71,7 +58,7 @@ export function useAgentLifecycleActions({
 
     setActionInFlight(true);
     try {
-      if (isManagedAgentLive(managedAgent, presenceStatus)) {
+      if (isManagedAgentActive(managedAgent)) {
         const result = await stopManagedAgentWithRules({
           agent: managedAgent,
           channels: await resolveChannels(),
@@ -107,7 +94,6 @@ export function useAgentLifecycleActions({
     availability,
     lifecycleActionsBlocked,
     managedAgent,
-    presenceStatus,
     relayAgents,
     resolveChannels,
     startManagedAgent,

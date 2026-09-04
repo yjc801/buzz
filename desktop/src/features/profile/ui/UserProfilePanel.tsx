@@ -90,6 +90,7 @@ import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { AuxiliaryPanelBody } from "@/shared/layout/AuxiliaryPanel";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { cn } from "@/shared/lib/cn";
 import type {
   AgentPersona,
@@ -167,6 +168,14 @@ export function UserProfilePanel({
   const [personaToExportSnapshot, setPersonaToExportSnapshot] =
     React.useState<AgentPersona | null>(null);
 
+  const [requestedInstancePubkey, setRequestedInstancePubkey] = React.useState<
+    string | null
+  >(null);
+  const preserveRequestedInstance = Boolean(
+    pubkey &&
+      requestedInstancePubkey &&
+      normalizePubkey(pubkey) === normalizePubkey(requestedInstancePubkey),
+  );
   const personasQuery = usePersonasQuery();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: true });
   const { instanceBuckets, linkedPersonaId, managedAgent } =
@@ -326,8 +335,6 @@ export function UserProfilePanel({
     channels: channelsQuery.data,
     refetchChannels: channelsQuery.refetch,
     managedAgent,
-    presenceResolved: presenceQuery.data !== undefined,
-    presenceStatus,
     relayAgents: relayAgentsQuery.data,
     startManagedAgent: startAgentMutation.mutateAsync,
     stopManagedAgent: stopAgentMutation.mutateAsync,
@@ -377,9 +384,11 @@ export function UserProfilePanel({
   React.useEffect(() => {
     if (prevTargetKeyRef.current === targetKey) return;
     prevTargetKeyRef.current = targetKey;
+    if (preserveRequestedInstance) return;
+    setRequestedInstancePubkey(null);
     setView("summary", { replace: true });
     setTab("info", { replace: true });
-  }, [setTab, setView, targetKey]);
+  }, [preserveRequestedInstance, setTab, setView, targetKey]);
   const {
     canHuddle,
     canMessage,
@@ -820,6 +829,7 @@ export function UserProfilePanel({
             isBot && canManagePersona ? handleExportPersona : undefined
           }
           onOpenInstance={(instancePubkey) => {
+            setRequestedInstancePubkey(instancePubkey);
             onOpenProfile?.(instancePubkey);
             setTab("runtime");
           }}

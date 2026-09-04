@@ -633,13 +633,10 @@ export function MembersSidebar({
       managedAgent?.backend.type === "local" && relayUrl
         ? managedAgentPairAction(managedAgentRuntime)
         : undefined;
-    // One authority for both the dot and the lifecycle controls:
-    // `getAvailability` resolves to a status only for a successful presence
-    // snapshot read over a connected relay, and to `undefined` otherwise.
-    // Undefined is NOT a resolved "offline" — it renders the same but must
-    // not drive provider lifecycle, which would offer Deploy for a live agent.
+    // Presence drives the dot and the start fence only. The lifecycle control
+    // routes off the retained deployment receipt, so an unresolved read no
+    // longer needs to hold the control back.
     const presenceStatus = getAvailability(member.pubkey) ?? null;
-    const presenceResolved = presenceStatus !== null;
     return (
       <MembersSidebarMemberCard
         canChangeRole={canManageMembers && member.pubkey !== currentPubkey}
@@ -684,7 +681,6 @@ export function MembersSidebar({
             : undefined
         }
         pairAction={pairAction}
-        presenceResolved={presenceResolved}
         presenceStatus={presenceStatus}
         profileAvatarUrl={memberProfile?.avatarUrl ?? null}
         profileOwnerPubkey={memberProfile?.ownerPubkey}

@@ -8,7 +8,6 @@ import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAva
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
-  isManagedAgentLive,
 } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
@@ -445,13 +444,11 @@ export function ProfileSummaryView({
           }
           agentActionLabel={
             isOwner === true && managedAgent
-              ? getManagedAgentPrimaryActionLabel(managedAgent, presenceStatus)
+              ? getManagedAgentPrimaryActionLabel(managedAgent)
               : undefined
           }
           agentActionLive={
-            managedAgent
-              ? isManagedAgentLive(managedAgent, presenceStatus)
-              : false
+            managedAgent ? isManagedAgentActive(managedAgent) : false
           }
           onAgentPrimaryAction={
             isOwner === true && managedAgent
@@ -465,7 +462,7 @@ export function ProfileSummaryView({
             // back once its harness died.
             isOwner === true &&
             managedAgent &&
-            isManagedAgentLive(managedAgent, presenceStatus)
+            isManagedAgentActive(managedAgent)
               ? handleAgentRestart
               : undefined
           }

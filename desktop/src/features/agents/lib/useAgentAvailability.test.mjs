@@ -22,20 +22,7 @@ for (const presence of ["online", "away", "offline", undefined]) {
     // Controls retain their existing routing. Offline is not permission to
     // spawn a second body, nor proof that a shutdown message succeeded.
     assert.equal(isManagedAgentActive(deployed), true);
-    // Fork divergence (see `isManagedAgentLive`): the retained receipt is the
-    // control-plane axis and never the live one, so a provider agent's primary
-    // control is routed by PRESENCE, not by `status === "deployed"`. Upstream
-    // routes it off the receipt and expects "Shutdown" here; this fork ships
-    // the presence-routed label because a `deployed` record whose harness is
-    // gone would otherwise offer Shutdown forever and never offer Deploy,
-    // leaving a dead remote agent unrecoverable. The presence-carrying calls
-    // below are the routing the app actually performs.
-    assert.equal(
-      getManagedAgentPrimaryActionLabel(deployed, availability),
-      availability === "online" || availability === "away"
-        ? "Shutdown"
-        : "Deploy",
-    );
+    assert.equal(getManagedAgentPrimaryActionLabel(deployed), "Shutdown");
     const html = renderToStaticMarkup(
       createElement(AgentRuntimeAvatarControl, {
         activeTestId: "active",

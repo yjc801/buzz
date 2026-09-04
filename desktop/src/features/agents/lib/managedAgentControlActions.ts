@@ -49,10 +49,15 @@ export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
 ///
 /// For a remote agent this is presence and only presence — the same signal
 /// the backend documents as the live axis, and the only one a remote
-/// harness can report. Using the control-plane axis here is what made a
-/// dead remote agent unrecoverable: its status stayed `deployed` forever,
-/// so the controls offered Shutdown for an agent that was not running and
-/// never offered Deploy.
+/// harness can report.
+///
+/// NOT the axis the lifecycle controls route on. Offline presence is not
+/// proof the harness is gone, so deploying off it can start a SECOND body
+/// against a live one; the control therefore reads the retained deployment
+/// receipt (`isManagedAgentActive`) and a dead remote agent is recovered by
+/// requesting shutdown and then deploying. This axis is for the wake path
+/// (`agentWake.ts`), which asks a different question: is there a harness
+/// there to receive this mention, or must one be started?
 ///
 /// A local agent has no presence requirement — the desktop owns its
 /// process, and `running` is first-hand knowledge.
@@ -73,12 +78,9 @@ export function isManagedAgentLive(
 /// instance and treats an already-running agent as a strict no-op that
 /// returns the existing id. Offering it costs one round trip in the worst
 /// case; withholding it strands the agent.
-export function getManagedAgentPrimaryActionLabel(
-  agent: ManagedAgent,
-  presence?: PresenceStatus | null,
-) {
+export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
   if (agent.backend.type === "provider") {
-    return isManagedAgentLive(agent, presence) ? "Shutdown" : "Deploy";
+    return isManagedAgentActive(agent) ? "Shutdown" : "Deploy";
   }
 
   if (isManagedAgentActive(agent)) {

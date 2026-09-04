@@ -127,9 +127,11 @@ name: buzz-pr-auto-merge
 # wrong key, scoped to the wrong channel, or duplicated on an addressable
 # coordinate), for a merge-job revalidation that CONTRADICTS the evaluate job,
 # and for anything after state changed — an audit comment that failed after a
-# merge, and a post-merge verdict read that no longer authorizes the merge or
-# cannot be completed at all. After main has moved, "we merged and cannot say
-# whether we were still allowed to" is not weather.
+# merge, a post-merge verdict read that no longer authorizes the merge or
+# cannot be completed at all, and a provenance label GitHub kept refusing after
+# the merge landed (nothing revisits a merged PR to add it later). After main
+# has moved, "we merged and cannot say whether we were still allowed to" is not
+# weather, and neither is "we merged and left no trace that we did".
 #
 # One merge per run: evaluate stops at the first candidate that passes, so
 # every merge was evaluated against a main that all of its gates observed.
@@ -1161,8 +1163,8 @@ jobs:
       # The only step in either job that can write to the repository, and the
       # only one AUTO_MERGE_TOKEN is exposed to. Even here it is applied per
       # command rather than exported as GH_TOKEN, and stripped from the
-      # environment of the relay read, so nothing but the merge write and the
-      # audit comment ever sees merge authority.
+      # environment of the relay read, so nothing but the merge write, the
+      # provenance label and the audit comment ever sees merge authority.
       - name: Merge
         if: steps.revalidate.outputs.proceed == 'true'
         env:
@@ -1306,6 +1308,60 @@ jobs:
           fi
           echo "- PR #$PR: MERGED at ${HEAD_SHA} (RISK ${RISK}, floor ${FLOOR})" >> "$GITHUB_STEP_SUMMARY"
 
+          # PROVENANCE LABEL, written the moment the merge has landed and
+          # BEFORE the post-merge read. It claims one thing — this sweep
+          # performed the merge — and that is true from here on whatever the
+          # read below finds, so it is not held back for the all-clear the
+          # way the audit comment is: a merge the post-merge read flags is
+          # still an auto-merge, and an owner filtering
+          # `is:merged label:auto-merged` is looking for exactly those too.
+          # Never before the write, either: GitHub may still reject the merge
+          # on the pinned `sha`, and a label on an unmerged PR would claim a
+          # merge that did not happen.
+          #
+          # It gates nothing — but a failure here is NOT weather, and it is
+          # not self-healing either. The candidate query enumerates OPEN PRs
+          # only, this PR is merged by the time the label is attempted, and no
+          # other job in this workflow writes or reconciles `auto-merged`. So
+          # a swallowed refusal leaves the PR permanently absent from the
+          # `is:merged label:auto-merged` inventory the runbook documents,
+          # with nothing but an expiring run annotation to say so. That is the
+          # catch-log-and-return-success shape AGENTS.md rule 1 forbids.
+          #
+          # Bounded retry first, because a 5xx from GitHub is genuinely
+          # weather and there is no reason to spend a red run on one. What a
+          # retry cannot fix — the label not existing, a permission short —
+          # then gets what an unfixable post-merge failure gets everywhere
+          # else in this step: a durable record on the PR and a red run. The
+          # post-merge verdict read and the audit comment still run first,
+          # unconditionally: they carry the load-bearing claims, and a missing
+          # provenance label must never cost them.
+          #
+          # REST under MERGE_TOKEN, as every write in this step is; the job's
+          # default token is read-only. The issues labels endpoint on a PR is
+          # covered by the same Pull requests: write permission the audit
+          # comment already relies on.
+          AUTO_MERGED_LABEL=auto-merged
+          LABEL_MISSING=""
+          for ATTEMPT in 1 2 3; do
+            if GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/labels" \
+                -f "labels[]=$AUTO_MERGED_LABEL" >/dev/null; then
+              LABEL_MISSING=""
+              break
+            fi
+            LABEL_MISSING="the ${AUTO_MERGED_LABEL} label could not be added (${ATTEMPT} attempt(s))"
+            [ "$ATTEMPT" -eq 3 ] || sleep $((ATTEMPT * 2))
+          done
+          LABEL_REPAIR=""
+          if [ -n "$LABEL_MISSING" ]; then
+            echo "::warning::PR #$PR: merged, but ${LABEL_MISSING} — leaving a repair note on the PR and failing this run"
+            # shellcheck disable=SC2016  # backticks are markdown, not command substitution
+            LABEL_REPAIR=$(printf '⚠️ **This merge is missing its `%s` provenance label.** GitHub refused the label write after the merge landed (%s), so PR #%s will not appear in `is:pr is:merged label:%s`.\n\nNothing retries this on its own: the sweep only ever visits OPEN pull requests, and this one is merged. Repair by hand — the usual cause is the label not existing yet (`docs/pr-auto-merge.md`, ops runbook):\n\n```\ngh label create %s --description "merged by the auto-merge sweep"\ngh pr edit %s --add-label %s\n```\n\nRun: %s/%s/actions/runs/%s\n' \
+              "$AUTO_MERGED_LABEL" "$LABEL_MISSING" "$PR" "$AUTO_MERGED_LABEL" \
+              "$AUTO_MERGED_LABEL" "$PR" "$AUTO_MERGED_LABEL" \
+              "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")
+          fi
+
           # AFTER THE WRITE. The window above cannot be closed, so it is closed
           # from the other side: read the coordinate once more, now that main
           # has already moved. A revocation that landed inside the window shows
@@ -1419,6 +1475,10 @@ jobs:
             ALERT=$(printf '🚨 %s\n\nPR #%s was squash-merged at `%s` on verdict `%s`. Re-reading the reviewer'"'"'s verdict coordinate immediately after the merge: %s.\n\n%s\n\nThis is a detection, not a prevention — the merge write cannot be fenced on a relay value, and the post-merge read cannot date what it finds, see "What cannot be fenced" in `docs/pr-auto-merge.md`.\n\nRun: %s/%s/actions/runs/%s\n' \
               "$HEADLINE" "$PR" "$HEAD_SHA" "$EVENT_ID" "$WHY" "$REMEDY" \
               "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")
+            # This run is already red and already writing a durable record, so
+            # the missing label rides along in it rather than costing the PR a
+            # second comment about the same merge.
+            [ -z "$LABEL_REPAIR" ] || ALERT=$(printf '%s\n\n---\n\n%s' "$ALERT" "$LABEL_REPAIR")
             if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$ALERT" >/dev/null; then
               echo "::error::PR #$PR: the post-merge alert could not be posted to the PR — this run log is the only record"
             fi
@@ -1440,5 +1500,16 @@ jobs:
             "$VERDICT_KIND" "$REVIEWER_NAME" "$EVENT_ID" "$RISK" "$FLOOR" "$EFFECTIVE" "$HEAD_SHA" \
             "$GITHUB_SERVER_URL" "$R" "$GITHUB_RUN_ID")" >/dev/null; then
             echo "::error::PR #$PR merged but the audit comment failed — the record is incomplete"
+            exit 1
+          fi
+
+          # The merge and its audit trail are complete; only the provenance
+          # label is not, and nothing else will ever come back for it.
+          if [ -n "$LABEL_REPAIR" ]; then
+            if ! GH_TOKEN="$MERGE_TOKEN" gh api "repos/$R/issues/$PR/comments" -f body="$LABEL_REPAIR" >/dev/null; then
+              echo "::error::PR #$PR: ${LABEL_MISSING}, and the repair note could not be posted to the PR either — this run log is the only record"
+            fi
+            echo "- PR #$PR: MERGED, then ${LABEL_MISSING} — add it by hand (gh pr edit $PR --add-label ${AUTO_MERGED_LABEL}); no later sweep revisits a merged PR" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::PR #$PR merged at ${HEAD_SHA}, but ${LABEL_MISSING}. It is absent from is:merged label:${AUTO_MERGED_LABEL} until someone adds it — see the repair note on the PR."
             exit 1
           fi

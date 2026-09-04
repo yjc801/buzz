@@ -321,7 +321,13 @@ post-merge read flips five scenarios from red to a silent success. Those
 scenarios also assert what the alert must **not** claim: restoring wording that
 asserts the revocation preceded the merge fails them, because the stub swaps
 its fixture by read number and therefore models both sequences at once — which
-is exactly the production ambiguity, not a shortcut in the test.
+is exactly the production ambiguity, not a shortcut in the test. The same file
+pins the `auto-merged` provenance label: written under the merge credential
+after the merge and never on a refusal, present on the flagged merges too, and
+— because nothing revisits a merged PR to add it later — retried, then made
+repairable rather than swallowed. A refusal the retry outlasts costs nothing;
+one it cannot must still leave the post-merge read and the audit comment
+intact, leave a repair note on the PR naming the by-hand fix, and end red.
 
 **The stops that have no window at all are the GitHub-side ones**, because
 GitHub evaluates them as part of the merge:
@@ -435,8 +441,13 @@ together (`just auto-merge-check`, wired into CI's contract steps).
   merge does not happen this tick. The wording is hedged on purpose: the
   message is written by `evaluate`, and the isolated `merge` job re-checks
   every gate afterwards and may still refuse.
-- After merging, CI leaves a GitHub PR comment naming the verdict event id,
-  RISK, floor, effective tier, head SHA, and the run.
+- After merging, CI adds the `auto-merged` label to the PR — the moment the
+  write lands, before the post-merge verdict read, so a sweep merge that read
+  later flags carries it too — and leaves a GitHub PR comment naming the
+  verdict event id, RISK, floor, effective tier, head SHA, and the run. The
+  label is provenance, not a gate: `is:pr is:merged label:auto-merged` lists
+  every merge the sweep performed. A label write GitHub keeps refusing fails
+  the run and leaves a repair note on the PR; see the runbook below.
 - When the reviewer requested auto-merge but a gate refused, CI posts one
   `⛔ auto-merge blocked at <sha>` notice per head naming every failed gate.
 
@@ -515,6 +526,35 @@ the only honest record.
   keeps the label, which the documented queue filter already excludes. Filter
   the queue with `is:open label:approved-manual-merge`. Contract test:
   `.github/scripts/pr-auto-merge-label.test.sh`.
+- **"Which merges were the sweep's?":** every PR the merge job merges gets
+  the `auto-merged` label, written immediately after the merge write succeeds
+  and before the post-merge verdict read. The label claims only that this
+  workflow performed the merge, which stays true whatever that read finds, so
+  a merge the run later flags red carries it too; it is never written before
+  the merge, because GitHub may still reject the write on the pinned `sha`.
+  Provenance only: it gates nothing. Written with `AUTO_MERGE_TOKEN` over
+  REST under the same Pull requests: write permission the audit comment uses;
+  the merge job's default token stays read-only. Filter with
+  `is:pr is:merged label:auto-merged`. Create the label once, with a
+  deliberate colour and description (`gh label create auto-merged`), the way
+  `no-auto-merge` and `approved-manual-merge` were — a missing label is the
+  likeliest reason the write is refused. Contract test:
+  `.github/scripts/pr-auto-merge-write.test.sh`.
+- **A merge whose label write failed:** the label write is retried three
+  times, because a 5xx is weather. Past that the run goes **red** and leaves a
+  comment on the merged PR naming the repair, rather than warning into a log
+  that expires. It is not self-healing: the sweep enumerates open PRs only, so
+  no later run comes back for the label, and the merge would otherwise be
+  permanently absent from `is:pr is:merged label:auto-merged` with no standing
+  record of the gap. Repair:
+
+  ```
+  gh label create auto-merged --description "merged by the auto-merge sweep"
+  gh pr edit <PR> --add-label auto-merged
+  ```
+
+  The merge itself is unaffected and needs no action — the audit comment and
+  the post-merge verdict read run before this and are the load-bearing record.
 - **Required ruleset on `main`:** a prerequisite for the feature doing
   anything at all. Everything else the workflow checks is a read with a window
   after it; a branch rule is evaluated by GitHub as part of the merge itself,

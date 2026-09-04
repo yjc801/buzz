@@ -33,7 +33,7 @@ pub const DEFAULT_SPRIG_VERSION: &str = "sprig-latest";
 /// Pinned npm versions of the ACP adapters provisioned when the corresponding
 /// `install_*_adapter` flag is on. Baked provider state, like the sprig pins.
 pub const CLAUDE_ADAPTER_VERSION: &str = "0.73.0";
-pub const CODEX_ADAPTER_VERSION: &str = "1.1.7";
+pub const CODEX_ADAPTER_VERSION: &str = "1.8.0";
 
 /// The agent's HOME and working directory inside the sprite (§Launch data:
 /// cwd = HOME, mirroring the local spawn's agent-workdir convention). The

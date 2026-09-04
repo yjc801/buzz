@@ -114,6 +114,11 @@ security-review-check:
 auto-merge-check:
     actionlint .github/workflows/buzz-pr-auto-merge.yml
     actionlint .github/workflows/buzz-pr-review-watchdog.yml
+    # -shellcheck=: this workflow's step is one long shell script full of
+    # jq programs, and shellcheck reads every '...' jq filter as a shell
+    # expansion that failed to expand (SC2016). The YAML, expression and
+    # action checks are the ones that matter here.
+    actionlint -shellcheck= .github/workflows/buzz-pr-mirror.yml
     node --check .github/scripts/pr-auto-merge-risk.js
     node --check .github/scripts/pr-auto-merge-verdict.js
     node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js

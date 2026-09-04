@@ -13,7 +13,8 @@ name: buzz-pr-mirror
 #   closed      → post ✅ Merged / 🚫 Closed without merge, then archive
 #   reopened    → unarchive, and reverse the close annotations everywhere
 #   schedule    → archive the room of any PR whose close GitHub never
-#                 announced (sweep_missed_closes — see below)
+#                 announced (sweep_missed_closes — see below), and restore
+#                 one it archived under a PR reopened out from under it
 #
 # Ported from yjc801/velvet's buzz-pr-mirror.yml. Keep the two in sync when
 # fixing relay-behavior bugs — the hard-won invariants in the shell below
@@ -40,10 +41,30 @@ name: buzz-pr-mirror
 # membership listing anyway, and the snapshot can lag the archive). The settle
 # window keeps the sweep off a PR whose own close run may still be queued or
 # running; if the two do meet, the later one's notice is refused and it exits
-# clean. The sweep never creates a room, never posts a fallback notice (it has
-# no durable record that one went out, so it would repeat every half hour),
-# and never unarchives: an archived room under an open PR may be the owner's
-# own choice, and `reopened` is announced normally.
+# clean. The sweep never creates a room and never posts a fallback notice (it
+# has no durable record that one went out, so it would repeat every half
+# hour).
+#
+# THAT REFUSAL PROVES THE ROOM IS ARCHIVED, NOT THAT ITS CLOSE RAN. A room
+# archived by hand while its PR was open refuses the notice exactly the same
+# way, and treating that as "nothing left to do" would leave every
+# cross-channel reference to the PR on its old open/reopened banner for good.
+# So a close that COMPLETES records itself in a per-PR addressable note
+# (bind_pr's CLOSE_MARKER_SLUG), readable whatever state the room is in, and
+# a reopen invalidates it. Archived plus marker means finished; archived
+# without it means finish the half that does not need this room — the
+# annotations — and record that.
+#
+# THE SWEEP'S PRE-WRITE PR RE-READ IS NOT A FENCE. Sweep and event runs sit
+# in different concurrency groups, so a reopen can land between that read and
+# the archive and complete first, leaving the room archived under an open PR
+# with no later sweep to notice (the listing enumerates closed PRs only).
+# There is no compare-and-set spanning GitHub and the relay, so the two
+# converge instead: the sweep re-reads after its writes and, on a PR that is
+# open again, puts the room through the same reopen epilogue the event run
+# uses. That is the only case in which the sweep unarchives — an archived
+# room under an open PR is otherwise the owner's own business, and `reopened`
+# is announced normally.
 #
 # CHANNEL NAMES CARRY THE PROJECT PREFIX: `buzz-pr-N`, never bare `pr-N`.
 # Every repo that mirrors into openvelvet prefixes with its own project name
@@ -233,6 +254,11 @@ jobs:
           # backfill. An event run reads neither.
           SWEEP_DAYS: ${{ github.event.inputs.sweep_days || '7' }}
           SWEEP_SETTLE_SECS: "1800"
+          # Ceiling on the closed-PR listing. The query is bounded by close
+          # date, so this is a completeness check rather than a page size: a
+          # window that fills it fails the sweep instead of being examined in
+          # part. 1000 is the search API's own hard ceiling.
+          SWEEP_LIST_LIMIT: "1000"
           PR_ACTION: ${{ github.event.action }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -426,10 +452,25 @@ jobs:
             # a slug the CLI rejects would turn every lookup into a hard error.
             BINDING_SLUG=$(printf 'pr-mirror-%s-%s' "$GITHUB_REPOSITORY" "$PR_NUMBER" \
               | tr '[:upper:]' '[:lower:]' | tr '/' '-')
-            printf '%s' "$BINDING_SLUG" | grep -qE '^[a-z0-9._-]{1,80}$' || {
-              echo "binding slug '$BINDING_SLUG' is outside the note-slug charset" >&2
-              return 1
-            }
+            # This PR's close-completion marker, and why it has to exist:
+            # AN ARCHIVED ROOM IS NOT PROOF THAT ITS CLOSE RAN. A room can be
+            # archived by hand while its PR is open, and the close epilogue's
+            # first write is refused on ANY archived room, so the refusal
+            # alone cannot tell a finished close from one that never
+            # happened. Taking the silent path on the second strands every
+            # cross-channel reference on its old open/reopened banner for
+            # good. This note is written only when a close epilogue
+            # COMPLETES, is invalidated by a reopen, and stays readable
+            # whatever state the room is in — it is an addressable note at
+            # CI's own author coordinate, not a channel-scoped write.
+            CLOSE_MARKER_SLUG="${BINDING_SLUG}-closed"
+            local SLUG
+            for SLUG in "$BINDING_SLUG" "$CLOSE_MARKER_SLUG"; do
+              printf '%s' "$SLUG" | grep -qE '^[a-z0-9._-]{1,80}$' || {
+                echo "note slug '$SLUG' is outside the note-slug charset" >&2
+                return 1
+              }
+            done
             # The annotation sweep's search key — repo-qualified, so velvet's
             # PR #N and this repo's PR #N never annotate each other.
             PR_PATH="github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
@@ -482,6 +523,42 @@ jobs:
             # substitution that is capturing a channel UUID.
             printf '%s\n' "$1" | buzz notes set --name "$BINDING_SLUG" \
               --title "PR mirror binding: ${GITHUB_REPOSITORY}#${PR_NUMBER}" \
+              --tag pr-mirror --content - >/dev/null
+          }
+
+          # The only marker content that means "this PR's close epilogue
+          # completed". A reopen overwrites it with something else rather
+          # than deleting it, so "present but not this" and "absent" are one
+          # case to every reader.
+          CLOSE_MARKER_DONE=closed
+
+          read_close_marker() {
+            # Prints the marker's content, or nothing when it is PROVABLY
+            # absent. Same exact-coordinate read, and the same refusal to
+            # infer absence from a broken read, as read_binding: absence is
+            # what sends the close epilogue down its do-the-work path, and a
+            # relay blip must not become a second annotation sweep under
+            # every reference.
+            local OUT STATUS=0
+            OUT=$(buzz notes get --name "$CLOSE_MARKER_SLUG" --author me --content-only 2>"$ERRFILE") \
+              || STATUS=$?
+            if [ "$STATUS" -eq 0 ]; then
+              printf '%s' "$OUT" | tr -d '[:space:]'
+              return 0
+            fi
+            if [ "$STATUS" -eq 1 ] && grep -q '"error":"not_found"' "$ERRFILE"; then
+              return 0
+            fi
+            echo "close-marker lookup failed (exit $STATUS): $(cat "$ERRFILE")" >&2
+            return 1
+          }
+
+          write_close_marker() {
+            # $1 is the state token — CLOSE_MARKER_DONE, or anything else to
+            # invalidate. Output is redirected because callers may run inside
+            # a command substitution capturing something else.
+            printf '%s\n' "$1" | buzz notes set --name "$CLOSE_MARKER_SLUG" \
+              --title "PR mirror close marker: ${GITHUB_REPOSITORY}#${PR_NUMBER}" \
               --tag pr-mirror --content - >/dev/null
           }
 
@@ -1087,9 +1164,11 @@ jobs:
             # The whole close for a PR whose room is known — $1 is its UUID.
             # Shared by the `closed` event and by sweep_missed_closes, so a
             # close GitHub never announced gets exactly the treatment an
-            # announced one does. Sets CLOSE_OUTCOME: "archived" when the
-            # room turns out to be closed already, "reconciled" when this
-            # call closed it.
+            # announced one does. Sets CLOSE_OUTCOME: "reconciled" when this
+            # call closed the room, "annotated" when the room was already
+            # archived with no close on record and only the cross-channel
+            # half was left to do, "archived" when this PR's close is already
+            # complete and there was nothing to do at all.
             #
             # THE FIRST WRITE IS THE FENCE. The relay refuses every
             # channel-scoped write on an archived room BEFORE storing it —
@@ -1103,15 +1182,37 @@ jobs:
             # and a stale "live" would cost a reaction and a threaded reply
             # under every cross-channel reference a second time. Every other
             # write follows the fence for that reason.
-            local CH="$1" SEND_ERR
+            local CH="$1" SEND_ERR MARKER
             CLOSE_OUTCOME=""
             if ! printf '%s — archiving this channel.\n%s\n' "$STATUS" "$PR_URL" \
                 | buzz messages send --channel "$CH" --content - 2>"$ERRFILE"; then
               SEND_ERR=$(cat "$ERRFILE")
               case "$SEND_ERR" in
                 *"channel is archived"*)
-                  echo "#${NAME} is already archived — nothing left to do"
-                  CLOSE_OUTCOME=archived
+                  # ARCHIVED IS NOT CLOSE-COMPLETE. The refusal proves the
+                  # room is archived and nothing more; the marker is what
+                  # proves this PR's close epilogue ran. Present, this is a
+                  # rerun of a finished close (or the sweep and the event run
+                  # meeting on one PR) and must be green and silent. Absent,
+                  # the room was archived without a close — by hand while the
+                  # PR was open, or by a close that died between the archive
+                  # and the marker — and its cross-channel references are
+                  # still on their old banner with nothing else coming to
+                  # correct them. Those live in OTHER rooms, so they can be
+                  # finished even though this room can no longer be written
+                  # to; the room's own notice is the one thing that is
+                  # genuinely lost, and the archive it announces has
+                  # already happened.
+                  MARKER=$(read_close_marker) || return 1
+                  if [ "$MARKER" = "$CLOSE_MARKER_DONE" ]; then
+                    echo "#${NAME} is archived and this close is on record — nothing left to do"
+                    CLOSE_OUTCOME=archived
+                    return 0
+                  fi
+                  echo "#${NAME} is archived with no close on record — finishing the close outside the room"
+                  annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
+                  write_close_marker "$CLOSE_MARKER_DONE" || return 1
+                  CLOSE_OUTCOME=annotated
                   return 0 ;;
               esac
               echo "close notice rejected: $SEND_ERR" >&2
@@ -1124,7 +1225,51 @@ jobs:
             ensure_provisioned "$CH" || return 1
             annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
             archive_channel "$CH" || return 1
+            # LAST, and only on the path that finished: the marker means
+            # "this PR's close epilogue completed", so every failure above
+            # must leave it absent and be redone by the rerun or the sweep.
+            write_close_marker "$CLOSE_MARKER_DONE" || return 1
             CLOSE_OUTCOME=reconciled
+          }
+
+          reopen_epilogue() {
+            # The whole reopen for a PR whose room is known — $1 is its UUID.
+            # Shared by the `reopened` event and by the sweep's post-write
+            # convergence check, which reaches it when a reopen landed while
+            # the sweep was closing the same PR.
+            local CH="$1"
+            # Invalidated FIRST: while this marker still reads "closed" a
+            # later close would take the silent path on an archived room and
+            # skip the annotations this reopen is about to reverse.
+            write_close_marker reopened || return 1
+            # Restoration is driven by write outcomes, not the discovery
+            # snapshot (the reaper commits archived_at before its discovery
+            # emission, so snapshots can be stale). Unarchive is
+            # best-effort — rejected harmlessly when the channel is already
+            # active. The reopen notice is the fence, and it is sent FIRST:
+            # the relay refuses every channel-scoped write on an archived
+            # room BEFORE storing it, so this send succeeding proves the
+            # room is live no matter what any snapshot said, and it fails
+            # loudly here rather than as a confusing add-member error
+            # further down. It replaces the old `--no-ttl` clear, which
+            # proved the same thing but also performed a mutation whose
+            # application nothing could verify — and there is now no TTL to
+            # clear, because no success path ever sets one.
+            buzz channels unarchive --channel "$CH" \
+              || echo "unarchive rejected (channel likely already active) — proceeding"
+            printf 'PR #%s reopened on GitHub — channel unarchived.\n%s\n' \
+              "$PR_NUMBER" "$PR_URL" | buzz messages send --channel "$CH" --content - || return 1
+            # Recovery runs after the fence: a create-then-cancel partial
+            # can reach reopened without ever having been provisioned.
+            ensure_provisioned "$CH" || return 1
+            # Reverse the close sweep everywhere, not just in this room. The
+            # close path edited CI-authored references, reacted on everyone
+            # else's, and replied under them; a room notice supersedes none
+            # of that, so without this a reopened PR stays marked "Closed
+            # without merge" across Buzz — including on its own seed card.
+            # Runs after the unarchive fence so writes into this channel are
+            # accepted.
+            annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" || return 1
           }
 
           hydrate_pr() {
@@ -1156,6 +1301,47 @@ jobs:
             return 0
           }
 
+          converge_after_close() {
+            # $1 PR number, $2 its room. Re-read the PR AFTER the close wrote,
+            # and undo the close if the PR is open again.
+            #
+            # THE SWEEP AND AN EVENT RUN ARE NOT SERIALIZED WITH EACH OTHER:
+            # they sit in different concurrency groups (one group for the
+            # sweep, one per PR for events), so the sweep's `state == closed`
+            # check is a snapshot and nothing more. A reopen arriving after
+            # it — its `reopened` run unarchiving the room, reversing the
+            # banners and finishing — is then followed by this sweep posting
+            # a close notice and archiving the room under a PR that is open.
+            # Nothing else would ever correct that: the sweep's own listing
+            # only enumerates CLOSED PRs, so the room stays archived and the
+            # references stay marked closed for as long as the PR lives.
+            #
+            # A pre-write re-read cannot close that window — there is no
+            # relay-side compare-and-set spanning GitHub's state and the
+            # room's — so the writes CONVERGE instead: whichever of the two
+            # runs writes last also checks last and restores what the other
+            # left wrong. The other interleaving is already safe (a reopen
+            # that starts after this archive unarchives it itself), and a
+            # doubled restoration is idempotent — the unarchive is
+            # best-effort and the banners are replaced, not stacked.
+            #
+            # A re-read that FAILS is red: the room has been archived and
+            # this run cannot show that GitHub agrees, which is precisely the
+            # state that must not be reported as a completed repair.
+            local NUM="$1" CH="$2" POST STATE
+            POST=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}") || {
+              echo "#${NUM}: post-close re-read failed — cannot show the room's state matches GitHub's" >&2
+              return 1
+            }
+            STATE=$(printf '%s' "$POST" | jq -r '.state // empty') || return 1
+            [ "$STATE" = closed ] && return 0
+            echo "#${NUM}: reopened while this sweep was closing it — restoring #${NAME}" >&2
+            hydrate_pr "$POST" || return 1
+            reopen_epilogue "$CH" || return 1
+            RESTORED=$((RESTORED + 1))
+            return 0
+          }
+
           sweep_missed_closes() {
             # Reconcile closes GitHub never announced — see the header. Every
             # same-repo PR closed at least SWEEP_SETTLE_SECS ago and within
@@ -1171,20 +1357,48 @@ jobs:
             # One PR's failure fails the sweep but not its siblings: each is
             # independent, the cron retries, and a red run is the honest
             # outcome for a room this identity could not resolve or close.
-            local NOW OLDEST NEWEST PRS CANDIDATES LISTED NUM CLOSED_AT PR_JSON
-            local EXAMINED=0 RECONCILED=0 ARCHIVED=0 NOROOM=0 FAILED=0
+            local NOW OLDEST OLDEST_DATE NEWEST PRS CANDIDATES LISTED NUM CLOSED_AT PR_JSON
+            local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 FAILED=0
             printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
               echo "SWEEP_DAYS must be a small integer, got '${SWEEP_DAYS}'" >&2
+              return 1
+            }
+            printf '%s' "$SWEEP_LIST_LIMIT" | grep -qE '^[0-9]{1,4}$' || {
+              echo "SWEEP_LIST_LIMIT must be a small integer, got '${SWEEP_LIST_LIMIT}'" >&2
+              return 1
+            }
+            # Base 10, explicitly: bash arithmetic reads a leading zero as
+            # octal, so a hand-typed `sweep_days=008` would pass the digit
+            # check above and then abort the whole sweep at the window
+            # calculation with "value too great for base".
+            SWEEP_DAYS=$((10#$SWEEP_DAYS))
+            SWEEP_LIST_LIMIT=$((10#$SWEEP_LIST_LIMIT))
+            [ "$SWEEP_DAYS" -gt 0 ] || {
+              echo "SWEEP_DAYS must be at least 1, got '${SWEEP_DAYS}'" >&2
               return 1
             }
             NOW=$(date +%s)
             NEWEST=$((NOW - SWEEP_SETTLE_SECS))
             OLDEST=$((NOW - SWEEP_DAYS * 86400))
-            # Newest-updated first: a close bumps updated_at, so the window
-            # sits at the top of the listing. Fork heads never got a room
-            # (the job condition skips them) and are not candidates.
-            PRS=$(gh pr list -R "$GITHUB_REPOSITORY" --state closed --limit 100 \
-              --search 'sort:updated-desc' \
+            # THE WINDOW IS BOUNDED SERVER-SIDE, NOT BY A PREFIX OF THE
+            # LISTING. A bare newest-first page filtered afterwards silently
+            # drops any in-window close sitting behind a page's worth of
+            # fork PRs, older PRs touched since, or simply more closes than
+            # the page holds — and because the sweep only ever lists closed
+            # PRs, a candidate hidden that way is hidden from every later
+            # sweep too, until it ages out unreconciled while every run
+            # reports green. `closed:>=` is UTC-day granularity, so it is a
+            # superset of the window and the exact bounds are still applied
+            # below. python3 rather than `date -d`: BSD date has no -d.
+            # Fork heads never got a room (the job condition skips them) and
+            # are not candidates; that filter stays client-side, because
+            # search has no head-repository qualifier.
+            OLDEST_DATE=$(python3 -c 'import sys,time; print(time.strftime("%Y-%m-%d", time.gmtime(int(sys.argv[1]))))' "$OLDEST") || {
+              echo "window start could not be formatted as a search bound" >&2
+              return 1
+            }
+            PRS=$(gh pr list -R "$GITHUB_REPOSITORY" --state closed --limit "$SWEEP_LIST_LIMIT" \
+              --search "sort:updated-desc closed:>=${OLDEST_DATE}" \
               --json number,closedAt,mergedAt,headRepositoryOwner,headRepository) || {
               echo "closed-PR listing failed — failing so the next sweep retries" >&2
               return 1
@@ -1201,8 +1415,17 @@ jobs:
                | [.number, .closedAt]
                | @tsv' > "$CANDIDATES" || return 1
             LISTED=$(printf '%s' "$PRS" | jq 'length') || return 1
-            if [ "$LISTED" -ge 100 ]; then
-              echo "listing window is full (${LISTED}) — PRs closed before its oldest entry were not examined this sweep"
+            # A full result set means the query was truncated, so the window
+            # was NOT enumerated completely and any candidate beyond the cap
+            # is invisible to this sweep and to every later one. That is a
+            # failure, not a warning: reporting green on an incomplete repair
+            # is exactly the silence this whole sweep exists to end. The
+            # remedy is a narrower dispatch window (or a higher cap, up to
+            # the search API's own 1000-result ceiling).
+            if [ "$LISTED" -ge "$SWEEP_LIST_LIMIT" ]; then
+              echo "closed-PR listing filled its ${SWEEP_LIST_LIMIT}-result cap inside the ${SWEEP_DAYS}-day window" >&2
+              echo "— the window was not enumerated completely; re-run with a narrower sweep_days" >&2
+              return 1
             fi
             echo "examining PRs closed within ${SWEEP_DAYS} day(s) and settled for ${SWEEP_SETTLE_SECS}s"
             while IFS=$'\t' read -r NUM CLOSED_AT; do
@@ -1243,10 +1466,20 @@ jobs:
                 reconciled)
                   echo "#${NUM}: closed ${CLOSED_AT} with #${NAME} still live — GitHub scheduled no close run; archived it now"
                   RECONCILED=$((RECONCILED + 1)) ;;
+                annotated)
+                  ANNOTATED=$((ANNOTATED + 1)) ;;
                 *) ARCHIVED=$((ARCHIVED + 1)) ;;
               esac
+              # THE PRE-WRITE RE-READ IS NOT A FENCE, so the writes are
+              # reconciled afterwards — see converge_after_close.
+              case "$CLOSE_OUTCOME" in
+                reconciled|annotated)
+                  if ! converge_after_close "$NUM" "$CH"; then
+                    FAILED=$((FAILED + 1))
+                  fi ;;
+              esac
             done < "$CANDIDATES"
-            echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ARCHIVED} already archived, ${NOROOM} without a room, ${FAILED} failed"
+            echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ANNOTATED} annotated outside an archived room, ${ARCHIVED} already archived, ${NOROOM} without a room, ${RESTORED} restored after a concurrent reopen, ${FAILED} failed"
             [ "$FAILED" -eq 0 ]
           }
 
@@ -1325,37 +1558,14 @@ jobs:
             reopened)
               CH=$(resolve_channel) || exit 1
               if [ -z "$CH" ]; then
+                # No room to restore, but the close marker still has to be
+                # invalidated and the cross-channel references reversed.
+                write_close_marker reopened || exit 1
                 create_and_seed || exit 1
+                annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" || exit 1
               else
-                # Restoration is driven by write outcomes, not the discovery
-                # snapshot (the reaper commits archived_at before its discovery
-                # emission, so snapshots can be stale). Unarchive is
-                # best-effort — rejected harmlessly when the channel is already
-                # active. The reopen notice is the fence, and it is sent FIRST:
-                # the relay refuses every channel-scoped write on an archived
-                # room BEFORE storing it, so this send succeeding proves the
-                # room is live no matter what any snapshot said, and it fails
-                # loudly here rather than as a confusing add-member error
-                # further down. It replaces the old `--no-ttl` clear, which
-                # proved the same thing but also performed a mutation whose
-                # application nothing could verify — and there is now no TTL to
-                # clear, because no success path ever sets one.
-                buzz channels unarchive --channel "$CH" \
-                  || echo "unarchive rejected (channel likely already active) — proceeding"
-                printf 'PR #%s reopened on GitHub — channel unarchived.\n%s\n' \
-                  "$PR_NUMBER" "$PR_URL" | buzz messages send --channel "$CH" --content -
-                # Recovery runs after the fence: a create-then-cancel partial
-                # can reach reopened without ever having been provisioned.
-                ensure_provisioned "$CH" || exit 1
+                reopen_epilogue "$CH" || exit 1
               fi
-              # Reverse the close sweep everywhere, not just in this room. The
-              # close path edited CI-authored references, reacted on everyone
-              # else's, and replied under them; a room notice supersedes none
-              # of that, so without this a reopened PR stays marked "Closed
-              # without merge" across Buzz — including on its own seed card.
-              # Runs after the unarchive fence so writes into this channel are
-              # accepted.
-              annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" || exit 1
               ;;
             closed)
               set_close_status

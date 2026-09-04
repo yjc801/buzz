@@ -31,7 +31,9 @@
 #   * a page number is an offset into a list that moves: a PR reopened
 #     mid-walk shifts every record behind it one offset earlier, and the next
 #     page then begins past one of them. That skip is caught at the page
-#     boundary and the listing enumerated again; a listing that never holds
+#     boundary and the listing enumerated again — and a balanced pair of
+#     movements, which no single boundary can see, is caught by re-reading the
+#     whole accepted prefix once the walk ends; a listing that never holds
 #     still is red, not a green sweep over a walk that may have skipped;
 #   * a close inside the settle window, a PR reopened between the listing
 #     and the write, a fork head, and a close outside the window are all
@@ -161,6 +163,18 @@ case "$*" in
     if [ -f "$FIXTURES/listing_drop" ] && [ "$REQ" -gt 1 ]; then
       FULL=$(printf '%s' "$FULL" \
         | jq --argjson n "$(cat "$FIXTURES/listing_drop")" 'map(select(.number != $n))')
+    fi
+    # `listing_balanced` is the pair of movements no single page boundary
+    # can see: from request N on, one record leaves the front (reopened) while
+    # a later one moves up to the front (updated). Every offset between them
+    # is exactly where it was, so each page's predecessor re-reads identically
+    # — and the promoted record is now behind the walk.
+    if [ -f "$FIXTURES/listing_balanced" ]; then
+      read -r BD BP BA < "$FIXTURES/listing_balanced"
+      if [ "$REQ" -ge "$BA" ]; then
+        FULL=$(printf '%s' "$FULL" | jq --argjson d "$BD" --argjson p "$BP" \
+          'map(select(.number == $p)) + map(select(.number != $d and .number != $p))')
+      fi
     fi
     if [ -f "$FIXTURES/listing_always_moves" ]; then
       FULL=$(printf '%s' "$FULL" | jq --argjson r "$REQ" \
@@ -321,6 +335,9 @@ listing_drops() { # listing_drops <number> — reopened after the walk's first r
 }
 listing_never_settles() { # a listing that shifts on every single read
   touch "$FIXTURES/listing_always_moves"
+}
+listing_balanced() { # listing_balanced <reopened> <promoted> <from-request>
+  printf '%s %s %s\n' "$1" "$2" "$3" > "$FIXTURES/listing_balanced"
 }
 pr_record() { # pr_record <number> <state:open|closed> <merged:true|false> → the re-read
   printf '{"state":"%s","merged":%s,"title":"PR %s","html_url":"https://github.com/%s/pull/%s","body":"","user":{"login":"yjc801"},"head":{"ref":"claude/x","sha":"%s"},"base":{"ref":"main","sha":"%s"}}\n' \
@@ -600,7 +617,8 @@ bind 4242 "$CH_A"
 pr_record 4242 closed false
 SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should fetch pages until a short one ends the listing" "$([ "$(count "PR_LIST page=3")" = 1 ]; echo $?)"
+# Page 3 is read twice: once by the walk, once by the prefix re-read.
+check "should fetch pages until a short one ends the listing" "$([ "$(count "PR_LIST page=3")" = 2 ]; echo $?)"
 check "should reconcile the second-page close" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
 check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled'; echo $?)"
 
@@ -613,7 +631,7 @@ bind 4242 "$CH_A"
 pr_record 4242 closed false
 SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should not fetch past the window" "$([ "$(count "PR_LIST")" = 1 ]; echo $?)"
+check "should not fetch past the window" "$([ "$(count "PR_LIST")" = 2 ]; echo $?)"   # the page, and its re-read
 check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
 
 # A PAGE NUMBER IS AN OFFSET INTO A LIST THAT MOVES. `sort=updated` is a
@@ -635,6 +653,31 @@ check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should notice the shift at the page boundary" "$(said 'shifted under the walk'; echo $?)"
 check "should archive the close the shifted walk skipped" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
 check "should account for the settled walk only" "$(said 'sweep: 1 examined, 1 reconciled'; echo $?)"
+
+# A BALANCED PAIR OF MOVEMENTS SHOWS AT NO SINGLE PAGE BOUNDARY. One record
+# leaving the front (reopened) while a later one moves up to the front
+# (updated) leaves every offset between them exactly where it was: each page's
+# predecessor re-reads identically, while the promoted record has moved behind
+# the walk and is never read. Here pages 1 and 2 are accepted, then #4241
+# reopens and still-closed #4242 moves up: page 3 reads on, every boundary
+# agrees, the short page ends the walk — and #4242, whose room is live, is
+# missing from a green sweep. Only re-reading the WHOLE accepted prefix sees
+# it.
+scenario "sweep: a balanced shift behind the walk is caught by the prefix re-read"
+listing_page 1 "$(listed 4241 3600 false someone-else buzz)"
+listing_page 2 "$(listed 4243 3700 false someone-else buzz)"
+listing_page 3 "$(listed 4244 3800 false someone-else buzz)"
+listing_page 4 "$(listed 4246 3900 false someone-else buzz)"
+listing_page 5 "$(listed 4242 4000 false)"
+listing_balanced 4241 4242 4
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "no page boundary should see this shift" \
+  "$(said 'no longer holds the records the walk read there'; echo $?)"
+check "should archive the close the balanced shift hid" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should account for the re-enumerated walk" "$(said 'sweep: 1 examined, 1 reconciled'; echo $?)"
 
 # Re-enumerating is bounded. A walk that may have skipped is not a walk to
 # archive from, so an unsettleable listing is red and left to the next sweep.

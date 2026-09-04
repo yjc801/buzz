@@ -1439,7 +1439,8 @@ jobs:
             # outcome for a room this identity could not resolve or close.
             local NOW OLDEST NEWEST CANDIDATES NUM CLOSED_AT PR_JSON
             local PAGES PAGE FETCHED CHUNK N PAGE_OLDEST
-            local ATTEMPT MOVED PREV_OFFSETS RECHECK SWEEP_LIST_ATTEMPTS=3
+            local ATTEMPT MOVED PREV_OFFSETS RECHECK PREFIX RE_PAGE WALKED
+            local SWEEP_LIST_ATTEMPTS=3
             local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 RECLOSED=0 FAILED=0
             local LIFECYCLE_WRITTEN=""
             printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
@@ -1514,19 +1515,30 @@ jobs:
             # oldest-page check below still satisfied and the sweep still
             # green: the same silent miss this whole change is undoing, on the
             # same rooms.
-            # So a page is trusted only if its predecessor still reads the
-            # same after it: the offsets the walk was taken at are re-read at
-            # the boundary, and a listing that moved is enumerated again from
+            # So a walk is trusted only if the offsets it was taken at still
+            # hold — and that takes two checks, because they fail on different
+            # movements. Each page's predecessor is re-read at the boundary,
+            # which catches a shift that has already reverted by the end of
+            # the walk. But a BALANCED pair of movements — one record leaving
+            # the front while a later one moves up to the front — leaves every
+            # offset between them untouched, so no boundary sees anything at
+            # all while the record that moved up is skipped from a stretch the
+            # walk has already passed. So the WHOLE accepted prefix is re-read
+            # once the walk ends, page 1 upward, before a single candidate is
+            # processed: every page still holding the records the walk read at
+            # that offset. A walk whose offsets moved is enumerated again from
             # page 1. One that will not hold still for a whole walk is red,
             # not green — nothing is archived from a walk that may have
             # skipped, and the next sweep tries again. The residual is a shift
-            # that reverts between a page and its re-read; that costs one
-            # sweep interval, not the window.
+            # that reverts before the re-read that would have caught it; that
+            # costs one sweep interval, not the window.
             PAGES=$(mktemp)
+            PREFIX=$(mktemp)
             ATTEMPT=0
             while :; do
               ATTEMPT=$((ATTEMPT + 1))
               : > "$PAGES"
+              : > "$PREFIX"
               PAGE=1
               FETCHED=0
               MOVED=""
@@ -1543,6 +1555,7 @@ jobs:
                 fi
                 N=$(printf '%s' "$CHUNK" | jq 'length') || return 1
                 printf '%s\n' "$CHUNK" >> "$PAGES"
+                page_offsets "$CHUNK" >> "$PREFIX" || return 1
                 FETCHED=$((FETCHED + N))
                 if [ "$N" -lt "$SWEEP_PAGE_SIZE" ]; then
                   break   # a short page is the end of the listing
@@ -1560,6 +1573,17 @@ jobs:
                 PREV_OFFSETS=$(page_offsets "$CHUNK") || return 1
                 PAGE=$((PAGE + 1))
               done
+              if [ -z "$MOVED" ]; then
+                RE_PAGE=0
+                while IFS= read -r WALKED; do
+                  RE_PAGE=$((RE_PAGE + 1))
+                  RECHECK=$(list_closed_page "$RE_PAGE") || return 1
+                  RECHECK=$(page_offsets "$RECHECK") || return 1
+                  [ "$RECHECK" = "$WALKED" ] && continue
+                  MOVED="the closed-PR listing shifted under the walk: page ${RE_PAGE} no longer holds the records the walk read there"
+                  break
+                done < "$PREFIX"
+              fi
               [ -n "$MOVED" ] || break
               echo "${MOVED} — enumerating it again" >&2
               if [ "$ATTEMPT" -ge "$SWEEP_LIST_ATTEMPTS" ]; then

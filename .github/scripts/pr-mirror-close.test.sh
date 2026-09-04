@@ -28,6 +28,11 @@
 #     start, never from the search index, which omits the PRs GitHub closed
 #     itself on base-branch deletion (buzz#128, velvet#210 — the very class
 #     the sweep is for);
+#   * a page number is an offset into a list that moves: a PR reopened
+#     mid-walk shifts every record behind it one offset earlier, and the next
+#     page then begins past one of them. That skip is caught at the page
+#     boundary and the listing enumerated again; a listing that never holds
+#     still is red, not a green sweep over a walk that may have skipped;
 #   * a close inside the settle window, a PR reopened between the listing
 #     and the write, a fork head, and a close outside the window are all
 #     left alone;
@@ -137,11 +142,33 @@ cat > "$WORK/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
   "api repos/"*"/pulls?state=closed"*)
-    # The REST listing, one page per fixture (pr_list.pN.json); a page with
-    # no fixture is the end of the listing.
-    P=$(printf '%s' "$2" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p')
-    echo "PR_LIST page=${P:-1} $2" >> "$LOG"
-    if [ -f "$FIXTURES/pr_list.p${P:-1}.json" ]; then cat "$FIXTURES/pr_list.p${P:-1}.json"; else echo '[]'; fi ;;
+    # The REST listing. It is ONE ordered list and a page is an offset slice
+    # of it, exactly as on GitHub — so a page the sweep asks for twice can
+    # answer differently, which is the whole point of the boundary re-read.
+    # Fixtures name pages (pr_list.pN.json) and are concatenated in order.
+    P=$(printf '%s' "$2" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p'); P="${P:-1}"
+    PP=$(printf '%s' "$2" | sed -n 's/.*[?&]per_page=\([0-9]*\).*/\1/p'); PP="${PP:-30}"
+    echo "PR_LIST page=${P} $2" >> "$LOG"
+    REQ=$(( $(cat "$FIXTURES/list.reqs" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$REQ" > "$FIXTURES/list.reqs"
+    FULL=$(for I in 1 2 3 4 5 6 7 8; do
+             [ -f "$FIXTURES/pr_list.p$I.json" ] && cat "$FIXTURES/pr_list.p$I.json"
+           done | jq -s 'add // []')
+    # THE LISTING MOVING UNDERNEATH THE WALK. `listing_drop` is a PR reopened
+    # once the walk had begun: it leaves `state=closed`, and every record
+    # behind it lands one offset earlier. `listing_always_moves` is a listing
+    # that never holds still — a fresh record at the front on every request.
+    if [ -f "$FIXTURES/listing_drop" ] && [ "$REQ" -gt 1 ]; then
+      FULL=$(printf '%s' "$FULL" \
+        | jq --argjson n "$(cat "$FIXTURES/listing_drop")" 'map(select(.number != $n))')
+    fi
+    if [ -f "$FIXTURES/listing_always_moves" ]; then
+      FULL=$(printf '%s' "$FULL" | jq --argjson r "$REQ" \
+        '[{number: (90000 + $r), closed_at: null, merged_at: null,
+           updated_at: (.[0].updated_at // "1970-01-01T00:00:00Z"),
+           head: {repo: null}}] + .')
+    fi
+    printf '%s' "$FULL" | jq --argjson o "$(( (P - 1) * PP ))" --argjson pp "$PP" '.[$o:($o + $pp)]' ;;
   "api repos/"*"/pulls/"*)
     N="${2##*/}"
     echo "PR_READ $N" >> "$LOG"
@@ -289,6 +316,12 @@ listing_page() { # listing_page <n> [listed-json...] → page <n> of the REST li
   printf '%s]\n' "$OUT" > "$FIXTURES/pr_list.p$N.json"
 }
 listing() { listing_page 1 "$@"; }
+listing_drops() { # listing_drops <number> — reopened after the walk's first read
+  printf '%s\n' "$1" > "$FIXTURES/listing_drop"
+}
+listing_never_settles() { # a listing that shifts on every single read
+  touch "$FIXTURES/listing_always_moves"
+}
 pr_record() { # pr_record <number> <state:open|closed> <merged:true|false> → the re-read
   printf '{"state":"%s","merged":%s,"title":"PR %s","html_url":"https://github.com/%s/pull/%s","body":"","user":{"login":"yjc801"},"head":{"ref":"claude/x","sha":"%s"},"base":{"ref":"main","sha":"%s"}}\n' \
     "$2" "$3" "$1" "$REPO" "$1" "$HEAD40" "$BASE40" > "$FIXTURES/pr_$1.json"
@@ -582,6 +615,38 @@ SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should not fetch past the window" "$([ "$(count "PR_LIST")" = 1 ]; echo $?)"
 check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
+
+# A PAGE NUMBER IS AN OFFSET INTO A LIST THAT MOVES. `sort=updated` is a
+# mutable order and GitHub freezes nothing between two page requests: a PR
+# reopened while the walk is running leaves `state=closed`, and every record
+# behind it lands one offset earlier — so the next page begins PAST one of
+# them. Nothing in the page's own contents shows it, and the window's
+# oldest-page check is still satisfied, so the sweep would report green over
+# exactly the live room it exists to archive.
+scenario "sweep: a listing that shifts mid-walk is re-enumerated, not silently skipped"
+listing_page 1 "$(listed 4241 3600 false someone-else buzz)"
+listing_page 2 "$(listed 4242 7200 false)"
+listing_page 3 "$(listed 4243 $((40 * 86400)) false yjc801 "${REPO#*/}" $((40 * 86400)))"
+listing_drops 4241
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should notice the shift at the page boundary" "$(said 'shifted under the walk'; echo $?)"
+check "should archive the close the shifted walk skipped" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should account for the settled walk only" "$(said 'sweep: 1 examined, 1 reconciled'; echo $?)"
+
+# Re-enumerating is bounded. A walk that may have skipped is not a walk to
+# archive from, so an unsettleable listing is red and left to the next sweep.
+scenario "sweep: a listing that never holds still is red, not green"
+listing "$(listed 4242 7200 false)"
+listing_never_settles
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+SWEEP_PAGE_SIZE_INPUT=1 run_step schedule; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should say the window was not enumerated completely" "$(said 'not enumerated completely'; echo $?)"
+check "should archive nothing from a walk that may have skipped" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 
 # THE PRE-WRITE RE-READ IS A SNAPSHOT, NOT A FENCE. Sweep and event runs are
 # in different concurrency groups, and no later sweep would ever revisit an

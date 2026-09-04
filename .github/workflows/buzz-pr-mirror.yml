@@ -1410,6 +1410,18 @@ jobs:
             done
           }
 
+          list_closed_page() { # list_closed_page <page> → one REST page of closed PRs
+            gh api "repos/${GITHUB_REPOSITORY}/pulls?state=closed&sort=updated&direction=desc&per_page=${SWEEP_PAGE_SIZE}&page=${1}" || {
+              echo "closed-PR listing failed on page ${1} — failing so the next sweep retries" >&2
+              return 1
+            }
+          }
+
+          # The offsets a walk of that listing was taken at, as the sequence of
+          # PR numbers on a page: two reads of one page agree on this exactly
+          # when nothing entered or left the listing ahead of it.
+          page_offsets() { printf '%s' "$1" | jq -c '[.[] | .number]'; }
+
           sweep_missed_closes() {
             # Reconcile closes GitHub never announced — see the header. Every
             # same-repo PR closed at least SWEEP_SETTLE_SECS ago and within
@@ -1427,6 +1439,7 @@ jobs:
             # outcome for a room this identity could not resolve or close.
             local NOW OLDEST NEWEST CANDIDATES NUM CLOSED_AT PR_JSON
             local PAGES PAGE FETCHED CHUNK N PAGE_OLDEST
+            local ATTEMPT MOVED PREV_OFFSETS RECHECK SWEEP_LIST_ATTEMPTS=3
             local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 RECLOSED=0 FAILED=0
             local LIFECYCLE_WRITTEN=""
             printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
@@ -1488,31 +1501,71 @@ jobs:
             # window. Fork heads never got a room (the job condition skips
             # them) and are not candidates; nor is a head whose repository
             # is gone.
+            # AND EACH PAGE BOUNDARY IS VERIFIED, because a page number is an
+            # offset into a list that moves. `sort=updated` orders by a
+            # mutable field and GitHub hands out no frozen listing: every page
+            # is an independent offset slice of whatever the list holds at the
+            # moment it is asked for. Between two of these requests a PR can
+            # be updated (it moves toward the front) or reopened (it leaves
+            # `state=closed` altogether), and every record after it lands at a
+            # different offset. Shifted back, the next page merely repeats
+            # records already read — harmless. Shifted forward, the next page
+            # begins PAST one record, dropping it from the walk with the
+            # oldest-page check below still satisfied and the sweep still
+            # green: the same silent miss this whole change is undoing, on the
+            # same rooms.
+            # So a page is trusted only if its predecessor still reads the
+            # same after it: the offsets the walk was taken at are re-read at
+            # the boundary, and a listing that moved is enumerated again from
+            # page 1. One that will not hold still for a whole walk is red,
+            # not green — nothing is archived from a walk that may have
+            # skipped, and the next sweep tries again. The residual is a shift
+            # that reverts between a page and its re-read; that costs one
+            # sweep interval, not the window.
             PAGES=$(mktemp)
-            PAGE=1
-            FETCHED=0
+            ATTEMPT=0
             while :; do
-              CHUNK=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=closed&sort=updated&direction=desc&per_page=${SWEEP_PAGE_SIZE}&page=${PAGE}") || {
-                echo "closed-PR listing failed on page ${PAGE} — failing so the next sweep retries" >&2
+              ATTEMPT=$((ATTEMPT + 1))
+              : > "$PAGES"
+              PAGE=1
+              FETCHED=0
+              MOVED=""
+              PREV_OFFSETS=""
+              while :; do
+                CHUNK=$(list_closed_page "$PAGE") || return 1
+                if [ "$PAGE" -gt 1 ]; then
+                  RECHECK=$(list_closed_page "$((PAGE - 1))") || return 1
+                  RECHECK=$(page_offsets "$RECHECK") || return 1
+                  if [ "$RECHECK" != "$PREV_OFFSETS" ]; then
+                    MOVED="the closed-PR listing shifted under the walk: page $((PAGE - 1)) no longer holds the records page ${PAGE} was read after"
+                    break
+                  fi
+                fi
+                N=$(printf '%s' "$CHUNK" | jq 'length') || return 1
+                printf '%s\n' "$CHUNK" >> "$PAGES"
+                FETCHED=$((FETCHED + N))
+                if [ "$N" -lt "$SWEEP_PAGE_SIZE" ]; then
+                  break   # a short page is the end of the listing
+                fi
+                PAGE_OLDEST=$(printf '%s' "$CHUNK" \
+                  | jq '[.[] | .updated_at | fromdateiso8601] | min') || return 1
+                if [ "$PAGE_OLDEST" -lt "$OLDEST" ]; then
+                  break   # past the window's start: everything after is older still
+                fi
+                if [ "$FETCHED" -ge "$SWEEP_LIST_LIMIT" ]; then
+                  echo "closed-PR listing reached its ${SWEEP_LIST_LIMIT}-result cap without passing the ${SWEEP_DAYS}-day window's start" >&2
+                  echo "— the window was not enumerated completely; re-run with a narrower sweep_days" >&2
+                  return 1
+                fi
+                PREV_OFFSETS=$(page_offsets "$CHUNK") || return 1
+                PAGE=$((PAGE + 1))
+              done
+              [ -n "$MOVED" ] || break
+              echo "${MOVED} — enumerating it again" >&2
+              if [ "$ATTEMPT" -ge "$SWEEP_LIST_ATTEMPTS" ]; then
+                echo "the closed-PR listing moved under all ${SWEEP_LIST_ATTEMPTS} enumerations; the window was not enumerated completely — leaving it to the next sweep" >&2
                 return 1
-              }
-              N=$(printf '%s' "$CHUNK" | jq 'length') || return 1
-              printf '%s\n' "$CHUNK" >> "$PAGES"
-              FETCHED=$((FETCHED + N))
-              if [ "$N" -lt "$SWEEP_PAGE_SIZE" ]; then
-                break   # a short page is the end of the listing
               fi
-              PAGE_OLDEST=$(printf '%s' "$CHUNK" \
-                | jq '[.[] | .updated_at | fromdateiso8601] | min') || return 1
-              if [ "$PAGE_OLDEST" -lt "$OLDEST" ]; then
-                break   # past the window's start: everything after is older still
-              fi
-              if [ "$FETCHED" -ge "$SWEEP_LIST_LIMIT" ]; then
-                echo "closed-PR listing reached its ${SWEEP_LIST_LIMIT}-result cap without passing the ${SWEEP_DAYS}-day window's start" >&2
-                echo "— the window was not enumerated completely; re-run with a narrower sweep_days" >&2
-                return 1
-              fi
-              PAGE=$((PAGE + 1))
             done
             CANDIDATES=$(mktemp)
             jq -s -r \
@@ -1526,7 +1579,6 @@ jobs:
                | select($t >= $oldest and $t <= $newest)
                | [.number, .closed_at]
                | @tsv' "$PAGES" > "$CANDIDATES" || return 1
-            echo "examining PRs closed within ${SWEEP_DAYS} day(s) and settled for ${SWEEP_SETTLE_SECS}s"
             echo "examining PRs closed within ${SWEEP_DAYS} day(s) and settled for ${SWEEP_SETTLE_SECS}s"
             while IFS=$'\t' read -r NUM CLOSED_AT; do
               [ -n "$NUM" ] || continue

@@ -14,6 +14,7 @@ use crate::{
     managed_agents::{
         discover_provider_candidates, load_managed_agents, load_personas, provider_deploy,
         resolve_provider_binary, save_managed_agents, ManagedAgentRecord, ManagedAgentSummary,
+        REPLAY_FLOOR_ENV_VAR,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -75,6 +76,13 @@ pub struct StartManagedAgentOutcome {
 /// a workspace or identity switch landing while this call waited behind
 /// another deployment cannot deploy on behalf of a stale callback. `None`
 /// preserves the unscoped behavior for callers without a tenant boundary.
+///
+/// `replay_floor_unix`: optional unix-seconds replay floor from a
+/// publish-first mention send. It is injected into the payload's
+/// `launch.policy_env` as `BUZZ_ACP_REPLAY_FLOOR`, so the remote harness's
+/// startup watermark replays back past the already-published triggering
+/// message exactly like a local spawn. Per-invocation only — never persisted
+/// on the record, so later redeploys do not carry a stale floor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn deploy_to_provider(
     app: &AppHandle,
@@ -82,10 +90,11 @@ pub(crate) async fn deploy_to_provider(
     pubkey: &str,
     provider_id: &str,
     config: &serde_json::Value,
-    agent_json: serde_json::Value,
+    mut agent_json: serde_json::Value,
     cached_binary_path: Option<&str>,
     expected_relay_url: Option<&str>,
     expected_signer_pubkey: Option<&str>,
+    replay_floor_unix: Option<u64>,
 ) -> Result<Option<bool>, String> {
     let deploy_lock = {
         let mut locks = state
@@ -126,6 +135,9 @@ pub(crate) async fn deploy_to_provider(
     // to `provider_deploy` below, so a scoped caller can never land a deploy
     // outside the tenant and identity it validated.
     assert_payload_scope(&agent_json, expected_relay_url, expected_signer_pubkey)?;
+    // The floor is invocation state, not record state, so it is injected into
+    // the payload actually invoked rather than persisted on the record.
+    apply_replay_floor(&mut agent_json, replay_floor_unix);
 
     // Resolve via discovered candidates only. Cached path must match BOTH
     // "is a discovered candidate" AND "belongs to this provider_id". A tampered
@@ -225,6 +237,57 @@ fn assert_payload_scope(
 
 /// Whether the access policy the provider actually received still matches the
 /// record's current policy.
+/// Inject a publish-first mention send's replay floor into the deploy payload.
+///
+/// The floor rides `launch.policy_env` (tier 1); any same-named key in
+/// `launch.env` (tier 2) is stripped because that tier later-wins and a
+/// persisted user value must not shadow this send's floor — the remote mirror
+/// of `apply_replay_floor_env`'s post-`descriptor.env` write on the local
+/// spawn. With no caller floor the payload is left untouched — a user-supplied
+/// `launch.env` value passes through, and plain redeploys never carry a stale
+/// floor.
+fn apply_replay_floor(agent_json: &mut serde_json::Value, replay_floor_unix: Option<u64>) {
+    let Some(floor) = replay_floor_unix else {
+        return;
+    };
+    let Some(launch) = agent_json
+        .get_mut("launch")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Some(env) = launch
+        .get_mut("env")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let shadowed: Vec<String> = env
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(REPLAY_FLOOR_ENV_VAR))
+            .cloned()
+            .collect();
+        for key in shadowed {
+            env.remove(&key);
+        }
+    }
+    match launch
+        .get_mut("policy_env")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        Some(policy_env) => {
+            policy_env.insert(
+                REPLAY_FLOOR_ENV_VAR.to_string(),
+                serde_json::Value::String(floor.to_string()),
+            );
+        }
+        None => {
+            launch.insert(
+                "policy_env".to_string(),
+                serde_json::json!({ (REPLAY_FLOOR_ENV_VAR): floor.to_string() }),
+            );
+        }
+    }
+}
+
 fn policy_matches_payload(
     record: &ManagedAgentRecord,
     deployed_agent_json: &serde_json::Value,
@@ -335,13 +398,13 @@ fn build_launch_block_for_policy(
         };
         policy_env.insert(model_key.into(), value.to_string());
     }
-    // I-4: remote parity for persisted startup effort. Mirrors the local spawn
-    // path in runtime.rs. The harness reads BUZZ_ACP_EFFORT_LEVEL into
-    // PoolStartup.startup_effort and applies it at first session creation via
-    // resolve_startup_effort().
-    if let Some(ref value) = record.effort_level {
-        policy_env.insert("BUZZ_ACP_EFFORT_LEVEL".into(), value.clone());
-    }
+    // Startup effort needs no remote-specific handling: the harness-agnostic
+    // effort projection already ran inside `resolve_effective_harness_descriptor`,
+    // so `descriptor.env` (→ `launch.env`, tier 2) carries exactly one effort key
+    // holding the effective value, with every foreign/legacy/transport effort key
+    // stripped. Tier 2 later-wins over `policy_env` (tier 1) and no authoritative
+    // tier-3 key collides with an effort key, so the projected value reaches the
+    // remote pod verbatim — identical authority to the local spawn.
     if let Some(value) = record.idle_timeout_seconds {
         policy_env.insert("BUZZ_ACP_IDLE_TIMEOUT".into(), value.to_string());
     }
@@ -358,14 +421,6 @@ fn build_launch_block_for_policy(
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
-    // B5 remote parity: when a canonical effort_level is persisted, strip
-    // BUZZ_ACP_EFFORT_LEVEL from launch.env so it cannot shadow the canonical
-    // value in policy_env (tier 1). In the k8s three-tier model tier 2
-    // (launch.env) overwrites tier 1 (policy_env) — later-wins — so the key
-    // must be absent from tier 2 whenever a canonical value is present.
-    // When effort_level is None there is no canonical to protect, so user
-    // env passthrough stands (env may legitimately seed startup effort).
-    //
     // B2 remote parity: mirror the local A1 model authority. For a Claude
     // launch, ALWAYS strip BOTH BUZZ_ACP_MODEL and ANTHROPIC_MODEL from
     // launch.env — the resolved canonical model rides policy_env.ANTHROPIC_MODEL
@@ -375,10 +430,13 @@ fn build_launch_block_for_policy(
     // canonical model. When no canonical model is present, neither key is in
     // policy_env, so stripping them keeps the remote process free of both —
     // matching local, where `apply_claude_model_env(None)` removes both.
+    //
+    // Effort keys need no stripping here: the projection already reduced
+    // `descriptor.env` to exactly one effort key holding the effective value,
+    // so launch.env carries the authority directly (see the effort note above).
     let is_claude = runtime.map(|r| r.id == "claude").unwrap_or(false);
     let strip_key = |k: &str| {
         k.eq_ignore_ascii_case(crate::managed_agents::ACP_SESSION_POLICY_ENV_VAR)
-            || (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
             || (is_claude
                 && (k.eq_ignore_ascii_case("BUZZ_ACP_MODEL")
                     || k.eq_ignore_ascii_case("ANTHROPIC_MODEL")))

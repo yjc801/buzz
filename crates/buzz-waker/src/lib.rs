@@ -112,7 +112,7 @@ pub const RECONNECT_OVERLAP_SECS: u64 = 2 * buzz_core::relay::MAX_TIMESTAMP_DRIF
 ///
 /// The harness clamps its replay floor to
 /// `startup_watermark - REPLAY_FLOOR_MAX_AGE_SECS`
-/// (`apply_replay_floor`, `crates/buzz-acp/src/lib.rs`), and that watermark is
+/// (`startup_watermark_with_floor`, `crates/buzz-acp/src/lib.rs`), and that watermark is
 /// captured *after* the wake pipeline runs, not when the waker decides to wake.
 /// So the whole pipeline budget is spent between this decision and the
 /// comparison the bound is actually made against, and only what is left over

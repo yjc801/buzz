@@ -16,6 +16,7 @@ mod agents;
 // the desktop file-size ratchet (`desktop/scripts/check-file-sizes.mjs`) and
 // may not grow, so even the `#[path]` declaration lives here.
 mod agents_waker_enrolment;
+mod bestie;
 mod canvas;
 mod channel_reconnect_repair;
 mod channel_templates;
@@ -89,6 +90,7 @@ pub use agent_models::*;
 pub use agent_providers::*;
 pub use agent_settings::*;
 pub use agents::*;
+pub use bestie::*;
 pub use canvas::*;
 pub use channel_reconnect_repair::*;
 pub use channel_templates::*;

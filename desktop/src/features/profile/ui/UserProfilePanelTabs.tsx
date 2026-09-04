@@ -26,6 +26,7 @@ import {
   useProfileActivityFeedScope,
 } from "@/features/profile/lib/profileActivityFeedScope";
 import { UserProfileAgentManagementRows } from "@/features/profile/ui/UserProfileAgentManagementRows";
+import { ProtectedAgentBestieAction } from "@protected-feature-components";
 import { ProfileInstancesSection } from "@/features/profile/ui/ProfileInstancesSection";
 import {
   type ProfileField,
@@ -325,6 +326,11 @@ export function ProfileInfoTabContent({
         onDuplicateAgent={onDuplicateAgent}
         onExportAgent={onExportAgent}
         runLocationMove={runLocationMove}
+        supplementalAction={
+          managedAgent ? (
+            <ProtectedAgentBestieAction agent={managedAgent} />
+          ) : null
+        }
         wakerToggle={wakerToggle}
       />
     </div>

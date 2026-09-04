@@ -1,7 +1,10 @@
 import * as React from "react";
 import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 
+import { OtherSetupAgentMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
+import { useIsOtherSetupAgent } from "@/features/agents/useKnownAgentPubkeys";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
@@ -198,14 +201,8 @@ export function ProfileSummaryView({
   userStatus,
   wakerToggle,
 }: ProfileSummaryViewProps) {
+  const notManagedOnDevice = useIsOtherSetupAgent(pubkey, profile?.ownerPubkey);
   const activeTurns = useAgentWorking(isBot ? pubkey : null).channels;
-  const avatarStatus = isBot
-    ? managedAgent
-      ? isManagedAgentActive(managedAgent)
-        ? "online"
-        : "offline"
-      : (presenceStatus ?? "offline")
-    : presenceStatus;
   const stickyLayoutRef = React.useRef<HTMLDivElement>(null);
   const [primaryActionsConcealed, setPrimaryActionsConcealed] =
     React.useState(false);
@@ -414,9 +411,10 @@ export function ProfileSummaryView({
       >
         <ProfileHero
           displayName={displayName}
+          notManagedOnDevice={notManagedOnDevice}
           isBot={isBot}
           onEditAgent={canEditAgent ? handleEditAgent : undefined}
-          presenceStatus={avatarStatus}
+          presenceStatus={presenceStatus}
           profile={profile}
           userStatus={userStatus}
         />
@@ -437,6 +435,14 @@ export function ProfileSummaryView({
           concealed={primaryActionsConcealed}
           followMutation={followMutation}
           agentActionDisabled={isAgentActionPending}
+          agentStartBlockReason={
+            managedAgent
+              ? agentPresenceStartBlockReason(
+                  isManagedAgentActive(managedAgent),
+                  presenceStatus,
+                )
+              : undefined
+          }
           agentActionLabel={
             isOwner === true && managedAgent
               ? getManagedAgentPrimaryActionLabel(managedAgent, presenceStatus)
@@ -614,6 +620,7 @@ export function ProfileSummaryView({
 // ── Hero & metadata ──────────────────────────────────────────────────────────
 
 function ProfileHero({
+  notManagedOnDevice,
   displayName,
   isBot,
   onEditAgent,
@@ -622,6 +629,7 @@ function ProfileHero({
   userStatus,
 }: {
   displayName: string;
+  notManagedOnDevice?: boolean;
   isBot: boolean;
   onEditAgent?: () => void;
   presenceStatus: "online" | "away" | "offline" | undefined;
@@ -688,6 +696,7 @@ function ProfileHero({
                 {displayName}
               </span>
               {botIndicator}
+              {notManagedOnDevice ? <OtherSetupAgentMarker /> : null}
               <span
                 aria-hidden="true"
                 className="pointer-events-none absolute top-1/2 left-full ml-1 -translate-y-1/2 text-muted-foreground opacity-0 transition-[color,opacity] duration-150 ease-out group-hover:text-foreground group-hover:opacity-100 group-focus-visible:opacity-100"
@@ -704,6 +713,7 @@ function ProfileHero({
           >
             <span className="truncate">{displayName}</span>
             {botIndicator}
+            {notManagedOnDevice ? <OtherSetupAgentMarker /> : null}
           </h3>
         )}
 
@@ -718,7 +728,7 @@ function ProfileHero({
           <p className="text-sm text-muted-foreground">{profile.nip05Handle}</p>
         ) : null}
 
-        {userStatus ? (
+        {userStatus && (userStatus.text || userStatus.emoji) ? (
           <p className="text-sm text-muted-foreground">
             {userStatus.emoji ? (
               <StatusEmoji

@@ -2,11 +2,13 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import {
+  isManagedAgentActive,
   isManagedAgentLive,
   respawnManagedAgentWithRules,
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
 import type {
   Channel,
@@ -16,6 +18,7 @@ import type {
 } from "@/shared/api/types";
 
 export function useAgentLifecycleActions({
+  availability,
   channels,
   refetchChannels,
   managedAgent,
@@ -25,6 +28,7 @@ export function useAgentLifecycleActions({
   startManagedAgent,
   stopManagedAgent,
 }: {
+  availability: PresenceStatus | undefined;
   channels: readonly Channel[] | undefined;
   /** Used when `channels` has not settled at action time — a render-time
    * snapshot fails a fast click with "not in any channel" for an agent
@@ -81,6 +85,8 @@ export function useAgentLifecycleActions({
         return;
       }
 
+      const blockReason = agentPresenceStartBlockReason(false, availability);
+      if (blockReason) throw new Error(blockReason);
       await startManagedAgentWithRules({
         agent: managedAgent,
         startManagedAgent,
@@ -98,6 +104,7 @@ export function useAgentLifecycleActions({
       setActionInFlight(false);
     }
   }, [
+    availability,
     lifecycleActionsBlocked,
     managedAgent,
     presenceStatus,
@@ -112,6 +119,11 @@ export function useAgentLifecycleActions({
 
     setActionInFlight(true);
     try {
+      const blockReason = agentPresenceStartBlockReason(
+        isManagedAgentActive(managedAgent),
+        availability,
+      );
+      if (blockReason) throw new Error(blockReason);
       await respawnManagedAgentWithRules({
         agent: managedAgent,
         channels: await resolveChannels(),
@@ -129,6 +141,7 @@ export function useAgentLifecycleActions({
       setActionInFlight(false);
     }
   }, [
+    availability,
     lifecycleActionsBlocked,
     managedAgent,
     relayAgents,

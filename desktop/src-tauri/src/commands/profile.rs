@@ -344,7 +344,8 @@ pub async fn get_presence(
     }
 
     // Presence is published as kind:20001 ephemeral events. Query the most
-    // recent per author.
+    // recent per author. Only a successful empty snapshot establishes absence;
+    // transport/auth/storage failures must reject so consumers remain unknown.
     //
     // A failed query PROPAGATES rather than collapsing to an empty map: an
     // empty result must mean "the relay answered and holds no presence for
@@ -489,3 +490,7 @@ mod tests {
         assert_eq!(filter["page"], serde_json::json!(1));
     }
 }
+
+#[cfg(test)]
+#[path = "profile_presence_tests.rs"]
+mod presence_tests;

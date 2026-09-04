@@ -136,6 +136,12 @@ case "$*" in
   "api repos/"*"/pulls/"*)
     N="${2##*/}"
     echo "PR_READ $N" >> "$LOG"
+    # Each read of one PR can answer differently — that is the lifecycle
+    # moving underneath the sweep. `pr_N.rK.json` answers the Kth read; the
+    # first/next pair below is the two-answer shorthand.
+    K=$(( $(cat "$FIXTURES/pr_$N.reads" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$K" > "$FIXTURES/pr_$N.reads"
+    [ -f "$FIXTURES/pr_$N.r$K.json" ] && { cat "$FIXTURES/pr_$N.r$K.json"; exit 0; }
     [ -f "$FIXTURES/pr_$N.rc" ] && exit "$(cat "$FIXTURES/pr_$N.rc")"
     # A second read of the same PR can answer differently — that is the
     # concurrent reopen the sweep has to converge with.
@@ -199,7 +205,22 @@ case "$SUB" in
     # number a scenario uses. Partial-room recovery is not under test here.
     printf '[{"pubkey":"%s","content":"**PR #4242 — t","created_at":1},' "$CI_PUB"
     printf '{"pubkey":"%s","content":"**PR #4243 — t","created_at":1}]\n' "$CI_PUB" ;;
-  "messages search") echo "SEARCH $(arg --query "$@")" >> "$LOG"; echo '[]' ;;
+  "messages search")
+    N=$(( $(cat "$FIXTURES/search.n" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$N" > "$FIXTURES/search.n"
+    echo "SEARCH $(arg --query "$@")" >> "$LOG"
+    # A whole competing `closed` event run, completing at this exact point:
+    # it annotates (not modelled — its banner is the one this run is about to
+    # overwrite), archives the room, and records its close. Injected here
+    # because between a reopen notice and its annotations is the interleaving
+    # that leaves the durable state split.
+    if [ -f "$FIXTURES/inject_close_at_search.$N" ]; then
+      read -r C SLUG < "$FIXTURES/inject_close_at_search.$N"
+      touch "$FIXTURES/archived.$C"
+      printf 'closed\n' > "$FIXTURES/binding.$SLUG"
+      echo "INJECTED_CLOSE $C" >> "$LOG"
+    fi
+    if [ -f "$FIXTURES/search_hits.json" ]; then cat "$FIXTURES/search_hits.json"; else echo '[]'; fi ;;
   "messages send")
     C=$(arg --channel "$@")
     BODY=$(cat)
@@ -219,7 +240,11 @@ case "$SUB" in
     C=$(arg --channel "$@")
     echo "UNARCHIVE $C" >> "$LOG"
     rm -f "$FIXTURES/archived.$C" ;;
-  "channels add-member"|"reactions add"|"reactions remove"|"messages edit")
+  "messages edit")
+    # The banner is the first line of the rewritten body — the durable state
+    # a reader of another room actually sees.
+    echo "EDIT $(arg --content "$@" | head -1)" >> "$LOG" ;;
+  "channels add-member"|"reactions add"|"reactions remove")
     echo "OTHER $SUB" >> "$LOG" ;;
   *) echo "stub buzz: unhandled: $SUB $*" >&2; exit 9 ;;
 esac
@@ -271,6 +296,22 @@ pr_reopened_after() { # pr_reopened_after <number> — the re-read AFTER the wri
 }
 pr_reread_broken() { # pr_reread_broken <number> — the post-write re-read fails
   printf '1\n' > "$FIXTURES/pr_$1.next.rc"
+}
+referenced_from() { # referenced_from <number> <channel> — a CI-authored
+  # mention of the PR in another room, carrying whatever banner was last
+  # written. This is the durable cross-channel state the epilogues edit.
+  printf '[{"id":"e1","pubkey":"%s","content":"seed\\nhttps://github.com/%s/pull/%s","tags":[["h","%s"]]}]\n' \
+    "$CI_PUB" "$REPO" "$1" "$2" > "$FIXTURES/search_hits.json"
+}
+pr_read_at() { # pr_read_at <number> <read-index> <state:open|closed> [merged]
+  printf '{"state":"%s","merged":%s,"title":"PR %s","html_url":"https://github.com/%s/pull/%s","body":"","user":{"login":"yjc801"},"head":{"ref":"claude/x","sha":"%s"},"base":{"ref":"main","sha":"%s"}}\n' \
+    "$3" "${4:-false}" "$1" "$REPO" "$1" "$HEAD40" "$BASE40" > "$FIXTURES/pr_$1.r$2.json"
+}
+close_lands_at_annotation() { # close_lands_at_annotation <number> <channel> <search-index>
+  # A competing `closed` run completes in full at the <n>th reference search
+  # of the run under test.
+  printf '%s pr-mirror-yjc801-buzz-%s-closed\n' "$2" "$1" \
+    > "$FIXTURES/inject_close_at_search.$3"
 }
 
 reset_fixtures() {
@@ -420,7 +461,7 @@ check "should record the completed close" \
   "$(grep -q '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed$' "$LOG"; echo $?)"
 check "should bound the listing by close date, not by a page of the newest" \
   "$(grep -q '^PR_LIST .*closed:>=[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "$LOG"; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 failed'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
 
 scenario "sweep: a room already archived with the close on record → one refused send, nothing else"
 listing "$(listed 4242 7200 true)"
@@ -475,7 +516,7 @@ check "should not archive the PR it could not resolve" "$([ "$(count "ARCHIVE $C
 check "should not fall through to the membership scan on a broken read" "$([ "$(count BINDING_WRITE)" = 0 ]; echo $?)"
 check "should still reconcile the other PR" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
 check "should report the failure" "$(said 'room resolution failed'; echo $?)"
-check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 1 failed'; echo $?)"
+check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled, 0 annotated outside an archived room, 0 already archived, 0 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 1 failed'; echo $?)"
 
 # No binding and no room of ours among this identity's channels: provably
 # none. The sweep neither creates one nor posts a fallback notice it could
@@ -485,7 +526,7 @@ listing "$(listed 4242 7200 false)"
 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
-check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 1 without a room, 0 restored after a concurrent reopen, 0 failed'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 annotated outside an archived room, 0 already archived, 1 without a room, 0 restored after a concurrent reopen, 0 re-closed after a concurrent close, 0 failed'; echo $?)"
 
 scenario "sweep: fork heads and closes outside the window are not candidates"
 listing "$(listed 4242 7200 false someone-else buzz)" "$(listed 4243 $((8 * 86400)) false)"
@@ -515,7 +556,8 @@ pr_record 4242 closed false
 pr_reopened_after 4242
 run_step schedule; RC=$?
 check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
-check "should re-read the PR after its own writes" "$([ "$(count "PR_READ 4242")" = 2 ]; echo $?)"
+check "should re-read until a read AFTER its last write agrees with it" \
+  "$([ "$(count "PR_READ 4242")" = 3 ]; echo $?)"
 check "should notice the reopen" "$(said 'reopened while this sweep was closing it'; echo $?)"
 check "should unarchive the room it had just archived" "$([ "$(count "UNARCHIVE $CH_A")" = 1 ]; echo $?)"
 check "should post the reopen notice into the restored room" "$([ "$(count "SEND $CH_A")" = 2 ]; echo $?)"
@@ -534,6 +576,56 @@ pr_reread_broken 4242
 run_step schedule; RC=$?
 check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
 check "should say it cannot show the states match" "$(said 'post-close re-read failed'; echo $?)"
+
+# ONE COMPENSATING PASS IS NOT A FENCE EITHER. Its GitHub read is a snapshot
+# in exactly the same way, so a competing `closed` run can finish — archive
+# and close record and all — while this sweep is restoring the room, putting
+# its writes BEFORE the reopen banners written here. GitHub, the room and the
+# record then all say closed while every cross-channel reference says
+# reopened, and no later sweep revisits it: archived plus the record is the
+# silent path. Convergence therefore loops until a read taken after this
+# run's last write agrees with it.
+scenario "sweep: a close completing while the sweep restores → converged on closed, not left on a stale reopen banner"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+pr_read_at 4242 1 closed
+pr_read_at 4242 2 open
+pr_read_at 4242 3 closed
+pr_read_at 4242 4 closed
+close_lands_at_annotation 4242 "$CH_A" 2
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "the competing close should have landed mid-restoration" "$([ "$(count INJECTED_CLOSE)" = 1 ]; echo $?)"
+check "should notice the newer close" "$(said 'closed again while this sweep was restoring it'; echo $?)"
+check "should not take the silent path on its own stale banners" \
+  "$(said "reversing this run's own reopen banners"; echo $?)"
+check "the cross-channel banner must end on the close, not the reopen" \
+  "$([ "$(grep '^EDIT' "$LOG" | tail -1)" = 'EDIT 🚫 **Closed without merge**' ]; echo $?)"
+check "the close record must end on the close" \
+  "$([ "$(grep '^MARKER_WRITE' "$LOG" | tail -1)" = 'MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed closed' ]; echo $?)"
+check "the last read must follow the last write and agree with it" \
+  "$([ "$(first_line 'PR_READ')" -lt "$(grep -n '^EDIT' "$LOG" | tail -1 | cut -d: -f1)" ] && [ "$(count "PR_READ 4242")" = 4 ]; echo $?)"
+check "should account for both compensations" \
+  "$(said '1 restored after a concurrent reopen, 1 re-closed after a concurrent close, 0 failed'; echo $?)"
+
+# Converging is bounded. A lifecycle still flipping at the cap is a repair
+# this run cannot show it completed, so it is red rather than green-with-a-
+# guess; the next sweep picks the PR up again.
+scenario "sweep: a lifecycle that never settles is red"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+pr_read_at 4242 1 closed
+pr_read_at 4242 2 open
+pr_read_at 4242 3 closed
+pr_read_at 4242 4 open
+pr_read_at 4242 5 closed
+run_step schedule; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should say the lifecycle is still moving" "$(said 'lifecycle still changing after 4 passes'; echo $?)"
+check "should not claim the repair" "$(said 'left to the next sweep rather than reported as repaired'; echo $?)"
+check "should stop reading rather than loop forever" "$([ "$(count "PR_READ 4242")" = 5 ]; echo $?)"
 
 # A truncated listing hides candidates from THIS sweep and from every later
 # one, because only closed PRs are ever listed.

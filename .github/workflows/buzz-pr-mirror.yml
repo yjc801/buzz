@@ -66,6 +66,20 @@ name: buzz-pr-mirror
 # room under an open PR is otherwise the owner's own business, and `reopened`
 # is announced normally.
 #
+# AND THAT COMPENSATION IS NOT A FENCE EITHER. Its own read is a snapshot in
+# exactly the same way, so a second close can complete while the sweep is
+# restoring the room and land BEFORE the reopen banners the sweep then writes
+# last — leaving the room archived and the marker `closed` while every
+# cross-channel reference says reopened, which no later sweep revisits. So
+# the convergence is a LOOP, not one pass: the sweep tracks the lifecycle
+# state it last made durable and keeps applying the opposite epilogue until a
+# read taken AFTER its own last write agrees with it. Re-applying a close
+# that way is forced past the archived-plus-marker silent path — the marker
+# may have been written by the very run that raced us, and this run's stale
+# banners still have to be reversed. A lifecycle still flipping after
+# CONVERGE_MAX_PASSES is red: the sweep says so and leaves the PR to the next
+# one, rather than reporting a repair it cannot show.
+#
 # CHANNEL NAMES CARRY THE PROJECT PREFIX: `buzz-pr-N`, never bare `pr-N`.
 # Every repo that mirrors into openvelvet prefixes with its own project name
 # (velvet uses `velvet-pr-N`), because the community is shared and PR numbers
@@ -1170,6 +1184,11 @@ jobs:
             # half was left to do, "archived" when this PR's close is already
             # complete and there was nothing to do at all.
             #
+            # $2 is "force" when the caller has already written the OTHER
+            # lifecycle state to this PR's references in this same run and
+            # needs them reversed — see converge_lifecycle. It suppresses the
+            # silent path only; every other behaviour is identical.
+            #
             # THE FIRST WRITE IS THE FENCE. The relay refuses every
             # channel-scoped write on an archived room BEFORE storing it —
             # the gate archive_channel proves its own work with — so the
@@ -1182,7 +1201,7 @@ jobs:
             # and a stale "live" would cost a reaction and a threaded reply
             # under every cross-channel reference a second time. Every other
             # write follows the fence for that reason.
-            local CH="$1" SEND_ERR MARKER
+            local CH="$1" FORCE="${2:-}" SEND_ERR MARKER
             CLOSE_OUTCOME=""
             if ! printf '%s — archiving this channel.\n%s\n' "$STATUS" "$PR_URL" \
                 | buzz messages send --channel "$CH" --content - 2>"$ERRFILE"; then
@@ -1203,13 +1222,21 @@ jobs:
                   # to; the room's own notice is the one thing that is
                   # genuinely lost, and the archive it announces has
                   # already happened.
+                  # FORCE bypasses the silent path: a marker written by the
+                  # run that raced this one says ITS close is on record, and
+                  # says nothing about the reopen banners this run put up and
+                  # now has to reverse.
                   MARKER=$(read_close_marker) || return 1
-                  if [ "$MARKER" = "$CLOSE_MARKER_DONE" ]; then
+                  if [ "$MARKER" = "$CLOSE_MARKER_DONE" ] && [ "$FORCE" != force ]; then
                     echo "#${NAME} is archived and this close is on record — nothing left to do"
                     CLOSE_OUTCOME=archived
                     return 0
                   fi
-                  echo "#${NAME} is archived with no close on record — finishing the close outside the room"
+                  if [ "$FORCE" = force ]; then
+                    echo "#${NAME} is archived — reversing this run's own reopen banners outside the room"
+                  else
+                    echo "#${NAME} is archived with no close on record — finishing the close outside the room"
+                  fi
                   annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
                   write_close_marker "$CLOSE_MARKER_DONE" || return 1
                   CLOSE_OUTCOME=annotated
@@ -1235,7 +1262,7 @@ jobs:
           reopen_epilogue() {
             # The whole reopen for a PR whose room is known — $1 is its UUID.
             # Shared by the `reopened` event and by the sweep's post-write
-            # convergence check, which reaches it when a reopen landed while
+            # convergence loop, which reaches it when a reopen landed while
             # the sweep was closing the same PR.
             local CH="$1"
             # Invalidated FIRST: while this marker still reads "closed" a
@@ -1301,9 +1328,15 @@ jobs:
             return 0
           }
 
-          converge_after_close() {
-            # $1 PR number, $2 its room. Re-read the PR AFTER the close wrote,
-            # and undo the close if the PR is open again.
+          # A lifecycle that flips more often than this inside one sweep pass
+          # is not something to keep chasing: the sweep says so and goes red.
+          CONVERGE_MAX_PASSES=4
+
+          converge_lifecycle() {
+            # $1 PR number, $2 its room. LIFECYCLE_WRITTEN holds the state
+            # this run last made durable ("closed" or "open" — GitHub's own
+            # vocabulary). Re-read the PR AFTER those writes and, while
+            # GitHub disagrees, apply the opposite epilogue and read again.
             #
             # THE SWEEP AND AN EVENT RUN ARE NOT SERIALIZED WITH EACH OTHER:
             # they sit in different concurrency groups (one group for the
@@ -1320,26 +1353,58 @@ jobs:
             # relay-side compare-and-set spanning GitHub's state and the
             # room's — so the writes CONVERGE instead: whichever of the two
             # runs writes last also checks last and restores what the other
-            # left wrong. The other interleaving is already safe (a reopen
-            # that starts after this archive unarchives it itself), and a
-            # doubled restoration is idempotent — the unarchive is
-            # best-effort and the banners are replaced, not stacked.
+            # left wrong. ONE compensating pass is not enough, because ITS
+            # read is a snapshot in exactly the same way: a second close can
+            # complete while this run is restoring the room, putting its
+            # archive and its marker BEFORE the reopen banners written here,
+            # and the durable state ends up split — archived and `closed`,
+            # references reopened, and every later sweep taking the silent
+            # path over it. The loop is what removes that: it returns only
+            # when a read taken after this run's last write agrees with that
+            # write, so no write of this run's is left standing as the stale
+            # one. The doubled work along the way is idempotent — the
+            # unarchive is best-effort, the banners are replaced rather than
+            # stacked, and the marker is rewritten with the same token.
             #
-            # A re-read that FAILS is red: the room has been archived and
-            # this run cannot show that GitHub agrees, which is precisely the
-            # state that must not be reported as a completed repair.
-            local NUM="$1" CH="$2" POST STATE
-            POST=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}") || {
-              echo "#${NUM}: post-close re-read failed — cannot show the room's state matches GitHub's" >&2
-              return 1
-            }
-            STATE=$(printf '%s' "$POST" | jq -r '.state // empty') || return 1
-            [ "$STATE" = closed ] && return 0
-            echo "#${NUM}: reopened while this sweep was closing it — restoring #${NAME}" >&2
-            hydrate_pr "$POST" || return 1
-            reopen_epilogue "$CH" || return 1
-            RESTORED=$((RESTORED + 1))
-            return 0
+            # A re-read that FAILS is red: the room has been written and this
+            # run cannot show that GitHub agrees, which is precisely the
+            # state that must not be reported as a completed repair. So is a
+            # lifecycle still flipping after CONVERGE_MAX_PASSES.
+            local NUM="$1" CH="$2" POST STATE PASSES=0
+            while :; do
+              PASSES=$((PASSES + 1))
+              POST=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}") || {
+                echo "#${NUM}: post-close re-read failed — cannot show the room's state matches GitHub's" >&2
+                return 1
+              }
+              STATE=$(printf '%s' "$POST" | jq -r '.state // empty') || return 1
+              case "$STATE" in
+                open|closed) ;;
+                *) echo "#${NUM}: post-close re-read carries no state — refusing to guess" >&2
+                   return 1 ;;
+              esac
+              [ "$STATE" = "$LIFECYCLE_WRITTEN" ] && return 0
+              if [ "$PASSES" -ge "$CONVERGE_MAX_PASSES" ]; then
+                echo "#${NUM}: lifecycle still changing after ${PASSES} passes — #${NAME} is left to the next sweep rather than reported as repaired" >&2
+                return 1
+              fi
+              hydrate_pr "$POST" || return 1
+              if [ "$STATE" = open ]; then
+                echo "#${NUM}: reopened while this sweep was closing it — restoring #${NAME}" >&2
+                reopen_epilogue "$CH" || return 1
+                LIFECYCLE_WRITTEN=open
+                RESTORED=$((RESTORED + 1))
+              else
+                echo "#${NUM}: closed again while this sweep was restoring it — re-closing #${NAME}" >&2
+                set_close_status
+                # Forced: the marker may already read "closed" because the
+                # run that raced this one wrote it, while this run's reopen
+                # banners are still up in every other room.
+                close_epilogue "$CH" force || return 1
+                LIFECYCLE_WRITTEN=closed
+                RECLOSED=$((RECLOSED + 1))
+              fi
+            done
           }
 
           sweep_missed_closes() {
@@ -1358,7 +1423,8 @@ jobs:
             # independent, the cron retries, and a red run is the honest
             # outcome for a room this identity could not resolve or close.
             local NOW OLDEST OLDEST_DATE NEWEST PRS CANDIDATES LISTED NUM CLOSED_AT PR_JSON
-            local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 FAILED=0
+            local EXAMINED=0 RECONCILED=0 ANNOTATED=0 ARCHIVED=0 NOROOM=0 RESTORED=0 RECLOSED=0 FAILED=0
+            local LIFECYCLE_WRITTEN=""
             printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
               echo "SWEEP_DAYS must be a small integer, got '${SWEEP_DAYS}'" >&2
               return 1
@@ -1471,15 +1537,17 @@ jobs:
                 *) ARCHIVED=$((ARCHIVED + 1)) ;;
               esac
               # THE PRE-WRITE RE-READ IS NOT A FENCE, so the writes are
-              # reconciled afterwards — see converge_after_close.
+              # reconciled afterwards — see converge_lifecycle. Only a pass
+              # that WROTE something has anything to reconcile.
               case "$CLOSE_OUTCOME" in
                 reconciled|annotated)
-                  if ! converge_after_close "$NUM" "$CH"; then
+                  LIFECYCLE_WRITTEN=closed
+                  if ! converge_lifecycle "$NUM" "$CH"; then
                     FAILED=$((FAILED + 1))
                   fi ;;
               esac
             done < "$CANDIDATES"
-            echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ANNOTATED} annotated outside an archived room, ${ARCHIVED} already archived, ${NOROOM} without a room, ${RESTORED} restored after a concurrent reopen, ${FAILED} failed"
+            echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ANNOTATED} annotated outside an archived room, ${ARCHIVED} already archived, ${NOROOM} without a room, ${RESTORED} restored after a concurrent reopen, ${RECLOSED} re-closed after a concurrent close, ${FAILED} failed"
             [ "$FAILED" -eq 0 ]
           }
 

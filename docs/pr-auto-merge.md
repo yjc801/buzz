@@ -489,11 +489,33 @@ write — leaves a later pass reading "not requested yet" over a request that is
 already in the room, whose remedy would be a second p-tag. So a pass with no
 marker searches the room for a request this CI identity published, adopts that
 message's own timestamp as the request time, and repairs the marker instead of
-asking again. It repeats that search, bounded to what could have appeared
-since, immediately before its own send, because the scheduled sweep and an
-event run sit in different concurrency groups and can both reach this path on
-one PR. That narrows the duplicate-wake window to the send itself; it does not
-close it, because there is no compare-and-set spanning the marker and the room.
+asking again.
+
+That search recognises the request by **reconstructing its whole shape**, not
+by finding a phrase inside a CI-authored message. The seed card republishes the
+PR's title, body and changed paths verbatim under the same CI key, so anything
+matched loosely is text a PR can write for itself: a PR whose title carried the
+phrase would have its own card adopted as the request, the real p-tag skipped,
+and — the card being old — the grace window found already elapsed and the room
+archived on the spot. PR-controlled text is only ever *embedded* in a card, so
+what it cannot forge is the whole message: the request is a single line that
+starts with the reviewer's `@name` and ends with the exact generated tail,
+while every card is multi-line and opens with its own `**PR #N —` prefix.
+
+The mirror repeats that search in full immediately before its own send, because
+the scheduled sweep and an event run sit in different concurrency groups and
+can both reach this path on one PR. In full, and not as a window onto what
+appeared since the first walk: `--since` filters `created_at`, which is not
+publication order. The relay accepts an event stamped up to
+`MAX_TIMESTAMP_DRIFT_SECS` (900s, `crates/buzz-core/src/relay.rs`) either side
+of server time, so a competing runner's request can be published a moment from
+now and still carry a timestamp fifteen minutes behind any cursor this run
+could pick — a narrow window silently excludes it and the pass sends the very
+duplicate the probe exists to prevent, while a window wide enough for the full
+drift is a bounded page that can truncate instead. Walking is complete by
+construction. That narrows the duplicate-wake window to the send itself; it does
+not close it, because there is no compare-and-set spanning the marker and the
+room.
 
 The mirror's scheduled sweep (`1,31 * * * *`) then finishes the close on
 facts, with a timer only as a backstop. The room is archived once **both** are

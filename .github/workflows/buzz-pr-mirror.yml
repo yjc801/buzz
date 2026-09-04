@@ -119,10 +119,14 @@ name: buzz-pr-mirror
 # second p-tag, which steers (cancels and re-prompts) the turn the first one
 # started. So a pass with no marker RECONCILES AGAINST THE ROOM first
 # (summary_request_at), adopts the published request's own created_at as the
-# request time, and repairs the marker rather than asking again. The probe is
-# repeated, bounded to what could have appeared since, immediately before the
-# send, because the sweep and an event run sit in different concurrency
-# groups and can both reach this path on one PR. That narrows the
+# request time, and repairs the marker rather than asking again. A request is
+# recognised by RECONSTRUCTING ITS WHOLE SHAPE, never by a phrase inside a
+# CI-authored message: the seed card republishes PR-controlled text under the
+# same CI key, so a loose match is text a PR can write for itself. The probe
+# is repeated in full immediately before the send, because the sweep and an
+# event run sit in different concurrency groups and can both reach this path
+# on one PR — in full, and not as a window onto "what appeared since",
+# because created_at is not publication order. That narrows the
 # duplicate-wake window to the send itself; it does not close it — there is
 # no compare-and-set spanning the marker and the room, the same limit
 # converge_lifecycle works around above.
@@ -1477,14 +1481,29 @@ jobs:
             finish_close "$CH" reconciled
           }
 
-          # The sentence that makes a message a summary REQUEST rather than
-          # any other CI notice carrying a reviewer p-tag (the seed card and
-          # every synchronize notice carry one too). It is matched literally
-          # against messages this CI identity authored, so keep the wording
-          # and the request text below identical, and do not let a banner
-          # glyph or the PR URL into it — annotate_references rewrites the
-          # first line of any CI message that names the PR.
-          SUMMARY_REQUEST_MARK='please post a review summary here'
+          # The tail of the request line, and the ONE definition of it: the
+          # request below is built from it, and a message is recognised as a
+          # request by reconstructing that shape rather than by looking for a
+          # phrase inside it.
+          #
+          # A SUBSTRING UNDER THE CI AUTHOR IS NOT PROOF OF ANYTHING. The
+          # seed card republishes the PR's title, body and changed paths
+          # verbatim under this same CI key (seed_card), so any phrase this
+          # matched loosely could be written INTO a PR and then published by
+          # CI itself: the pass would adopt the card as the request, skip the
+          # real p-tag, and — with an old card — find the grace window
+          # already elapsed and archive on the spot. PR-controlled text is
+          # only ever EMBEDDED in a card, so what it cannot forge is the
+          # whole message: the request is a SINGLE LINE that starts with the
+          # reviewer's @name and ends with this tail, while every card is
+          # multi-line and opens with its own '**PR #N —' prefix.
+          #
+          # So: keep the request one line, keep it built from this variable,
+          # and keep a banner glyph and the PR URL out of it —
+          # annotate_references rewrites the first line of any CI message
+          # that names the PR, and rewriting the request would unmake the
+          # shape this match depends on.
+          SUMMARY_REQUEST_TAIL='please post a review summary here: what the review found, what was fixed, and anything left open.'
 
           summary_request_at() {
             # Prints the created_at of the NEWEST summary request THIS CI
@@ -1504,22 +1523,25 @@ jobs:
             # against, and its own created_at is the request time the marker
             # is then repaired with.
             #
-            # $2 bounds the read to messages at or after that unix time — the
-            # form used for the last-instant re-check, where anything that
-            # could have been published since the full walk is newer than it.
-            # Without it this walks the whole history backward, like
+            # This ALWAYS walks the whole history backward, like
             # coder_already_mentioned and for the same reason: the request is
-            # not pinned to any position in a room the reviewer keeps
-            # posting into, and a bounded newest-page probe would eventually
-            # false-negative and re-ask.
-            local CH="$1" SINCE="${2:-}" BEFORE="" PAGE FOUND OLDEST COUNT
-            if [ -n "$SINCE" ]; then
-              PAGE=$(buzz messages get --channel "$CH" --since "$SINCE" --limit 200) || return 1
-              printf '%s' "$PAGE" | jq -r --arg ci "$CI_PUB" --arg m "$SUMMARY_REQUEST_MARK" \
-                '[(.messages? // .)[]? | select(.pubkey == $ci)
-                  | select(.content | contains($m)) | .created_at] | max // empty' || return 1
-              return 0
-            fi
+            # not pinned to any position in a room the reviewer keeps posting
+            # into, and a bounded probe would eventually false-negative and
+            # re-ask.
+            #
+            # A TIME CURSOR CANNOT BOUND THIS, not even for the last-instant
+            # re-check. `--since` filters created_at, which is not
+            # publication order: the relay accepts an event stamped up to
+            # MAX_TIMESTAMP_DRIFT_SECS (900s, crates/buzz-core/src/relay.rs)
+            # either side of server time, so a competing runner's request can
+            # be published a moment from now and still carry a created_at
+            # fifteen minutes behind any cursor this run could pick. A narrow
+            # window silently excludes it and the pass sends the duplicate
+            # p-tag the probe exists to prevent; a window wide enough for the
+            # full drift is a bounded page that can truncate instead. Walking
+            # is complete by construction and costs one extra paged read on
+            # the one path that needs it.
+            local CH="$1" BEFORE="" PAGE FOUND OLDEST COUNT
             while :; do
               if [ -z "$BEFORE" ]; then
                 PAGE=$(buzz messages get --channel "$CH" --limit 100) || return 1
@@ -1530,9 +1552,14 @@ jobs:
               if [ "$COUNT" -eq 0 ]; then
                 return 0   # walked past the start of history: never asked
               fi
-              FOUND=$(printf '%s' "$PAGE" | jq -r --arg ci "$CI_PUB" --arg m "$SUMMARY_REQUEST_MARK" \
-                '[(.messages? // .)[]? | select(.pubkey == $ci)
-                  | select(.content | contains($m)) | .created_at] | max // empty') || return 1
+              FOUND=$(printf '%s' "$PAGE" | jq -r --arg ci "$CI_PUB" --arg tail "$SUMMARY_REQUEST_TAIL" \
+                '[(.messages? // .)[]?
+                  | select(.pubkey == $ci)
+                  | select((.content | sub("\n+$"; "")) as $c
+                      | ($c | contains("\n") | not)
+                      and ($c | startswith("@"))
+                      and ($c | endswith($tail)))
+                  | .created_at] | max // empty') || return 1
               # Newest page first, so the first page holding one holds the
               # newest one — the wake whose turn is running.
               if [ -n "$FOUND" ]; then
@@ -1592,8 +1619,7 @@ jobs:
             # The annotation sweep runs before the ask for the same reason
             # everything else does — the ask is the LAST thing written, so
             # nothing after it can fail and leave a wake with no record.
-            local CH="$1" FORCE="${2:-}" REQUESTED_AT PROBE_AT PUBLISHED
-            PROBE_AT=$(( $(date +%s) - 5 ))
+            local CH="$1" FORCE="${2:-}" REQUESTED_AT PUBLISHED
             PUBLISHED=$(summary_request_at "$CH") || return 1
             if [ -n "$PUBLISHED" ]; then
               adopt_published_request "$CH" "$PUBLISHED" "$FORCE" || return 1
@@ -1609,14 +1635,17 @@ jobs:
             CLOSE_WROTE=yes
             ensure_provisioned "$CH" quiet || return 1
             annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
-            # LAST INSTANT, and bounded to what could have appeared since the
-            # walk above: another publisher — the sweep and an event run sit
-            # in different concurrency groups — may have published the
-            # request while this pass was provisioning and annotating. This
-            # narrows the duplicate-wake window to the send itself; it does
-            # not close it, because there is no compare-and-set spanning the
-            # marker and the room.
-            PUBLISHED=$(summary_request_at "$CH" "$PROBE_AT") || return 1
+            # LAST INSTANT: another publisher — the sweep and an event run
+            # sit in different concurrency groups — may have published the
+            # request while this pass was provisioning and annotating. The
+            # re-probe is the same FULL walk as the first one and not a
+            # window onto "what appeared since", because created_at is not
+            # publication order and a competing request can be published now
+            # carrying a timestamp the full relay drift behind us (see
+            # summary_request_at). This narrows the duplicate-wake window to
+            # the send itself; it does not close it, because there is no
+            # compare-and-set spanning the marker and the room.
+            PUBLISHED=$(summary_request_at "$CH") || return 1
             if [ -n "$PUBLISHED" ]; then
               adopt_published_request "$CH" "$PUBLISHED" "$FORCE" || return 1
               return 0
@@ -1624,8 +1653,7 @@ jobs:
             # The clock is read with the same 5s allowance as PUSHED_AT, so a
             # reply stamped a moment before this run's clock counts as one.
             REQUESTED_AT=$(( $(date +%s) - 5 ))
-            if ! printf '@%s %s: what the review found, what was fixed, and anything left open.\n' \
-                "$REVIEWER_NAME" "$SUMMARY_REQUEST_MARK" \
+            if ! printf '@%s %s\n' "$REVIEWER_NAME" "$SUMMARY_REQUEST_TAIL" \
                 | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"; then
               echo "the review-summary request was rejected — failing so the rerun re-probes and re-asks" >&2
               return 1

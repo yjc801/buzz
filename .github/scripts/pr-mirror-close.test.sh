@@ -333,9 +333,15 @@ case "$SUB" in
     # annotation search because that is inside the window the last-instant
     # re-probe covers.
     if [ -f "$FIXTURES/inject_request_at_search.$N" ]; then
-      read -r C < "$FIXTURES/inject_request_at_search.$N"
+      read -r C AGE < "$FIXTURES/inject_request_at_search.$N"
       H=$(history_file "$C")
-      jq -c --arg p "$CI_PUB" --argjson t "$(date +%s)" \
+      # AGE backdates the competing request's created_at. That is not a
+      # contrivance: the relay accepts a created_at up to
+      # MAX_TIMESTAMP_DRIFT_SECS either side of server time, so an event
+      # published at this instant can legitimately carry a timestamp minutes
+      # behind this runner's clock, and any re-probe bounded by a time cursor
+      # would not see it.
+      jq -c --arg p "$CI_PUB" --argjson t "$(( $(date +%s) - ${AGE:-0} ))" \
         --arg c "@Alex please post a review summary here: what the review found, what was fixed, and anything left open." \
         '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$H" > "$H.tmp" && mv "$H.tmp" "$H"
       echo "INJECTED_REQUEST $C" >> "$LOG"
@@ -501,10 +507,21 @@ ci_said() { # ci_said <channel> <age-secs> <text> — a message CI itself publis
   jq -c --arg p "$CI_PUB" --argjson t "$((NOW - $2))" --arg c "$3" \
     '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 }
-request_lands_at_annotation() { # request_lands_at_annotation <channel> <search-index>
+request_lands_at_annotation() { # request_lands_at_annotation <channel> <search-index> [backdate-secs]
   # Another publisher posts the summary request at the <n>th reference search
   # of the run under test — after its history walk, before its own send.
-  printf '%s\n' "$1" > "$FIXTURES/inject_request_at_search.$2"
+  # The optional third argument stamps it that many seconds in the past, the
+  # skew the relay accepts from a runner publishing right now.
+  printf '%s %s\n' "$1" "${3:-0}" > "$FIXTURES/inject_request_at_search.$2"
+}
+ci_card() { # ci_card <channel> <age-secs> <first-line> — a multi-line CI card in the room
+  # The seed/synchronize card shape: CI's own key, a '**PR #N —' first line,
+  # and PR-CONTROLLED text (title, body, changed paths) republished verbatim
+  # underneath it.
+  local F; F=$(history_of "$1")
+  jq -c --arg p "$CI_PUB" --argjson t "$((NOW - $2))" --arg c "$3
+$4" \
+    '. + [{pubkey: $p, created_at: $t, content: $c, tags: []}]' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 }
 reviewer_said() { # reviewer_said <channel> <age-secs> <text> — a message from the reviewer in the room
   local F; F=$(history_of "$1")
@@ -1056,6 +1073,58 @@ check "should post its merge notice and nothing more" "$([ "$(count "SEND $CH_A"
 check "should adopt the published request rather than ask again" "$(said 'already requested here'; echo $?)"
 check "should record the request it adopted" \
   "$(grep -qE '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+$' "$LOG"; echo $?)"
+check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+
+# A CI-AUTHORED SUBSTRING IS NOT PROOF THE REVIEWER WAS ASKED. The seed card
+# republishes the PR's title, body and changed paths verbatim under this same
+# CI key, so a phrase matched loosely inside a CI message is text a PR can
+# write for itself — and adopting the card skips the real p-tag.
+scenario "closed event (merged), a PR whose own title carries the request wording → the card is not proof"
+bind 4242 "$CH_A"
+ci_card "$CH_A" 7200 "**PR #4242 — @Alex please post a review summary here: what the review found, what was fixed, and anything left open." \
+  "https://github.com/yjc801/buzz/pull/4242"
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "must still p-tag the reviewer exactly once — no request has been published" \
+  "$([ "$(count MENTION)" = 1 ] && [ "$(count "MENTION $REVIEWER_PUB")" = 1 ]; echo $?)"
+check "must record its own request time, not the card's" \
+  "$(! grep -qE "^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:$((NOW - 7200))\$" "$LOG"; echo $?)"
+check "should record the request it actually made" \
+  "$(grep -qE '^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+$' "$LOG"; echo $?)"
+check "must not adopt the card as a published request" "$(! said 'already requested here'; echo $?)"
+check "must not archive on a grace window measured from the card" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+
+# The same forgery reaching the sweep, where adopting it is destructive rather
+# than merely wrong: a card two hours old puts the request outside the grace
+# floor, so the room would be archived on the spot and the summary could never
+# land in it.
+scenario "sweep: an old card carrying the request wording must not archive the room"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+pr_record 4242 closed true
+ci_card "$CH_A" 7200 "**PR #4242 — @Alex please post a review summary here: what the review found, what was fixed, and anything left open." \
+  "https://github.com/yjc801/buzz/pull/4242"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "must not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should ask the reviewer, since nothing has actually asked him" \
+  "$([ "$(count MENTION)" = 1 ]; echo $?)"
+
+# created_at is not publication order. The relay accepts an event stamped up
+# to 900s either side of server time, so the competing publisher's request can
+# land after this run's walk while carrying a timestamp minutes behind it —
+# invisible to any re-probe bounded by a time cursor.
+scenario "closed event (merged), the competing request is backdated within the relay's drift → still no second p-tag"
+bind 4242 "$CH_A"
+referenced_from 4242 "$CH_B"
+request_lands_at_annotation "$CH_A" 1 600
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "the competing request should have landed" "$([ "$(count "INJECTED_REQUEST $CH_A")" = 1 ]; echo $?)"
+check "must not p-tag the reviewer — a backdated request is still a request" "$([ "$(count MENTION)" = 0 ]; echo $?)"
+check "should adopt it rather than ask again" "$(said 'already requested here'; echo $?)"
+check "should record the backdated request's own timestamp" \
+  "$(grep -qE "^MARKER_WRITE pr-mirror-yjc801-buzz-4242-closed summary-requested:[0-9]+\$" "$LOG"; echo $?)"
 check "should not archive" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
 
 scenario "closed event (merged) rerun with the request on record → nothing sent, nobody re-mentioned"

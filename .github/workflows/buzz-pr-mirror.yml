@@ -12,11 +12,38 @@ name: buzz-pr-mirror
 #                 alone leaves him asleep
 #   closed      → post ✅ Merged / 🚫 Closed without merge, then archive
 #   reopened    → unarchive, and reverse the close annotations everywhere
+#   schedule    → archive the room of any PR whose close GitHub never
+#                 announced (sweep_missed_closes — see below)
 #
 # Ported from yjc801/velvet's buzz-pr-mirror.yml. Keep the two in sync when
 # fixing relay-behavior bugs — the hard-won invariants in the shell below
 # (search failure ≠ absence, CI-authored seed markers, write-outcome-driven
 # unarchive) were all paid for once already and apply identically here.
+#
+# A CLOSE GITHUB NEVER ANNOUNCES IS RECONCILED BY THE SWEEP. A `pull_request`
+# run executes on the PR's merge commit, so for a PR GitHub cannot merge it
+# schedules no run at all — not a skipped one, none: a PR with conflicts, and
+# a PR GitHub closed itself because the branch it targeted was deleted. A
+# stacked PR is both at once the moment its parent merges and the parent's
+# branch goes: velvet#174, velvet#210 and buzz#128 each closed within seconds
+# of their base branch's deletion, none got a `closed` run, and each left its
+# room live with its seed card still asking for a review. No trigger closes
+# the base-deleted half (`pull_request_target` would fire on a conflicting PR,
+# but it resolves the workflow from the base branch — the thing that was
+# deleted), so the schedule below runs sweep_missed_closes: every same-repo PR
+# closed within SWEEP_DAYS and settled for SWEEP_SETTLE_SECS has its room
+# resolved through the same binding read an event run uses, and is put
+# through the same close epilogue. That epilogue's FIRST write is the close
+# notice, and that write is the state read: the relay refuses it pre-storage
+# on an archived room, so a room already closed costs one refused send and no
+# discovery snapshot is consulted (the CLI projects `archived` away from the
+# membership listing anyway, and the snapshot can lag the archive). The settle
+# window keeps the sweep off a PR whose own close run may still be queued or
+# running; if the two do meet, the later one's notice is refused and it exits
+# clean. The sweep never creates a room, never posts a fallback notice (it has
+# no durable record that one went out, so it would repeat every half hour),
+# and never unarchives: an archived room under an open PR may be the owner's
+# own choice, and `reopened` is announced normally.
 #
 # CHANNEL NAMES CARRY THE PROJECT PREFIX: `buzz-pr-N`, never bare `pr-N`.
 # Every repo that mirrors into openvelvet prefixes with its own project name
@@ -139,22 +166,44 @@ name: buzz-pr-mirror
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
+  # Closes GitHub never announced — see the header. Off the other sweeps'
+  # cadence (auto-merge 4-59/10, review watchdog 9-59/10).
+  schedule:
+    - cron: "1,31 * * * *"
+  workflow_dispatch:
+    inputs:
+      sweep_days:
+        description: "Reconcile PRs closed within this many days (the cron uses 7)"
+        type: string
+        default: "7"
 
+# Event runs serialize per PR, and a newer push cancels an older run (the
+# synchronize arm's quiet window relies on that). The sweep has its own group
+# and is never cancelled: there is nothing newer to make way for, and a
+# cancelled sweep would leave a room with its close notice posted and its
+# archive not yet proven.
 concurrency:
-  group: buzz-mirror-${{ github.event.number }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('buzz-mirror-{0}', github.event.number) || 'buzz-mirror-sweep' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+  # The sweep lists closed PRs and re-reads each one at the write.
+  pull-requests: read
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # A sweep with a backlog runs one full close epilogue per stale room.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 10 || 30 }}
     # PRs from forks of this fork run without secrets, so every buzz command
     # would fail auth. Skip rather than fail: an unauthenticated run has
     # nothing useful to do and a red X on a contributor's PR is misleading.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # The sweep runs only on this repository, for the same reason.
+    if: >-
+      (github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name != 'pull_request' && github.repository == 'yjc801/buzz')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -176,6 +225,14 @@ jobs:
           BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
           BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
           BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
+          # Read by the sweep alone: an event run never touches GitHub.
+          GH_TOKEN: ${{ github.token }}
+          # The sweep's window, and how long a close must have settled before
+          # the sweep will touch it — see sweep_missed_closes. The cron gets
+          # the default; the dispatch input widens the window for a one-off
+          # backfill. An event run reads neither.
+          SWEEP_DAYS: ${{ github.event.inputs.sweep_days || '7' }}
+          SWEEP_SETTLE_SECS: "1800"
           PR_ACTION: ${{ github.event.action }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -234,7 +291,6 @@ jobs:
           # other key rather than discovering an empty world and rebuilding it.
           EXPECTED_CI_PUBKEY: fbc33a2cf3637867fa90e9e3e334304701e1fdf3c57eae4283cea60134f604af
         run: |
-          NAME="buzz-pr-${PR_NUMBER}"
           RANGE="origin/${BASE_REF}...HEAD"
 
           # WHEN THE PUSH LANDED — the cutoff for "has the reviewer already
@@ -359,14 +415,24 @@ jobs:
           }
           ensure_ci_profile || exit 1
 
-          # Slug of this PR's binding note. Lowercased and slash-free to stay
-          # inside the note-slug charset; asserted rather than assumed, because
-          # a slug the CLI rejects would turn every lookup into a hard error.
-          BINDING_SLUG=$(printf 'pr-mirror-%s-%s' "$GITHUB_REPOSITORY" "$PR_NUMBER" \
-            | tr '[:upper:]' '[:lower:]' | tr '/' '-')
-          printf '%s' "$BINDING_SLUG" | grep -qE '^[a-z0-9._-]{1,80}$' || {
-            echo "binding slug '$BINDING_SLUG' is outside the note-slug charset" >&2
-            exit 1
+          bind_pr() {
+            # Everything keyed by PR number, derived in one place: an event
+            # run keys itself once, and the sweep re-keys per PR through the
+            # same function so the two can never disagree on a name or slug.
+            PR_NUMBER="$1"
+            NAME="buzz-pr-${PR_NUMBER}"
+            # Slug of this PR's binding note. Lowercased and slash-free to stay
+            # inside the note-slug charset; asserted rather than assumed, because
+            # a slug the CLI rejects would turn every lookup into a hard error.
+            BINDING_SLUG=$(printf 'pr-mirror-%s-%s' "$GITHUB_REPOSITORY" "$PR_NUMBER" \
+              | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+            printf '%s' "$BINDING_SLUG" | grep -qE '^[a-z0-9._-]{1,80}$' || {
+              echo "binding slug '$BINDING_SLUG' is outside the note-slug charset" >&2
+              return 1
+            }
+            # The annotation sweep's search key — repo-qualified, so velvet's
+            # PR #N and this repo's PR #N never annotate each other.
+            PR_PATH="github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
           }
 
           # Ceiling on the membership scan that proves a room's absence. It has
@@ -956,9 +1022,7 @@ jobs:
           # reaction plus a threaded reply. Coverage is bounded by the channels
           # the CI identity is a member of and by the 100 hits `messages
           # search` returns (its --limit is capped at 100 inside the CLI).
-          # The search key is repo-qualified, so velvet's PR #N and this repo's
-          # PR #N never annotate each other.
-          PR_PATH="github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
+          # The search key is PR_PATH, set by bind_pr.
           # Any banner this workflow has ever written, so re-annotating
           # replaces the previous state instead of stacking on top of it.
           BANNER_RE='^(✅|🚫|♻️) '
@@ -1010,6 +1074,187 @@ jobs:
                   fi
                 done
           }
+
+          set_close_status() {
+            if [ "$PR_MERGED" = "true" ]; then
+              STATUS="✅ **Merged**"; EMOJI="✅"
+            else
+              STATUS="🚫 **Closed without merge**"; EMOJI="🚫"
+            fi
+          }
+
+          close_epilogue() {
+            # The whole close for a PR whose room is known — $1 is its UUID.
+            # Shared by the `closed` event and by sweep_missed_closes, so a
+            # close GitHub never announced gets exactly the treatment an
+            # announced one does. Sets CLOSE_OUTCOME: "archived" when the
+            # room turns out to be closed already, "reconciled" when this
+            # call closed it.
+            #
+            # THE FIRST WRITE IS THE FENCE. The relay refuses every
+            # channel-scoped write on an archived room BEFORE storing it —
+            # the gate archive_channel proves its own work with — so the
+            # close notice going out proves the room is live, and its refusal
+            # proves the room is already archived (a rerun of a finished
+            # close, or the sweep and the event run meeting on one PR), in
+            # which case nothing is left to do and nothing has been written.
+            # No snapshot is consulted: the discovery record can lag the
+            # archive (the reaper commits archived_at before its emission),
+            # and a stale "live" would cost a reaction and a threaded reply
+            # under every cross-channel reference a second time. Every other
+            # write follows the fence for that reason.
+            local CH="$1" SEND_ERR
+            CLOSE_OUTCOME=""
+            if ! printf '%s — archiving this channel.\n%s\n' "$STATUS" "$PR_URL" \
+                | buzz messages send --channel "$CH" --content - 2>"$ERRFILE"; then
+              SEND_ERR=$(cat "$ERRFILE")
+              case "$SEND_ERR" in
+                *"channel is archived"*)
+                  echo "#${NAME} is already archived — nothing left to do"
+                  CLOSE_OUTCOME=archived
+                  return 0 ;;
+              esac
+              echo "close notice rejected: $SEND_ERR" >&2
+              return 1
+            fi
+            # Even the close path recovers a partial first, so an owner-less
+            # channel is never archived into invisibility. After the fence,
+            # so the seed card it may post lands in a room proven live — and
+            # before the annotation sweep, so that card gets its banner too.
+            ensure_provisioned "$CH" || return 1
+            annotate_references "$STATUS" "$EMOJI" "♻️" || return 1
+            archive_channel "$CH" || return 1
+            CLOSE_OUTCOME=reconciled
+          }
+
+          hydrate_pr() {
+            # Re-key this run to one PR from its GitHub record ($1, the
+            # pulls/N JSON), giving the sweep the facts a `pull_request`
+            # payload gives an event run. The head is fetched for RANGE,
+            # which only the recovery leg (a seed card for an unprovisioned
+            # room) reads; a head or base that can no longer be fetched —
+            # the base branch of a stacked PR is gone by the time the sweep
+            # sees it — leaves that card's diff empty, and says so, rather
+            # than failing the archive.
+            local JSON="$1" BASE_SHA
+            PR_TITLE=$(printf '%s' "$JSON" | jq -r '.title // empty') || return 1
+            PR_URL=$(printf '%s' "$JSON" | jq -r '.html_url // empty') || return 1
+            PR_BODY=$(printf '%s' "$JSON" | jq -r '.body // empty') || return 1
+            PR_AUTHOR=$(printf '%s' "$JSON" | jq -r '.user.login // empty') || return 1
+            PR_MERGED=$(printf '%s' "$JSON" | jq -r '.merged // false') || return 1
+            HEAD_REF=$(printf '%s' "$JSON" | jq -r '.head.ref // empty') || return 1
+            HEAD_SHA=$(printf '%s' "$JSON" | jq -r '.head.sha // empty') || return 1
+            BASE_REF=$(printf '%s' "$JSON" | jq -r '.base.ref // empty') || return 1
+            BASE_SHA=$(printf '%s' "$JSON" | jq -r '.base.sha // empty') || return 1
+            if [ -z "$PR_URL" ] || [ -z "$HEAD_SHA" ]; then
+              echo "#${PR_NUMBER}: PR record lacks a URL or a head — refusing to guess" >&2
+              return 1
+            fi
+            RANGE="${BASE_SHA}...${HEAD_SHA}"
+            git fetch -q origin "refs/pull/${PR_NUMBER}/head" "$BASE_SHA" 2>/dev/null \
+              || echo "#${PR_NUMBER}: head or base no longer fetchable — a recovery seed card would carry no diff" >&2
+            return 0
+          }
+
+          sweep_missed_closes() {
+            # Reconcile closes GitHub never announced — see the header. Every
+            # same-repo PR closed at least SWEEP_SETTLE_SECS ago and within
+            # SWEEP_DAYS is resolved through the binding read an event run
+            # uses and, if it has a room, put through close_epilogue, whose
+            # first write tells a live room from an archived one. Closes
+            # inside the settle window are left to their own event run —
+            # queued, or running under timeout-minutes above. The PR is
+            # re-read at the moment of the write: a reopen since the listing
+            # hands the room back to the `reopened` run instead of archiving
+            # it under an open PR.
+            #
+            # One PR's failure fails the sweep but not its siblings: each is
+            # independent, the cron retries, and a red run is the honest
+            # outcome for a room this identity could not resolve or close.
+            local NOW OLDEST NEWEST PRS CANDIDATES LISTED NUM CLOSED_AT PR_JSON
+            local EXAMINED=0 RECONCILED=0 ARCHIVED=0 NOROOM=0 FAILED=0
+            printf '%s' "$SWEEP_DAYS" | grep -qE '^[0-9]{1,3}$' || {
+              echo "SWEEP_DAYS must be a small integer, got '${SWEEP_DAYS}'" >&2
+              return 1
+            }
+            NOW=$(date +%s)
+            NEWEST=$((NOW - SWEEP_SETTLE_SECS))
+            OLDEST=$((NOW - SWEEP_DAYS * 86400))
+            # Newest-updated first: a close bumps updated_at, so the window
+            # sits at the top of the listing. Fork heads never got a room
+            # (the job condition skips them) and are not candidates.
+            PRS=$(gh pr list -R "$GITHUB_REPOSITORY" --state closed --limit 100 \
+              --search 'sort:updated-desc' \
+              --json number,closedAt,mergedAt,headRepositoryOwner,headRepository) || {
+              echo "closed-PR listing failed — failing so the next sweep retries" >&2
+              return 1
+            }
+            CANDIDATES=$(mktemp)
+            printf '%s' "$PRS" | jq -r \
+              --arg owner "${GITHUB_REPOSITORY%%/*}" --arg repo "${GITHUB_REPOSITORY#*/}" \
+              --argjson oldest "$OLDEST" --argjson newest "$NEWEST" \
+              '.[]
+               | select(.headRepositoryOwner.login == $owner and .headRepository.name == $repo)
+               | select(.closedAt != null)
+               | (.closedAt | fromdateiso8601) as $t
+               | select($t >= $oldest and $t <= $newest)
+               | [.number, .closedAt]
+               | @tsv' > "$CANDIDATES" || return 1
+            LISTED=$(printf '%s' "$PRS" | jq 'length') || return 1
+            if [ "$LISTED" -ge 100 ]; then
+              echo "listing window is full (${LISTED}) — PRs closed before its oldest entry were not examined this sweep"
+            fi
+            echo "examining PRs closed within ${SWEEP_DAYS} day(s) and settled for ${SWEEP_SETTLE_SECS}s"
+            while IFS=$'\t' read -r NUM CLOSED_AT; do
+              [ -n "$NUM" ] || continue
+              EXAMINED=$((EXAMINED + 1))
+              if ! bind_pr "$NUM"; then
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if ! CH=$(resolve_channel); then
+                echo "#${NUM}: room resolution failed" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if [ -z "$CH" ]; then
+                # A PR that predates the mirror, or whose `opened` run never
+                # got as far as a room. Nothing to archive.
+                NOROOM=$((NOROOM + 1)); continue
+              fi
+              # Re-read at the side-effect boundary, and take the PR's facts
+              # from this read rather than the listing: the close notice and
+              # a recovery seed card are built from them.
+              if ! PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}"); then
+                echo "#${NUM}: PR re-read failed" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              if [ "$(printf '%s' "$PR_JSON" | jq -r '.state // empty')" != closed ]; then
+                echo "#${NUM}: reopened since the listing — the reopened run owns its room"
+                continue
+              fi
+              if ! hydrate_pr "$PR_JSON"; then
+                FAILED=$((FAILED + 1)); continue
+              fi
+              set_close_status
+              if ! close_epilogue "$CH"; then
+                echo "#${NUM}: close epilogue failed — #${NAME} may still be live" >&2
+                FAILED=$((FAILED + 1)); continue
+              fi
+              case "$CLOSE_OUTCOME" in
+                reconciled)
+                  echo "#${NUM}: closed ${CLOSED_AT} with #${NAME} still live — GitHub scheduled no close run; archived it now"
+                  RECONCILED=$((RECONCILED + 1)) ;;
+                *) ARCHIVED=$((ARCHIVED + 1)) ;;
+              esac
+            done < "$CANDIDATES"
+            echo "sweep: ${EXAMINED} examined, ${RECONCILED} reconciled, ${ARCHIVED} already archived, ${NOROOM} without a room, ${FAILED} failed"
+            [ "$FAILED" -eq 0 ]
+          }
+
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            sweep_missed_closes || exit 1
+            exit 0
+          fi
+          bind_pr "$PR_NUMBER" || exit 1
 
           case "$PR_ACTION" in
             opened)
@@ -1113,16 +1358,12 @@ jobs:
               annotate_references "♻️ **Reopened**" "♻️" "✅" "🚫" || exit 1
               ;;
             closed)
-              if [ "$PR_MERGED" = "true" ]; then
-                STATUS="✅ **Merged**"; EMOJI="✅"
-              else
-                STATUS="🚫 **Closed without merge**"; EMOJI="🚫"
-              fi
-
-              annotate_references "$STATUS" "$EMOJI" "♻️" || exit 1
-
+              set_close_status
               CH=$(resolve_channel) || exit 1
               if [ -z "$CH" ]; then
+                # No room to close; the cross-channel references still get
+                # their banner.
+                annotate_references "$STATUS" "$EMOJI" "♻️" || exit 1
                 if [ -z "$FALLBACK_CHANNEL" ]; then
                   echo "no #${NAME} channel and no BUZZ_FALLBACK_CHANNEL set — nothing to archive"
                   exit 0
@@ -1131,11 +1372,6 @@ jobs:
                   | buzz messages send --channel "$FALLBACK_CHANNEL" --content -
                 exit 0
               fi
-              # Even the close path recovers a partial first, so an
-              # owner-less channel is never archived into invisibility.
-              ensure_provisioned "$CH" || exit 1
-              printf '%s — archiving this channel.\n%s\n' "$STATUS" "$PR_URL" \
-                | buzz messages send --channel "$CH" --content -
-              archive_channel "$CH" || exit 1
+              close_epilogue "$CH" || exit 1
               ;;
           esac

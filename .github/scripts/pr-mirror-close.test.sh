@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# Contract test for the close path of .github/workflows/buzz-pr-mirror.yml:
+# the `closed` event's epilogue, and the scheduled sweep that repeats it for
+# closes GitHub never announced.
+#
+# WHY. A `pull_request` run executes on the PR's merge commit, so a PR GitHub
+# cannot merge gets no `closed` run at all — none, not a skipped one. A
+# stacked PR is the everyday case: the moment its parent merges and the
+# parent's branch is deleted, GitHub closes the child itself and schedules
+# nothing (velvet#174, velvet#210, buzz#128 — each left its room live with
+# the seed card still asking for a review). The sweep is the only thing that
+# closes that gap, so the properties pinned here are the ones that decide
+# whether a room is archived at all, and whether one is archived wrongly:
+#
+#   * a settled close with a live room gets the full epilogue — notice,
+#     provisioning check, annotation, archive, and the archive PROVEN by the
+#     relay refusing a follow-up write;
+#   * a room already archived costs one refused send and nothing else: the
+#     event run and the sweep can meet on one PR, and a rerun of a finished
+#     close must be green and silent;
+#   * a close inside the settle window, a PR reopened between the listing
+#     and the write, a fork head, and a close outside the window are all
+#     left alone;
+#   * a binding read that FAILS (as opposed to proving absence) archives
+#     nothing, fails the sweep, and does not stop the sweep's other PRs;
+#   * an archive the relay accepted but never applied is red, not green.
+#
+# The script under test is EXTRACTED FROM THE WORKFLOW, like
+# pr-review-wake.test.sh: a sweep deleted from the YAML fails here instead of
+# silently passing. GitHub, the relay CLI and git are stubbed;
+# scripts/buzz-mint-auth-tag.py is NOT, so the identity fence does its real
+# derivation against a real test key.
+#
+# Usage: .github/scripts/pr-mirror-close.test.sh   (from the repo root)
+
+set -uo pipefail
+
+WORKFLOW=.github/workflows/buzz-pr-mirror.yml
+STEP="Sync PR channel"
+REPO=yjc801/buzz
+CH_A=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+CH_B=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+BASE40=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+REVIEWER_PUB=2222222222222222222222222222222222222222222222222222222222222222
+OWNER_PUB=3333333333333333333333333333333333333333333333333333333333333333
+CODER_PUB=4444444444444444444444444444444444444444444444444444444444444444
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "run from the repository root" >&2
+  exit 2
+fi
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+REAL_PYTHON3=$(command -v python3) || { echo "python3 required" >&2; exit 2; }
+command -v jq >/dev/null || { echo "jq required" >&2; exit 2; }
+
+PASS=0
+FAILED=0
+fail() { echo "FAIL: $*" >&2; FAILED=$((FAILED + 1)); }
+ok() { PASS=$((PASS + 1)); }
+check() { # check <description> <condition-result-rc>
+  if [ "$2" -eq 0 ]; then ok; else fail "$1"; fi
+}
+
+# --- extract the step's script from the workflow ---------------------------
+# Deliberately not a YAML library: this must run on any box with python3 and
+# no pip installs, exactly like the workflow itself.
+"$REAL_PYTHON3" - "$WORKFLOW" "$STEP" > "$WORK/step.sh" <<'PY'
+import sys
+
+path, step = sys.argv[1], sys.argv[2]
+lines = open(path, encoding="utf-8").read().split("\n")
+try:
+    i = next(n for n, ln in enumerate(lines) if ln.strip() == f"- name: {step}")
+except StopIteration:
+    sys.exit(f"step {step!r} not found in {path}")
+try:
+    j = next(n for n in range(i, len(lines)) if lines[n].strip() == "run: |")
+except StopIteration:
+    sys.exit(f"step {step!r} has no literal run block")
+indent = len(lines[j]) - len(lines[j].lstrip()) + 2
+body = []
+for ln in lines[j + 1 :]:
+    if ln.strip() and not ln.startswith(" " * indent):
+        break
+    body.append(ln[indent:] if ln.strip() else "")
+if not body:
+    sys.exit(f"step {step!r} has an empty run block")
+sys.stdout.write("\n".join(body) + "\n")
+PY
+[ -s "$WORK/step.sh" ] || { echo "extraction produced nothing" >&2; exit 2; }
+
+# --- the sweep is wired, statically ----------------------------------------
+# A sweep that exists in the script but never fires is the same as no sweep.
+echo "--- wiring"
+check "the workflow should run on a schedule" \
+  "$(grep -qE '^  schedule:' "$WORKFLOW"; echo $?)"
+check "only event runs should be cancellable — a cancelled sweep leaves a half-closed room" \
+  "$(grep -qF "cancel-in-progress: \${{ github.event_name == 'pull_request' }}" "$WORKFLOW"; echo $?)"
+check "the job condition should admit the sweep on this repository" \
+  "$(grep -qF "github.event_name != 'pull_request' && github.repository == 'yjc801/buzz'" "$WORKFLOW"; echo $?)"
+check "the sweep should be allowed to list PRs" \
+  "$(grep -qE '^  pull-requests: read' "$WORKFLOW"; echo $?)"
+
+# --- test identity ---------------------------------------------------------
+# A real key so the fence's real derivation runs; the workflow's pin is
+# asserted against its siblings by pr-review-wake.test.sh, not here.
+CI_SECRET=$("$REAL_PYTHON3" -c 'import hashlib; print(hashlib.sha256(b"mirror-ci").hexdigest())')
+CI_PUB=$(NOSTR_SECRET="$CI_SECRET" "$REAL_PYTHON3" scripts/buzz-mint-auth-tag.py pubkey)
+[ ${#CI_PUB} -eq 64 ] || { echo "key derivation failed" >&2; exit 2; }
+
+# --- stubs -----------------------------------------------------------------
+mkdir -p "$WORK/bin"
+FIXTURES="$WORK/fixtures"
+LOG="$WORK/calls.log"
+export FIXTURES LOG CI_PUB
+
+# gh: the sweep's listing and its per-PR re-read at the write. An event run
+# must never reach GitHub; an unhandled request is a failure, not a pass.
+cat > "$WORK/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo "PR_LIST" >> "$LOG"
+    cat "$FIXTURES/pr_list.json" ;;
+  "api repos/"*"/pulls/"*)
+    N="${2##*/}"
+    echo "PR_READ $N" >> "$LOG"
+    [ -f "$FIXTURES/pr_$N.rc" ] && exit "$(cat "$FIXTURES/pr_$N.rc")"
+    cat "$FIXTURES/pr_$N.json" ;;
+  *) echo "stub gh: unhandled: $*" >&2; exit 9 ;;
+esac
+GHEOF
+
+# buzz: the relay CLI. Archive state lives in $FIXTURES/archived.<channel>,
+# and every channel-scoped write on an archived room is refused BEFORE it is
+# stored, with the relay's own wording (verified live 2026-08-09, per the
+# workflow header) — that refusal is the fence under test. A room is created
+# by nobody: `channels create` is unhandled, so a sweep that tries fails.
+cat > "$WORK/bin/buzz" <<'BUZZEOF'
+#!/usr/bin/env bash
+arg() { # arg <flag> "$@" → the value after <flag>
+  local F="$1"; shift
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "$F" ]; then printf '%s' "${2:-}"; return; fi
+    shift
+  done
+}
+refuse_if_archived() {
+  if [ -f "$FIXTURES/archived.$1" ]; then
+    echo '{"error":"invalid","message":"invalid: channel is archived"}' >&2
+    exit 1
+  fi
+}
+SUB="$1 $2"; shift 2
+case "$SUB" in
+  "users get") echo '[{"name":"Buzz CI"}]' ;;
+  "notes get")
+    SLUG=$(arg --name "$@")
+    echo "BINDING_READ $SLUG" >> "$LOG"
+    if [ -f "$FIXTURES/binding.$SLUG.rc" ]; then
+      echo '{"error":"internal","message":"relay unreachable"}' >&2
+      exit "$(cat "$FIXTURES/binding.$SLUG.rc")"
+    fi
+    if [ -f "$FIXTURES/binding.$SLUG" ]; then cat "$FIXTURES/binding.$SLUG"; exit 0; fi
+    echo '{"error":"not_found","message":"no such note"}' >&2
+    exit 1 ;;
+  "notes set") cat >/dev/null; echo "BINDING_WRITE" >> "$LOG" ;;
+  "channels list") cat "$FIXTURES/channels_list.json" ;;
+  "channels members") printf '[{"pubkey":"%s","role":"owner"}]\n' "$CI_PUB" ;;
+  "messages get")
+    # Every room is fully provisioned: a CI-authored seed card for each PR
+    # number a scenario uses. Partial-room recovery is not under test here.
+    printf '[{"pubkey":"%s","content":"**PR #4242 — t","created_at":1},' "$CI_PUB"
+    printf '{"pubkey":"%s","content":"**PR #4243 — t","created_at":1}]\n' "$CI_PUB" ;;
+  "messages search") echo "SEARCH $(arg --query "$@")" >> "$LOG"; echo '[]' ;;
+  "messages send")
+    C=$(arg --channel "$@")
+    BODY=$(cat)
+    refuse_if_archived "$C"
+    { echo "SEND $C"; printf '%s\n' "$BODY"; echo "--- end send ---"; } >> "$LOG" ;;
+  "channels archive")
+    C=$(arg --channel "$@")
+    echo "ARCHIVE $C" >> "$LOG"
+    # Accepted is applied, unless a scenario says otherwise; the fence is
+    # what has to notice the difference.
+    [ -f "$FIXTURES/archive_noop" ] || touch "$FIXTURES/archived.$C" ;;
+  "channels update")
+    C=$(arg --channel "$@")
+    echo "PROBE $C" >> "$LOG"
+    refuse_if_archived "$C" ;;
+  "channels unarchive"|"channels add-member"|"reactions add"|"reactions remove"|"messages edit")
+    echo "OTHER $SUB" >> "$LOG" ;;
+  *) echo "stub buzz: unhandled: $SUB $*" >&2; exit 9 ;;
+esac
+BUZZEOF
+
+# git: the sweep's best-effort head fetch, and the recovery leg's diff.
+cat > "$WORK/bin/git" <<'GITEOF'
+#!/usr/bin/env bash
+echo "GIT $*" >> "$LOG"
+exit 0
+GITEOF
+chmod +x "$WORK/bin/gh" "$WORK/bin/buzz" "$WORK/bin/git"
+
+# --- fixtures --------------------------------------------------------------
+NOW=$(date +%s)
+as_iso() { "$REAL_PYTHON3" -c 'import sys,time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(sys.argv[1]))))' "$1"; }
+
+listed() { # listed <number> <closed-age-secs> <merged:true|false> [head-owner] [head-repo]
+  local MERGED_AT=null
+  [ "$3" = true ] && MERGED_AT="\"$(as_iso $((NOW - $2)))\""
+  printf '{"number":%s,"closedAt":"%s","mergedAt":%s,"headRepositoryOwner":{"login":"%s"},"headRepository":{"name":"%s"}}' \
+    "$1" "$(as_iso $((NOW - $2)))" "$MERGED_AT" "${4:-yjc801}" "${5:-buzz}"
+}
+listing() { # listing [listed-json...] → the sweep's `gh pr list` result
+  local OUT="[" FIRST=1 E
+  for E in "$@"; do
+    [ $FIRST -eq 1 ] || OUT="$OUT,"
+    FIRST=0
+    OUT="$OUT$E"
+  done
+  printf '%s]\n' "$OUT" > "$FIXTURES/pr_list.json"
+}
+pr_record() { # pr_record <number> <state:open|closed> <merged:true|false> → the re-read
+  printf '{"state":"%s","merged":%s,"title":"PR %s","html_url":"https://github.com/%s/pull/%s","body":"","user":{"login":"yjc801"},"head":{"ref":"claude/x","sha":"%s"},"base":{"ref":"main","sha":"%s"}}\n' \
+    "$2" "$3" "$1" "$REPO" "$1" "$HEAD40" "$BASE40" > "$FIXTURES/pr_$1.json"
+}
+bind() { # bind <number> <channel> — the CI-authored binding note
+  printf '%s\n' "$2" > "$FIXTURES/binding.pr-mirror-yjc801-buzz-$1"
+}
+binding_broken() { # binding_broken <number> — the read fails (not "not found")
+  printf '2\n' > "$FIXTURES/binding.pr-mirror-yjc801-buzz-$1.rc"
+}
+
+reset_fixtures() {
+  rm -rf "$FIXTURES"; mkdir -p "$FIXTURES"
+  : > "$LOG"
+  echo '[]' > "$FIXTURES/channels_list.json"
+  echo '[]' > "$FIXTURES/pr_list.json"
+}
+
+run_step() { # run_step <event-name> [pr-action] [pr-number]
+  # `bash -eo pipefail` is the shell GitHub runs `run:` blocks with.
+  PATH="$WORK/bin:$PATH" \
+  GITHUB_REPOSITORY="$REPO" \
+  GITHUB_EVENT_NAME="$1" \
+  GH_TOKEN=stub \
+  BUZZ_RELAY_URL=https://relay.invalid \
+  BUZZ_PRIVATE_KEY="$CI_SECRET" \
+  BUZZ_AUTH_TAG=stub \
+  PR_ACTION="${2:-}" \
+  PR_NUMBER="${3:-}" \
+  PR_MERGED="${PR_MERGED_INPUT:-false}" \
+  PR_TITLE="t" \
+  PR_BODY="" \
+  PR_URL="https://github.com/$REPO/pull/${3:-0}" \
+  PR_AUTHOR=yjc801 \
+  HEAD_SHA="$HEAD40" \
+  PREV_HEAD_SHA="" \
+  PR_UPDATED_AT="" \
+  REVIEW_QUIET_SECS=0 \
+  HEAD_REF=claude/x \
+  BASE_REF=main \
+  FALLBACK_CHANNEL="" \
+  REVIEWER_NAME=Alex \
+  REVIEWER_PUBKEY="$REVIEWER_PUB" \
+  CODER_NAME=Will \
+  CODER_PUBKEY="$CODER_PUB" \
+  OWNER_PUBKEY="$OWNER_PUB" \
+  EXPECTED_CI_PUBKEY="$CI_PUB" \
+  SWEEP_DAYS="${SWEEP_DAYS_INPUT:-7}" \
+  SWEEP_SETTLE_SECS=1800 \
+    bash -eo pipefail "$WORK/step.sh" > "$WORK/stdout" 2>&1
+}
+
+count() { grep -c "^$1" "$LOG" 2>/dev/null || true; }
+first_line() { grep -n -m1 "^$1" "$LOG" | cut -d: -f1; }
+said() { grep -q -- "$1" "$WORK/stdout"; }
+scenario() { echo "--- $1"; reset_fixtures; }
+
+# ===========================================================================
+# THE CLOSED EVENT.
+scenario "closed event, live room → notice, annotation, archive, and the archive proven"
+bind 4242 "$CH_A"
+PR_MERGED_INPUT=true run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should post the close notice into the room" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should name the outcome" "$(grep -q '✅ \*\*Merged\*\* — archiving' "$LOG"; echo $?)"
+check "should annotate the cross-channel references" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should prove the archive by the relay's refusal" "$(said 'proved by the relay refusing'; echo $?)"
+check "the notice must precede the archive — it is the fence" \
+  "$([ "$(first_line "SEND $CH_A")" -lt "$(first_line "ARCHIVE $CH_A")" ]; echo $?)"
+check "an event run must not touch GitHub" "$([ "$(count PR_)" = 0 ]; echo $?)"
+
+# A rerun of a finished close, or the sweep having got there first.
+scenario "closed event, room already archived → green and silent"
+bind 4242 "$CH_A"
+touch "$FIXTURES/archived.$CH_A"
+run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should not archive again" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should not re-annotate (a second reply under every reference)" "$([ "$(count SEARCH)" = 0 ]; echo $?)"
+check "should say the room is already archived" "$(said 'already archived'; echo $?)"
+
+scenario "closed event, no room and no fallback → the references still get their banner"
+run_step pull_request closed 4242; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should annotate" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should archive nothing" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+
+# ACCEPTED IS NOT APPLIED: `channels archive` exits 0 on storage. Only the
+# relay refusing a follow-up write proves the room is closed.
+scenario "closed event, archive accepted but never applied → red, after retrying"
+bind 4242 "$CH_A"
+touch "$FIXTURES/archive_noop"
+run_step pull_request closed 4242; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should retry the archive three times" "$([ "$(count "ARCHIVE $CH_A")" = 3 ]; echo $?)"
+check "should report the room may still be live" "$(said 'archive never took effect'; echo $?)"
+
+# ===========================================================================
+# THE SWEEP.
+scenario "sweep: a settled close with a live room → reconciled"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should re-read the PR at the write" "$([ "$(count "PR_READ 4242")" = 1 ]; echo $?)"
+check "should post the close notice" "$([ "$(count "SEND $CH_A")" = 1 ]; echo $?)"
+check "the notice should carry the outcome from the re-read" "$(grep -q '🚫 \*\*Closed without merge\*\* — archiving' "$LOG"; echo $?)"
+check "should annotate the references" "$([ "$(count SEARCH)" = 1 ]; echo $?)"
+check "should archive once" "$([ "$(count "ARCHIVE $CH_A")" = 1 ]; echo $?)"
+check "should prove the archive" "$(said 'proved by the relay refusing'; echo $?)"
+check "should say why it acted" "$(said 'GitHub scheduled no close run; archived it now'; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 1 reconciled, 0 already archived, 0 without a room, 0 failed'; echo $?)"
+
+scenario "sweep: a room already archived → one refused send, nothing else"
+listing "$(listed 4242 7200 true)"
+bind 4242 "$CH_A"
+touch "$FIXTURES/archived.$CH_A"
+pr_record 4242 closed true
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should not archive again" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should not re-annotate" "$([ "$(count SEARCH)" = 0 ]; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 1 already archived'; echo $?)"
+
+# The close run for a fresh close may be queued or still running; the sweep
+# leaves it alone until the settle window has passed.
+scenario "sweep: a close inside the settle window → untouched"
+listing "$(listed 4242 600 false)"
+bind 4242 "$CH_A"
+pr_record 4242 closed false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not even resolve the room" "$([ "$(count BINDING_READ)" = 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
+
+# The listing is a snapshot; the write is fenced on a fresh read.
+scenario "sweep: reopened between the listing and the write → untouched"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+pr_record 4242 open false
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should re-read the PR" "$([ "$(count "PR_READ 4242")" = 1 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should archive nothing" "$([ "$(count ARCHIVE)" = 0 ]; echo $?)"
+check "should hand the room to the reopened run" "$(said 'reopened since the listing'; echo $?)"
+
+# Failure is signalled by status, never by an empty string: a binding read
+# that breaks must not read as "no room", and must not take the sweep's
+# other PRs down with it.
+scenario "sweep: a failed binding read archives nothing, fails the sweep, and spares its siblings"
+listing "$(listed 4242 7200 false)" "$(listed 4243 7200 true)"
+binding_broken 4242
+bind 4243 "$CH_B"
+pr_record 4243 closed true
+run_step schedule; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should not archive the PR it could not resolve" "$([ "$(count "ARCHIVE $CH_A")" = 0 ]; echo $?)"
+check "should not fall through to the membership scan on a broken read" "$([ "$(count BINDING_WRITE)" = 0 ]; echo $?)"
+check "should still reconcile the other PR" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
+check "should report the failure" "$(said 'room resolution failed'; echo $?)"
+check "should account for both" "$(said 'sweep: 2 examined, 1 reconciled, 0 already archived, 0 without a room, 1 failed'; echo $?)"
+
+# No binding and no room of ours among this identity's channels: provably
+# none. The sweep neither creates one nor posts a fallback notice it could
+# not deduplicate.
+scenario "sweep: a PR without a room is left alone"
+listing "$(listed 4242 7200 false)"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should send nothing" "$([ "$(count SEND)" = 0 ]; echo $?)"
+check "should account for it" "$(said 'sweep: 1 examined, 0 reconciled, 0 already archived, 1 without a room, 0 failed'; echo $?)"
+
+scenario "sweep: fork heads and closes outside the window are not candidates"
+listing "$(listed 4242 7200 false someone-else buzz)" "$(listed 4243 $((8 * 86400)) false)"
+bind 4242 "$CH_A"
+bind 4243 "$CH_B"
+run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should not resolve either room" "$([ "$(count BINDING_READ)" = 0 ]; echo $?)"
+check "should examine nothing" "$(said 'sweep: 0 examined'; echo $?)"
+
+# The dispatch input widens the window for a one-off backfill.
+scenario "sweep: a wider window from the dispatch input reaches an older close"
+listing "$(listed 4243 $((8 * 86400)) false)"
+bind 4243 "$CH_B"
+pr_record 4243 closed false
+SWEEP_DAYS_INPUT=30 run_step schedule; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should reconcile the older close" "$([ "$(count "ARCHIVE $CH_B")" = 1 ]; echo $?)"
+
+scenario "sweep: a window that is not a small integer is refused"
+listing "$(listed 4242 7200 false)"
+bind 4242 "$CH_A"
+SWEEP_DAYS_INPUT="7; rm -rf /" run_step schedule; RC=$?
+check "expected a non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should touch nothing" "$([ "$(count PR_LIST)" = 0 ] && [ "$(count SEND)" = 0 ]; echo $?)"
+
+echo
+echo "$PASS assertions passed, $FAILED failed"
+[ "$FAILED" -eq 0 ]

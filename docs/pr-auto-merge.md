@@ -267,9 +267,10 @@ or a republished approval a changed authorization would be a false report:
 
 All three go **red**, post the reason to the PR, and best-effort tell the PR
 channel (best-effort because the mirror archives that channel after the merge
-— once the reviewer's post-merge summary has settled, or after its grace
-window, see [Post-merge review summary](#post-merge-review-summary) — and this
-send does not wait on it; the PR comment is the durable record). All three
+— on this repo on the merge's own `closed` event, the post-merge summary
+request being switched off, see [Post-merge review
+summary](#post-merge-review-summary) — and this send does not wait on it; the
+PR comment is the durable record). All three
 are "after state changed", which is the one category this workflow's failure
 philosophy reserves red for rather than degrading to a warning. Prevention was
 impossible. Silence was not.
@@ -439,8 +440,9 @@ together (`just auto-merge-check`, wired into CI's contract steps).
 - Before merging, CI posts an intent message into the PR channel
   (`⏩ auto-merge authorized for <sha> — verdict event <id> … Merging now if
   the final gates still hold.`) — *before*: the merge is the point of no
-  return, and nothing here waits on the mirror, which archives the channel
-  once the reviewer's post-merge summary has settled (see [Post-merge review
+  return, and nothing here waits on the mirror, which archives the channel on
+  the merge's `closed` event (the post-merge summary request is switched off
+  on this repo — see [Post-merge review
   summary](#post-merge-review-summary)). If the announcement cannot be
   published, the merge does not happen this tick. The wording is hedged on
   purpose: the message is written by `evaluate`, and the isolated `merge` job
@@ -457,8 +459,24 @@ together (`just auto-merge-check`, wired into CI's contract steps).
 
 ## Post-merge review summary
 
-A merged PR's room is not archived by its `closed` event. The mirror
-(`.github/workflows/buzz-pr-mirror.yml`) posts the merge notice and then, as
+**Switched off on this repo.** The mirror's `POST_MERGE_SUMMARY` env value is
+`"off"` (`.github/workflows/buzz-pr-mirror.yml`), so a merged PR's `closed`
+event archives its room exactly as a close without a merge does: one
+mention-free notice (`✅ **Merged** — archiving this channel.`), the
+cross-channel annotations, the archive, the close marker — and the reviewer is
+not asked for anything. The switch governs only whether a *new* request is
+made. A room that already holds one when it flips — a `summary-requested:`
+marker, or a request this CI identity published under a lost marker write — is
+still finished by the hold described below, because the p-tag is out and an
+archive now would refuse the summary it asked for; such rooms drain within one
+grace window. The mechanism is kept and tested under `on`
+(`.github/scripts/pr-mirror-close.test.sh`, which also asserts the shipped
+value is `"off"`), so setting it back to `"on"` restores it. What follows
+describes that mechanism.
+
+With the request on, a merged PR's room is not archived by its `closed` event.
+The mirror (`.github/workflows/buzz-pr-mirror.yml`) posts the merge notice and
+then, as
 the last thing it writes into the room, a request to the reviewer — a
 CI-authored p-tag, the only kind that wakes an agent
 (`crates/buzz-waker/src/decide.rs`: no agent-authored event ever wakes

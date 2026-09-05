@@ -13,7 +13,7 @@
 //!                                       ▼
 //!                            match_names_to_profiles ──► pubkeys
 //!                                                          │
-//! body text ──► strip_code_regions ──► extract_nostr_uris ─┤
+//! body text ──► find_nostr_uris ──► extract_nostr_uris ───────┤
 //!                                                          ▼
 //!                            explicit mentions ──► normalize ──► merge_mentions ──► p-tags
 //! ```
@@ -22,12 +22,18 @@
 //! [`extract_at_mentions_with_known`] replaces the first step to correctly
 //! handle multi-word display names.
 //!
-//! [`extract_nostr_uris`] handles NIP-27 inline `nostr:npub1…` references,
-//! skipping those inside code blocks/spans via [`strip_code_regions`].
+//! [`find_nostr_uris`] locates NIP-27 inline `nostr:npub1…` references with
+//! their byte ranges, skipping those inside code blocks/spans (the same
+//! regions [`code_regions`] reports and [`strip_code_regions`] blanks);
+//! [`extract_nostr_uris`] reduces that to the deduplicated pubkeys. Senders
+//! that rewrite a reference into Buzz's native `@<label>` form use the ranges,
+//! since clients render mentions by matching label text against p-tagged
+//! profiles and never substitute a label at render time.
 //!
 //! See [`crate::mentions::MENTION_CAP`] for the hard upper bound on tags.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use nostr::{FromBech32, PublicKey};
 
@@ -236,105 +242,115 @@ pub fn normalize_mention_pubkeys(pubkeys: &[String], sender_pubkey: Option<&str>
         .collect()
 }
 
-/// Remove fenced code blocks and inline code spans from content.
+/// Byte ranges of fenced code blocks and inline code spans in `content`.
 ///
-/// Returns a copy of `content` with ` ```…``` ` blocks and `` `…` `` spans
-/// replaced by spaces. Used only for mention scanning — the original
-/// content is stored verbatim. Preserves valid UTF-8 throughout.
-pub fn strip_code_regions(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut chars = content.char_indices().peekable();
+/// A fenced block runs from its opening ` ``` ` (which must be the first
+/// non-whitespace on its line) through the end of the closing fence's line,
+/// or to the end of the content when unclosed. An inline span runs from its
+/// opening backtick through its closing backtick on the same line. Ranges are
+/// ascending, non-overlapping, and always fall on `char` boundaries. This is
+/// the single definition of "inside code" that [`strip_code_regions`] and
+/// [`find_nostr_uris`] share, so the two can never disagree about a span.
+pub fn code_regions(content: &str) -> Vec<Range<usize>> {
+    let mut regions = Vec::new();
+    let mut i = 0;
 
-    while let Some(&(i, ch)) = chars.peek() {
-        // Fenced code block: ``` at line start (possibly after whitespace)
-        if ch == '`' && content[i..].starts_with("```") {
-            let is_fence_start = if i == 0 {
-                true
-            } else {
-                let before = &content[..i];
-                before.ends_with('\n')
-                    || before.chars().all(|c| c.is_ascii_whitespace())
-                    || before.rsplit_once('\n').is_some_and(|(_, after_nl)| {
-                        after_nl.chars().all(|c| c.is_ascii_whitespace())
-                    })
-            };
+    while i < content.len() {
+        let Some(ch) = content[i..].chars().next() else {
+            break;
+        };
 
-            if is_fence_start {
-                // Find end of opening fence line
-                let after_fence = i + 3;
-                let rest = &content[after_fence..];
-                let line_end = rest
-                    .find('\n')
-                    .map_or(content.len(), |p| after_fence + p + 1);
-
-                // Find closing fence
-                let mut search_from = line_end;
-                let close_end = loop {
-                    if search_from >= content.len() {
-                        break content.len();
-                    }
-                    if let Some(pos) = content[search_from..].find("```") {
-                        let abs_pos = search_from + pos;
-                        let at_line_start = abs_pos == 0
-                            || content.as_bytes()[abs_pos - 1] == b'\n'
-                            || content[..abs_pos]
-                                .rsplit_once('\n')
-                                .is_some_and(|(_, after_nl)| {
-                                    after_nl.chars().all(|c| c.is_ascii_whitespace())
-                                });
-                        if at_line_start {
-                            // Skip to end of closing fence line
-                            let after_close = abs_pos + 3;
-                            let end = content[after_close..]
-                                .find('\n')
-                                .map_or(content.len(), |p| after_close + p + 1);
-                            break end;
-                        }
-                        search_from = abs_pos + 3;
-                    } else {
-                        break content.len();
-                    }
-                };
-
-                out.push(' ');
-                // Advance chars iterator past the fenced block
-                while let Some(&(ci, _)) = chars.peek() {
-                    if ci >= close_end {
-                        break;
-                    }
-                    chars.next();
-                }
+        if ch == '`' {
+            // Fenced code block: ``` at line start (possibly after whitespace)
+            if content[i..].starts_with("```") && is_fence_start(content, i) {
+                let close_end = fenced_block_end(content, i);
+                regions.push(i..close_end);
+                i = close_end;
                 continue;
             }
-        }
 
-        // Inline code span: `…`
-        if ch == '`' {
+            // Inline code span: `…` with the closing backtick on the same line
             let after_tick = i + 1;
             if after_tick < content.len() {
-                // Find closing backtick on same line
                 if let Some(rel_end) = content[after_tick..].find('`') {
                     let close_pos = after_tick + rel_end;
-                    // Only treat as code span if no newline between the backticks
                     if !content[after_tick..close_pos].contains('\n') {
-                        out.push(' ');
-                        // Advance past closing backtick
-                        while let Some(&(ci, _)) = chars.peek() {
-                            if ci > close_pos {
-                                break;
-                            }
-                            chars.next();
-                        }
+                        regions.push(i..close_pos + 1);
+                        i = close_pos + 1;
                         continue;
                     }
                 }
             }
         }
 
-        out.push(ch);
-        chars.next();
+        i += ch.len_utf8();
     }
 
+    regions
+}
+
+/// Whether the ` ``` ` at byte `i` opens a fenced block: it is the first
+/// non-whitespace on its line.
+fn is_fence_start(content: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let before = &content[..i];
+    before.ends_with('\n')
+        || before.chars().all(|c| c.is_ascii_whitespace())
+        || before
+            .rsplit_once('\n')
+            .is_some_and(|(_, after_nl)| after_nl.chars().all(|c| c.is_ascii_whitespace()))
+}
+
+/// End (exclusive) of the fenced block opened at byte `i`: the byte after the
+/// closing fence's line, or the end of the content when the block is unclosed.
+fn fenced_block_end(content: &str, i: usize) -> usize {
+    let after_fence = i + 3;
+    let rest = &content[after_fence..];
+    let line_end = rest
+        .find('\n')
+        .map_or(content.len(), |p| after_fence + p + 1);
+
+    let mut search_from = line_end;
+    loop {
+        if search_from >= content.len() {
+            return content.len();
+        }
+        let Some(pos) = content[search_from..].find("```") else {
+            return content.len();
+        };
+        let abs_pos = search_from + pos;
+        let at_line_start = abs_pos == 0
+            || content.as_bytes()[abs_pos - 1] == b'\n'
+            || content[..abs_pos]
+                .rsplit_once('\n')
+                .is_some_and(|(_, after_nl)| after_nl.chars().all(|c| c.is_ascii_whitespace()));
+        if at_line_start {
+            let after_close = abs_pos + 3;
+            return content[after_close..]
+                .find('\n')
+                .map_or(content.len(), |p| after_close + p + 1);
+        }
+        search_from = abs_pos + 3;
+    }
+}
+
+/// Remove fenced code blocks and inline code spans from content.
+///
+/// Returns a copy of `content` with ` ```…``` ` blocks and `` `…` `` spans
+/// replaced by spaces. Used only for mention scanning — the original
+/// content is stored verbatim. Preserves valid UTF-8 throughout. The
+/// regions removed are exactly those [`code_regions`] reports.
+pub fn strip_code_regions(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for region in code_regions(content) {
+        out.push_str(&content[cursor..region.start]);
+        out.push(' ');
+        cursor = region.end;
+    }
+    out.push_str(&content[cursor..]);
     out
 }
 
@@ -344,20 +360,37 @@ fn is_bech32_char(c: char) -> bool {
     matches!(c, '0'..='9' | 'a'..='z' | 'A'..='Z')
 }
 
-/// Extract pubkeys from NIP-27 `nostr:npub1…` URIs in content.
+/// A NIP-27 `nostr:npub1…` reference located in message content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NostrUriMatch {
+    /// Byte range of the whole `nostr:npub1…` token within the scanned content.
+    pub range: Range<usize>,
+    /// Lowercase hex public key the token decodes to.
+    pub pubkey: String,
+}
+
+/// Locate NIP-27 `nostr:npub1…` references in content, with their byte ranges.
 ///
-/// Scans `content` (which should already have code regions stripped via
-/// [`strip_code_regions`]) for `nostr:npub1` followed by 58 bech32 characters.
-/// Decodes each to a 32-byte pubkey hex string. Invalid bech32 is silently
-/// skipped. Returns deduplicated lowercase hex pubkeys.
-pub fn extract_nostr_uris(content: &str) -> Vec<String> {
+/// Scans for `nostr:npub1` followed by 58 bech32 characters and decodes each
+/// to a 32-byte pubkey. References inside the [`code_regions`] of `content`
+/// are skipped, so callers pass the original text, not a stripped copy.
+/// Invalid bech32 is silently skipped. Matches are returned in text order,
+/// one per occurrence — a pubkey referenced twice appears twice, so a caller
+/// rewriting the text can replace every occurrence.
+pub fn find_nostr_uris(content: &str) -> Vec<NostrUriMatch> {
     const PREFIX: &str = "nostr:npub1";
     const BECH32_SUFFIX_LEN: usize = 58; // chars after "npub1"
 
-    let mut pubkeys = Vec::new();
-    let mut seen = HashSet::new();
+    if !content.contains(PREFIX) {
+        return vec![];
+    }
+    let regions = code_regions(content);
+    let mut matches = Vec::new();
 
     for (start, _) in content.match_indices(PREFIX) {
+        if regions.iter().any(|region| region.contains(&start)) {
+            continue;
+        }
         let bech32_start = start + "nostr:".len();
         let bech32_end = bech32_start + 5 + BECH32_SUFFIX_LEN; // "npub1" + 58
 
@@ -376,13 +409,29 @@ pub fn extract_nostr_uris(content: &str) -> Vec<String> {
         // NIP-19 allows uppercase; normalize before decode
         let normalized = candidate.to_ascii_lowercase();
         if let Ok(pk) = PublicKey::from_bech32(&normalized) {
-            let hex = pk.to_hex();
-            if seen.insert(hex.clone()) {
-                pubkeys.push(hex);
-            }
+            matches.push(NostrUriMatch {
+                range: start..bech32_end,
+                pubkey: pk.to_hex(),
+            });
         }
     }
 
+    matches
+}
+
+/// Extract pubkeys from NIP-27 `nostr:npub1…` URIs in content.
+///
+/// The deduplicated pubkeys of [`find_nostr_uris`], in first-seen order.
+/// References inside code blocks/spans are skipped, so `content` may be the
+/// original text; passing a [`strip_code_regions`] copy gives the same result.
+pub fn extract_nostr_uris(content: &str) -> Vec<String> {
+    let mut pubkeys = Vec::new();
+    let mut seen = HashSet::new();
+    for found in find_nostr_uris(content) {
+        if seen.insert(found.pubkey.clone()) {
+            pubkeys.push(found.pubkey);
+        }
+    }
     pubkeys
 }
 
@@ -816,5 +865,92 @@ mod tests {
         let content = format!("nostr:{}", npub_mixed);
         let result = extract_nostr_uris(&content);
         assert_eq!(result, vec![TEST_HEX1]);
+    }
+
+    #[test]
+    fn code_regions_reports_fenced_and_inline_byte_ranges() {
+        let input = "a `x` b\n```\ncode\n```\nc";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(&input[regions[0].clone()], "`x`");
+        assert_eq!(&input[regions[1].clone()], "```\ncode\n```\n");
+        assert!(regions.windows(2).all(|w| w[0].end <= w[1].start));
+    }
+
+    #[test]
+    fn code_regions_ranges_fall_on_char_boundaries_around_unicode() {
+        let input = "こんにちは `コード` 世界 ```\nブロック\n```";
+        for region in code_regions(input) {
+            assert!(input.is_char_boundary(region.start));
+            assert!(input.is_char_boundary(region.end));
+        }
+    }
+
+    #[test]
+    fn strip_code_regions_is_the_regions_blanked() {
+        // The two public views of "inside code" must agree exactly: blanking
+        // each reported range with one space reproduces the stripped copy.
+        for input in [
+            "plain",
+            "a `x` b",
+            "```\nblock\n```\ntail",
+            "unclosed ```\nblock",
+            "``` not a fence",
+            "a `multi\nline` b",
+            "こんにちは `コード` 世界",
+        ] {
+            let mut expected = String::new();
+            let mut cursor = 0;
+            for region in code_regions(input) {
+                expected.push_str(&input[cursor..region.start]);
+                expected.push(' ');
+                cursor = region.end;
+            }
+            expected.push_str(&input[cursor..]);
+            assert_eq!(strip_code_regions(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn find_nostr_uris_reports_positions_and_skips_code() {
+        let content = format!(
+            "hi nostr:{} and `nostr:{}` then nostr:{}",
+            TEST_NPUB1, TEST_NPUB2, TEST_NPUB2
+        );
+        let found = find_nostr_uris(&content);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            &content[found[0].range.clone()],
+            format!("nostr:{TEST_NPUB1}")
+        );
+        assert_eq!(found[0].pubkey, TEST_HEX1);
+        assert_eq!(
+            &content[found[1].range.clone()],
+            format!("nostr:{TEST_NPUB2}")
+        );
+        assert_eq!(found[1].pubkey, TEST_HEX2);
+        assert!(found[1].range.start > content.find('`').unwrap());
+    }
+
+    #[test]
+    fn find_nostr_uris_keeps_every_occurrence_of_one_key() {
+        let content = format!("nostr:{} again nostr:{}", TEST_NPUB1, TEST_NPUB1);
+        let found = find_nostr_uris(&content);
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|m| m.pubkey == TEST_HEX1));
+        assert_eq!(extract_nostr_uris(&content), vec![TEST_HEX1]);
+    }
+
+    #[test]
+    fn extract_nostr_uris_skips_code_without_prestripping() {
+        let content = format!(
+            "see `nostr:{}`\n```\nnostr:{}\n```\nonly nostr:{}",
+            TEST_NPUB1, TEST_NPUB1, TEST_NPUB2
+        );
+        assert_eq!(extract_nostr_uris(&content), vec![TEST_HEX2]);
+        assert_eq!(
+            extract_nostr_uris(&strip_code_regions(&content)),
+            vec![TEST_HEX2]
+        );
     }
 }

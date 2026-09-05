@@ -9,7 +9,7 @@ use crate::validate::{
     validate_content_size, validate_hex64, validate_uuid, MAX_DIFF_BYTES,
 };
 use buzz_sdk::mentions::{
-    extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
+    extract_at_mentions_with_known, find_nostr_uris, strip_code_regions, NostrUriMatch, MENTION_CAP,
 };
 
 /// Extract the thread root event ID from a Nostr tag array.
@@ -152,20 +152,39 @@ fn resolve_names_to_pubkeys(
     Ok(resolved)
 }
 
+/// Outcome of the membership and profile preflight for one send.
+#[derive(Debug, Default)]
+struct MentionPreflight {
+    /// Current channel roster (lowercase hex). Empty when no preflight ran.
+    member_pubkeys: Vec<String>,
+    /// Pubkeys uniquely resolved from `@Name` text against member profiles.
+    auto_resolved: Vec<String>,
+    /// Each member's current profile label (`display_name`, else `name`),
+    /// keyed by lowercase hex pubkey. Populated only when the send needs
+    /// labels: `@Name` text to resolve, or `nostr:npub1…` references to
+    /// rewrite.
+    labels_by_pubkey: std::collections::HashMap<String, String>,
+}
+
 /// Resolve mention text against the channel membership snapshot.
 ///
-/// Returns both the current member set and uniquely name-resolved pubkeys.
-/// Lookup failures are fatal when mention processing is requested: publishing
-/// visible mention text without its intended `p` tag is worse than not sending.
+/// Returns the current member set, uniquely name-resolved pubkeys, and the
+/// members' current profile labels. Lookup failures are fatal when mention
+/// processing is requested: publishing visible mention text without its
+/// intended `p` tag is worse than not sending. `needs_labels` forces the
+/// profile fetch even without `@Name` text, for callers about to rewrite a
+/// `nostr:npub1…` reference into a label.
 async fn resolve_content_mentions(
     client: &BuzzClient,
     channel_id: &str,
     content: &str,
     has_explicit_mentions: bool,
-) -> Result<(Vec<String>, Vec<String>), CliError> {
+    needs_labels: bool,
+) -> Result<MentionPreflight, CliError> {
     let stripped = strip_code_regions(content);
-    if !stripped.contains('@') && !has_explicit_mentions {
-        return Ok((vec![], vec![]));
+    let has_at_names = stripped.contains('@');
+    if !has_at_names && !has_explicit_mentions {
+        return Ok(MentionPreflight::default());
     }
 
     let members_filter = serde_json::json!({
@@ -179,8 +198,11 @@ async fn resolve_content_mentions(
             CliError::Other("could not load channel membership for mention preflight".into())
         })?;
 
-    if !stripped.contains('@') {
-        return Ok((member_pubkeys, vec![]));
+    if !has_at_names && !needs_labels {
+        return Ok(MentionPreflight {
+            member_pubkeys,
+            ..MentionPreflight::default()
+        });
     }
 
     let profiles_filter = serde_json::json!({
@@ -196,6 +218,7 @@ async fn resolve_content_mentions(
 
     let mut name_to_pubkeys: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let mut labels_by_pubkey = std::collections::HashMap::new();
     let mut display_names = Vec::new();
     for e in &profile_events {
         let Some(pubkey) = e.get("pubkey").and_then(|v| v.as_str()) else {
@@ -219,13 +242,92 @@ async fn resolve_content_mentions(
             .entry(name.to_ascii_lowercase())
             .or_default()
             .push(pubkey.to_string());
+        labels_by_pubkey.insert(pubkey.to_ascii_lowercase(), name.to_string());
         display_names.push(name.to_string());
     }
 
-    let known_refs: Vec<&str> = display_names.iter().map(String::as_str).collect();
-    let names = extract_at_mentions_with_known(&stripped, &known_refs);
-    let resolved = resolve_names_to_pubkeys(&names, &name_to_pubkeys, has_explicit_mentions)?;
-    Ok((member_pubkeys, resolved))
+    let auto_resolved = if has_at_names {
+        let known_refs: Vec<&str> = display_names.iter().map(String::as_str).collect();
+        let names = extract_at_mentions_with_known(&stripped, &known_refs);
+        resolve_names_to_pubkeys(&names, &name_to_pubkeys, has_explicit_mentions)?
+    } else {
+        vec![]
+    };
+    Ok(MentionPreflight {
+        member_pubkeys,
+        auto_resolved,
+        labels_by_pubkey,
+    })
+}
+
+/// Deduplicated pubkeys of `nostr:npub1…` references, in first-seen order.
+fn unique_uri_pubkeys(matches: &[NostrUriMatch]) -> Vec<String> {
+    let mut pubkeys: Vec<String> = Vec::new();
+    for found in matches {
+        if !pubkeys.contains(&found.pubkey) {
+            pubkeys.push(found.pubkey.clone());
+        }
+    }
+    pubkeys
+}
+
+/// Rewrite NIP-27 `nostr:npub1…` references into Buzz's native `@<label>` form.
+///
+/// Clients render a mention by matching `@<label>` text against the profile
+/// of each p-tagged member and never substitute a label at render time, so a
+/// raw URI would display verbatim. The label is the member's current profile
+/// name at send time; a member with no usable name is labelled by hex pubkey,
+/// which clients compact. This is what lets a sender that knows only a pubkey
+/// produce a correctly labelled mention without knowing, or guessing, a name.
+///
+/// `matches` must come from [`find_nostr_uris`] on this exact `content`, so
+/// they are in text order and exclude code regions, which stay untouched.
+fn expand_nostr_mentions(
+    content: &str,
+    matches: &[NostrUriMatch],
+    labels_by_pubkey: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for found in matches {
+        if found.range.start < cursor || found.range.end > content.len() {
+            continue;
+        }
+        out.push_str(&content[cursor..found.range.start]);
+        let label = labels_by_pubkey
+            .get(&found.pubkey)
+            .and_then(|raw| sanitize_mention_label(raw))
+            .unwrap_or_else(|| found.pubkey.clone());
+        out.push('@');
+        out.push_str(&label);
+        cursor = found.range.end;
+    }
+    out.push_str(&content[cursor..]);
+    out
+}
+
+/// Normalise a profile name into a label safe to embed as `@<label>`: drop
+/// control characters, collapse whitespace runs, and strip a leading `@` so a
+/// profile named `@alice` does not render as `@@alice`. `None` when nothing
+/// usable remains.
+fn sanitize_mention_label(raw: &str) -> Option<String> {
+    // Control whitespace (newline, tab) still separates words; other control
+    // characters carry nothing a label should render.
+    let cleaned: String = raw
+        .chars()
+        .filter_map(|c| match c {
+            c if c.is_whitespace() => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_start_matches('@').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn normalize_explicit_mentions(values: &[String]) -> Result<Vec<String>, CliError> {
@@ -624,18 +726,27 @@ pub async fn cmd_send_message(
     let channel_uuid = parse_uuid(&p.channel_id)?;
 
     let explicit_mentions = normalize_explicit_mentions(&p.mentions)?;
-    let stripped = strip_code_regions(&p.content);
-    let uri_pubkeys = extract_nostr_uris(&stripped);
+    // NIP-27 references outside code regions, with positions: each becomes a
+    // p-tag and, below, a labelled `@Name` in the published text.
+    let uri_matches = find_nostr_uris(&p.content);
+    let uri_pubkeys = unique_uri_pubkeys(&uri_matches);
     // Supplying any identity explicitly authorizes unresolved or ambiguous @Name text
     // as presentation-only, matching Desktop's separate visible-label and p-tag model.
     // Uniquely resolvable member names still add their own p-tags; callers must supply
     // every intended identity whose visible label cannot be resolved uniquely.
     let has_explicit_mentions = !explicit_mentions.is_empty() || !uri_pubkeys.is_empty();
-    let (member_pubkeys, auto_resolved) =
-        resolve_content_mentions(client, &p.channel_id, &p.content, has_explicit_mentions).await?;
-    let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &auto_resolved)?;
+    let preflight = resolve_content_mentions(
+        client,
+        &p.channel_id,
+        &p.content,
+        has_explicit_mentions,
+        !uri_matches.is_empty(),
+    )
+    .await?;
+    let mention_pubkeys =
+        merge_message_mentions(&explicit_mentions, &uri_pubkeys, &preflight.auto_resolved)?;
 
-    let missing = missing_members(&mention_pubkeys, &member_pubkeys);
+    let missing = missing_members(&mention_pubkeys, &preflight.member_pubkeys);
     if !missing.is_empty() {
         return Err(CliError::Usage(
             serde_json::json!({
@@ -645,6 +756,14 @@ pub async fn cmd_send_message(
             })
             .to_string(),
         ));
+    }
+
+    // Every referenced identity is a confirmed member, so rewrite each
+    // `nostr:npub1…` into the label clients can render. The label is the
+    // member's profile name as of this send; the p-tag was already merged.
+    if !uri_matches.is_empty() {
+        p.content = expand_nostr_mentions(&p.content, &uri_matches, &preflight.labels_by_pubkey);
+        validate_content_size(&p.content)?;
     }
 
     // Upload files and build imeta tags
@@ -1085,13 +1204,15 @@ pub async fn dispatch(
 mod tests {
     use super::{
         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
-        find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
-        thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
+        expand_nostr_mentions, find_root_from_tags, format_events, match_profiles_by_name,
+        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        resolve_names_to_pubkeys, resolve_thread_target, sanitize_mention_label,
+        thread_ref_from_event, thread_ref_from_parent_tags, unique_uri_pubkeys, BuzzClient,
+        CliError, Uuid,
     };
     use buzz_sdk::mentions::{
-        extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
+        extract_at_mentions_with_known, extract_at_names, find_nostr_uris, match_names_to_profiles,
+        MentionProfile,
     };
     use nostr::Keys;
     use serde_json::json;
@@ -1599,6 +1720,99 @@ mod tests {
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
     }
 
+    // ── nostr:npub1… → @<label> expansion ─────────────────────────────────
+
+    fn npub_for(hex: &str) -> String {
+        use nostr::ToBech32;
+        nostr::PublicKey::from_hex(hex)
+            .unwrap()
+            .to_bech32()
+            .unwrap()
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn expand_nostr_mentions_uses_the_current_profile_label() {
+        let content = format!("nostr:{} — review complete.", npub_for(PK_VALID_A));
+        let found = find_nostr_uris(&content);
+        let out = expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "Alice Smith")]));
+        assert_eq!(out, "@Alice Smith — review complete.");
+    }
+
+    #[test]
+    fn expand_nostr_mentions_falls_back_to_hex_without_a_profile_name() {
+        let content = format!("ping nostr:{}", npub_for(PK_VALID_A));
+        let found = find_nostr_uris(&content);
+        let out = expand_nostr_mentions(&content, &found, &labels(&[]));
+        assert_eq!(out, format!("ping @{PK_VALID_A}"));
+    }
+
+    #[test]
+    fn expand_nostr_mentions_rewrites_every_occurrence_but_tags_once() {
+        let npub = npub_for(PK_VALID_A);
+        let content = format!("nostr:{npub} first, nostr:{npub} again");
+        let found = find_nostr_uris(&content);
+        assert_eq!(found.len(), 2);
+        assert_eq!(unique_uri_pubkeys(&found), vec![PK_VALID_A]);
+        let out = expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "Alice")]));
+        assert_eq!(out, "@Alice first, @Alice again");
+    }
+
+    #[test]
+    fn expand_nostr_mentions_leaves_code_regions_verbatim() {
+        let npub = npub_for(PK_VALID_A);
+        let content = format!("see `nostr:{npub}`\n```\nnostr:{npub}\n```\nnostr:{npub} ok");
+        let found = find_nostr_uris(&content);
+        assert_eq!(found.len(), 1);
+        let out = expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "Alice")]));
+        assert_eq!(
+            out,
+            format!("see `nostr:{npub}`\n```\nnostr:{npub}\n```\n@Alice ok")
+        );
+    }
+
+    #[test]
+    fn expand_nostr_mentions_normalizes_uppercase_bech32() {
+        let npub = npub_for(PK_VALID_A);
+        let content = format!("nostr:npub1{}", npub[5..].to_ascii_uppercase());
+        let found = find_nostr_uris(&content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pubkey, PK_VALID_A);
+        let out = expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "Alice")]));
+        assert_eq!(out, "@Alice");
+    }
+
+    #[test]
+    fn expand_nostr_mentions_without_matches_returns_content_unchanged() {
+        let content = "no references here";
+        assert_eq!(expand_nostr_mentions(content, &[], &labels(&[])), content);
+    }
+
+    #[test]
+    fn sanitize_mention_label_normalizes_profile_names() {
+        assert_eq!(
+            sanitize_mention_label("Alice Smith").as_deref(),
+            Some("Alice Smith")
+        );
+        assert_eq!(
+            sanitize_mention_label("  Alice\t\tSmith ").as_deref(),
+            Some("Alice Smith")
+        );
+        assert_eq!(
+            sanitize_mention_label("Ali\u{0}ce\nSmith").as_deref(),
+            Some("Alice Smith")
+        );
+        assert_eq!(sanitize_mention_label("@alice").as_deref(), Some("alice"));
+        assert_eq!(sanitize_mention_label("@@ "), None);
+        assert_eq!(sanitize_mention_label(""), None);
+    }
+
     // ── cmd_send_message — emoji-tag binding seam ─────────────────────────
     //
     // These tests drive `cmd_send_message` through a minimal fake relay
@@ -1886,6 +2100,188 @@ mod tests {
         assert!(
             emoji_tags.is_empty(),
             "palette-error fallback must produce no emoji tags, got: {emoji_tags:?}"
+        );
+    }
+
+    // ── cmd_send_message — nostr:npub1… labelling seam ────────────────────
+    //
+    // These drive `cmd_send_message` through a fake relay that answers each
+    // `/query` by the requested kind: 39002 (roster), 0 (profiles), anything
+    // else (emoji palette) empty. They pin the production path: a NIP-27
+    // reference in the content must be submitted as `@<current display
+    // name>` plus a p-tag, and code regions must survive untouched. Removing
+    // the `expand_nostr_mentions` call in `cmd_send_message` fails them.
+
+    type KindRoutedState = (
+        StdArc<std::collections::HashMap<u64, String>>,
+        StdArc<std::sync::Mutex<Option<CapturedEvent>>>,
+    );
+
+    async fn fake_send_relay_by_kind(
+        responses: std::collections::HashMap<u64, String>,
+    ) -> (String, StdArc<std::sync::Mutex<Option<CapturedEvent>>>) {
+        let captured_event: StdArc<std::sync::Mutex<Option<CapturedEvent>>> =
+            StdArc::new(std::sync::Mutex::new(None));
+        let state: KindRoutedState = (StdArc::new(responses), captured_event.clone());
+
+        let app = AxumRouter::new()
+            .route(
+                "/query",
+                axum_post(
+                    |AxumState((responses, _)): AxumState<KindRoutedState>,
+                     _headers: AxumHeaderMap,
+                     req: AxumBytes| async move {
+                        let filters: serde_json::Value =
+                            serde_json::from_slice(&req).unwrap_or(serde_json::Value::Null);
+                        let kind = filters
+                            .get(0)
+                            .and_then(|f| f.get("kinds"))
+                            .and_then(|k| k.get(0))
+                            .and_then(|k| k.as_u64());
+                        let body = kind
+                            .and_then(|k| responses.get(&k).cloned())
+                            .unwrap_or_else(|| "[]".to_string());
+                        (
+                            AxumStatusCode::OK,
+                            [("content-type", "application/json")],
+                            body,
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/events",
+                axum_post(
+                    |AxumState((_, cap)): AxumState<KindRoutedState>,
+                     _headers: AxumHeaderMap,
+                     body: AxumBytes| async move {
+                        let body_str = String::from_utf8_lossy(&body).to_string();
+                        *cap.lock().unwrap() = Some(CapturedEvent { body: body_str });
+                        (
+                            AxumStatusCode::OK,
+                            [("content-type", "application/json")],
+                            r#"{"event_id":"fake0000","accepted":true}"#,
+                        )
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: StdSocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), captured_event)
+    }
+
+    fn roster_response(members: &[&str]) -> String {
+        let tags: Vec<serde_json::Value> = std::iter::once(json!(["d", SEND_TEST_CHANNEL]))
+            .chain(members.iter().map(|m| json!(["p", m])))
+            .collect();
+        json!([{ "kind": 39002, "tags": tags }]).to_string()
+    }
+
+    fn profiles_response(profiles: &[(&str, serde_json::Value)]) -> String {
+        let events: Vec<serde_json::Value> = profiles
+            .iter()
+            .map(|(pubkey, content)| json!({ "kind": 0, "pubkey": pubkey, "content": content.to_string() }))
+            .collect();
+        serde_json::Value::Array(events).to_string()
+    }
+
+    fn submitted_event(
+        captured: &StdArc<std::sync::Mutex<Option<CapturedEvent>>>,
+    ) -> serde_json::Value {
+        let raw = captured.lock().unwrap();
+        let raw = raw.as_ref().expect("event must have been submitted");
+        serde_json::from_str(&raw.body).unwrap()
+    }
+
+    fn p_tags(event: &serde_json::Value) -> Vec<String> {
+        event["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| {
+                let t = t.as_array()?;
+                (t.first()?.as_str()? == "p").then(|| t.get(1)?.as_str().map(str::to_string))?
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_publishes_npub_reference_as_labelled_mention() {
+        let npub = npub_for(PK_VALID_A);
+        let responses = std::collections::HashMap::from([
+            (39002, roster_response(&[PK_VALID_A, PK_VALID_B])),
+            (
+                0,
+                profiles_response(&[(PK_VALID_A, json!({ "display_name": "Alice Smith" }))]),
+            ),
+        ]);
+        let (url, captured) = fake_send_relay_by_kind(responses).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        cmd_send_message(
+            &client,
+            send_params(&format!(
+                "nostr:{npub} — done; see `nostr:{npub}` for the raw form"
+            )),
+        )
+        .await
+        .unwrap();
+
+        let event = submitted_event(&captured);
+        assert_eq!(
+            event["content"].as_str().unwrap(),
+            format!("@Alice Smith — done; see `nostr:{npub}` for the raw form"),
+            "the reference outside code must become the member's current label; the one in code must not"
+        );
+        assert_eq!(p_tags(&event), vec![PK_VALID_A.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_labels_npub_reference_by_hex_when_profile_has_no_name() {
+        let npub = npub_for(PK_VALID_A);
+        let responses = std::collections::HashMap::from([
+            (39002, roster_response(&[PK_VALID_A])),
+            (
+                0,
+                profiles_response(&[(PK_VALID_A, json!({ "about": "no name set" }))]),
+            ),
+        ]);
+        let (url, captured) = fake_send_relay_by_kind(responses).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        cmd_send_message(&client, send_params(&format!("nostr:{npub} please look")))
+            .await
+            .unwrap();
+
+        let event = submitted_event(&captured);
+        assert_eq!(
+            event["content"].as_str().unwrap(),
+            format!("@{PK_VALID_A} please look")
+        );
+        assert_eq!(p_tags(&event), vec![PK_VALID_A.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_refuses_npub_reference_to_a_non_member_before_rewriting() {
+        let npub = npub_for(PK_VALID_A);
+        let responses = std::collections::HashMap::from([
+            (39002, roster_response(&[PK_VALID_B])),
+            (0, profiles_response(&[])),
+        ]);
+        let (url, captured) = fake_send_relay_by_kind(responses).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        let err = cmd_send_message(&client, send_params(&format!("nostr:{npub} hi")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+        assert!(err.to_string().contains(PK_VALID_A));
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "nothing may be submitted"
         );
     }
 }

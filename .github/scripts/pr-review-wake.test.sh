@@ -31,6 +31,7 @@ BASE_TIP=cccccccccccccccccccccccccccccccccccccccc
 CHANNEL=11111111-1111-1111-1111-111111111111
 REVIEWER_PUB=2222222222222222222222222222222222222222222222222222222222222222
 OWNER_PUB=3333333333333333333333333333333333333333333333333333333333333333
+CODER_PUB=4444444444444444444444444444444444444444444444444444444444444444
 
 if [ ! -f "$WORKFLOW" ]; then
   echo "run from the repository root" >&2
@@ -160,6 +161,12 @@ case "$SUB" in
     { echo "SEND $ARGS"; cat; echo "--- end send ---"; } >> "$SENDS"
     [ -f "$FIXTURES/send.rc" ] && exit "$(cat "$FIXTURES/send.rc")"
     true ;;
+  profile)
+    # The reviewer's display name, from his kind:0 profile. Presentation
+    # only: a failed read must leave the nudge addressed by pubkey, not
+    # skipped — see the "profile unreadable" scenario.
+    [ -f "$FIXTURES/profile.rc" ] && exit "$(cat "$FIXTURES/profile.rc")"
+    echo "Alex" ;;
   *) echo "stub relay: unhandled: $SUB $ARGS" >&2; exit 9 ;;
 esac
 PYEOF
@@ -199,6 +206,14 @@ reviewer_events() { # reviewer_events [json...]
 reset_fixtures() {
   rm -rf "$FIXTURES"; mkdir -p "$FIXTURES"
   : > "$SENDS"
+  # The sweep learns the reviewer and the owner from .buzz/routing.json; the
+  # extracted step is pointed at this copy so the identities asserted below
+  # are the test's, not the live file's. Validated by the real script.
+  cat > "$FIXTURES/routing.json" <<JSON
+{"version": 1, "owner": "$OWNER_PUB", "reviewer": "$REVIEWER_PUB",
+ "agent_branches": ["agent/*"],
+ "implementers": [{"pubkey": "$CODER_PUB", "branches": ["agent/*"], "paths": ["crates/*"], "issues": true}]}
+JSON
   cat > "$FIXTURES/pr_view.json" <<JSON
 {"state": "OPEN", "isDraft": false, "headRefOid": "$HEAD_SHA",
  "headRepositoryOwner": {"login": "yjc801"}, "headRepository": {"name": "buzz"}}
@@ -225,9 +240,7 @@ run_sweep() {
   BUZZ_RELAY_URL=https://relay.invalid \
   BUZZ_PRIVATE_KEY="$CI_SECRET" \
   BUZZ_AUTH_TAG=stub \
-  REVIEWER_NAME=Alex \
-  REVIEWER_PUBKEY="$REVIEWER_PUB" \
-  OWNER_PUBKEY="$OWNER_PUB" \
+  BUZZ_ROUTING_FILE="$FIXTURES/routing.json" \
   EXPECTED_CI_PUBKEY="$CI_PUB" \
   SILENT_SECS=900 \
   DEAD_SECS=1800 \
@@ -256,6 +269,29 @@ check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
 check "should post once" "$([ "$(sent_count)" = 1 ]; echo $?)"
 check "should p-tag the reviewer" "$(grep -q -- "--mention $REVIEWER_PUB" "$SENDS"; echo $?)"
 check "should carry the dedup marker" "$(grep -q "Reviewer nudge for $HEAD_SHA" "$SENDS"; echo $?)"
+check "should address the reviewer by his profile name, not a pinned one" \
+  "$(grep -q '@Alex please review this PR' "$SENDS"; echo $?)"
+
+# 2b. The name is presentation; the p-tag is the wake. An unreadable profile
+#     must not cost the nudge — it is addressed by pubkey instead.
+scenario "silent past SILENT_SECS, profile unreadable → nudge by pubkey"
+ci_events 1200
+printf '4\n' > "$FIXTURES/profile.rc"
+run_sweep; RC=$?
+check "expected rc 0, got $RC" "$([ "$RC" -eq 0 ]; echo $?)"
+check "should still post once" "$([ "$(sent_count)" = 1 ]; echo $?)"
+check "should still p-tag the reviewer" "$(grep -q -- "--mention $REVIEWER_PUB" "$SENDS"; echo $?)"
+check "should fall back to addressing him by pubkey" \
+  "$(grep -q "@$REVIEWER_PUB please review this PR" "$SENDS"; echo $?)"
+
+# 2c. A routing file the validator refuses stops the sweep before it can
+#     nudge the wrong key or page nobody.
+scenario "invalid routing file → the sweep refuses to run"
+ci_events 1200
+echo '{"version": 1, "owner": "nobody"}' > "$FIXTURES/routing.json"
+run_sweep; RC=$?
+check "expected non-zero rc, got $RC" "$([ "$RC" -ne 0 ]; echo $?)"
+check "should not post" "$([ "$(sent_count)" = 0 ]; echo $?)"
 
 # 3. THE STALE-VERDICT RACE. A review of the PREVIOUS head posts its verdict
 #    after the request for this head. It is verdict-shaped, it is inside the
@@ -540,16 +576,41 @@ ROUTEPY
 
 # The diff is the only input route_scope reads besides HEAD_REF, and it reads
 # it through `git diff --name-only`; stub that rather than build a repository.
+# Two implementers with disjoint branch grammars and disjoint paths, so the
+# cases below can tell "routed by branch" from "routed by path" — the
+# distinction the shipped gap was about. Labels come from a stub in place of
+# the workflow's label_for (profile-resolved at run time; that lookup is
+# outside route_scope and stubbed here to a fixed map).
+TESTCODER_PUB=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+OTHERCODER_PUB=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ROUTE_ROUTING_JSON=$(cat <<JSON | bash .github/scripts/buzz-routing.sh validate
+{"version": 1, "owner": "$OWNER_PUB", "reviewer": "$REVIEWER_PUB",
+ "agent_branches": ["agent/*"],
+ "implementers": [
+   {"pubkey": "$TESTCODER_PUB", "branches": ["agent/testcoder", "agent/testcoder-*"],
+    "paths": ["crates/*", "desktop/*", ".github/workflows/*"]},
+   {"pubkey": "$OTHERCODER_PUB", "branches": ["agent/other-*"], "paths": ["web/*"]}]}
+JSON
+) || { echo "route fixture did not validate" >&2; exit 2; }
+export ROUTE_ROUTING_JSON TESTCODER_PUB OTHERCODER_PUB
+
 cat > "$WORK/route-drive.sh" <<'DRIVEEOF'
 set -uo pipefail
-CODER_NAME=TestCoder
-CODER_PUBKEY=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+ROUTING_JSON="$ROUTE_ROUTING_JSON"
 RANGE=unused
 git() { case "$*" in *--name-only*) printf '%s\n' "$FAKE_FILES" ;; *) return 0 ;; esac; }
+label_for() {
+  case "$1" in
+    "$TESTCODER_PUB") echo TestCoder ;;
+    "$OTHERCODER_PUB") echo OtherCoder ;;
+    *) echo "$1" ;;
+  esac
+}
 # shellcheck disable=SC1091
 . "$ROUTE_SH"
 route_scope
 printf 'mentions=%s\n' "${SCOPE_MENTIONS[*]-}"
+printf 'pubkey=%s\n' "$SCOPE_PUBKEY"
 printf 'names=%s\n' "$SCOPE_NAMES"
 printf 'author=%s\n' "$AUTHOR_LINE"
 DRIVEEOF
@@ -589,19 +650,62 @@ check "owner branch should name the owner as author" \
 check "owner branch + owned path should still name the path owner" \
   "$(printf '%s' "$(field "$OUT" author)" | grep -q 'TestCoder'; echo $?)"
 
-# Not his PR, not his paths: nobody is routed, and the card says so.
-OUT=$(route claude/owner-branch web/app.tsx) || { echo "$OUT" >&2; exit 2; }
+# Not his PR, not anybody's paths: nobody is routed, and the card says so.
+OUT=$(route claude/owner-branch README.md) || { echo "$OUT" >&2; exit 2; }
 check "owner branch + unowned path should not p-tag the coder" \
   "$([ -z "$(field "$OUT" mentions)" ]; echo $?)"
 check "owner branch + unowned path should say no coder owns the paths" \
   "$(printf '%s' "$(field "$OUT" author)" | grep -qi 'no coding agent owns'; echo $?)"
+
+# ROUTING IS CONFIGURATION. The identities above come from .buzz/routing.json,
+# and the cases below pin what the file's grammar means: a head is routed by
+# the implementer whose BRANCH pattern claims it, never by whose paths it
+# touches; an agent branch nobody claims is stated as unidentified; and the
+# path-owner note follows the paths of whichever implementer owns them.
+
+# Another implementer's branch, on paths the first implementer owns: the
+# branch decides, so the second is mentioned and the first is not.
+OUT=$(route agent/other-7 crates/buzz-relay/src/lib.rs) || { echo "$OUT" >&2; exit 2; }
+check "a second implementer's branch should p-tag him, by branch not by path" \
+  "$([ "$(field "$OUT" pubkey)" = "$OTHERCODER_PUB" ]; echo $?)"
+check "a second implementer's branch should p-tag exactly one identity" \
+  "$(printf '%s' "$(field "$OUT" mentions)" | grep -q '^--mention e\{64\}$'; echo $?)"
+check "a second implementer's branch should name him in the heads-up" \
+  "$(printf '%s' "$(field "$OUT" names)" | grep -q '@OtherCoder'; echo $?)"
+
+# An agent branch no implementer claims: stated, not guessed. No mention —
+# nobody is known to wake — and the changed paths do not pick an author.
+OUT=$(route agent/newcomer-1 crates/buzz-relay/src/lib.rs) || { echo "$OUT" >&2; exit 2; }
+check "an unclaimed agent branch should p-tag nobody" \
+  "$([ -z "$(field "$OUT" mentions)" ]; echo $?)"
+check "an unclaimed agent branch should be stated as unidentified" \
+  "$(printf '%s' "$(field "$OUT" author)" | grep -q 'unidentified coding agent'; echo $?)"
+check "an unclaimed agent branch should not be called the owner's" \
+  "$(! printf '%s' "$(field "$OUT" author)" | grep -q 'the owner'; echo $?)"
+
+# Branch grammar is exact glob matching: `agent/testcoder-*` claims
+# `agent/testcoder-2`, and `agent/testcoders` matches neither pattern.
+OUT=$(route agent/testcoder-2 docs/x.md) || { echo "$OUT" >&2; exit 2; }
+check "a per-coder branch grammar should claim its own heads" \
+  "$([ "$(field "$OUT" pubkey)" = "$TESTCODER_PUB" ]; echo $?)"
+OUT=$(route agent/testcoders docs/x.md) || { echo "$OUT" >&2; exit 2; }
+check "a near-miss of the branch grammar should not be claimed" \
+  "$([ -z "$(field "$OUT" pubkey)" ]; echo $?)"
+
+# The owner's PR touching the second implementer's paths names HIM for
+# reference, and still p-tags nobody.
+OUT=$(route claude/owner-branch web/app.tsx) || { echo "$OUT" >&2; exit 2; }
+check "owner branch + second implementer's path should p-tag nobody" \
+  "$([ -z "$(field "$OUT" mentions)" ]; echo $?)"
+check "owner branch + second implementer's path should name him as path owner" \
+  "$(printf '%s' "$(field "$OUT" author)" | grep -q 'Path owner(s): OtherCoder'; echo $?)"
 
 # The Author line is display-only. A PR that edits this workflow chooses the
 # text of its own review request under CI's key, so an instruction here is an
 # injection path into the reviewer's routing; the reviewer must derive the
 # branch class from its own authenticated GitHub read instead.
 for CASE in "agent/testcoder|crates/x.rs" "agent/testcoder|docs/x.md" \
-            "claude/o|scripts/x.sh" "claude/o|web/x.tsx"; do
+            "claude/o|.github/workflows/x.yml" "claude/o|web/x.tsx" "agent/other-1|web/x.tsx" "agent/nobody|crates/x.rs"; do
   OUT=$(route "${CASE%%|*}" "${CASE##*|}") || { echo "$OUT" >&2; exit 2; }
   check "Author line for ${CASE} should issue no routing directive" \
     "$(! printf '%s' "$(field "$OUT" author)" \

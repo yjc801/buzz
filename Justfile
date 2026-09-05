@@ -119,6 +119,7 @@ auto-merge-check:
     # expansion that failed to expand (SC2016). The YAML, expression and
     # action checks are the ones that matter here.
     actionlint -shellcheck= .github/workflows/buzz-pr-mirror.yml
+    actionlint -shellcheck= .github/workflows/buzz-issue-mirror.yml
     node --check .github/scripts/pr-auto-merge-risk.js
     node --check .github/scripts/pr-auto-merge-verdict.js
     node --test .github/scripts/pr-auto-merge-risk.test.js .github/scripts/pr-auto-merge-verdict.test.js
@@ -128,6 +129,7 @@ auto-merge-check:
     bash .github/scripts/pr-auto-merge-revalidate.test.sh
     bash .github/scripts/pr-auto-merge-write.test.sh
     bash .github/scripts/pr-auto-merge-label.test.sh
+    bash .github/scripts/buzz-routing.test.sh
     bash .github/scripts/pr-review-wake.test.sh
     bash .github/scripts/pr-mirror-close.test.sh
 
@@ -454,8 +456,10 @@ gate base="origin/main":
                 ;;
             # Gate nothing on their own. The Justfile and hook config are
             # covered by whichever recipes the rest of the diff selects — and
-            # by `just --evaluate` below when they change alone.
-            *.md | .github/* | scripts/* | docs/* | benchmarks/* | examples/* | Justfile | lefthook.yml) ;;
+            # by `just --evaluate` below when they change alone. The routing
+            # file and the workflow scripts are CI config: `auto-merge-check`
+            # validates them, and CI runs it on every PR.
+            *.md | .github/* | .buzz/* | scripts/* | docs/* | benchmarks/* | examples/* | Justfile | lefthook.yml) ;;
             *) unknown=1 ;;
         esac
     done <<<"$changed"

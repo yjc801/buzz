@@ -780,43 +780,81 @@ fn provider_id_from_filename(name: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
-/// Enumerate PATH for buzz-backend-* executables. Returns (id, path) pairs.
-/// Only includes files that are executable. Does NOT execute any binaries.
+/// Enumerate the provider search path for `buzz-backend-*` executables.
+/// Returns (id, path) pairs. Only includes files that are executable. Does
+/// NOT execute any binaries.
 ///
-/// On macOS, GUI apps inherit a minimal PATH from launchd (`/usr/bin:/bin:/usr/sbin:/sbin`)
-/// which excludes both the app bundle's `Contents/MacOS/` dir and `~/.local/bin`.
-/// We augment the search with those directories so bundled and user-installed providers
-/// are always discovered regardless of how the caller was launched.
+/// Scans the directories of [`provider_search_dirs`] in order — the running
+/// executable's own directory, then `PATH`, then `~/.local/bin` — and the
+/// first file of a given name wins. So a provider the app ships as a sidecar
+/// (`Contents/MacOS/buzz-backend-sprites` in the `.app`) shadows any copy of
+/// the same name further down, in particular a hand-built
+/// `~/.local/bin/buzz-backend-sprites`: that copy is exactly the one that
+/// goes stale, pinning adapter versions the waker's release has long moved
+/// past and flip-flopping every sprite's provision fingerprint between the
+/// two (docs/waker-provider-digest-gap.md). A shadowed copy is not reported
+/// at all, so a caller holding a cached path to it cannot re-select it either.
 pub fn discover_provider_candidates() -> Vec<(String, PathBuf)> {
-    let prefix = "buzz-backend-";
-    let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::new();
-
+    let exe = std::env::current_exe().ok();
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    let home = dirs::home_dir();
+    discover_provider_candidates_in(&provider_search_dirs(
+        exe.as_deref(),
+        &path_var,
+        home.as_deref(),
+    ))
+}
 
-    // Prepend the exe parent dir (Contents/MacOS/ in a .app bundle) so bundled
-    // providers are found even when the process PATH is minimal.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let parent_buf = parent.to_path_buf();
-            if !dirs.contains(&parent_buf) {
-                dirs.insert(0, parent_buf);
-            }
-        }
+/// The directories [`discover_provider_candidates`] scans, in scan order.
+///
+/// 1. The directory containing `exe` — `Contents/MacOS/` inside a `.app`
+///    bundle, where Tauri places every `externalBin` sidecar. Always first,
+///    even when `PATH` also lists it further down: a sidecar is the build
+///    artifact the app was released with, and nothing a shell put ahead of
+///    it on `PATH` is a better answer to "the provider this app ships".
+/// 2. Every entry of `path_var`, in order.
+/// 3. `<home>/.local/bin` — the conventional location for hand-installed
+///    provider binaries, appended last (unless `PATH` already lists it) so
+///    it is a fallback for providers the app does not bundle, never an
+///    override for ones it does.
+///
+/// On macOS a GUI app inherits a minimal `PATH` from launchd
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) that contains neither 1 nor 3, which is
+/// why both are added explicitly rather than trusted to be there.
+fn provider_search_dirs(
+    exe: Option<&Path>,
+    path_var: &std::ffi::OsStr,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(path_var).collect();
+
+    if let Some(exe_dir) = exe
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        dirs.retain(|dir| dir != exe_dir);
+        dirs.insert(0, exe_dir.to_path_buf());
     }
 
-    // Also include ~/.local/bin — the conventional location for user-installed
-    // provider binaries (symlinks created by install scripts).
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home {
         let local_bin = home.join(".local").join("bin");
         if !dirs.contains(&local_bin) {
             dirs.push(local_bin);
         }
     }
+    dirs
+}
+
+/// Scan `dirs` in order for executables named `buzz-backend-<id>`. The first
+/// file of a given name wins; a same-named file in a later directory is
+/// neither reported nor executed.
+fn discover_provider_candidates_in(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let prefix = "buzz-backend-";
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
 
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -838,7 +876,8 @@ pub fn discover_provider_candidates() -> Vec<(String, PathBuf)> {
 ///
 /// This is the ONLY way to resolve provider binaries for execution. It:
 /// 1. Validates the ID against `^[a-z0-9][a-z0-9_-]*$` (no path traversal)
-/// 2. Looks up the ID in `discover_provider_candidates()` (PATH-discovered only)
+/// 2. Looks up the ID in `discover_provider_candidates()` (search-path discovered
+///    only; a bundled sidecar wins over a hand-installed copy — see there)
 /// 3. Returns the canonical path of the discovered binary
 ///
 /// All deploy, start, and create paths MUST use this instead of raw

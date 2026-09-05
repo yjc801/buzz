@@ -72,7 +72,8 @@ moment. The digest drifts on every image rebuild. Pinning against it would
 break on routine rebuilds rather than only on genuine mismatch.
 
 Note the macOS side has the same defect: the local binary is a hand-built
-`cargo build` output, not a released artifact either.
+`cargo build` output, not a released artifact either. That half is closed
+too — see [The macOS side](#the-macos-side-closed-2026-09-05) below.
 
 ## Required sequencing — all four landed
 
@@ -109,6 +110,50 @@ inspecting the published binaries directly: the v0.1.0 asset contains no
 
 So: when a change lands in `crates/buzz-backend-sprites`, it is not deployed
 until a `buzz-backend-sprites-v*` tag is cut and both pins move with it.
+
+## The macOS side, closed 2026-09-05
+
+The desktop's own deploys had the mirror-image problem. `buzz-backend-sprites`
+was not in the `.app` at all, so `discover_provider_candidates` walked past
+`Contents/MacOS/` and `PATH` to `~/.local/bin`, where a hand-built copy sat —
+and stayed. On 2026-09-05 that copy still pinned `CLAUDE_ADAPTER_VERSION`
+0.64.0 (Claude Code 2.1.220, which the API had started rejecting) after
+`crates/buzz-backend-sprites/src/config.rs` had moved to 0.73.0 and the pins
+above had been bumped to `buzz-backend-sprites-v0.1.2`. Because the adapter
+pin is part of the provision fingerprint (`intent.rs`, `ProvisionTemplate`),
+every desktop-driven deploy reprovisioned the sprite back to 0.64.0 and every
+waker deploy flipped it to 0.73.0 again.
+
+Fixed by making the provider a build artifact rather than a host-discovered
+file:
+
+- **Bundled as a sidecar.** `binaries/buzz-backend-sprites` is in
+  `bundle.externalBin` for macOS and Linux — in the fork's platform overlays,
+  since `tauri.conf.json` stays byte-identical to upstream
+  ([fork-branding.md](fork-branding.md)) — built and staged by
+  `scripts/bundle-sidecars.sh` exactly like `buzz-backend-kubernetes`, and
+  verified present *and answering as `sprites`* by
+  `.github/workflows/fork-desktop-release.yml` before a DMG is published.
+- **The bundle wins.** Discovery scans the executable's own directory first,
+  ahead of `PATH` even when `PATH` lists it later, and reports one file per
+  name — so a stale `~/.local/bin` copy is not merely outranked, it is not a
+  candidate at all, and a record's cached path to it cannot re-select it
+  (`buzz-provider-deploy`,
+  `a_bundled_sprites_sidecar_shadows_a_hand_built_copy_in_local_bin`).
+- **The release refuses to skew.** The desktop's sidecar is built from the
+  desktop's commit, while the daemon runs the pinned release; between a
+  provider change landing on `main` and the pins moving, the two would
+  disagree on the fingerprint. The fork release workflow compares every
+  source-baked `ProvisionTemplate` input (template version, adapter and sprig
+  pins, embedded scripts) between `HEAD` and the tag named in
+  `provider-digests.json`, and fails the release — not the pins — when they
+  differ. Cut a provider release from that source and bump both pins first.
+
+So the provider-bump rule now has three legs, not two: `PROVIDER_SPRITES_TAG`,
+`provider-digests.json`, **and a desktop release built after both moved**.
+Until that release ships, the previous DMG's sidecar still carries the
+previous pins — the same skew, bounded now by the desktop's release cadence
+rather than by whenever someone last ran `cargo build`.
 
 ## Explicitly not the cause
 

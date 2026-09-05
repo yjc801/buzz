@@ -380,7 +380,7 @@ pub enum MessagesCmd {
         /// Channel UUID (from 'buzz channels list')
         #[arg(long)]
         channel: String,
-        /// Message text — supports @mentions and markdown. Use '-' to read from stdin.
+        /// Message text — supports @mentions and markdown. A NIP-27 `nostr:npub1…` reference is published as `@<that member's current display name>` plus a p-tag, so a sender that knows a pubkey never has to type a name. Use '-' to read from stdin.
         #[arg(long)]
         content: String,
         /// Nostr event kind (default: channel default)

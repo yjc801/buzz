@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "owner": "632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420",
+  "reviewer": "276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd",
+  "agent_branches": ["agent/*"],
+  "implementers": [
+    {
+      "pubkey": "15e158a9408649cc82dbe8637d25a63f9cde38cfb1b4ca35f59a8075080b470b",
+      "branches": ["agent/*"],
+      "paths": [
+        "crates/*",
+        "desktop/*",
+        "mobile/*",
+        "migrations/*",
+        "scripts/*",
+        ".github/workflows/*"
+      ],
+      "issues": true
+    }
+  ]
+}

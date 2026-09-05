@@ -286,7 +286,27 @@ refuse_if_archived() {
 }
 SUB="$1 $2"; shift 2
 case "$SUB" in
-  "users get") echo '[{"name":"Buzz CI"}]' ;;
+  "users get")
+    # Profiles for the identities the step resolves labels for. The card's
+    # `@Alex please review` is this name, read from a profile at run time —
+    # nothing in the workflow pins it. A pubkey with no profile here gets no
+    # entry, which the workflow addresses by pubkey.
+    OUT="["; SEP=""
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--pubkey" ]; then
+        case "${2:-}" in
+          "$REVIEWER_PUB") N=Alex ;;
+          "$CODER_PUB") N=Will ;;
+          "$OWNER_PUB") N=Owner ;;
+          "$CI_PUB") N="Buzz CI" ;;
+          *) N="" ;;
+        esac
+        [ -n "$N" ] && { OUT="$OUT$SEP{\"pubkey\":\"$2\",\"display_name\":\"$N\"}"; SEP=","; }
+        shift
+      fi
+      shift
+    done
+    echo "$OUT]" ;;
   "notes get")
     SLUG=$(arg --name "$@")
     echo "BINDING_READ $SLUG" >> "$LOG"
@@ -660,6 +680,13 @@ reset_fixtures() {
   rm -rf "$FIXTURES"; mkdir -p "$FIXTURES"
   : > "$LOG"
   echo '[]' > "$FIXTURES/channels_list.json"
+  # Who the rooms are for: the step reads .buzz/routing.json (from the base
+  # branch in production; from this fixture here), never an env pin.
+  cat > "$FIXTURES/routing.json" <<JSON
+{"version": 1, "owner": "$OWNER_PUB", "reviewer": "$REVIEWER_PUB",
+ "agent_branches": ["agent/*"],
+ "implementers": [{"pubkey": "$CODER_PUB", "branches": ["agent/*"], "paths": ["crates/*"], "issues": true}]}
+JSON
 }
 
 run_step() { # run_step <event-name> [pr-action] [pr-number]
@@ -685,11 +712,7 @@ run_step() { # run_step <event-name> [pr-action] [pr-number]
   HEAD_REF=claude/x \
   BASE_REF=main \
   FALLBACK_CHANNEL="" \
-  REVIEWER_NAME=Alex \
-  REVIEWER_PUBKEY="$REVIEWER_PUB" \
-  CODER_NAME=Will \
-  CODER_PUBKEY="$CODER_PUB" \
-  OWNER_PUBKEY="$OWNER_PUB" \
+  BUZZ_ROUTING_FILE="$FIXTURES/routing.json" \
   EXPECTED_CI_PUBKEY="$CI_PUB" \
   SWEEP_DAYS="${SWEEP_DAYS_INPUT:-7}" \
   SWEEP_LIST_LIMIT="${SWEEP_LIST_LIMIT_INPUT:-1000}" \

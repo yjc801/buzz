@@ -142,17 +142,14 @@ jobs:
           ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ', ') }}
           ISSUE_STATE_REASON: ${{ github.event.issue.state_reason }}
-          # Will — the buzz platform coding agent. He is MENTIONED here, not
-          # merely added: an issue is work to pick up, and only the p-tag
-          # fires a turn. NOT Chris (velvet's coder): his instructions scope
-          # him to velvet's apps/api + packages/* and tell him to stop rather
-          # than work outside them, so pointing him at a Rust workspace either
-          # gets a refusal or gets work his own prompt disowns.
-          CODER_NAME: Will
-          CODER_PUBKEY: 15e158a9408649cc82dbe8637d25a63f9cde38cfb1b4ca35f59a8075080b470b
-          # Community owner — added to every new channel so it shows up in
-          # their sidebar (open channels are joinable but not auto-joined).
-          OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+          # The owner (added to every room so it shows in their sidebar) and
+          # the implementer(s) MENTIONED for pickup — an issue is work, and
+          # only the p-tag fires a turn — are NOT pinned here. They are read
+          # from .buzz/routing.json on the default branch this workflow runs
+          # from: every implementer flagged `issues: true`. Display names come
+          # from kind:0 profiles at run time. Empty means "read the checkout".
+          # Schema and rationale: docs/pr-review-routing.md.
+          BUZZ_ROUTING_FILE: ""
           # Deliberately NOT Alex. He is the reviewer, his known failure mode
           # is review-loop volume, and an issue room has nothing to review
           # until a PR exists — at which point buzz-pr-mirror.yml brings him
@@ -192,6 +189,58 @@ jobs:
             echo "each binding note, and update EXPECTED_CI_PUBKEY in both mirrors." >&2
             exit 1
           fi
+
+          # ROUTING — the owner, and the implementer(s) an issue room mentions.
+          # Read from the checkout: `issues` workflows run only from the
+          # default branch, so this IS the reviewed file. Validation is the
+          # shared script, so a malformed file fails here before any relay
+          # write. An issue room whose whole point is the pickup mention must
+          # not be created with nobody to mention, so an empty `issues: true`
+          # set fails the job rather than seeding a silent room.
+          ROUTING_JSON=$(bash .github/scripts/buzz-routing.sh validate < "${BUZZ_ROUTING_FILE:-.buzz/routing.json}") || {
+            echo "::error::.buzz/routing.json is missing or invalid — refusing to guess who picks up issues"
+            exit 1
+          }
+          OWNER_PUBKEY=$(jq -r .owner <<<"$ROUTING_JSON")
+          ISSUE_IMPLEMENTERS=$(jq -r '.implementers[] | select(.issues == true) | .pubkey' <<<"$ROUTING_JSON")
+          if [ -z "$ISSUE_IMPLEMENTERS" ]; then
+            echo "::error::no implementer in .buzz/routing.json has issues: true — an issue room exists to mention one"
+            exit 1
+          fi
+          routing_pubkeys() { # the room's required roster: owner plus every issue implementer
+            printf '%s\n' "$OWNER_PUBKEY" $ISSUE_IMPLEMENTERS
+          }
+
+          # LABELS — display names as of this run, never stored (a stored
+          # name fails silently after a rename; a stored pubkey fails loudly
+          # at the roster check). A member with no usable name is addressed
+          # by pubkey, which the CLI still turns into a p-tag.
+          ROUTING_LABELS_JSON='{}'
+          load_labels() {
+            local ARGS=() P PROFILES
+            for P in $(routing_pubkeys); do
+              ARGS+=(--pubkey "$P")
+            done
+            PROFILES=$(buzz users get "${ARGS[@]}") || {
+              echo "profile lookup for the routed identities failed — failing so the rerun re-probes" >&2
+              return 1
+            }
+            ROUTING_LABELS_JSON=$(printf '%s' "$PROFILES" | jq -c '
+              [ .[]? | select(.pubkey | type == "string")
+                | {key: .pubkey,
+                   value: ((.display_name // .name // "") | tostring | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" "))}
+                | select(.value != "") ] | from_entries') || return 1
+          }
+          label_for() { # label_for <pubkey> → the member's current display name, else the pubkey
+            jq -r --arg p "$1" '.[$p] // $p' <<<"$ROUTING_LABELS_JSON"
+          }
+          load_labels || exit 1
+          IMPLEMENTER_MENTIONS=()
+          IMPLEMENTER_NAMES=""
+          for P in $ISSUE_IMPLEMENTERS; do
+            IMPLEMENTER_MENTIONS+=(--mention "$P")
+            IMPLEMENTER_NAMES="${IMPLEMENTER_NAMES}@$(label_for "$P") "
+          done
 
           # Slug of this issue's binding note. The `issue-mirror-` prefix keeps
           # it disjoint from the PR mirror's `pr-mirror-` namespace, so issue
@@ -305,7 +354,7 @@ jobs:
               echo "roster read failed for $CH — failing so the rerun re-probes" >&2
               return 1
             }
-            for P in "$OWNER_PUBKEY" "$CODER_PUBKEY"; do
+            for P in $(routing_pubkeys); do
               printf '%s' "$ROSTER" | jq -e --arg p "$P" 'any(.[]?; .pubkey == $p)' >/dev/null || {
                 echo "add-member for $P was accepted but is not applied — failing so the rerun retries" >&2
                 return 1
@@ -404,7 +453,7 @@ jobs:
                 printf '\n---\n%s\n' "$ISSUE_BODY"
               fi
             fi
-            printf '\n@%s please pick this up.\n' "$CODER_NAME"
+            printf '\n%splease pick this up.\n' "$IMPLEMENTER_NAMES"
           }
 
           provision_members() {
@@ -425,7 +474,7 @@ jobs:
             # from the member-added event's timestamp, so a card posted after
             # the add is replayed to it and a card posted before it is not.
             local CH="$1" P
-            for P in "$OWNER_PUBKEY" "$CODER_PUBKEY"; do
+            for P in $(routing_pubkeys); do
               # Stdout redirected: `create_and_seed` is captured with $(...)
               # by the `closed` recovery path, and add-member's structured
               # success JSON would otherwise land in that capture ahead of
@@ -439,10 +488,10 @@ jobs:
           }
 
           post_seed() {
-            # `--mention` is what p-tags Will and fires a turn; without it this
+            # `--mention` is what p-tags each issue implementer and fires a turn; without it this
             # is just a card in a room he can see. Re-posting on a resumed
             # partial re-mentions him, which is the intended retry.
-            seed_card | buzz messages send --channel "$1" --content - --mention "$CODER_PUBKEY"
+            seed_card | buzz messages send --channel "$1" --content - "${IMPLEMENTER_MENTIONS[@]}"
           }
 
           channel_seed_state() {

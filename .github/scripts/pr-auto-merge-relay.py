@@ -120,6 +120,7 @@ MINT = _load_mint()
 # NIP-23 long-form; the PR mirror writes its channel binding as one of these,
 # keyed by the slug in the `d` tag. See crates/buzz-cli/src/commands/notes.rs.
 KIND_LONG_FORM = 30023
+KIND_PROFILE = 0
 # NIP-29 group chat message — what the reviewer's verdicts are.
 KIND_CHANNEL_MESSAGE = 9
 # The relay's advertised NIP-11 max_limit. Asking for exactly this and
@@ -472,6 +473,38 @@ def read_channel_events(base, secret, auth_tag, channel, author, kind, opener=No
     return verified_events(events, channel, author, kind)
 
 
+def read_profile_name(base, secret, auth_tag, pubkey, opener=None):
+    """The display name on `pubkey`'s kind:0 profile, or "" when it has none.
+
+    Presentation only — the p-tag that wakes an agent is the pubkey, and the
+    caller falls back to it when this is empty. The event is proved against
+    the pubkey it claims so a relay cannot hand back somebody else's name.
+    """
+    events = post_query(
+        base,
+        secret,
+        auth_tag,
+        [{"kinds": [KIND_PROFILE], "authors": [pubkey], "limit": 1}],
+        opener=opener,
+    )
+    for event in events:
+        if event.get("pubkey") != pubkey or event.get("kind") != KIND_PROFILE:
+            continue
+        prove(event, pubkey, f"profile of {pubkey[:8]}")
+        try:
+            content = json.loads(event.get("content") or "{}")
+        except ValueError:
+            return ""
+        if not isinstance(content, dict):
+            return ""
+        for key in ("display_name", "name"):
+            value = content.get(key)
+            if isinstance(value, str) and value.strip():
+                return " ".join(value.split())
+        return ""
+    return ""
+
+
 def standing_verdict(repo, pr, reviewer, env, opener=None):
     base, secret, auth_tag = open_relay(env)
     note = read_verdict_note(base, secret, auth_tag, repo, pr, reviewer, opener=opener)
@@ -631,6 +664,22 @@ def selftest():
     _refuses("mention not hex64", lambda: build_message(ci_sec, "", channel, "x", 1, ["alex"]))
     _refuses("mention empty", lambda: build_message(ci_sec, "", channel, "x", 1, [""]))
 
+    # Profile names are presentation: proved against the claimed author,
+    # display_name over name, whitespace collapsed, empty when absent.
+    def profile(payload, who=rev_pub):
+        return read_profile_name(
+            "https://relay.example", ci_sec, "", who, opener=_fake_opener(payload),
+        )
+
+    named = _sign(rev_sec, KIND_PROFILE, [], json.dumps({"display_name": " Alex  Review ", "name": "alex"}))
+    assert profile([named]) == "Alex Review"
+    assert profile([_sign(rev_sec, KIND_PROFILE, [], json.dumps({"name": "alex"}))]) == "alex"
+    assert profile([_sign(rev_sec, KIND_PROFILE, [], json.dumps({"about": "no name"}))]) == ""
+    assert profile([_sign(rev_sec, KIND_PROFILE, [], "not json")]) == ""
+    assert profile([]) == ""
+    assert profile([_sign(ci_sec, KIND_PROFILE, [], json.dumps({"name": "impostor"}))]) == "", "another author's profile is not this pubkey's name"
+    _refuses("edited profile", lambda: profile([dict(named, content=json.dumps({"display_name": "Mallory"}))]))
+
     print("selftest: relay client proofs pass (NIP-98, binding, verdict coordinate, channel scoping, completeness, signing)")
 
 
@@ -685,6 +734,11 @@ def _run(command, opts):
             )
             return EXIT_ABSENT, None
         return 0, json.dumps(result["event"], separators=(",", ":"), ensure_ascii=False)
+
+    if command == "profile":
+        pubkey = _need(opts, "--pubkey", HEX64_RE.pattern, "a 64-hex pubkey")
+        base, secret, auth_tag = open_relay(os.environ)
+        return 0, read_profile_name(base, secret, auth_tag, pubkey)
 
     if command == "send":
         channel = _need(opts, "--channel", UUID_RE.pattern, "a channel UUID")

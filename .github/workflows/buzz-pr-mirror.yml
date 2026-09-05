@@ -437,20 +437,14 @@ jobs:
           # Pre-workflow PRs have no #buzz-pr-N channel; close notices for them
           # go here. Empty is supported — see the header.
           FALLBACK_CHANNEL: ${{ vars.BUZZ_FALLBACK_CHANNEL }}
-          # Alex — the reviewer agent (mention by pubkey so notification doesn't
-          # depend on display-name resolution)
-          REVIEWER_NAME: Alex
-          REVIEWER_PUBKEY: 276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd
-          # Will — the buzz platform coding agent; member of every task room.
-          # NOT Chris (velvet's coder): his instructions scope him to velvet's
-          # apps/api + packages/* and tell him to stop rather than work outside
-          # them, so pointing him at a Rust workspace either gets a refusal or
-          # gets work his own prompt disowns.
-          CODER_NAME: Will
-          CODER_PUBKEY: 15e158a9408649cc82dbe8637d25a63f9cde38cfb1b4ca35f59a8075080b470b
-          # Community owner — added to every new channel so it shows up in
-          # their sidebar (open channels are joinable but not auto-joined).
-          OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+          # WHO THE ROOMS ARE FOR — owner, reviewer, implementers — is NOT
+          # pinned here. load_routing (below) reads .buzz/routing.json from the
+          # BASE branch, so a PR cannot re-route its own review by editing the
+          # file, and every display name is resolved from the member's kind:0
+          # profile at run time (load_labels) rather than stored anywhere.
+          # Empty means "read the base branch"; the contract tests point this
+          # at a fixture. Schema and rationale: docs/pr-review-routing.md.
+          BUZZ_ROUTING_FILE: ""
           # The pinned CI identity — the public half of BUZZ_CI_PRIVATE_KEY, and
           # the owner of every room this workflow has created. See the header:
           # changing it without migrating channel ownership and the binding
@@ -598,6 +592,64 @@ jobs:
             fi
           }
           ensure_ci_profile || exit 1
+
+          # ROUTING — who this room is for. Read from the BASE branch, never
+          # the head: this workflow runs from the PR's own checkout, so a file
+          # read from HEAD would let a PR choose its own reviewer and coder.
+          # The base branch changes only by merging, which is the review this
+          # file gates. A scheduled sweep has no base ref and runs on the
+          # default branch, so it reads the checkout. Validation is the shared
+          # script, so a malformed file fails here before any relay write
+          # instead of degrading to a room with nobody in it. Nothing in the
+          # file is a display name — see load_labels.
+          load_routing() {
+            local RAW
+            if [ -n "${BUZZ_ROUTING_FILE:-}" ]; then
+              RAW=$(cat "$BUZZ_ROUTING_FILE") || return 1
+            elif [ -n "${BASE_REF:-}" ]; then
+              RAW=$(git show "origin/${BASE_REF}:.buzz/routing.json") || {
+                echo "could not read .buzz/routing.json from origin/${BASE_REF} — failing rather than guessing who this room is for" >&2
+                return 1
+              }
+            else
+              RAW=$(cat .buzz/routing.json) || return 1
+            fi
+            ROUTING_JSON=$(printf '%s' "$RAW" | bash .github/scripts/buzz-routing.sh validate) || return 1
+            OWNER_PUBKEY=$(jq -r .owner <<<"$ROUTING_JSON")
+            REVIEWER_PUBKEY=$(jq -r .reviewer <<<"$ROUTING_JSON")
+          }
+          routing_pubkeys() { # every routed identity, one per line — the room's required roster
+            jq -r '[.owner, .reviewer, .implementers[].pubkey][]' <<<"$ROUTING_JSON"
+          }
+          load_routing || exit 1
+
+          # LABELS — the routed identities' display names, from their kind:0
+          # profiles as of this run. Never stored: a stored name fails
+          # silently after a rename (the card still posts, addressed to a
+          # label that no longer renders as a mention) while a stored pubkey
+          # fails loudly (the CLI refuses a mention that is not on the
+          # roster). A member with no usable name is addressed by pubkey,
+          # which the CLI still turns into a p-tag. One relay read per run.
+          ROUTING_LABELS_JSON='{}'
+          load_labels() {
+            local ARGS=() P PROFILES
+            for P in $(routing_pubkeys); do
+              ARGS+=(--pubkey "$P")
+            done
+            PROFILES=$(buzz users get "${ARGS[@]}") || {
+              echo "profile lookup for the routed identities failed — failing so the rerun re-probes" >&2
+              return 1
+            }
+            ROUTING_LABELS_JSON=$(printf '%s' "$PROFILES" | jq -c '
+              [ .[]? | select(.pubkey | type == "string")
+                | {key: .pubkey,
+                   value: ((.display_name // .name // "") | tostring | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" "))}
+                | select(.value != "") ] | from_entries') || return 1
+          }
+          label_for() { # label_for <pubkey> → the member's current display name, else the pubkey
+            jq -r --arg p "$1" '.[$p] // $p' <<<"$ROUTING_LABELS_JSON"
+          }
+          load_labels || exit 1
 
           bind_pr() {
             # Everything keyed by PR number, derived in one place: an event
@@ -843,7 +895,7 @@ jobs:
               echo "roster read failed for $CH — failing so the rerun re-probes" >&2
               return 1
             }
-            for P in "$OWNER_PUBKEY" "$REVIEWER_PUBKEY" "$CODER_PUBKEY"; do
+            for P in $(routing_pubkeys); do
               printf '%s' "$ROSTER" | jq -e --arg p "$P" 'any(.[]?; .pubkey == $p)' >/dev/null || {
                 echo "add-member for $P was accepted but is not applied — failing so the rerun retries" >&2
                 return 1
@@ -927,17 +979,19 @@ jobs:
           #
           # WHO AUTHORED THE HEAD. Every PR here is opened under the owner's
           # GitHub login (the coding agents push with the owner's credentials),
-          # so PR_AUTHOR never identifies the author. The branch does: the
-          # coder prompts pin their work to agent/<slug> — owner-managed, like
-          # the scope glob below — so agent/* is a coder's own PR and every
-          # other branch is the owner's own work, however the commits were
-          # produced. Naming that on the card is what velvet#205 was missing:
-          # the card there told the path owner to stand by on the owner's own
-          # PR and the reviewer handed him the findings, so the rounds ran
-          # between the reviewer and a coder on a change neither of them owned
-          # and the owner, who wrote it, was tagged only at the round cap. On
-          # this repository every PR to date is owner-authored, so until Will
-          # opens one the line always reads "the owner".
+          # so PR_AUTHOR never identifies the author. The branch does: each
+          # coder's prompt pins his work to a branch grammar of his own, and
+          # .buzz/routing.json records that grammar next to his pubkey
+          # (owner-managed, and read from the base branch — see load_routing).
+          # A head one implementer's `branches` claims is his own PR; a head
+          # matching `agent_branches` that nobody claims is an unidentified
+          # coding agent's; every other head is the owner's own work, however
+          # the commits were produced. Naming that on the card is what
+          # velvet#205 was missing: the card there told the path owner to
+          # stand by on the owner's own PR and the reviewer handed him the
+          # findings, so the rounds ran between the reviewer and a coder on a
+          # change neither of them owned and the owner, who wrote it, was
+          # tagged only at the round cap.
           #
           # THE Author LINE IS DISPLAY-ONLY, AND THAT IS A CONTRACT ON THE
           # CONSUMER, NOT A PROPERTY OF THIS LINE. Normative statement and
@@ -1000,45 +1054,73 @@ jobs:
           # wake him either until he moves to a provider backend. It is correct
           # and forward-compatible, not sufficient.
           #
-          # The globs mirror the scope Will's own prompt declares. They must keep
-          # mirroring it: a mention outside that scope buys "say so in-thread and
-          # stop", not work. `web/` is deliberately absent — his prompt does not
-          # claim it — so a web-only PR routes to nobody and the card says so.
+          # Each implementer's `paths` in .buzz/routing.json mirror the scope
+          # his own prompt declares, and must keep mirroring it: a mention
+          # outside that scope buys "say so in-thread and stop", not work. A
+          # path nobody lists routes to nobody, and the card says so. Names
+          # here are labels resolved from profiles at run time (label_for);
+          # the file holds only pubkeys.
           AUTHOR_LINE=""
           SCOPE_NAMES=""
           SCOPE_MENTIONS=()
+          SCOPE_PUBKEY=""
+          routing_matches_any() {
+            # $1: newline-separated candidates, $2: newline-separated shell
+            # globs. `case` pattern semantics — `*` matches any run of
+            # characters, `/` included — so `crates/*` covers every path
+            # under crates/ and `agent/*` every branch under agent/.
+            local C G
+            while IFS= read -r C; do
+              [ -n "$C" ] || continue
+              while IFS= read -r G; do
+                [ -n "$G" ] || continue
+                # shellcheck disable=SC2254  # unquoted on purpose: $G is the pattern
+                case "$C" in $G) return 0 ;; esac
+              done <<<"$2"
+            done <<<"$1"
+            return 1
+          }
           route_scope() {
-            local FILES OWNERS=""
+            local FILES OWNERS="" IMPL PK
             # Reset, not append: only one seeding path runs per job today, but a
             # second call must not mention the same agent twice. It is also the
-            # ONLY thing that clears the mention on a non-`agent/` head — that
+            # ONLY thing that clears the mention on a non-implementer head — that
             # arm sets no scope at all, deliberately, rather than setting one
             # and unsetting it.
             AUTHOR_LINE=""
             SCOPE_NAMES=""
             SCOPE_MENTIONS=()
+            SCOPE_PUBKEY=""
             FILES=$(git diff --name-only "$RANGE")
-            if printf '%s\n' "$FILES" \
-              | grep -qE '^(crates/|desktop/|mobile/|migrations/|scripts/|\.github/workflows/)'; then
-              OWNERS="${OWNERS}${CODER_NAME} "
+            # One pass over .buzz/routing.json: the implementer whose branch
+            # pattern claims the head (first match wins; the validator keeps
+            # pubkeys distinct), and every implementer whose paths the diff
+            # touches — the latter for the reference note only.
+            while IFS= read -r IMPL; do
+              [ -n "$IMPL" ] || continue
+              PK=$(jq -r .pubkey <<<"$IMPL")
+              if routing_matches_any "$FILES" "$(jq -r '.paths[]' <<<"$IMPL")"; then
+                OWNERS="${OWNERS}$(label_for "$PK") "
+              fi
+              if [ -z "$SCOPE_PUBKEY" ] && routing_matches_any "$HEAD_REF" "$(jq -r '.branches[]' <<<"$IMPL")"; then
+                SCOPE_PUBKEY="$PK"
+              fi
+            done < <(jq -c '.implementers[]' <<<"$ROUTING_JSON")
+            if [ -n "$SCOPE_PUBKEY" ]; then
+              SCOPE_NAMES="@$(label_for "$SCOPE_PUBKEY") "
+              SCOPE_MENTIONS=(--mention "$SCOPE_PUBKEY")
+              AUTHOR_LINE="Author: a coding agent — \`${HEAD_REF}\` is an implementer branch in .buzz/routing.json."
+            elif routing_matches_any "$HEAD_REF" "$(jq -r '.agent_branches[]' <<<"$ROUTING_JSON")"; then
+              # Stated, never guessed: the changed paths do not identify an
+              # author, and nobody is mentioned because nobody is known.
+              AUTHOR_LINE="Author: an unidentified coding agent — \`${HEAD_REF}\` matches an agent branch pattern that no implementer in .buzz/routing.json claims."
+            elif [ -n "$OWNERS" ]; then
+              AUTHOR_LINE="Author: the owner — \`${HEAD_REF}\` is not an agent branch. Path owner(s): ${OWNERS% } — named for reference, not assigned."
+            else
+              AUTHOR_LINE="Author: the owner — \`${HEAD_REF}\` is not an agent branch. No coding agent owns the changed paths."
             fi
-            case "$HEAD_REF" in
-              agent/*)
-                SCOPE_NAMES="@${CODER_NAME} "
-                SCOPE_MENTIONS=(--mention "$CODER_PUBKEY")
-                AUTHOR_LINE="Author: a coding agent — \`${HEAD_REF}\` is an \`agent/\` branch."
-                ;;
-              *)
-                if [ -n "$OWNERS" ]; then
-                  AUTHOR_LINE="Author: the owner — \`${HEAD_REF}\` is not an \`agent/\` branch. Path owner(s): ${OWNERS% } — named for reference, not assigned."
-                else
-                  AUTHOR_LINE="Author: the owner — \`${HEAD_REF}\` is not an \`agent/\` branch. No coding agent owns the changed paths."
-                fi
-                ;;
-            esac
-            # Explicit: `grep -q` returning 1 is the ordinary "no match" answer,
-            # and the default `bash -e` shell would treat a trailing non-zero as
-            # a job failure.
+            # Explicit: the default `bash -e` shell would treat a trailing
+            # non-zero from the last test above as a job failure.
             return 0
           }
 
@@ -1048,6 +1130,15 @@ jobs:
             if [ "$COUNT" -gt 25 ]; then
               printf '…and %s more files\n' "$((COUNT - 25))"
             fi
+          }
+
+          participants_line() {
+            local P IMPLS=""
+            for P in $(jq -r '.implementers[].pubkey' <<<"$ROUTING_JSON"); do
+              IMPLS="${IMPLS}$(label_for "$P"), "
+            done
+            printf 'Participants: owner %s · reviewer %s · implementer(s) %s' \
+              "$(label_for "$OWNER_PUBKEY")" "$(label_for "$REVIEWER_PUBKEY")" "${IMPLS%, }"
           }
 
           seed_card() {
@@ -1061,6 +1152,11 @@ jobs:
             # reviewer, not by anything enforceable here — see the Author-line
             # note above route_scope and docs/pr-review-routing.md.
             printf '%s\n' "$AUTHOR_LINE"
+            # Display names as of this card, from the routed identities'
+            # profiles — so a reader (human or agent) has the exact label a
+            # mention needs, without an `@` that would p-tag anyone. Display
+            # only, like the Author line: the routed KEYS are what CI mentions.
+            printf '%s\n' "$(participants_line)"
             printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
             printf '```\n%s\n```\n' "$(diff_files)"
             if [ -n "$PR_BODY" ]; then
@@ -1102,10 +1198,10 @@ jobs:
               printf '\nThis card is a late record of a pull request that is already closed. No review is being requested.\n'
               return 0
             fi
-            printf '\n@%s please review.\n' "$REVIEWER_NAME"
+            printf '\n@%s please review.\n' "$(label_for "$REVIEWER_PUBKEY")"
             if [ -n "$SCOPE_NAMES" ]; then
               printf '\n%s— your pull request. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
-                "$SCOPE_NAMES" "$REVIEWER_NAME"
+                "$SCOPE_NAMES" "$(label_for "$REVIEWER_PUBKEY")"
             fi
           }
 
@@ -1122,7 +1218,7 @@ jobs:
             # deleted — a soft-delete can strand a searchable-but-unwritable
             # discovery ghost.
             local CH="$1" P
-            for P in "$OWNER_PUBKEY" "$REVIEWER_PUBKEY" "$CODER_PUBKEY"; do
+            for P in $(routing_pubkeys); do
               if ! buzz channels add-member --channel "$CH" --pubkey "$P"; then
                 echo "add-member failed for $P — job fails; the rerun resumes this partial channel" >&2
                 return 1
@@ -1242,7 +1338,7 @@ jobs:
                 echo no; return 0   # walked past the start of history
               fi
               MATCH=0
-              printf '%s' "$PAGE" | jq -e --arg ci "$CI_PUB" --arg p "$CODER_PUBKEY" \
+              printf '%s' "$PAGE" | jq -e --arg ci "$CI_PUB" --arg p "$SCOPE_PUBKEY" \
                 '[(.messages? // .)[]? | select(.pubkey == $ci) |
                   select((.tags // [])[]? | select(.[0] == "p" and .[1] == $p))] | length > 0' \
                 >/dev/null || MATCH=$?
@@ -1847,7 +1943,7 @@ jobs:
             # The clock is read with the same 5s allowance as PUSHED_AT, so a
             # reply stamped a moment before this run's clock counts as one.
             REQUESTED_AT=$(( $(date +%s) - 5 ))
-            if ! printf '@%s %s\n' "$REVIEWER_NAME" "$SUMMARY_REQUEST_TAIL" \
+            if ! printf '@%s %s\n' "$(label_for "$REVIEWER_PUBKEY")" "$SUMMARY_REQUEST_TAIL" \
                 | buzz messages send --channel "$CH" --content - --mention "$REVIEWER_PUBKEY"; then
               echo "the review-summary request was rejected — failing so the rerun re-probes and re-asks" >&2
               return 1
@@ -2543,7 +2639,7 @@ jobs:
                   [ "$ALREADY" = no ] && CODER_UNTAGGED=yes
                 fi
                 SYNC_MENTIONS=()
-                [ "$CODER_UNTAGGED" = yes ] && SYNC_MENTIONS+=(--mention "$CODER_PUBKEY")
+                [ "$CODER_UNTAGGED" = yes ] && SYNC_MENTIONS+=(--mention "$SCOPE_PUBKEY")
                 # Resolution, provisioning and routing ran BEFORE the quiet
                 # window so a configuration fault fails fast; only the send
                 # waits. A newer push cancels this run during the sleep.
@@ -2565,10 +2661,10 @@ jobs:
                   printf '\n```\n%s\n```\n' "$(diff_files)"
                   if [ "$CODER_UNTAGGED" = yes ]; then
                     printf '\n%s— your pull request. Stand by for @%s'"'"'s review before starting work; this is a heads-up, not an assignment.\n' \
-                      "$SCOPE_NAMES" "$REVIEWER_NAME"
+                      "$SCOPE_NAMES" "$(label_for "$REVIEWER_PUBKEY")"
                   fi
                   if [ "$ACKED" = no ]; then
-                    printf '\n@%s please review this head. A review in progress on the previous head is stale.\n' "$REVIEWER_NAME"
+                    printf '\n@%s please review this head. A review in progress on the previous head is stale.\n' "$(label_for "$REVIEWER_PUBKEY")"
                   else
                     echo "reviewer already replied to ${HEAD_SHA:0:12} — posting the update without a reviewer mention" >&2
                   fi

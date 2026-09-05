@@ -30,6 +30,14 @@ pub const TEMPLATE_VERSION: u32 = 1;
 /// The provider-controlled inputs that shape what provision writes into the
 /// sprite. Field order is the canonical serialization order; adding a field
 /// is a deliberate act that must extend the mutation test below.
+///
+/// Two binaries compute this for the same sprite — the desktop's bundled
+/// sidecar and the waker's pinned release — and they must agree, or each
+/// deploy reprovisions what the other just wrote. The fork's desktop release
+/// (`.github/workflows/fork-desktop-release.yml`) therefore compares every
+/// *source-baked* input here (the template version, the `config.rs` pins, the
+/// embedded scripts) between `HEAD` and the pinned release before building;
+/// a new source-baked field must be added to that comparison too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProvisionTemplate {
     pub template_version: u32,

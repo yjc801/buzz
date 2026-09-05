@@ -5,8 +5,14 @@ SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz)
 HOST=$(rustc -vV | sed -n 's|host: ||p')
 TARGET=${1:-$HOST}
 if [[ "$TARGET" != *windows* ]]; then
-    SIDECARS+=(buzz-backend-kubernetes)
-    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
+    # Both remote-agent providers ship inside the app. buzz-backend-sprites in
+    # particular must be the build artifact, never a copy discovered on the
+    # host: desktop/src-tauri/provider-digests.json pins the release the
+    # waker runs, and a hand-built ~/.local/bin copy with older adapter pins
+    # flip-flops every sprite's provision fingerprint against it
+    # (docs/waker-provider-digest-gap.md).
+    SIDECARS+=(buzz-backend-kubernetes buzz-backend-sprites)
+    BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-backend-sprites -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
 else
     BUILD_HINT="cargo build --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli"
 fi

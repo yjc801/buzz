@@ -122,6 +122,52 @@ jobs:
           fi
           echo "All six signing credentials present."
 
+      # The app ships buzz-backend-sprites as a sidecar built from this commit
+      # (a build artifact, not a file discovered on the host — a hand-built
+      # ~/.local/bin copy is exactly what went stale), while the remote-wake
+      # daemon runs the provider release pinned in provider-digests.json. Both
+      # provision the same sprites, and the provision fingerprint
+      # (crates/buzz-backend-sprites/src/intent.rs, ProvisionTemplate) is a
+      # function of source-baked inputs: the template version, the adapter and
+      # sprig pins, and the embedded launcher/probe/workspace scripts. If those
+      # differ between this commit and the pinned release, every desktop deploy
+      # and every wake reprovisions the sprite back and forth — on 2026-09-05
+      # the desktop's stale copy pinned adapter 0.64.0 against the waker's
+      # 0.73.0. So refuse to cut a desktop that would do that. The fix is
+      # never to loosen this: tag a buzz-backend-sprites release from this
+      # source, then bump Dockerfile.waker and provider-digests.json together.
+      - name: Refuse a provider that disagrees with the waker's pinned release
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          TAG=$(node -p "require('./desktop/src-tauri/provider-digests.json').sprites.release")
+          [[ "$TAG" == buzz-backend-sprites-v* ]] || { echo "::error::provider-digests.json names no sprites release"; exit 1; }
+          git fetch --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          # Everything ProvisionTemplate hashes that comes from source rather
+          # than from the deploy request. Each grep must hit exactly once, so
+          # a renamed constant fails here instead of comparing two blanks.
+          provision_inputs() {
+            local rev=$1 crate=crates/buzz-backend-sprites/src
+            git show "${rev}:${crate}/intent.rs" | grep -cE '^pub const TEMPLATE_VERSION:' | grep -qx 1
+            git show "${rev}:${crate}/intent.rs" | grep -E '^pub const TEMPLATE_VERSION:'
+            for const in DEFAULT_SPRIG_VERSION CLAUDE_ADAPTER_VERSION CODEX_ADAPTER_VERSION; do
+              git show "${rev}:${crate}/config.rs" | grep -cE "^pub const ${const}:" | grep -qx 1
+              git show "${rev}:${crate}/config.rs" | grep -E "^pub const ${const}:"
+            done
+            for asset in launcher.sh probe.sh workspace.sh; do
+              printf '%s ' "$asset"
+              git show "${rev}:${crate}/assets/${asset}" | shasum -a 256 | cut -d' ' -f1
+            done
+          }
+          provision_inputs "$TAG" > "$RUNNER_TEMP/provision-release.txt"
+          provision_inputs HEAD > "$RUNNER_TEMP/provision-head.txt"
+          if ! diff "$RUNNER_TEMP/provision-release.txt" "$RUNNER_TEMP/provision-head.txt"; then
+            echo "::error::crates/buzz-backend-sprites at HEAD would provision sprites differently from ${TAG}, which the waker runs. Cut a new buzz-backend-sprites release from this source and bump Dockerfile.waker + desktop/src-tauri/provider-digests.json together before releasing the desktop (docs/waker-provider-digest-gap.md)."
+            exit 1
+          fi
+          echo "Provider provisioning inputs at HEAD match ${TAG}:"
+          cat "$RUNNER_TEMP/provision-head.txt"
+
       # Stamped here and reported at the end, because the run-level timestamps
       # from the API are not settled for a minute or so after a run finishes —
       # reading them immediately returns a completion time of 00:00:00.
@@ -208,11 +254,15 @@ jobs:
       # fails at runtime with "ACP harness command `buzz-acp` was not found"
       # the first time anyone starts a local agent. bundle-sidecars.sh hard-
       # fails on a missing binary, so this must run before the Tauri build.
+      #
+      # buzz-backend-sprites is built here too, so the provider the app deploys
+      # sprites through is this commit's — not whatever `cargo build` output
+      # happened to sit in ~/.local/bin on the machine running the app.
       - name: Build sidecars
         if: steps.freshness.outputs.build == 'true'
         run: |
           cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes \
-            -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+            -p buzz-backend-sprites -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
 
       # Signed and notarized with THIS fork's Developer ID, under the Waggle
@@ -292,13 +342,34 @@ jobs:
         run: |
           set -euo pipefail
           APP=desktop/src-tauri/target/release/bundle/macos/Waggle.app/Contents/MacOS
-          for bin in buzz-acp buzz-agent buzz buzz-dev-mcp; do
+          for bin in buzz-acp buzz-agent buzz buzz-dev-mcp buzz-backend-kubernetes buzz-backend-sprites; do
             if [[ ! -s "$APP/$bin" ]]; then
               echo "::error::sidecar $bin missing or empty in the bundle"
               exit 1
             fi
             echo "ok: $bin ($(stat -f%z "$APP/$bin") bytes)"
           done
+
+      # Present is not enough: the sprites sidecar must be what provider
+      # discovery selects and what the deploy protocol can talk to. Drive it
+      # the way buzz-provider-deploy does — a JSON request on stdin — and
+      # check it identifies itself as the `sprites` provider the app issues
+      # launch bundles for.
+      - name: Verify the bundled sprites provider answers
+        if: steps.freshness.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          APP=desktop/src-tauri/target/release/bundle/macos/Waggle.app/Contents/MacOS
+          [[ -x "$APP/buzz-backend-sprites" ]] || { echo "::error::bundled buzz-backend-sprites is not executable"; exit 1; }
+          INFO=$(printf '{"op":"info"}' | "$APP/buzz-backend-sprites")
+          node -e '
+            const info = JSON.parse(process.argv[1]);
+            if (info.ok !== true || info.name !== "sprites") {
+              console.error("::error::bundled provider did not answer as sprites: " + process.argv[1]);
+              process.exit(1);
+            }
+            console.log(`ok: buzz-backend-sprites ${info.version} (protocol ${info.protocol_version})`);
+          ' "$INFO"
 
       # The preflight proves the secrets EXIST. This proves they worked. A wrong
       # or expired certificate, or a Tauri version that skips signing instead of

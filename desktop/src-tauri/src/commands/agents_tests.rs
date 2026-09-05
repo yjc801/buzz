@@ -663,6 +663,105 @@ fn tauri_platform_configs_bundle_kubernetes_only_on_supported_hosts() {
     }
 }
 
+/// The sprites provider ships inside the app on every host that bundles the
+/// Kubernetes provider — a build artifact, not a file discovered on the
+/// host. Before this, a desktop deploy resolved a hand-built
+/// `~/.local/bin/buzz-backend-sprites` that still pinned adapter 0.64.0
+/// after the tree and the waker's release (`provider-digests.json`) had moved
+/// to 0.73.0, so desktop deploys and remote wakes reprovisioned every sprite
+/// back and forth (docs/waker-provider-digest-gap.md). Discovery scans the
+/// bundle directory first, so bundling is what makes the app's own provider
+/// win. The externalBin entry must carry the bare `buzz-backend-<id>` name
+/// discovery derives the provider id from — the id this app issues launch
+/// bundles for.
+#[test]
+fn tauri_platform_configs_bundle_the_sprites_provider_wherever_kubernetes_is_bundled() {
+    use tauri_utils::{config::parse::read_from, platform::Target};
+
+    let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (target, expected) in [
+        (Target::MacOS, true),
+        (Target::Linux, true),
+        (Target::Windows, false),
+    ] {
+        let (config, paths) = read_from(target, config_root).expect("read Tauri config");
+        let external_bins = config["bundle"]["externalBin"]
+            .as_array()
+            .expect("bundle.externalBin array");
+        let has_sprites = external_bins
+            .iter()
+            .any(|value| value == "binaries/buzz-backend-sprites");
+        let has_kubernetes = external_bins
+            .iter()
+            .any(|value| value == "binaries/buzz-backend-kubernetes");
+        assert_eq!(
+            has_sprites, expected,
+            "unexpected sprites externalBin for {target}; merged {paths:?}"
+        );
+        assert_eq!(
+            has_sprites, has_kubernetes,
+            "sprites and kubernetes must ship on the same hosts for {target}; merged {paths:?}"
+        );
+    }
+
+    // Tauri copies a sidecar into Contents/MacOS under the externalBin
+    // entry's basename, discovery strips `buzz-backend-` from that to get the
+    // provider id, and `provider_digests_for` says which ids a launch bundle
+    // can authorize. Of everything the macOS app bundles, exactly one sidecar
+    // must be a provider the manifest authorizes — and it must be sprites.
+    let (macos, _) = read_from(Target::MacOS, config_root).expect("read Tauri config");
+    let authorized: Vec<&str> = macos["bundle"]["externalBin"]
+        .as_array()
+        .expect("bundle.externalBin array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|entry| std::path::Path::new(entry).file_name())
+        .filter_map(std::ffi::OsStr::to_str)
+        .filter_map(|name| name.strip_prefix("buzz-backend-"))
+        .filter(|id| crate::managed_agents::waker_bundle::provider_digests_for(id).is_ok())
+        .collect();
+    assert_eq!(
+        authorized,
+        vec!["sprites"],
+        "the bundled provider must be the one provider-digests.json authorizes"
+    );
+}
+
+/// The fork's platform overlays replace `bundle.externalBin` wholesale —
+/// JSON merge patch has no array append — so a sidecar upstream adds to
+/// `tauri.conf.json` would silently vanish from the fork's macOS and Linux
+/// bundles unless the overlays are updated with it. Fail here instead of
+/// shipping an app missing a binary it expects at runtime.
+#[test]
+fn fork_platform_overlays_keep_every_upstream_sidecar() {
+    use tauri_utils::{config::parse::read_from, platform::Target};
+
+    let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let base: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config_root.join("tauri.conf.json"))
+            .expect("read base Tauri config"),
+    )
+    .expect("parse base Tauri config");
+    let base_bins = base["bundle"]["externalBin"]
+        .as_array()
+        .expect("base bundle.externalBin array");
+    assert!(!base_bins.is_empty(), "upstream lists sidecars");
+
+    for target in [Target::MacOS, Target::Linux] {
+        let (merged, paths) = read_from(target, config_root).expect("read Tauri config");
+        let merged_bins = merged["bundle"]["externalBin"]
+            .as_array()
+            .expect("merged bundle.externalBin array");
+        for bin in base_bins {
+            assert!(
+                merged_bins.contains(bin),
+                "{target} overlay drops upstream sidecar {bin}; add it to the overlay \
+                 in {paths:?} (docs/fork-branding.md)"
+            );
+        }
+    }
+}
+
 #[test]
 fn current_build_deploy_payload_forwards_compiled_policy() {
     use crate::managed_agents::{BackendKind, RespondTo};

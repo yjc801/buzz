@@ -25,10 +25,13 @@ import { invalidateChannelMembersRosters } from "@/features/channels/rosterFresh
 import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
 import { removeChannelMember } from "@/shared/api/tauri";
+import { revalidateRelayAgents } from "@/shared/api/tauriRelayAgents";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
+  type AgentChannelRemovalReport,
   deleteManagedAgentWithRules,
   isManagedAgentActive,
+  removeAgentFromChannelsWithReport,
   respawnManagedAgentWithRules,
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
@@ -335,23 +338,21 @@ export function useManagedAgentActions() {
     }
   }
 
-  function getAgentChannelIds(pubkey: string): string[] {
-    const normalized = normalizePubkey(pubkey);
-    const relayAgent = (relayAgentsQuery.data ?? []).find(
-      (ra) => normalizePubkey(ra.pubkey) === normalized,
-    );
-    return relayAgent?.channelIds ?? [];
-  }
-
-  async function removeAgentFromAllChannels(pubkey: string) {
-    const channelIds = getAgentChannelIds(pubkey);
-    if (channelIds.length === 0) return;
-    await Promise.allSettled(
-      channelIds.map((channelId) => removeChannelMember(channelId, pubkey)),
-    );
+  async function removeAgentFromAllChannels(
+    pubkey: string,
+    channels: readonly Channel[],
+  ): Promise<AgentChannelRemovalReport> {
+    const report = await removeAgentFromChannelsWithReport({
+      agentPubkey: pubkey,
+      channels,
+      relayAgents: relayAgentsQuery.data ?? [],
+      revalidateRelayAgents,
+      removeChannelMember,
+    });
     // Direct writes bypass the member mutations' invalidation; without this,
     // the deleted agent stays in cached rosters for the freshness window.
-    await invalidateChannelMembersRosters(queryClient, channelIds);
+    await invalidateChannelMembersRosters(queryClient, report.channelIds);
+    return report;
   }
 
   async function handleDelete(pubkey: string) {
@@ -366,9 +367,13 @@ export function useManagedAgentActions() {
         deleteManagedAgent: deleteMutation.mutateAsync,
         getAvailability,
         relayAgents: relayAgentsQuery.data ?? [],
+        removeFromChannels: (agentPubkey) =>
+          removeAgentFromAllChannels(agentPubkey, channels),
       });
       if (result.cancelled) return;
-      await removeAgentFromAllChannels(pubkey);
+      if (result.noticeMessage) {
+        setActionNoticeMessage(result.noticeMessage);
+      }
       if (logAgentPubkey === pubkey) {
         setLogAgentPubkey(null);
       }

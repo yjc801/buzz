@@ -112,6 +112,9 @@ function setup() {
     ["send_channel_message", () => ({ event_id: "event", created_at: 0 })],
     ["list_managed_agents", () => []],
     ["get_relay_agents", () => []],
+    // Delete resolves the agent's channels fresh from the relay before
+    // leaving them; an empty answer means "no channels to leave".
+    ["revalidate_relay_agents", () => []],
     ["list_available_acp_runtimes", () => []],
     ["get_channels", () => []],
     ["plugin:event|listen", () => 1],
@@ -238,12 +241,14 @@ for (const owner of ["agents", "profile"]) {
         else await surface.current().deleteManagedAgentRecord(agent);
       });
       const shouldShutdown = scenario !== "offline" && scenario !== "missing";
+      // Channels are left before the record is dropped: a refused removal
+      // then leaves the record in place so the delete can be retried.
       assert.deepEqual(
         effects().map(([name]) => name),
         [
           ...(shouldShutdown ? ["send_channel_message"] : []),
-          "delete_managed_agent",
           "remove_channel_member",
+          "delete_managed_agent",
         ],
       );
       if (shouldShutdown) {
@@ -424,9 +429,11 @@ test("Agents deletion rechecks availability after channel discovery, not the cli
     });
     await operation;
   });
+  // Membership is left BEFORE the record is dropped, so a refused removal can
+  // be retried by deleting again while the record still exists.
   assert.deepEqual(
     effects().map(([name]) => name),
-    ["send_channel_message", "delete_managed_agent", "remove_channel_member"],
+    ["send_channel_message", "remove_channel_member", "delete_managed_agent"],
   );
   assert.match(confirms[0], /availability is unknown/);
 });

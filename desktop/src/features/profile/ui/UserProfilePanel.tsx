@@ -508,6 +508,9 @@ export function UserProfilePanel({
       const result = await deleteManagedAgentRecord(managedAgent);
       if (result.cancelled) return;
 
+      if (result.noticeMessage) {
+        toast.warning(result.noticeMessage);
+      }
       toast.success(`Deleted ${managedAgent.name}.`);
       onClose();
     } catch (error) {
@@ -567,6 +570,9 @@ export function UserProfilePanel({
         const deletedInstances =
           await deleteManagedAgentsForPersona(resolvedPersona);
         if (deletedInstances.cancelled) return;
+        if (deletedInstances.noticeMessage) {
+          toast.warning(deletedInstances.noticeMessage);
+        }
 
         await setPersonaActiveMutation.mutateAsync({
           id: resolvedPersona.id,

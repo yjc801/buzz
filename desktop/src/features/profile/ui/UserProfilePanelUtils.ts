@@ -8,7 +8,7 @@ import type {
   RelayAgent,
   UpdateManagedAgentInput,
 } from "@/shared/api/types";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 
 export { truncatePubkey };
 
@@ -150,17 +150,6 @@ export function deriveProfileChannels(
   return [...links.values()].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
-}
-
-export function getRelayAgentChannelIds(
-  relayAgents: readonly RelayAgent[] | undefined,
-  agentPubkey: string,
-): string[] {
-  const normalized = normalizePubkey(agentPubkey);
-  const agent = (relayAgents ?? []).find(
-    (candidate) => normalizePubkey(candidate.pubkey) === normalized,
-  );
-  return agent?.channelIds ?? [];
 }
 
 export function buildPersonaDraftProfile(persona: AgentPersona): Profile {

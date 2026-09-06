@@ -308,6 +308,18 @@ with a TypeScript lookup table or an id comparison in a component.
 
 17. **Databricks model discovery has one shared catalog authority.** Desktop and ACP call the shared `buzz-agent` discovery library; Desktop passes the effective merged `DATABRICKS_MODEL_FILTER` explicitly, and the library applies it to raw workspace endpoint IDs and Unity Catalog model-service FQNs after the additive union. A successful filtered-empty catalog is authoritative: it stays empty, disables switching, and never falls through to configured or known-model fallback. UC FQNs are catalog data and always use the MLflow Chat Completions route, regardless of family-looking text in their components. Global Defaults preserves the discovered model ID as the selected value while its closed trigger renders the provider-scoped display label; do not force the raw persisted ID over that label.
 
+18. **Deleting an agent leaves its channels first, and never silently.**
+    Delete resolves the agent's channels from the fresh per-agent directory
+    lookup (every kind:39002 roster on the relay) unioned with the cached
+    directory and the viewer's channel list, removes it from each channel
+    before the record is dropped, and turns any refused removal or failed
+    lookup into a confirm that names the channels. A retired identity left
+    in a roster keeps appearing in member lists and mention pickers on every
+    client; upstream mobile binds `@Name` to whichever same-name member
+    joined first, so a stale twin silently captures mentions meant for the
+    live agent. See `lib/managedAgentControlActions.ts`
+    (`removeAgentFromChannelsWithReport`, `deleteManagedAgentWithRules`).
+
 ## Channel-only runtime controls
 
 Desktop observer controls identify a channel, not a thread session. The harness

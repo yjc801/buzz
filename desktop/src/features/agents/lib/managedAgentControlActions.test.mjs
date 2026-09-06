@@ -3,10 +3,13 @@ import test from "node:test";
 
 import {
   deleteManagedAgentWithRules,
+  describeAgentChannelRemovalReport,
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
   isManagedAgentLive,
   mapWithConcurrency,
+  removeAgentFromChannelsWithReport,
+  resolveAgentChannelIdsForRemoval,
   resolveManagedAgentChannelId,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
@@ -693,4 +696,240 @@ test("an agent that never deployed anywhere deletes without forcing", async () =
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].forceRemoteDelete, undefined);
+});
+
+// --- Leaving channels on delete -------------------------------------------
+//
+// A retired identity left in a roster keeps appearing in member lists and
+// mention pickers on every client. Upstream mobile binds "@Name" to whichever
+// same-name member joined first, so a stale twin silently captures mentions
+// meant for the live agent. Delete therefore resolves membership fresh,
+// leaves every channel before the record is dropped, and never reports a
+// refusal as success.
+
+const CHANNEL_CACHED = "11111111-1111-4111-8111-111111111111";
+const CHANNEL_LISTED = "22222222-2222-4222-8222-222222222222";
+const CHANNEL_FRESH = "33333333-3333-4333-8333-333333333333";
+
+function relayAgent(pubkey, channelIds) {
+  return {
+    pubkey,
+    ownerPubkey: null,
+    name: "Mesh Agent",
+    agentType: "acp",
+    channels: [],
+    channelIds,
+    capabilities: [],
+    status: "unknown",
+    respondTo: null,
+    respondToAllowlist: [],
+  };
+}
+
+function channelWithMembers(id, name, memberPubkeys) {
+  return { id, name, memberPubkeys };
+}
+
+/** Like `withConfirm`, but holds the stub across the awaits before the prompt. */
+async function withConfirmAsync(answer, body) {
+  const previous = globalThis.window;
+  globalThis.window = { confirm: () => answer };
+  try {
+    return await body();
+  } finally {
+    if (previous === undefined) delete globalThis.window;
+    else globalThis.window = previous;
+  }
+}
+
+const cleanRemoval = (channelIds) => ({
+  channelIds,
+  removed: channelIds,
+  failed: [],
+  lookupError: null,
+});
+
+test("removal resolves channels from the fresh lookup, the cache, and the channel list", async () => {
+  const pubkey = agent().pubkey;
+  const requested = [];
+  const { channelIds, lookupError } = await resolveAgentChannelIdsForRemoval({
+    agentPubkey: pubkey,
+    channels: [
+      channelWithMembers(CHANNEL_LISTED, "release", [pubkey.toUpperCase()]),
+      channelWithMembers("someone-elses", "other", ["c".repeat(64)]),
+    ],
+    relayAgents: [
+      relayAgent(pubkey, [CHANNEL_CACHED]),
+      relayAgent("f".repeat(64), ["not-this-agent"]),
+    ],
+    revalidateRelayAgents: async (pubkeys) => {
+      requested.push(pubkeys);
+      return [relayAgent(pubkey, [CHANNEL_FRESH, CHANNEL_CACHED])];
+    },
+  });
+  assert.deepEqual(requested, [[pubkey]]);
+  assert.deepEqual(
+    [...channelIds].sort(),
+    [CHANNEL_CACHED, CHANNEL_LISTED, CHANNEL_FRESH].sort(),
+  );
+  assert.equal(lookupError, null);
+});
+
+test("a failed fresh lookup is reported while the cached channels are still left", async () => {
+  const pubkey = agent().pubkey;
+  const removed = [];
+  const report = await removeAgentFromChannelsWithReport({
+    agentPubkey: pubkey,
+    channels: [],
+    relayAgents: [relayAgent(pubkey, [CHANNEL_CACHED])],
+    revalidateRelayAgents: async () => {
+      throw new Error("relay unreachable");
+    },
+    removeChannelMember: async (channelId, target) => {
+      removed.push([channelId, target]);
+    },
+  });
+  assert.deepEqual(removed, [[CHANNEL_CACHED, pubkey]]);
+  assert.deepEqual(report.removed, [CHANNEL_CACHED]);
+  assert.deepEqual(report.failed, []);
+  assert.equal(report.lookupError, "relay unreachable");
+});
+
+test("a refused removal is reported for its channel instead of thrown", async () => {
+  const pubkey = agent().pubkey;
+  const report = await removeAgentFromChannelsWithReport({
+    agentPubkey: pubkey,
+    channels: [channelWithMembers(CHANNEL_LISTED, "release", [pubkey])],
+    relayAgents: [relayAgent(pubkey, [CHANNEL_CACHED])],
+    revalidateRelayAgents: async () => [],
+    removeChannelMember: async (channelId) => {
+      if (channelId === CHANNEL_LISTED) {
+        throw new Error("actor not authorized");
+      }
+    },
+  });
+  assert.deepEqual(report.removed, [CHANNEL_CACHED]);
+  assert.deepEqual(report.failed, [
+    { channelId: CHANNEL_LISTED, error: "actor not authorized" },
+  ]);
+  assert.equal(report.lookupError, null);
+});
+
+test("deleting leaves the agent's channels before the record is dropped", async () => {
+  const order = [];
+  const result = await deleteManagedAgentWithRules({
+    agent: agent(),
+    channels: [],
+    deleteManagedAgent: async () => {
+      order.push("delete");
+    },
+    relayAgents: [],
+    removeFromChannels: async (pubkey) => {
+      assert.equal(pubkey, agent().pubkey);
+      order.push("remove");
+      return cleanRemoval([CHANNEL_CACHED]);
+    },
+  });
+  assert.deepEqual(order, ["remove", "delete"]);
+  assert.deepEqual(result, {});
+});
+
+test("a channel the agent could not leave blocks the delete until the user accepts it", async () => {
+  const leftover = {
+    channelIds: [CHANNEL_LISTED],
+    removed: [],
+    failed: [{ channelId: CHANNEL_LISTED, error: "actor not authorized" }],
+    lookupError: null,
+  };
+  const channels = [channelWithMembers(CHANNEL_LISTED, "release", [])];
+
+  const declined = [];
+  const declinedResult = await withConfirmAsync(false, () =>
+    deleteManagedAgentWithRules({
+      agent: agent(),
+      channels,
+      deleteManagedAgent: async (args) => {
+        declined.push(args);
+      },
+      relayAgents: [],
+      removeFromChannels: async () => leftover,
+    }),
+  );
+  assert.deepEqual(declinedResult, { cancelled: true });
+  assert.equal(
+    declined.length,
+    0,
+    "the record survives so the delete can be retried",
+  );
+
+  const accepted = [];
+  const acceptedResult = await withConfirmAsync(true, () =>
+    deleteManagedAgentWithRules({
+      agent: agent(),
+      channels,
+      deleteManagedAgent: async (args) => {
+        accepted.push(args);
+      },
+      relayAgents: [],
+      removeFromChannels: async () => leftover,
+    }),
+  );
+  assert.equal(accepted.length, 1);
+  assert.match(acceptedResult.noticeMessage, /#release/);
+  assert.match(acceptedResult.noticeMessage, /actor not authorized/);
+});
+
+test("a failed membership lookup is a decision too, never a silent success", async () => {
+  const calls = [];
+  const result = await withConfirmAsync(false, () =>
+    deleteManagedAgentWithRules({
+      agent: agent(),
+      channels: [],
+      deleteManagedAgent: async (args) => {
+        calls.push(args);
+      },
+      relayAgents: [],
+      removeFromChannels: async () => ({
+        channelIds: [CHANNEL_CACHED],
+        removed: [CHANNEL_CACHED],
+        failed: [],
+        lookupError: "relay unreachable",
+      }),
+    }),
+  );
+  assert.deepEqual(result, { cancelled: true });
+  assert.equal(calls.length, 0);
+});
+
+test("the removal account is silent on a clean removal and names channels otherwise", () => {
+  assert.equal(
+    describeAgentChannelRemovalReport(
+      cleanRemoval([CHANNEL_CACHED]),
+      [],
+      "Eric",
+    ),
+    null,
+  );
+  const text = describeAgentChannelRemovalReport(
+    {
+      channelIds: [CHANNEL_LISTED, CHANNEL_FRESH],
+      removed: [],
+      failed: [
+        { channelId: CHANNEL_LISTED, error: "actor not authorized" },
+        { channelId: CHANNEL_FRESH, error: "actor not authorized" },
+      ],
+      lookupError: "relay unreachable",
+    },
+    [channelWithMembers(CHANNEL_LISTED, "release", [])],
+    "Eric",
+  );
+  assert.match(
+    text,
+    /could not remove Eric from #release, 33333333-3333-4333-8333-333333333333 \(actor not authorized\)/,
+  );
+  assert.match(
+    text,
+    /could not confirm every channel Eric belongs to \(relay unreachable\)/,
+  );
+  assert.match(text, /mention pickers/);
 });

@@ -33,6 +33,31 @@ export type ManagedAgentActionResult = {
   noticeMessage?: string;
 };
 
+type RemoveChannelMember = (
+  channelId: string,
+  pubkey: string,
+) => Promise<unknown>;
+type RevalidateRelayAgents = (
+  pubkeys: string[],
+) => Promise<readonly RelayAgent[]>;
+
+/// What removing a deleted agent from its channels actually achieved.
+export type AgentChannelRemovalReport = {
+  /** Every channel the agent was found in, across all sources, deduplicated. */
+  channelIds: string[];
+  removed: string[];
+  failed: Array<{ channelId: string; error: string }>;
+  /**
+   * The authoritative membership lookup failed. The cached sources were still
+   * used, but a channel joined after the cache was built may be missing.
+   */
+  lookupError: string | null;
+};
+
+export type RemoveAgentFromChannels = (
+  agentPubkey: string,
+) => Promise<AgentChannelRemovalReport>;
+
 /// Control-plane axis: does the agent's *infrastructure* exist?
 ///
 /// For a provider agent `deployed` means a deploy returned a
@@ -326,6 +351,133 @@ export async function mapWithConcurrency<T, R>(
   return results;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/// Every channel a managed agent belongs to, resolved at delete time.
+///
+/// Three sources are unioned. The cached relay directory and the channel
+/// list are cheap but lag: the directory query may predate the agent's
+/// newest membership, and the channel list only covers channels the viewer
+/// is in. The fresh per-agent directory lookup derives membership from every
+/// kind:39002 roster on the relay, so a channel the agent joined after the
+/// cache was built is still found. A failed lookup is reported, never
+/// swallowed, because the union is then only as complete as the cache.
+export async function resolveAgentChannelIdsForRemoval({
+  agentPubkey,
+  channels,
+  relayAgents,
+  revalidateRelayAgents,
+}: {
+  agentPubkey: string;
+  channels: readonly Channel[];
+  relayAgents: readonly RelayAgent[];
+  revalidateRelayAgents: RevalidateRelayAgents;
+}): Promise<{ channelIds: string[]; lookupError: string | null }> {
+  const normalized = normalizePubkey(agentPubkey);
+  const channelIds = new Set<string>();
+  const addFrom = (agents: readonly RelayAgent[]) => {
+    for (const relayAgent of agents) {
+      if (normalizePubkey(relayAgent.pubkey) !== normalized) continue;
+      for (const channelId of relayAgent.channelIds) {
+        channelIds.add(channelId);
+      }
+    }
+  };
+  addFrom(relayAgents);
+  for (const channel of channels) {
+    if (
+      channel.memberPubkeys.some(
+        (memberPubkey) => normalizePubkey(memberPubkey) === normalized,
+      )
+    ) {
+      channelIds.add(channel.id);
+    }
+  }
+  let lookupError: string | null = null;
+  try {
+    addFrom(await revalidateRelayAgents([agentPubkey]));
+  } catch (error) {
+    lookupError = errorMessage(error);
+  }
+  return { channelIds: [...channelIds], lookupError };
+}
+
+/// Remove a managed agent from every channel it belongs to, reporting per
+/// channel what did not land. Never throws: one relay refusal must not hide
+/// the other channels, and only the caller knows what a failure means.
+export async function removeAgentFromChannelsWithReport({
+  agentPubkey,
+  channels,
+  relayAgents,
+  revalidateRelayAgents,
+  removeChannelMember,
+}: {
+  agentPubkey: string;
+  channels: readonly Channel[];
+  relayAgents: readonly RelayAgent[];
+  revalidateRelayAgents: RevalidateRelayAgents;
+  removeChannelMember: RemoveChannelMember;
+}): Promise<AgentChannelRemovalReport> {
+  const { channelIds, lookupError } = await resolveAgentChannelIdsForRemoval({
+    agentPubkey,
+    channels,
+    relayAgents,
+    revalidateRelayAgents,
+  });
+  const results = await mapWithConcurrency(channelIds, 4, (channelId) =>
+    removeChannelMember(channelId, agentPubkey),
+  );
+  const removed: string[] = [];
+  const failed: AgentChannelRemovalReport["failed"] = [];
+  results.forEach((result, index) => {
+    const channelId = channelIds[index];
+    if ("error" in result) {
+      failed.push({ channelId, error: errorMessage(result.error) });
+    } else {
+      removed.push(channelId);
+    }
+  });
+  return { channelIds, removed, failed, lookupError };
+}
+
+/// The user-facing account of a removal that did not fully land, or null
+/// when every channel was left cleanly. Names channels where it can; a
+/// channel outside the viewer's list is identified by id.
+export function describeAgentChannelRemovalReport(
+  report: AgentChannelRemovalReport,
+  channels: readonly Channel[],
+  agentName: string,
+): string | null {
+  if (report.failed.length === 0 && report.lookupError === null) {
+    return null;
+  }
+  const nameById = new Map(
+    channels.map((channel) => [channel.id, channel.name.trim()]),
+  );
+  const parts: string[] = [];
+  if (report.failed.length > 0) {
+    const names = report.failed.map(({ channelId }) => {
+      const name = nameById.get(channelId);
+      return name ? `#${name}` : channelId;
+    });
+    const reasons = [...new Set(report.failed.map(({ error }) => error))];
+    parts.push(
+      `Buzz could not remove ${agentName} from ${names.join(", ")} (${reasons.join("; ")}).`,
+    );
+  }
+  if (report.lookupError !== null) {
+    parts.push(
+      `Buzz could not confirm every channel ${agentName} belongs to (${report.lookupError}).`,
+    );
+  }
+  parts.push(
+    "A retired identity left in a channel keeps appearing in its member list and mention pickers until it is removed.",
+  );
+  return parts.join(" ");
+}
+
 export async function stopManagedAgentWithRules({
   agent,
   channels,
@@ -366,10 +518,19 @@ export async function deleteManagedAgentWithRules({
   preferredChannelId,
   getAvailability,
   relayAgents,
+  removeFromChannels,
   skipRemoteDeleteConfirm = false,
 }: {
   agent: ManagedAgent;
   deleteManagedAgent: DeleteManagedAgent;
+  /**
+   * Removes the agent from every channel it belongs to BEFORE the record is
+   * deleted, and reports what did not land. A retired identity left in a
+   * roster keeps showing up in member lists and mention pickers on every
+   * client — mobile binds "@Name" to whichever same-name member joined
+   * first — so a failure here is the user's decision, never a silent success.
+   */
+  removeFromChannels?: RemoveAgentFromChannels;
   skipRemoteDeleteConfirm?: boolean;
 } & ManagedAgentActionContext): Promise<ManagedAgentActionResult> {
   if (agent.backend.type === "provider" && agent.backendAgentId) {
@@ -445,6 +606,26 @@ export async function deleteManagedAgentWithRules({
     }
   }
 
+  // Leave every channel while the record still exists, so a refusal can be
+  // retried by simply deleting again once the cause is fixed. The shutdown
+  // request above has already been published, so removal cannot cut it off.
+  let leftoverNotice: string | undefined;
+  if (removeFromChannels) {
+    const report = await removeFromChannels(agent.pubkey);
+    const leftover = describeAgentChannelRemovalReport(
+      report,
+      channels,
+      agent.name,
+    );
+    if (leftover) {
+      const confirmed = window.confirm(`${leftover} Delete the agent anyway?`);
+      if (!confirmed) {
+        return { cancelled: true };
+      }
+      leftoverNotice = leftover;
+    }
+  }
+
   const isDeployedRemote =
     agent.backend.type === "provider" && agent.backendAgentId;
   const hasResidualDeployment = agent.residualDeployments.length > 0;
@@ -454,5 +635,5 @@ export async function deleteManagedAgentWithRules({
       isDeployedRemote || hasResidualDeployment ? true : undefined,
   });
 
-  return {};
+  return leftoverNotice ? { noticeMessage: leftoverNotice } : {};
 }

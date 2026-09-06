@@ -339,20 +339,25 @@ fn expand_nostr_mentions(
     out
 }
 
-/// The alias receivers bind a rendered mention to: the profile's
-/// `display_name`, else its `name`, exactly as desktop and mobile match it —
-/// trimmed, internal spacing kept, a leading `@` kept (so a profile named
-/// `@alice` is written `@@alice`, which is the text those clients bind).
-/// Normalising it here would produce a label neither client associates with
-/// the tagged profile. `None` when no candidate can be embedded safely; the
-/// caller then labels by pubkey.
+/// The alias receivers bind a rendered mention to, exactly as the stricter
+/// receiver derives it. Mobile's profile label is `display_name ?? name`
+/// (`ProfileData.fromEvent` in `mobile/lib/shared/relay/nostr_models.dart`):
+/// a `display_name` that is present — even empty or unsafe — is the only
+/// alias it knows, and `name` is consulted only when `display_name` is
+/// absent or null. Desktop binds both, so following mobile's rule yields a
+/// label both receivers bind. The chosen alias is embedded verbatim: trimmed,
+/// internal spacing kept, a leading `@` kept (so a profile named `@alice` is
+/// written `@@alice`, which is the text the clients bind). `None` when that
+/// one alias cannot be embedded safely; the caller then labels by pubkey
+/// rather than publish a name-shaped label a receiver would not bind.
 fn profile_mention_label(profile: &serde_json::Value) -> Option<String> {
-    ["display_name", "name"].iter().find_map(|key| {
-        profile
-            .get(key)
-            .and_then(|value| value.as_str())
-            .and_then(safe_mention_label)
-    })
+    let primary = match profile.get("display_name") {
+        None | Some(serde_json::Value::Null) => profile.get("name"),
+        Some(display_name) => Some(display_name),
+    };
+    primary
+        .and_then(|value| value.as_str())
+        .and_then(safe_mention_label)
 }
 
 /// `raw` trimmed, when it is non-empty and free of control characters (a
@@ -1873,25 +1878,36 @@ mod tests {
     }
 
     #[test]
-    fn profile_mention_label_prefers_display_name_then_name_then_nothing() {
+    fn profile_mention_label_follows_the_mobile_receiver_display_name_or_else_name() {
+        // Mobile binds `display_name ?? name`: a present display_name is the
+        // only alias it knows, so an empty or unsafe one must not fall
+        // through to `name` — that would publish a label mobile never binds.
         assert_eq!(
             profile_mention_label(&json!({ "display_name": "Alice Smith", "name": "alice" }))
                 .as_deref(),
             Some("Alice Smith")
         );
         assert_eq!(
-            profile_mention_label(&json!({ "display_name": "", "name": "alice" })).as_deref(),
+            profile_mention_label(&json!({ "name": "alice" })).as_deref(),
             Some("alice")
         );
         assert_eq!(
-            profile_mention_label(&json!({ "display_name": "Ali\nce", "name": "alice" }))
-                .as_deref(),
+            profile_mention_label(&json!({ "display_name": null, "name": "alice" })).as_deref(),
             Some("alice")
         );
         assert_eq!(
-            profile_mention_label(&json!({ "display_name": "Ali\nce" })),
+            profile_mention_label(&json!({ "display_name": "", "name": "alice" })),
             None
         );
+        assert_eq!(
+            profile_mention_label(&json!({ "display_name": "   ", "name": "alice" })),
+            None
+        );
+        assert_eq!(
+            profile_mention_label(&json!({ "display_name": "Ali\nce", "name": "alice" })),
+            None
+        );
+        assert_eq!(profile_mention_label(&json!({ "name": "Ali\nce" })), None);
         assert_eq!(profile_mention_label(&json!({ "about": "no names" })), None);
     }
 
@@ -2391,13 +2407,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cmd_send_message_labels_npub_reference_by_hex_when_profile_has_no_name() {
+    async fn cmd_send_message_labels_npub_reference_by_hex_when_profile_has_no_safe_alias() {
+        // `display_name` present but empty: mobile's only alias is that empty
+        // string, so `name` must not be published in its place. Hex it is.
         let npub = npub_for(PK_VALID_A);
         let responses = std::collections::HashMap::from([
             (39002, roster_response(&[PK_VALID_A])),
             (
                 0,
-                profiles_response(&[(PK_VALID_A, json!({ "about": "no name set" }))]),
+                profiles_response(&[(
+                    PK_VALID_A,
+                    json!({ "display_name": "", "name": "alice", "about": "no usable label" }),
+                )]),
             ),
         ]);
         let (url, captured, _filters) = fake_send_relay_by_kind(responses).await;

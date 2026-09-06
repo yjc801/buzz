@@ -602,15 +602,37 @@ jobs:
           # script, so a malformed file fails here before any relay write
           # instead of degrading to a room with nobody in it. Nothing in the
           # file is a display name — see load_labels.
+          #
+          # BOOTSTRAP. The PR that introduces the file, and any PR opened
+          # before it merges, has a base branch with no routing at all. There
+          # is nothing reviewed to protect in that state — the rule above
+          # keeps a PR from overriding routing that exists, and none does —
+          # so the head's copy is used and the card says so. The exception
+          # is dead once the file is on the base branch, and can only come
+          # back through a merge that deletes it. Absence is decided by
+          # `cat-file -e` on a base ref proved present first: an unreachable
+          # base or an unreadable file is still a failure, never a fallback.
+          ROUTING_BOOTSTRAP=no
           load_routing() {
-            local RAW
+            local RAW REF
             if [ -n "${BUZZ_ROUTING_FILE:-}" ]; then
               RAW=$(cat "$BUZZ_ROUTING_FILE") || return 1
             elif [ -n "${BASE_REF:-}" ]; then
-              RAW=$(git show "origin/${BASE_REF}:.buzz/routing.json") || {
-                echo "could not read .buzz/routing.json from origin/${BASE_REF} — failing rather than guessing who this room is for" >&2
+              REF="origin/${BASE_REF}"
+              git rev-parse --verify --quiet "${REF}^{commit}" >/dev/null || {
+                echo "${REF} is not in this checkout — failing rather than guessing who this room is for" >&2
                 return 1
               }
+              if git cat-file -e "${REF}:.buzz/routing.json" 2>/dev/null; then
+                RAW=$(git show "${REF}:.buzz/routing.json") || {
+                  echo "could not read .buzz/routing.json from ${REF} — failing rather than guessing who this room is for" >&2
+                  return 1
+                }
+              else
+                echo "${REF} has no .buzz/routing.json yet — bootstrap: using this head's copy, stated on the card" >&2
+                RAW=$(cat .buzz/routing.json) || return 1
+                ROUTING_BOOTSTRAP=yes
+              fi
             else
               RAW=$(cat .buzz/routing.json) || return 1
             fi
@@ -1157,6 +1179,9 @@ jobs:
             # mention needs, without an `@` that would p-tag anyone. Display
             # only, like the Author line: the routed KEYS are what CI mentions.
             printf '%s\n' "$(participants_line)"
+            if [ "$ROUTING_BOOTSTRAP" = yes ]; then
+              printf 'Routing: read from this pull request'"'"'s own head — `%s` has no `.buzz/routing.json` yet. Display-only, like the Author line; the file is authoritative once it is on the base branch.\n' "$BASE_REF"
+            fi
             printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
             printf '```\n%s\n```\n' "$(diff_files)"
             if [ -n "$PR_BODY" ]; then

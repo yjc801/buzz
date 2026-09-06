@@ -720,6 +720,98 @@ check "the mirror should cite the routing contract doc" \
 check "docs/pr-review-routing.md should exist" \
   "$([ -f docs/pr-review-routing.md ]; echo $?)"
 
+# ===========================================================================
+# WHERE THE MIRROR READS ITS ROUTING FROM.
+#
+# `load_routing` is the trust boundary of the routing file: the mirror runs
+# from the PR's own head, so the file must come from the BASE branch, or a
+# PR could re-route its own review. The one exception is bootstrap — a base
+# with no file at all has nothing reviewed to protect, so the head's copy is
+# used and flagged — and it must stay narrow: an unreachable base or an
+# unreadable file is a failure, never a fallback. Extracted from the
+# workflow, not restated, so widening the exception fails here.
+echo "--- mirror: routing comes from the base branch, with a bootstrap exception no wider than 'absent'"
+
+"$REAL_PYTHON3" - "$MIRROR" > "$WORK/routing.sh" <<'ROUTINGPY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+try:
+    i = next(n for n, ln in enumerate(lines) if ln.strip() == "ROUTING_BOOTSTRAP=no")
+    f = next(n for n in range(i, len(lines)) if lines[n].strip() == "load_routing() {")
+    indent = lines[f][: len(lines[f]) - len(lines[f].lstrip())]
+    j = next(n for n in range(f + 1, len(lines)) if lines[n] == indent + "}")
+except StopIteration:
+    sys.exit("the load_routing definition was not found in " + sys.argv[1])
+sys.stdout.write("\n".join(ln[len(indent):] for ln in lines[i : j + 1]) + "\n")
+ROUTINGPY
+[ -s "$WORK/routing.sh" ] || { echo "load_routing extraction produced nothing" >&2; exit 2; }
+
+# A checkout with a HEAD copy of the file (a distinct reviewer, so the two
+# sources can be told apart) and the real validator at the path the workflow
+# calls; the base branch is a fake `git` serving a fixture or nothing.
+HEAD_REVIEWER=5555555555555555555555555555555555555555555555555555555555555555
+DRIVE_DIR="$WORK/checkout"
+mkdir -p "$DRIVE_DIR/.buzz" "$DRIVE_DIR/.github/scripts"
+cp .github/scripts/buzz-routing.sh "$DRIVE_DIR/.github/scripts/"
+printf '{"version":1,"owner":"%s","reviewer":"%s","agent_branches":[],"implementers":[]}\n' \
+  "$OWNER_PUB" "$HEAD_REVIEWER" > "$DRIVE_DIR/.buzz/routing.json"
+printf '{"version":1,"owner":"%s","reviewer":"%s","agent_branches":[],"implementers":[]}\n' \
+  "$OWNER_PUB" "$REVIEWER_PUB" > "$WORK/base-routing.json"
+printf '{"version":1,"owner":"nobody"}\n' > "$WORK/base-routing-invalid.json"
+export DRIVE_DIR
+
+cat > "$WORK/routing-drive.sh" <<'DRIVEEOF'
+set -uo pipefail
+cd "$DRIVE_DIR"
+git() {
+  case "$1 $2" in
+    "rev-parse --verify") [ "$FAKE_BASE_EXISTS" = yes ] ;;
+    "cat-file -e") [ -n "$FAKE_BASE_ROUTING" ] ;;
+    "show "*) [ -n "$FAKE_BASE_ROUTING" ] && cat "$FAKE_BASE_ROUTING" ;;
+    *) echo "fake git: unhandled: $*" >&2; return 9 ;;
+  esac
+}
+# shellcheck disable=SC1091
+. "$ROUTING_SH"
+RC=0; load_routing 2>/dev/null || RC=$?
+printf 'rc=%s\n' "$RC"
+printf 'bootstrap=%s\n' "$ROUTING_BOOTSTRAP"
+printf 'reviewer=%s\n' "${REVIEWER_PUBKEY:-}"
+DRIVEEOF
+
+load() { # load <base-exists yes|no> <base-routing-file-or-empty> [BASE_REF] [BUZZ_ROUTING_FILE]
+  FAKE_BASE_EXISTS="$1" FAKE_BASE_ROUTING="$2" BASE_REF="${3-main}" BUZZ_ROUTING_FILE="${4-}" \
+    ROUTING_SH="$WORK/routing.sh" bash "$WORK/routing-drive.sh"
+}
+
+OUT=$(load yes "$WORK/base-routing.json")
+check "base has the file → it is used, not the head's copy" \
+  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$REVIEWER_PUB" ]; echo $?)"
+check "base has the file → not a bootstrap" "$([ "$(field "$OUT" bootstrap)" = no ]; echo $?)"
+
+OUT=$(load yes "")
+check "base has no file → the head's copy is used (bootstrap)" \
+  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$HEAD_REVIEWER" ]; echo $?)"
+check "base has no file → flagged as bootstrap for the card" "$([ "$(field "$OUT" bootstrap)" = yes ]; echo $?)"
+
+OUT=$(load no "")
+check "base ref unreachable → failure, never a fallback to the head" \
+  "$([ "$(field "$OUT" rc)" != 0 ] && [ -z "$(field "$OUT" reviewer)" ]; echo $?)"
+check "base ref unreachable → not flagged as bootstrap" "$([ "$(field "$OUT" bootstrap)" = no ]; echo $?)"
+
+OUT=$(load yes "$WORK/base-routing-invalid.json")
+check "base has an invalid file → failure, never a fallback to the head" \
+  "$([ "$(field "$OUT" rc)" != 0 ] && [ -z "$(field "$OUT" reviewer)" ]; echo $?)"
+
+OUT=$(load no "" "")
+check "no base ref (scheduled run) → the checkout's copy" \
+  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$HEAD_REVIEWER" ] && [ "$(field "$OUT" bootstrap)" = no ]; echo $?)"
+
+OUT=$(load no "" main "$WORK/base-routing.json")
+check "BUZZ_ROUTING_FILE override → that file, without touching git" \
+  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$REVIEWER_PUB" ]; echo $?)"
+
 echo
 echo "$PASS assertions passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

@@ -674,6 +674,108 @@ fn provider_filename_strips_the_windows_extension() {
     assert_eq!(provider_id_from_filename("other"), None);
 }
 
+/// Tauri copies an `externalBin` entry into the bundle under its bare name
+/// (`binaries/buzz-backend-sprites-aarch64-apple-darwin` becomes
+/// `Contents/MacOS/buzz-backend-sprites`), and that bare name is what
+/// discovery sees. It must resolve to the id the desktop issues launch
+/// bundles for, or the sidecar ships and is never selected.
+#[test]
+fn the_bundled_sprites_sidecar_name_resolves_to_the_sprites_provider_id() {
+    assert_eq!(
+        provider_id_from_filename("buzz-backend-sprites"),
+        Some("sprites")
+    );
+    // The Windows narrowing keeps the provider off that platform, but the
+    // name convention must still hold there if it ever ships.
+    assert_eq!(
+        provider_id_from_filename("buzz-backend-sprites.exe"),
+        Some("sprites")
+    );
+}
+
+/// Two copies of `buzz-backend-sprites`: one the app ships beside its own
+/// executable, one hand-built into `~/.local/bin` — the copy that goes stale
+/// (2026-09-05: it still pinned adapter 0.64.0 after the tree and the
+/// waker's release had moved to 0.73.0, so desktop deploys and wakes
+/// reprovisioned every sprite back and forth). The bundled one must win, and
+/// the stale one must not even be listed, so a record's cached path to it
+/// cannot re-select it either (`deploy_to_provider` only honours a cached
+/// path that discovery still reports).
+///
+/// `PATH` here deliberately lists `~/.local/bin` first and the bundle
+/// directory last, the way a shell-launched app would see it: the order the
+/// shell chose must not beat the order the bundle guarantees.
+#[cfg(unix)]
+#[test]
+fn a_bundled_sprites_sidecar_shadows_a_hand_built_copy_in_local_bin() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle_bin = temp.path().join("Waggle.app/Contents/MacOS");
+    let home = temp.path().join("home");
+    let local_bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bundle_bin).unwrap();
+    std::fs::create_dir_all(&local_bin).unwrap();
+    write_test_provider(&bundle_bin.join("buzz-backend-sprites"), "echo bundled");
+    write_test_provider(&local_bin.join("buzz-backend-sprites"), "echo stale");
+
+    let exe = bundle_bin.join("Waggle");
+    let path_var = std::env::join_paths([local_bin.clone(), bundle_bin.clone()]).unwrap();
+
+    let dirs = provider_search_dirs(Some(&exe), &path_var, Some(&home));
+    assert_eq!(
+        dirs,
+        vec![bundle_bin.clone(), local_bin.clone()],
+        "the bundle directory is scanned first even when PATH orders it last, \
+         and ~/.local/bin is not listed twice"
+    );
+
+    let candidates = discover_provider_candidates_in(&dirs);
+    let sprites: Vec<&PathBuf> = candidates
+        .iter()
+        .filter(|(id, _)| id == "sprites")
+        .map(|(_, path)| path)
+        .collect();
+    assert_eq!(
+        sprites,
+        vec![&bundle_bin.join("buzz-backend-sprites")],
+        "exactly one sprites candidate, and it is the bundled sidecar"
+    );
+}
+
+/// The launchd case: a Finder-launched app sees only the system PATH, which
+/// holds neither the bundle nor `~/.local/bin`. Both are still searched, in
+/// that order, so a bundled provider is found without any PATH help and a
+/// hand-installed one remains reachable for providers the app does not ship.
+#[cfg(unix)]
+#[test]
+fn a_minimal_launchd_path_still_finds_the_bundle_first_and_local_bin_last() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle_bin = temp.path().join("Waggle.app/Contents/MacOS");
+    let home = temp.path().join("home");
+    let local_bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bundle_bin).unwrap();
+    std::fs::create_dir_all(&local_bin).unwrap();
+    write_test_provider(&bundle_bin.join("buzz-backend-sprites"), "echo bundled");
+    write_test_provider(&local_bin.join("buzz-backend-other"), "echo hand-installed");
+
+    let system_path = std::env::join_paths(["/usr/bin", "/bin", "/usr/sbin", "/sbin"]).unwrap();
+    let dirs = provider_search_dirs(Some(&bundle_bin.join("Waggle")), &system_path, Some(&home));
+    assert_eq!(dirs.first(), Some(&bundle_bin));
+    assert_eq!(dirs.last(), Some(&local_bin));
+
+    let candidates = discover_provider_candidates_in(&dirs);
+    assert!(
+        candidates.contains(&(
+            "sprites".to_string(),
+            bundle_bin.join("buzz-backend-sprites")
+        )),
+        "bundled provider discovered off a minimal PATH: {candidates:?}"
+    );
+    assert!(
+        candidates.contains(&("other".to_string(), local_bin.join("buzz-backend-other"))),
+        "unbundled provider still reachable from ~/.local/bin: {candidates:?}"
+    );
+}
+
 #[test]
 fn resolve_provider_binary_rejects_invalid_ids() {
     // Path traversal

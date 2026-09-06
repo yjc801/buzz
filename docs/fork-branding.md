@@ -36,6 +36,20 @@ and `build`):
   top. This is the one branding edit that can still conflict, but the file only
   changes when the sidecar list changes, not on a release cadence.
 
+The macOS and Linux overlays also carry the fork's extra sidecar,
+`binaries/buzz-backend-sprites`, for the same reason: adding it to
+`tauri.conf.json`'s `bundle.externalBin` would re-arm the per-release
+conflict. JSON merge patch replaces arrays rather than appending, so those two
+overlays list the **full** sidecar set — upstream's six plus the sprites
+provider — and must be updated whenever upstream adds a sidecar. A desktop
+test (`fork_platform_overlays_keep_every_upstream_sidecar`) fails when an
+overlay drops an entry the base file has, so a missed mirror surfaces in CI
+rather than as an app missing a binary at runtime. The Justfile stub lists,
+`scripts/bundle-sidecars.sh`, and `_ci-desktop-macos.yml` carry the same
+addition; they are upstream files, but like the Windows overlay they only
+change when the sidecar list does. Why the provider is bundled at all is in
+[waker-provider-digest-gap.md](waker-provider-digest-gap.md#the-macos-side-closed-2026-09-05).
+
 Config precedence is base → platform → `--config`, and nothing passed via
 `--config` sets branding:
 

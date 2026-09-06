@@ -4,16 +4,23 @@ A Buzz remote-agent backend provider that runs managed agents in
 [Fly.io Sprites](https://sprites.dev) — persistent Linux VMs that hibernate
 when idle and bill compute per second while awake.
 
-One agent, one sprite. The desktop discovers this binary by name
-(`buzz-backend-<id>` on PATH or `~/.local/bin`), so installing it is the whole
-integration:
+One agent, one sprite. The desktop discovers providers by name
+(`buzz-backend-<id>`, scanning its own bundle directory, then PATH, then
+`~/.local/bin`) and ships this one as a sidecar, so a released `.app` needs
+nothing installed: pick **Sprites** as an agent's backend in Buzz Desktop.
+
+A hand-installed copy is only for callers that do not bundle it (a source
+checkout run some other way, scripts):
 
 ```sh
 cargo build --release -p buzz-backend-sprites
 install -m 755 target/release/buzz-backend-sprites ~/.local/bin/
 ```
 
-Then pick **Sprites** as an agent's backend in Buzz Desktop.
+The bundled sidecar shadows that copy by design — a `~/.local/bin` build goes
+stale, and a stale one pins adapter versions that disagree with the release
+the remote-wake daemon runs, reprovisioning every sprite on each deploy
+(`docs/waker-provider-digest-gap.md`). Rebuild it if you rely on it.
 
 Credentials come from the ambient environment, never from the agent's
 configuration (spec I2). The provider looks for `SPRITE_TOKEN`, then

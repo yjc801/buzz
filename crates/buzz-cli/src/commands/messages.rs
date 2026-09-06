@@ -166,23 +166,49 @@ struct MentionPreflight {
     labels_by_pubkey: std::collections::HashMap<String, String>,
 }
 
+/// Bound on the authors named in one kind-0 profile query.
+///
+/// A profile is replaceable, one per author, but the relay clamps any filter
+/// to `DEFAULT_MAX_PAGE_LIMIT` (1,000) results (`buzz-db` event store, relay
+/// REQ handler). A roster past that would drop the newest rows silently — the
+/// referenced member's profile among them — and the mention would degrade to
+/// a hex label with nothing reporting it. Ask in bounded chunks instead.
+const PROFILE_QUERY_CHUNK: usize = 500;
+
+/// Kind-0 profiles for `authors`, fetched in [`PROFILE_QUERY_CHUNK`]-sized
+/// filters and merged. `None` on any transport or parse failure.
+async fn fetch_profiles(client: &BuzzClient, authors: &[String]) -> Option<Vec<serde_json::Value>> {
+    let mut profiles = Vec::new();
+    for chunk in authors.chunks(PROFILE_QUERY_CHUNK) {
+        let filter = serde_json::json!({
+            "kinds": [0],
+            "authors": chunk,
+            "limit": chunk.len(),
+        });
+        profiles.extend(fetch_events(client, &filter).await?);
+    }
+    Some(profiles)
+}
+
 /// Resolve mention text against the channel membership snapshot.
 ///
 /// Returns the current member set, uniquely name-resolved pubkeys, and the
 /// members' current profile labels. Lookup failures are fatal when mention
 /// processing is requested: publishing visible mention text without its
-/// intended `p` tag is worse than not sending. `needs_labels` forces the
-/// profile fetch even without `@Name` text, for callers about to rewrite a
-/// `nostr:npub1…` reference into a label.
+/// intended `p` tag is worse than not sending. `label_pubkeys` are the
+/// identities a caller is about to label (`nostr:npub1…` references): their
+/// profiles are fetched directly, and every member's only when `@Name` text
+/// has to be resolved against the roster.
 async fn resolve_content_mentions(
     client: &BuzzClient,
     channel_id: &str,
     content: &str,
     has_explicit_mentions: bool,
-    needs_labels: bool,
+    label_pubkeys: &[String],
 ) -> Result<MentionPreflight, CliError> {
     let stripped = strip_code_regions(content);
     let has_at_names = stripped.contains('@');
+    let needs_labels = !label_pubkeys.is_empty();
     if !has_at_names && !has_explicit_mentions {
         return Ok(MentionPreflight::default());
     }
@@ -205,16 +231,20 @@ async fn resolve_content_mentions(
         });
     }
 
-    let profiles_filter = serde_json::json!({
-        "kinds": [0],
-        "authors": member_pubkeys,
-        "limit": member_pubkeys.len(),
-    });
-    let profile_events = fetch_events(client, &profiles_filter)
-        .await
-        .ok_or_else(|| {
-            CliError::Other("could not load member profiles for mention resolution".into())
-        })?;
+    // Every member's profile only when `@Name` text must resolve against the
+    // roster; a label-only send asks for the referenced identities alone.
+    let authors: Vec<String> = if has_at_names {
+        member_pubkeys.clone()
+    } else {
+        label_pubkeys
+            .iter()
+            .filter(|pubkey| member_pubkeys.contains(pubkey))
+            .cloned()
+            .collect()
+    };
+    let profile_events = fetch_profiles(client, &authors).await.ok_or_else(|| {
+        CliError::Other("could not load member profiles for mention resolution".into())
+    })?;
 
     let mut name_to_pubkeys: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -230,6 +260,9 @@ async fn resolve_content_mentions(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(content_json) else {
             continue;
         };
+        if let Some(label) = profile_mention_label(&v) {
+            labels_by_pubkey.insert(pubkey.to_ascii_lowercase(), label);
+        }
         let Some(name) = v
             .get("display_name")
             .or_else(|| v.get("name"))
@@ -242,7 +275,6 @@ async fn resolve_content_mentions(
             .entry(name.to_ascii_lowercase())
             .or_default()
             .push(pubkey.to_string());
-        labels_by_pubkey.insert(pubkey.to_ascii_lowercase(), name.to_string());
         display_names.push(name.to_string());
     }
 
@@ -276,9 +308,10 @@ fn unique_uri_pubkeys(matches: &[NostrUriMatch]) -> Vec<String> {
 /// Clients render a mention by matching `@<label>` text against the profile
 /// of each p-tagged member and never substitute a label at render time, so a
 /// raw URI would display verbatim. The label is the member's current profile
-/// name at send time; a member with no usable name is labelled by hex pubkey,
-/// which clients compact. This is what lets a sender that knows only a pubkey
-/// produce a correctly labelled mention without knowing, or guessing, a name.
+/// alias at send time, exactly as the receivers match it; a member with no
+/// safe alias is labelled by hex pubkey, which clients compact. This is what
+/// lets a sender that knows only a pubkey produce a correctly labelled
+/// mention without knowing, or guessing, a name.
 ///
 /// `matches` must come from [`find_nostr_uris`] on this exact `content`, so
 /// they are in text order and exclude code regions, which stay untouched.
@@ -296,7 +329,7 @@ fn expand_nostr_mentions(
         out.push_str(&content[cursor..found.range.start]);
         let label = labels_by_pubkey
             .get(&found.pubkey)
-            .and_then(|raw| sanitize_mention_label(raw))
+            .cloned()
             .unwrap_or_else(|| found.pubkey.clone());
         out.push('@');
         out.push_str(&label);
@@ -306,24 +339,27 @@ fn expand_nostr_mentions(
     out
 }
 
-/// Normalise a profile name into a label safe to embed as `@<label>`: drop
-/// control characters, collapse whitespace runs, and strip a leading `@` so a
-/// profile named `@alice` does not render as `@@alice`. `None` when nothing
-/// usable remains.
-fn sanitize_mention_label(raw: &str) -> Option<String> {
-    // Control whitespace (newline, tab) still separates words; other control
-    // characters carry nothing a label should render.
-    let cleaned: String = raw
-        .chars()
-        .filter_map(|c| match c {
-            c if c.is_whitespace() => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_start_matches('@').trim();
-    if trimmed.is_empty() {
+/// The alias receivers bind a rendered mention to: the profile's
+/// `display_name`, else its `name`, exactly as desktop and mobile match it —
+/// trimmed, internal spacing kept, a leading `@` kept (so a profile named
+/// `@alice` is written `@@alice`, which is the text those clients bind).
+/// Normalising it here would produce a label neither client associates with
+/// the tagged profile. `None` when no candidate can be embedded safely; the
+/// caller then labels by pubkey.
+fn profile_mention_label(profile: &serde_json::Value) -> Option<String> {
+    ["display_name", "name"].iter().find_map(|key| {
+        profile
+            .get(key)
+            .and_then(|value| value.as_str())
+            .and_then(safe_mention_label)
+    })
+}
+
+/// `raw` trimmed, when it is non-empty and free of control characters (a
+/// newline or tab could not sit inside a one-line `@<label>` token).
+fn safe_mention_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
         None
     } else {
         Some(trimmed.to_string())
@@ -740,7 +776,7 @@ pub async fn cmd_send_message(
         &p.channel_id,
         &p.content,
         has_explicit_mentions,
-        !uri_matches.is_empty(),
+        &uri_pubkeys,
     )
     .await?;
     let mention_pubkeys =
@@ -1206,9 +1242,9 @@ mod tests {
         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
         expand_nostr_mentions, find_root_from_tags, format_events, match_profiles_by_name,
         merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys, resolve_thread_target, sanitize_mention_label,
+        profile_mention_label, resolve_names_to_pubkeys, resolve_thread_target, safe_mention_label,
         thread_ref_from_event, thread_ref_from_parent_tags, unique_uri_pubkeys, BuzzClient,
-        CliError, Uuid,
+        CliError, Uuid, PROFILE_QUERY_CHUNK,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, find_nostr_uris, match_names_to_profiles,
@@ -1767,13 +1803,33 @@ mod tests {
     #[test]
     fn expand_nostr_mentions_leaves_code_regions_verbatim() {
         let npub = npub_for(PK_VALID_A);
-        let content = format!("see `nostr:{npub}`\n```\nnostr:{npub}\n```\nnostr:{npub} ok");
+        let content = format!(
+            "see `nostr:{npub}`\n```\nnostr:{npub}\n```\n~~~\nnostr:{npub}\n~~~\n    nostr:{npub}\n``nostr:{npub}``\nnostr:{npub} ok"
+        );
         let found = find_nostr_uris(&content);
-        assert_eq!(found.len(), 1);
+        assert_eq!(found.len(), 1, "{found:?}");
         let out = expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "Alice")]));
         assert_eq!(
             out,
-            format!("see `nostr:{npub}`\n```\nnostr:{npub}\n```\n@Alice ok")
+            format!(
+                "see `nostr:{npub}`\n```\nnostr:{npub}\n```\n~~~\nnostr:{npub}\n~~~\n    nostr:{npub}\n``nostr:{npub}``\n@Alice ok"
+            )
+        );
+    }
+
+    #[test]
+    fn expand_nostr_mentions_embeds_the_exact_alias_receivers_bind() {
+        // A profile named `@alice` renders as `@@alice` on both clients; a
+        // double space inside a name is part of the alias they match.
+        let content = format!("nostr:{} hi", npub_for(PK_VALID_A));
+        let found = find_nostr_uris(&content);
+        assert_eq!(
+            expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "@alice")])),
+            "@@alice hi"
+        );
+        assert_eq!(
+            expand_nostr_mentions(&content, &found, &labels(&[(PK_VALID_A, "Alice  Smith")])),
+            "@Alice  Smith hi"
         );
     }
 
@@ -1795,22 +1851,48 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_mention_label_normalizes_profile_names() {
+    fn safe_mention_label_keeps_the_receivers_alias_or_refuses() {
         assert_eq!(
-            sanitize_mention_label("Alice Smith").as_deref(),
+            safe_mention_label("Alice Smith").as_deref(),
             Some("Alice Smith")
         );
         assert_eq!(
-            sanitize_mention_label("  Alice\t\tSmith ").as_deref(),
+            safe_mention_label("  Alice Smith ").as_deref(),
             Some("Alice Smith")
         );
         assert_eq!(
-            sanitize_mention_label("Ali\u{0}ce\nSmith").as_deref(),
+            safe_mention_label("Alice  Smith").as_deref(),
+            Some("Alice  Smith")
+        );
+        assert_eq!(safe_mention_label("@alice").as_deref(), Some("@alice"));
+        assert_eq!(safe_mention_label("Ali\nce"), None);
+        assert_eq!(safe_mention_label("Ali\tce"), None);
+        assert_eq!(safe_mention_label("Ali\u{0}ce"), None);
+        assert_eq!(safe_mention_label("   "), None);
+        assert_eq!(safe_mention_label(""), None);
+    }
+
+    #[test]
+    fn profile_mention_label_prefers_display_name_then_name_then_nothing() {
+        assert_eq!(
+            profile_mention_label(&json!({ "display_name": "Alice Smith", "name": "alice" }))
+                .as_deref(),
             Some("Alice Smith")
         );
-        assert_eq!(sanitize_mention_label("@alice").as_deref(), Some("alice"));
-        assert_eq!(sanitize_mention_label("@@ "), None);
-        assert_eq!(sanitize_mention_label(""), None);
+        assert_eq!(
+            profile_mention_label(&json!({ "display_name": "", "name": "alice" })).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            profile_mention_label(&json!({ "display_name": "Ali\nce", "name": "alice" }))
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            profile_mention_label(&json!({ "display_name": "Ali\nce" })),
+            None
+        );
+        assert_eq!(profile_mention_label(&json!({ "about": "no names" })), None);
     }
 
     // ── cmd_send_message — emoji-tag binding seam ─────────────────────────
@@ -2112,35 +2194,68 @@ mod tests {
     // name>` plus a p-tag, and code regions must survive untouched. Removing
     // the `expand_nostr_mentions` call in `cmd_send_message` fails them.
 
+    type CapturedFilters = StdArc<std::sync::Mutex<Vec<serde_json::Value>>>;
     type KindRoutedState = (
         StdArc<std::collections::HashMap<u64, String>>,
         StdArc<std::sync::Mutex<Option<CapturedEvent>>>,
+        CapturedFilters,
     );
 
+    /// A relay that answers each `/query` by the requested kind and records
+    /// every filter it was sent. Kind-0 answers are narrowed to the filter's
+    /// `authors`, as a real relay's would be, so a chunked profile fetch
+    /// returns each profile exactly once.
     async fn fake_send_relay_by_kind(
         responses: std::collections::HashMap<u64, String>,
-    ) -> (String, StdArc<std::sync::Mutex<Option<CapturedEvent>>>) {
+    ) -> (
+        String,
+        StdArc<std::sync::Mutex<Option<CapturedEvent>>>,
+        CapturedFilters,
+    ) {
         let captured_event: StdArc<std::sync::Mutex<Option<CapturedEvent>>> =
             StdArc::new(std::sync::Mutex::new(None));
-        let state: KindRoutedState = (StdArc::new(responses), captured_event.clone());
+        let captured_filters: CapturedFilters = StdArc::new(std::sync::Mutex::new(Vec::new()));
+        let state: KindRoutedState = (
+            StdArc::new(responses),
+            captured_event.clone(),
+            captured_filters.clone(),
+        );
 
         let app = AxumRouter::new()
             .route(
                 "/query",
                 axum_post(
-                    |AxumState((responses, _)): AxumState<KindRoutedState>,
+                    |AxumState((responses, _, filters_log)): AxumState<KindRoutedState>,
                      _headers: AxumHeaderMap,
                      req: AxumBytes| async move {
                         let filters: serde_json::Value =
                             serde_json::from_slice(&req).unwrap_or(serde_json::Value::Null);
-                        let kind = filters
-                            .get(0)
-                            .and_then(|f| f.get("kinds"))
+                        let first = filters.get(0).cloned().unwrap_or(serde_json::Value::Null);
+                        filters_log.lock().unwrap().push(first.clone());
+                        let kind = first
+                            .get("kinds")
                             .and_then(|k| k.get(0))
                             .and_then(|k| k.as_u64());
-                        let body = kind
+                        let mut body = kind
                             .and_then(|k| responses.get(&k).cloned())
                             .unwrap_or_else(|| "[]".to_string());
+                        if kind == Some(0) {
+                            if let Some(authors) = first.get("authors").and_then(|a| a.as_array()) {
+                                let wanted: Vec<&str> =
+                                    authors.iter().filter_map(|a| a.as_str()).collect();
+                                let events: Vec<serde_json::Value> =
+                                    serde_json::from_str(&body).unwrap_or_default();
+                                let narrowed: Vec<serde_json::Value> = events
+                                    .into_iter()
+                                    .filter(|e| {
+                                        e.get("pubkey")
+                                            .and_then(|p| p.as_str())
+                                            .is_some_and(|p| wanted.contains(&p))
+                                    })
+                                    .collect();
+                                body = serde_json::Value::Array(narrowed).to_string();
+                            }
+                        }
                         (
                             AxumStatusCode::OK,
                             [("content-type", "application/json")],
@@ -2152,7 +2267,7 @@ mod tests {
             .route(
                 "/events",
                 axum_post(
-                    |AxumState((_, cap)): AxumState<KindRoutedState>,
+                    |AxumState((_, cap, _)): AxumState<KindRoutedState>,
                      _headers: AxumHeaderMap,
                      body: AxumBytes| async move {
                         let body_str = String::from_utf8_lossy(&body).to_string();
@@ -2170,7 +2285,33 @@ mod tests {
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: StdSocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), captured_event)
+        (format!("http://{addr}"), captured_event, captured_filters)
+    }
+
+    fn kind0_filters(filters: &CapturedFilters) -> Vec<serde_json::Value> {
+        filters
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f.get("kinds")
+                    .and_then(|k| k.get(0))
+                    .and_then(|k| k.as_u64())
+                    == Some(0)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn filter_authors(filter: &serde_json::Value) -> Vec<String> {
+        filter["authors"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn roster_response(members: &[&str]) -> String {
@@ -2218,7 +2359,7 @@ mod tests {
                 profiles_response(&[(PK_VALID_A, json!({ "display_name": "Alice Smith" }))]),
             ),
         ]);
-        let (url, captured) = fake_send_relay_by_kind(responses).await;
+        let (url, captured, filters) = fake_send_relay_by_kind(responses).await;
         let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
 
         cmd_send_message(
@@ -2237,6 +2378,16 @@ mod tests {
             "the reference outside code must become the member's current label; the one in code must not"
         );
         assert_eq!(p_tags(&event), vec![PK_VALID_A.to_string()]);
+
+        // A label-only send asks for the referenced identity's profile, not
+        // the roster's: the relay caps a filter at 1,000 results, and in a
+        // larger room the referenced profile could fall outside that window.
+        let profile_queries = kind0_filters(&filters);
+        assert_eq!(profile_queries.len(), 1, "{profile_queries:?}");
+        assert_eq!(
+            filter_authors(&profile_queries[0]),
+            vec![PK_VALID_A.to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2249,7 +2400,7 @@ mod tests {
                 profiles_response(&[(PK_VALID_A, json!({ "about": "no name set" }))]),
             ),
         ]);
-        let (url, captured) = fake_send_relay_by_kind(responses).await;
+        let (url, captured, _filters) = fake_send_relay_by_kind(responses).await;
         let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
 
         cmd_send_message(&client, send_params(&format!("nostr:{npub} please look")))
@@ -2271,7 +2422,7 @@ mod tests {
             (39002, roster_response(&[PK_VALID_B])),
             (0, profiles_response(&[])),
         ]);
-        let (url, captured) = fake_send_relay_by_kind(responses).await;
+        let (url, captured, _filters) = fake_send_relay_by_kind(responses).await;
         let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
 
         let err = cmd_send_message(&client, send_params(&format!("nostr:{npub} hi")))
@@ -2282,6 +2433,57 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_none(),
             "nothing may be submitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_resolves_at_names_in_bounded_profile_chunks() {
+        // A roster past the relay's 1,000-result clamp: the profiles must be
+        // requested in chunks no larger than PROFILE_QUERY_CHUNK, covering
+        // every member exactly once, or the name resolution silently misses
+        // whoever fell outside the window.
+        let roster_size = 2 * PROFILE_QUERY_CHUNK + 200;
+        let mut members: Vec<String> = vec![PK_VALID_A.to_string()];
+        while members.len() < roster_size {
+            members.push(Keys::generate().public_key().to_hex());
+        }
+        let member_refs: Vec<&str> = members.iter().map(String::as_str).collect();
+        let responses = std::collections::HashMap::from([
+            (39002, roster_response(&member_refs)),
+            (
+                0,
+                profiles_response(&[(PK_VALID_A, json!({ "display_name": "Alice Smith" }))]),
+            ),
+        ]);
+        let (url, captured, filters) = fake_send_relay_by_kind(responses).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        cmd_send_message(&client, send_params("@Alice Smith please look"))
+            .await
+            .unwrap();
+
+        let event = submitted_event(&captured);
+        assert_eq!(p_tags(&event), vec![PK_VALID_A.to_string()]);
+
+        let profile_queries = kind0_filters(&filters);
+        assert_eq!(profile_queries.len(), 3, "{}", profile_queries.len());
+        let mut covered: Vec<String> = Vec::new();
+        for query in &profile_queries {
+            let authors = filter_authors(query);
+            assert!(
+                authors.len() <= PROFILE_QUERY_CHUNK,
+                "chunk of {}",
+                authors.len()
+            );
+            assert_eq!(query["limit"].as_u64(), Some(authors.len() as u64));
+            covered.extend(authors);
+        }
+        covered.sort();
+        let mut expected = members.clone();
+        expected.sort();
+        assert_eq!(
+            covered, expected,
+            "every member's profile must be asked for exactly once"
         );
     }
 }

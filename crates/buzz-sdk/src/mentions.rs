@@ -242,106 +242,153 @@ pub fn normalize_mention_pubkeys(pubkeys: &[String], sender_pubkey: Option<&str>
         .collect()
 }
 
-/// Byte ranges of fenced code blocks and inline code spans in `content`.
+/// Byte ranges of Markdown code in `content`, in the grammar the clients
+/// render: fenced blocks opened by three or more backticks or tildes (up to
+/// three leading spaces; a backtick fence's info string may not contain a
+/// backtick) and closed by a line of at least as many of the same marker, or
+/// running to the end when unclosed; lines indented by four spaces or a tab;
+/// and inline spans opened by a run of backticks and closed by the next run
+/// of exactly the same length, across lines, where an opener preceded by an
+/// odd number of backslashes is literal and an unclosed opener is literal.
+/// Fenced and indented regions are found first; backticks inside them never
+/// open or close a span.
 ///
-/// A fenced block runs from its opening ` ``` ` (which must be the first
-/// non-whitespace on its line) through the end of the closing fence's line,
-/// or to the end of the content when unclosed. An inline span runs from its
-/// opening backtick through its closing backtick on the same line. Ranges are
-/// ascending, non-overlapping, and always fall on `char` boundaries. This is
-/// the single definition of "inside code" that [`strip_code_regions`] and
-/// [`find_nostr_uris`] share, so the two can never disagree about a span.
+/// Ranges are ascending, non-overlapping, and always fall on `char`
+/// boundaries. This is the single definition of "inside code" that
+/// [`strip_code_regions`] and [`find_nostr_uris`] share, so the two can never
+/// disagree about a span — and it mirrors the desktop's mention scanner, so a
+/// reference the CLI rewrites is one the clients would have treated as prose.
 pub fn code_regions(content: &str) -> Vec<Range<usize>> {
-    let mut regions = Vec::new();
-    let mut i = 0;
+    let mut regions: Vec<Range<usize>> = Vec::new();
 
-    while i < content.len() {
-        let Some(ch) = content[i..].chars().next() else {
-            break;
-        };
-
-        if ch == '`' {
-            // Fenced code block: ``` at line start (possibly after whitespace)
-            if content[i..].starts_with("```") && is_fence_start(content, i) {
-                let close_end = fenced_block_end(content, i);
-                regions.push(i..close_end);
-                i = close_end;
-                continue;
-            }
-
-            // Inline code span: `…` with the closing backtick on the same line
-            let after_tick = i + 1;
-            if after_tick < content.len() {
-                if let Some(rel_end) = content[after_tick..].find('`') {
-                    let close_pos = after_tick + rel_end;
-                    if !content[after_tick..close_pos].contains('\n') {
-                        regions.push(i..close_pos + 1);
-                        i = close_pos + 1;
-                        continue;
-                    }
-                }
-            }
+    // Line-level regions: fenced blocks and indented code.
+    let mut fence: Option<(u8, usize, usize)> = None; // (marker, length, block start)
+    let mut pos = 0;
+    while pos < content.len() {
+        let rel_end = content[pos..].find('\n').unwrap_or(content.len() - pos);
+        let terminator_end = (pos + rel_end + 1).min(content.len());
+        let mut line_end = pos + rel_end;
+        if line_end > pos && content.as_bytes()[line_end - 1] == b'\r' {
+            line_end -= 1;
         }
+        let line = &content[pos..line_end];
 
-        i += ch.len_utf8();
+        if let Some((marker, length, block_start)) = fence {
+            if is_closing_fence(line, marker, length) {
+                regions.push(block_start..terminator_end);
+                fence = None;
+            }
+        } else if let Some((marker, length)) = opening_fence(line) {
+            fence = Some((marker, length, pos));
+        } else if line.starts_with("    ") || line.starts_with('\t') {
+            regions.push(pos..line_end);
+        }
+        pos = terminator_end;
+    }
+    if let Some((_, _, block_start)) = fence {
+        regions.push(block_start..content.len());
     }
 
+    // Inline spans over whatever is not already code. Backticks are ASCII,
+    // so byte indices here are char boundaries.
+    let bytes = content.as_bytes();
+    let masked = |i: usize| regions.iter().any(|r| r.contains(&i));
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' || masked(i) || escaped_at(bytes, i) {
+            i += 1;
+            continue;
+        }
+        let mut opener_end = i + 1;
+        while opener_end < bytes.len() && bytes[opener_end] == b'`' && !masked(opener_end) {
+            opener_end += 1;
+        }
+        let length = opener_end - i;
+        let mut closer = opener_end;
+        let mut closed = false;
+        while closer < bytes.len() {
+            if bytes[closer] != b'`' || masked(closer) {
+                closer += 1;
+                continue;
+            }
+            let mut closer_end = closer + 1;
+            while closer_end < bytes.len() && bytes[closer_end] == b'`' && !masked(closer_end) {
+                closer_end += 1;
+            }
+            if closer_end - closer == length {
+                spans.push(i..closer_end);
+                i = closer_end;
+                closed = true;
+                break;
+            }
+            closer = closer_end;
+        }
+        if !closed {
+            i = opener_end;
+        }
+    }
+
+    regions.extend(spans);
+    regions.sort_by_key(|r| r.start);
     regions
 }
 
-/// Whether the ` ``` ` at byte `i` opens a fenced block: it is the first
-/// non-whitespace on its line.
-fn is_fence_start(content: &str, i: usize) -> bool {
-    if i == 0 {
-        return true;
+/// A fence opener: up to three spaces, then three or more of one marker. A
+/// backtick fence whose info string contains a backtick is not a fence.
+fn opening_fence(line: &str) -> Option<(u8, usize)> {
+    let rest = strip_fence_indent(line)?;
+    let marker = *rest.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
     }
-    let before = &content[..i];
-    before.ends_with('\n')
-        || before.chars().all(|c| c.is_ascii_whitespace())
-        || before
-            .rsplit_once('\n')
-            .is_some_and(|(_, after_nl)| after_nl.chars().all(|c| c.is_ascii_whitespace()))
+    let length = rest.bytes().take_while(|&b| b == marker).count();
+    if length < 3 {
+        return None;
+    }
+    if marker == b'`' && rest[length..].contains('`') {
+        return None;
+    }
+    Some((marker, length))
 }
 
-/// End (exclusive) of the fenced block opened at byte `i`: the byte after the
-/// closing fence's line, or the end of the content when the block is unclosed.
-fn fenced_block_end(content: &str, i: usize) -> usize {
-    let after_fence = i + 3;
-    let rest = &content[after_fence..];
-    let line_end = rest
-        .find('\n')
-        .map_or(content.len(), |p| after_fence + p + 1);
-
-    let mut search_from = line_end;
-    loop {
-        if search_from >= content.len() {
-            return content.len();
-        }
-        let Some(pos) = content[search_from..].find("```") else {
-            return content.len();
-        };
-        let abs_pos = search_from + pos;
-        let at_line_start = abs_pos == 0
-            || content.as_bytes()[abs_pos - 1] == b'\n'
-            || content[..abs_pos]
-                .rsplit_once('\n')
-                .is_some_and(|(_, after_nl)| after_nl.chars().all(|c| c.is_ascii_whitespace()));
-        if at_line_start {
-            let after_close = abs_pos + 3;
-            return content[after_close..]
-                .find('\n')
-                .map_or(content.len(), |p| after_close + p + 1);
-        }
-        search_from = abs_pos + 3;
-    }
+/// A fence closer: up to three spaces, at least `length` of `marker`, then
+/// only spaces or tabs.
+fn is_closing_fence(line: &str, marker: u8, length: usize) -> bool {
+    let Some(rest) = strip_fence_indent(line) else {
+        return false;
+    };
+    let run = rest.bytes().take_while(|&b| b == marker).count();
+    run >= length && rest[run..].bytes().all(|b| b == b' ' || b == b'\t')
 }
 
-/// Remove fenced code blocks and inline code spans from content.
+/// The line past up to three leading spaces, or `None` when it is indented
+/// further (that is indented code, not a fence).
+fn strip_fence_indent(line: &str) -> Option<&str> {
+    let spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if spaces > 3 {
+        return None;
+    }
+    Some(&line[spaces..])
+}
+
+/// Whether the byte at `i` is preceded by an odd number of backslashes.
+fn escaped_at(bytes: &[u8], i: usize) -> bool {
+    let mut slashes = 0;
+    let mut cursor = i;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slashes += 1;
+        cursor -= 1;
+    }
+    slashes % 2 == 1
+}
+
+/// Remove Markdown code from content.
 ///
-/// Returns a copy of `content` with ` ```…``` ` blocks and `` `…` `` spans
-/// replaced by spaces. Used only for mention scanning — the original
-/// content is stored verbatim. Preserves valid UTF-8 throughout. The
-/// regions removed are exactly those [`code_regions`] reports.
+/// Returns a copy of `content` with every region [`code_regions`] reports —
+/// fenced blocks, indented code, inline spans — replaced by a single space.
+/// Used only for mention scanning; the original content is stored verbatim.
+/// Preserves valid UTF-8 throughout.
 pub fn strip_code_regions(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut cursor = 0;
@@ -898,6 +945,10 @@ mod tests {
             "``` not a fence",
             "a `multi\nline` b",
             "こんにちは `コード` 世界",
+            "~~~\ntilde\n~~~\nafter",
+            "p\n    indented\n\ttab",
+            "a ``double ` inside`` b",
+            "esc \\`not` a `span`",
         ] {
             let mut expected = String::new();
             let mut cursor = 0;
@@ -939,6 +990,92 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|m| m.pubkey == TEST_HEX1));
         assert_eq!(extract_nostr_uris(&content), vec![TEST_HEX1]);
+    }
+
+    #[test]
+    fn code_regions_recognizes_tilde_fences() {
+        let input = "a\n~~~\ncode `x`\n~~~\nb";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        assert_eq!(&input[regions[0].clone()], "~~~\ncode `x`\n~~~\n");
+    }
+
+    #[test]
+    fn code_regions_closing_fence_must_match_marker_and_length() {
+        let input = "````\ncode\n```\nstill code\n````\nafter";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        assert_eq!(
+            &input[regions[0].clone()],
+            "````\ncode\n```\nstill code\n````\n"
+        );
+        let input = "```\ncode\n~~~\nstill\n```\nafter";
+        assert_eq!(
+            &input[code_regions(input)[0].clone()],
+            "```\ncode\n~~~\nstill\n```\n"
+        );
+    }
+
+    #[test]
+    fn code_regions_backtick_fence_info_string_may_not_contain_backticks() {
+        // Not a fence, so the three backticks are an unclosed (literal)
+        // opener and the single-backtick pair is an ordinary span.
+        let input = "``` not `code`\nprose";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        assert_eq!(&input[regions[0].clone()], "`code`");
+    }
+
+    #[test]
+    fn code_regions_indented_lines_are_code() {
+        let input = "p\n    four spaces\n\ttab\n  two spaces";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert_eq!(&input[regions[0].clone()], "    four spaces");
+        assert_eq!(&input[regions[1].clone()], "\ttab");
+    }
+
+    #[test]
+    fn code_regions_multi_backtick_spans_close_on_the_same_length() {
+        let input = "a ``x ` y`` b `z` c";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert_eq!(&input[regions[0].clone()], "``x ` y``");
+        assert_eq!(&input[regions[1].clone()], "`z`");
+    }
+
+    #[test]
+    fn code_regions_escaped_backtick_does_not_open_a_span() {
+        let input = r"a \`b` c `d`";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        assert_eq!(&input[regions[0].clone()], "` c `");
+    }
+
+    #[test]
+    fn code_regions_unclosed_fence_runs_to_the_end() {
+        let input = "prose\n```\nnostr:x";
+        assert_eq!(code_regions(input), vec![6..input.len()]);
+    }
+
+    #[test]
+    fn code_regions_spans_cross_lines_and_crlf_fences_close() {
+        let input = "a `x\ny` b\r\n```\r\ncode\r\n```\r\nc";
+        let regions = code_regions(input);
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert_eq!(&input[regions[0].clone()], "`x\ny`");
+        assert_eq!(&input[regions[1].clone()], "```\r\ncode\r\n```\r\n");
+    }
+
+    #[test]
+    fn find_nostr_uris_skips_every_markdown_code_form() {
+        let content = format!(
+            "~~~\nnostr:{n}\n~~~\n    nostr:{n}\n``nostr:{n}``\nprose nostr:{n}",
+            n = TEST_NPUB1
+        );
+        let found = find_nostr_uris(&content);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].range.start, content.rfind("nostr:").unwrap());
     }
 
     #[test]

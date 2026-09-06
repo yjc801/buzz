@@ -203,7 +203,11 @@ REPLY_ID=$(echo "$REPLY" | jq -r '.event_id')
 # messages send with mentions — @name in content is auto-resolved, no flag needed
 buzz messages send --channel "$CHANNEL_ID" --content "Hey @someone" | jq .
 
-# messages send with NIP-27 nostr:npub1… inline mention — auto-resolved to p-tag
+# messages send with NIP-27 nostr:npub1… inline mention — the member must be
+# on the roster; the reference is published as `@<their current display name>`
+# (hex pubkey when the profile has no name) plus a p-tag. Verify with
+# `messages get`: content reads "Check with @<Name> on this", never the raw
+# URI, and a reference inside backticks stays verbatim.
 buzz messages send --channel "$CHANNEL_ID" \
   --content "Check with nostr:npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg on this" | jq .
 

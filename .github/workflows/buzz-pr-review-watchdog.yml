@@ -110,12 +110,14 @@ jobs:
           BUZZ_RELAY_URL: https://openvelvet.communities.buzz.xyz
           BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_CI_PRIVATE_KEY }}
           BUZZ_AUTH_TAG: ${{ secrets.BUZZ_CI_AUTH_TAG }}
-          # Alex — the reviewer agent. Pinned here and in the mirror and the
-          # auto-merge sweep; rotate all three together.
-          REVIEWER_NAME: Alex
-          REVIEWER_PUBKEY: 276883e88d5a20e0cbd760ac2c12876f69e32585861da2258344863e5833b3dd
-          # Community owner — the stall notice is for a human.
-          OWNER_PUBKEY: 632318a2b1a944927ca4167a5f4e66d0b5d00bae33323ee31d3b935b4b82d420
+          # The reviewer (nudged) and the owner (paged on a stall) are NOT
+          # pinned here: they are read from .buzz/routing.json on the default
+          # branch this sweep runs from, and the reviewer's display name comes
+          # from his kind:0 profile at run time. Empty means "read the
+          # checkout"; the contract test points this at a fixture. The
+          # auto-merge sweep still pins the reviewer on its own; the routing
+          # contract test holds the two equal. See docs/pr-review-routing.md.
+          BUZZ_ROUTING_FILE: ""
           # The CI identity whose profile carries the owner auth tag. A rotated
           # key would author no binding notes and wake no owner-only agent.
           # MUST equal the pin in buzz-pr-mirror.yml, buzz-issue-mirror.yml and
@@ -153,6 +155,21 @@ jobs:
             echo "PR #$1: $2"
             echo "- PR #$1: $2" >> "$GITHUB_STEP_SUMMARY"
           }
+
+          # ROUTING — who is nudged and who is paged. The file is validated by
+          # the shared script so a malformed one stops the sweep here, before
+          # it can page nobody or nudge the wrong key. The reviewer's label is
+          # presentation: the p-tag that wakes him is the pubkey, so a failed
+          # or empty profile read falls back to addressing him by key rather
+          # than skipping the nudge.
+          ROUTING_JSON=$(bash .github/scripts/buzz-routing.sh validate < "${BUZZ_ROUTING_FILE:-.buzz/routing.json}") || {
+            echo "::error::.buzz/routing.json is missing or invalid — the watchdog will not guess who to nudge"
+            exit 1
+          }
+          REVIEWER_PUBKEY=$(jq -r .reviewer <<<"$ROUTING_JSON")
+          OWNER_PUBKEY=$(jq -r .owner <<<"$ROUTING_JSON")
+          REVIEWER_LABEL=$(relay profile --pubkey "$REVIEWER_PUBKEY") || REVIEWER_LABEL=""
+          [ -n "$REVIEWER_LABEL" ] || REVIEWER_LABEL="$REVIEWER_PUBKEY"
 
           # Is this message a verdict FOR THIS HEAD?
           #
@@ -317,7 +334,7 @@ jobs:
                 RC=0
                 # shellcheck disable=SC2016  # backticks are markdown, not command substitution
                 printf '%s: no reply %d min after the review request for `%s`.\n@%s please review this PR. %s\n' \
-                  "$NUDGE" "$((AGE / 60))" "$HEAD" "$REVIEWER_NAME" "$DEFER" | post "$N" "$HEAD" "$CH" "$REVIEWER_PUBKEY" || RC=$?
+                  "$NUDGE" "$((AGE / 60))" "$HEAD" "$REVIEWER_LABEL" "$DEFER" | post "$N" "$HEAD" "$CH" "$REVIEWER_PUBKEY" || RC=$?
                 settle "$N" "$HEAD" "$RC" "NUDGED — silent ${AGE}s since request for ${HEAD:0:12}"; continue
               fi
               if [ $((NOW - NUDGE_T)) -ge "$SILENT" ] && [ "$HAS_STALL" = "0" ]; then
@@ -336,7 +353,7 @@ jobs:
               RC=0
               # shellcheck disable=SC2016  # backticks are markdown, not command substitution
               printf '%s: last reviewer message %d min ago on `%s`, no verdict.\n@%s if that review died, restart it; if it is still running, carry on. %s\n' \
-                "$NUDGE" "$((IDLE / 60))" "$HEAD" "$REVIEWER_NAME" "$DEFER" | post "$N" "$HEAD" "$CH" "$REVIEWER_PUBKEY" || RC=$?
+                "$NUDGE" "$((IDLE / 60))" "$HEAD" "$REVIEWER_LABEL" "$DEFER" | post "$N" "$HEAD" "$CH" "$REVIEWER_PUBKEY" || RC=$?
               settle "$N" "$HEAD" "$RC" "NUDGED — acked but no verdict for ${IDLE}s on ${HEAD:0:12}"; continue
             fi
             if [ $((NOW - NUDGE_T)) -ge "$DEAD" ] && [ "$HAS_STALL" = "0" ]; then

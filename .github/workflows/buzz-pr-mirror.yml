@@ -434,6 +434,9 @@ jobs:
           REVIEW_QUIET_SECS: ${{ vars.BUZZ_REVIEW_QUIET_SECS || 180 }}
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
+          # The default branch: where the reviewed .buzz/routing.json lives
+          # when a PR's base branch predates it — see load_routing.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # Pre-workflow PRs have no #buzz-pr-N channel; close notices for them
           # go here. Empty is supported — see the header.
           FALLBACK_CHANNEL: ${{ vars.BUZZ_FALLBACK_CHANNEL }}
@@ -603,18 +606,22 @@ jobs:
           # instead of degrading to a room with nobody in it. Nothing in the
           # file is a display name — see load_labels.
           #
-          # BOOTSTRAP. The PR that introduces the file, and any PR opened
-          # before it merges, has a base branch with no routing at all. There
-          # is nothing reviewed to protect in that state — the rule above
-          # keeps a PR from overriding routing that exists, and none does —
-          # so the head's copy is used and the card says so. The exception
-          # is dead once the file is on the base branch, and can only come
-          # back through a merge that deletes it. Absence is decided by
-          # `cat-file -e` on a base ref proved present first: an unreachable
-          # base or an unreadable file is still a failure, never a fallback.
+          # A BASE WITHOUT THE FILE IS NOT AUTHORITY FOR THE HEAD. BASE_REF is
+          # the PR's chosen target, and a PR can target a legacy or stacked
+          # branch that predates the registry. The reviewed copy then lives
+          # on the default branch, and that is what such a PR gets — never
+          # its own head's, which would let it pick the identities CI
+          # provisions and wakes. Only when NEITHER the base nor the default
+          # branch has the file is there nothing reviewed to protect, and
+          # that one condition — the PR introducing the registry — reads the
+          # head's copy and says so on the card. That exception is dead once
+          # the default branch carries the file and can only return through
+          # a merge that deletes it. Absence is decided by `cat-file -e` on a
+          # ref proved present first: an unreachable ref or an unreadable or
+          # invalid file is still a failure, never a fallback.
           ROUTING_BOOTSTRAP=no
           load_routing() {
-            local RAW REF
+            local RAW REF DEF
             if [ -n "${BUZZ_ROUTING_FILE:-}" ]; then
               RAW=$(cat "$BUZZ_ROUTING_FILE") || return 1
             elif [ -n "${BASE_REF:-}" ]; then
@@ -629,9 +636,26 @@ jobs:
                   return 1
                 }
               else
-                echo "${REF} has no .buzz/routing.json yet — bootstrap: using this head's copy, stated on the card" >&2
-                RAW=$(cat .buzz/routing.json) || return 1
-                ROUTING_BOOTSTRAP=yes
+                [ -n "${DEFAULT_BRANCH:-}" ] || {
+                  echo "${REF} has no .buzz/routing.json and DEFAULT_BRANCH is unset — failing rather than reading the head's copy" >&2
+                  return 1
+                }
+                DEF="origin/${DEFAULT_BRANCH}"
+                git rev-parse --verify --quiet "${DEF}^{commit}" >/dev/null || {
+                  echo "${REF} has no .buzz/routing.json and ${DEF} is not in this checkout — failing rather than reading the head's copy" >&2
+                  return 1
+                }
+                if git cat-file -e "${DEF}:.buzz/routing.json" 2>/dev/null; then
+                  echo "${REF} has no .buzz/routing.json — using the reviewed copy on ${DEF}" >&2
+                  RAW=$(git show "${DEF}:.buzz/routing.json") || {
+                    echo "could not read .buzz/routing.json from ${DEF} — failing rather than reading the head's copy" >&2
+                    return 1
+                  }
+                else
+                  echo "neither ${REF} nor ${DEF} has .buzz/routing.json yet — bootstrap: using this head's copy, stated on the card" >&2
+                  RAW=$(cat .buzz/routing.json) || return 1
+                  ROUTING_BOOTSTRAP=yes
+                fi
               fi
             else
               RAW=$(cat .buzz/routing.json) || return 1
@@ -925,6 +949,36 @@ jobs:
             done
           }
 
+          reconcile_members() {
+            # The required roster is dynamic now — .buzz/routing.json — so a
+            # rotation adds a pubkey every EXISTING room lacks, and the CLI
+            # refuses a mention that is not on the roster: without this, a
+            # seeded room would keep its old roster and every later update
+            # card and review wake would be rejected before publishing. Read
+            # the roster once, add only what is missing (roleless add-member
+            # is the role-preserving upsert), and confirm the adds applied.
+            # Writes only when something is missing, and only on a room the
+            # caller has proved live — every caller runs after its fence.
+            local CH="$1" ROSTER P MISSING=0
+            ROSTER=$(channel_roster "$CH") || {
+              echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+              return 1
+            }
+            for P in $(routing_pubkeys); do
+              if ! printf '%s' "$ROSTER" | jq -e --arg p "$P" 'any(.[]?; .pubkey == $p)' >/dev/null; then
+                echo "room $CH lacks routed identity $P — adding"
+                if ! buzz channels add-member --channel "$CH" --pubkey "$P" >/dev/null; then
+                  echo "add-member failed for $P — job fails; the rerun retries" >&2
+                  return 1
+                fi
+                MISSING=1
+              fi
+            done
+            if [ "$MISSING" = 1 ]; then
+              verify_members "$CH" || return 1
+            fi
+          }
+
           resolve_by_membership() {
             # Establish, without guessing, whether a room of ours already
             # exists. Prints its UUID, or nothing when there provably is none;
@@ -1180,7 +1234,7 @@ jobs:
             # only, like the Author line: the routed KEYS are what CI mentions.
             printf '%s\n' "$(participants_line)"
             if [ "$ROUTING_BOOTSTRAP" = yes ]; then
-              printf 'Routing: read from this pull request'"'"'s own head — `%s` has no `.buzz/routing.json` yet. Display-only, like the Author line; the file is authoritative once it is on the base branch.\n' "$BASE_REF"
+              printf 'Routing: read from this pull request'"'"'s own head — neither `%s` nor `%s` has `.buzz/routing.json` yet. Display-only, like the Author line; the file is authoritative once it is on the default branch.\n' "$BASE_REF" "$DEFAULT_BRANCH"
             fi
             printf '%s\n\n%s\n\n' "$PR_URL" "$(git diff --shortstat "$RANGE")"
             printf '```\n%s\n```\n' "$(diff_files)"
@@ -1389,14 +1443,17 @@ jobs:
             # after a create-then-cancel partial, and skipping recovery
             # there would launder an owner-less channel into green forever.
             # $2 is "quiet" when the recovery card must wake nobody — see
-            # seed_card. The seeded path reads and writes nothing either way,
-            # so this is safe to call before a fence.
+            # seed_card. The seeded path reconciles the roster against the
+            # current .buzz/routing.json (reconcile_members), which can
+            # write, so call this only on a room already proved live — after
+            # the fence, as every caller does.
             local CH="$1" QUIET="${2:-}" STATE
             if ! STATE=$(channel_seed_state "$CH"); then
               echo "seed-marker lookup failed — failing so the rerun re-probes instead of guessing" >&2
               return 1
             fi
             if [ "$STATE" = seeded ]; then
+              reconcile_members "$CH" || return 1
               echo "channel $NAME fully provisioned"
               return 0
             fi

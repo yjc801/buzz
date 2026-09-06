@@ -724,13 +724,15 @@ check "docs/pr-review-routing.md should exist" \
 # WHERE THE MIRROR READS ITS ROUTING FROM.
 #
 # `load_routing` is the trust boundary of the routing file: the mirror runs
-# from the PR's own head, so the file must come from the BASE branch, or a
-# PR could re-route its own review. The one exception is bootstrap — a base
-# with no file at all has nothing reviewed to protect, so the head's copy is
-# used and flagged — and it must stay narrow: an unreachable base or an
-# unreadable file is a failure, never a fallback. Extracted from the
-# workflow, not restated, so widening the exception fails here.
-echo "--- mirror: routing comes from the base branch, with a bootstrap exception no wider than 'absent'"
+# from the PR's own head, so the file must come from a reviewed branch, or a
+# PR could re-route its own review. The PR's base is that branch when it has
+# the file; a base that predates the file (legacy or stacked) defers to the
+# default branch's copy; only when neither has it — the PR introducing the
+# registry — is the head's copy used, and flagged. That exception must stay
+# exactly that narrow: an unreachable ref or an unreadable or invalid file is
+# a failure, never a fallback. Extracted from the workflow, not restated, so
+# widening the exception fails here.
+echo "--- mirror: routing comes from a reviewed branch, with a bootstrap exception no wider than 'absent everywhere'"
 
 "$REAL_PYTHON3" - "$MIRROR" > "$WORK/routing.sh" <<'ROUTINGPY'
 import sys
@@ -747,28 +749,37 @@ sys.stdout.write("\n".join(ln[len(indent):] for ln in lines[i : j + 1]) + "\n")
 ROUTINGPY
 [ -s "$WORK/routing.sh" ] || { echo "load_routing extraction produced nothing" >&2; exit 2; }
 
-# A checkout with a HEAD copy of the file (a distinct reviewer, so the two
-# sources can be told apart) and the real validator at the path the workflow
-# calls; the base branch is a fake `git` serving a fixture or nothing.
+# A checkout with a HEAD copy of the file and the real validator at the path
+# the workflow calls. Each ref the step may consult — the PR's base and the
+# default branch — is a fake `git` state: `missing` (unreachable), `absent`
+# (reachable, no file), or a fixture file. Three distinct reviewers tell the
+# sources apart.
 HEAD_REVIEWER=5555555555555555555555555555555555555555555555555555555555555555
+MAIN_REVIEWER=6666666666666666666666666666666666666666666666666666666666666666
 DRIVE_DIR="$WORK/checkout"
 mkdir -p "$DRIVE_DIR/.buzz" "$DRIVE_DIR/.github/scripts"
 cp .github/scripts/buzz-routing.sh "$DRIVE_DIR/.github/scripts/"
-printf '{"version":1,"owner":"%s","reviewer":"%s","agent_branches":[],"implementers":[]}\n' \
-  "$OWNER_PUB" "$HEAD_REVIEWER" > "$DRIVE_DIR/.buzz/routing.json"
-printf '{"version":1,"owner":"%s","reviewer":"%s","agent_branches":[],"implementers":[]}\n' \
-  "$OWNER_PUB" "$REVIEWER_PUB" > "$WORK/base-routing.json"
+routing_doc() { printf '{"version":1,"owner":"%s","reviewer":"%s","agent_branches":[],"implementers":[]}\n' "$OWNER_PUB" "$1"; }
+routing_doc "$HEAD_REVIEWER" > "$DRIVE_DIR/.buzz/routing.json"
+routing_doc "$REVIEWER_PUB" > "$WORK/base-routing.json"
+routing_doc "$MAIN_REVIEWER" > "$WORK/main-routing.json"
 printf '{"version":1,"owner":"nobody"}\n' > "$WORK/base-routing-invalid.json"
 export DRIVE_DIR
 
 cat > "$WORK/routing-drive.sh" <<'DRIVEEOF'
 set -uo pipefail
 cd "$DRIVE_DIR"
+ref_state() { # ref_state <origin/<name>[^{commit}|:<path>]> → missing | absent | <fixture path>
+  local NAME="${1#origin/}"; NAME="${NAME%%^*}"; NAME="${NAME%%:*}"
+  local VAR="FAKE_REF_${NAME}"
+  printf '%s' "${!VAR:-missing}"
+}
 git() {
+  local S
   case "$1 $2" in
-    "rev-parse --verify") [ "$FAKE_BASE_EXISTS" = yes ] ;;
-    "cat-file -e") [ -n "$FAKE_BASE_ROUTING" ] ;;
-    "show "*) [ -n "$FAKE_BASE_ROUTING" ] && cat "$FAKE_BASE_ROUTING" ;;
+    "rev-parse --verify") [ "$(ref_state "$4")" != missing ] ;;
+    "cat-file -e") S=$(ref_state "$3"); [ "$S" != missing ] && [ "$S" != absent ] ;;
+    "show "*) S=$(ref_state "$2"); [ "$S" != missing ] && [ "$S" != absent ] && cat "$S" ;;
     *) echo "fake git: unhandled: $*" >&2; return 9 ;;
   esac
 }
@@ -780,37 +791,59 @@ printf 'bootstrap=%s\n' "$ROUTING_BOOTSTRAP"
 printf 'reviewer=%s\n' "${REVIEWER_PUBKEY:-}"
 DRIVEEOF
 
-load() { # load <base-exists yes|no> <base-routing-file-or-empty> [BASE_REF] [BUZZ_ROUTING_FILE]
-  FAKE_BASE_EXISTS="$1" FAKE_BASE_ROUTING="$2" BASE_REF="${3-main}" BUZZ_ROUTING_FILE="${4-}" \
+load() { # load <base-ref> <default-branch> [BUZZ_ROUTING_FILE]; ref states via FAKE_REF_main / FAKE_REF_legacy
+  BASE_REF="$1" DEFAULT_BRANCH="$2" BUZZ_ROUTING_FILE="${3-}" \
+    FAKE_REF_main="${FAKE_REF_main-missing}" FAKE_REF_legacy="${FAKE_REF_legacy-missing}" \
     ROUTING_SH="$WORK/routing.sh" bash "$WORK/routing-drive.sh"
 }
+loaded() { # loaded <out> <expected reviewer> <expected bootstrap>
+  [ "$(field "$1" rc)" = 0 ] && [ "$(field "$1" reviewer)" = "$2" ] && [ "$(field "$1" bootstrap)" = "$3" ]
+}
+refused() { # refused <out> — failed without adopting any source
+  [ "$(field "$1" rc)" != 0 ] && [ -z "$(field "$1" reviewer)" ] && [ "$(field "$1" bootstrap)" = no ]
+}
 
-OUT=$(load yes "$WORK/base-routing.json")
-check "base has the file → it is used, not the head's copy" \
-  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$REVIEWER_PUB" ]; echo $?)"
-check "base has the file → not a bootstrap" "$([ "$(field "$OUT" bootstrap)" = no ]; echo $?)"
+OUT=$(FAKE_REF_main="$WORK/base-routing.json" load main main)
+check "base has the file → it is used, not the head's copy" "$(loaded "$OUT" "$REVIEWER_PUB" no; echo $?)"
 
-OUT=$(load yes "")
-check "base has no file → the head's copy is used (bootstrap)" \
-  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$HEAD_REVIEWER" ]; echo $?)"
-check "base has no file → flagged as bootstrap for the card" "$([ "$(field "$OUT" bootstrap)" = yes ]; echo $?)"
+OUT=$(FAKE_REF_main=absent load main main)
+check "base is the default branch and has no file → bootstrap from the head, flagged" \
+  "$(loaded "$OUT" "$HEAD_REVIEWER" yes; echo $?)"
 
-OUT=$(load no "")
-check "base ref unreachable → failure, never a fallback to the head" \
-  "$([ "$(field "$OUT" rc)" != 0 ] && [ -z "$(field "$OUT" reviewer)" ]; echo $?)"
-check "base ref unreachable → not flagged as bootstrap" "$([ "$(field "$OUT" bootstrap)" = no ]; echo $?)"
+# THE CASE THE EXCEPTION MUST NOT COVER: a PR targeting a branch that predates
+# the file, after the default branch has it. The reviewed copy wins; the head
+# is never consulted.
+OUT=$(FAKE_REF_legacy=absent FAKE_REF_main="$WORK/main-routing.json" load legacy main)
+check "base lacks the file but the default branch has it → the default branch's copy" \
+  "$(loaded "$OUT" "$MAIN_REVIEWER" no; echo $?)"
 
-OUT=$(load yes "$WORK/base-routing-invalid.json")
-check "base has an invalid file → failure, never a fallback to the head" \
-  "$([ "$(field "$OUT" rc)" != 0 ] && [ -z "$(field "$OUT" reviewer)" ]; echo $?)"
+OUT=$(FAKE_REF_legacy=absent FAKE_REF_main=absent load legacy main)
+check "neither base nor default branch has the file → bootstrap from the head, flagged" \
+  "$(loaded "$OUT" "$HEAD_REVIEWER" yes; echo $?)"
 
-OUT=$(load no "" "")
-check "no base ref (scheduled run) → the checkout's copy" \
-  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$HEAD_REVIEWER" ] && [ "$(field "$OUT" bootstrap)" = no ]; echo $?)"
+OUT=$(FAKE_REF_legacy=missing FAKE_REF_main="$WORK/main-routing.json" load legacy main)
+check "base ref unreachable → failure, never a fallback" "$(refused "$OUT"; echo $?)"
 
-OUT=$(load no "" main "$WORK/base-routing.json")
+OUT=$(FAKE_REF_legacy=absent FAKE_REF_main=missing load legacy main)
+check "base lacks the file and the default branch is unreachable → failure, never the head" \
+  "$(refused "$OUT"; echo $?)"
+
+OUT=$(FAKE_REF_legacy=absent FAKE_REF_main="$WORK/main-routing.json" load legacy "")
+check "base lacks the file and no default branch is known → failure, never the head" \
+  "$(refused "$OUT"; echo $?)"
+
+OUT=$(FAKE_REF_main="$WORK/base-routing-invalid.json" load main main)
+check "base has an invalid file → failure, never a fallback" "$(refused "$OUT"; echo $?)"
+
+OUT=$(FAKE_REF_legacy=absent FAKE_REF_main="$WORK/base-routing-invalid.json" load legacy main)
+check "default branch has an invalid file → failure, never the head" "$(refused "$OUT"; echo $?)"
+
+OUT=$(load "" main)
+check "no base ref (scheduled run) → the checkout's copy" "$(loaded "$OUT" "$HEAD_REVIEWER" no; echo $?)"
+
+OUT=$(load main main "$WORK/base-routing.json")
 check "BUZZ_ROUTING_FILE override → that file, without touching git" \
-  "$([ "$(field "$OUT" rc)" = 0 ] && [ "$(field "$OUT" reviewer)" = "$REVIEWER_PUB" ]; echo $?)"
+  "$(loaded "$OUT" "$REVIEWER_PUB" no; echo $?)"
 
 echo
 echo "$PASS assertions passed, $FAILED failed"

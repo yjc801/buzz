@@ -362,6 +362,36 @@ jobs:
             done
           }
 
+          reconcile_members() {
+            # The required roster is dynamic now — .buzz/routing.json — so a
+            # rotation adds a pubkey every EXISTING room lacks, and the CLI
+            # refuses a mention that is not on the roster: without this, a
+            # seeded room would keep its old roster and every later update
+            # card and review wake would be rejected before publishing. Read
+            # the roster once, add only what is missing (roleless add-member
+            # is the role-preserving upsert), and confirm the adds applied.
+            # Writes only when something is missing, and only on a room the
+            # caller has proved live — every caller runs after its fence.
+            local CH="$1" ROSTER P MISSING=0
+            ROSTER=$(channel_roster "$CH") || {
+              echo "roster read failed for $CH — failing so the rerun re-probes" >&2
+              return 1
+            }
+            for P in $(routing_pubkeys); do
+              if ! printf '%s' "$ROSTER" | jq -e --arg p "$P" 'any(.[]?; .pubkey == $p)' >/dev/null; then
+                echo "room $CH lacks routed identity $P — adding"
+                if ! buzz channels add-member --channel "$CH" --pubkey "$P" >/dev/null; then
+                  echo "add-member failed for $P — job fails; the rerun retries" >&2
+                  return 1
+                fi
+                MISSING=1
+              fi
+            done
+            if [ "$MISSING" = 1 ]; then
+              verify_members "$CH" || return 1
+            fi
+          }
+
           resolve_by_membership() {
             # Establish, without guessing, whether a room of ours already
             # exists. Prints its UUID, or nothing when there provably is none;
@@ -549,12 +579,16 @@ jobs:
             # meet its next workflow event at closed or reopened, and skipping
             # recovery there would launder an owner-less, never-mentioned
             # channel into green forever.
+            # The seeded path reconciles the roster against the current
+            # .buzz/routing.json (reconcile_members), which can write, so
+            # every caller runs this after its fence, on a room proved live.
             local CH="$1" STATE
             if ! STATE=$(channel_seed_state "$CH"); then
               echo "seed-marker lookup failed — failing so the rerun re-probes instead of guessing" >&2
               return 1
             fi
             if [ "$STATE" = seeded ]; then
+              reconcile_members "$CH" || return 1
               echo "channel $NAME fully provisioned"
               return 0
             fi

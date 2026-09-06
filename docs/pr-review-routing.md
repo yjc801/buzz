@@ -82,16 +82,27 @@ thing. A consumer that wants the same registry (the reviewer, below) must read
 it the same way: from the base branch, through its own authenticated GitHub
 read, never from the PR checkout and never from the card.
 
-**Bootstrap.** The PR that introduces the file, and any PR opened before it
-merges, has a base branch with no routing at all. There is nothing reviewed to
-protect in that state — the rule keeps a PR from overriding routing that
-exists, and none does — so the mirror uses the head's copy and the card says
-so (`Routing: read from this pull request's own head …`). The exception is
-dead once the file is on the base branch and can only return through a merge
-that deletes it. Absence is decided by `git cat-file -e` on a base ref proved
-present first; an unreachable base or an unreadable file is a failure, never a
+**A base without the file is not authority for the head.** A PR can target a
+legacy or stacked branch that predates the registry. The reviewed copy then
+lives on the default branch, and that is what such a PR gets — never its own
+head's, which would let it pick the identities CI provisions and wakes. Only
+when neither the base nor the default branch has the file is there nothing
+reviewed to protect, and that one condition — the PR introducing the
+registry — reads the head's copy and says so on the card (`Routing: read
+from this pull request's own head …`). The exception is dead once the default
+branch carries the file and can only return through a merge that deletes it.
+Absence is decided by `git cat-file -e` on a ref proved present first; an
+unreachable ref or an unreadable or invalid file is a failure, never a
 fallback. Pinned by the `load_routing` section of
 `.github/scripts/pr-review-wake.test.sh`.
+
+**The roster follows the file.** Every routed identity is a required member of
+every room, and the CLI refuses a mention that is not on the roster. A change
+to the file — a rotation, a new implementer — therefore adds a pubkey that
+every existing room lacks, so on every event that finds a seeded room the
+mirrors reconcile it: read the roster once, add what is missing, confirm the
+adds applied (`reconcile_members`). Without that, the next update card or
+review wake on an existing PR would be refused before publishing.
 
 `.github/scripts/buzz-routing.sh validate` is the single validator every
 workflow runs before its first relay write; a malformed file fails the job

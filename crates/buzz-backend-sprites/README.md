@@ -50,6 +50,55 @@ provisioning: `buzz-agent` (always installed, via the sprig multicall), or
 else — including Goose, which the sprite base image does not ship — is
 refused at deploy time, before the sprite is touched.
 
+## Workspace hygiene
+
+Agents mint checkouts faster than they retire them: before this existed the
+fleet held per-PR clones and worktrees by the dozen, several carrying gigabytes
+of `target/` or `node_modules` for pull requests closed weeks earlier, and
+nothing on a sprite ever asked whether the PR behind a checkout was still open.
+`buzz-workspace sweep` (in `src/assets/workspace.sh`) is the deterministic
+answer: the launcher runs it at every start — so a PR closed while the agent
+slept is cleaned on the next wake — and once a day while the harness lives, off
+the election lock and at the lowest priority. No agent turn is involved.
+
+What it reclaims, and the evidence it needs first:
+
+| checkout | when | action |
+|---|---|---|
+| linked worktree | every associated PR closed or merged, or the commit is on `origin/<default>` | `git worktree remove` (build caches go with it) |
+| slot (`<repo>-slots/N`) | same, and the claim has expired | claim released; the checkout and its build cache stay (that cache is the pool's purpose) |
+| standalone clone | same, and it is off the default branch | switched to the default branch and fast-forwarded — **never deleted** outside `~/.scratch` |
+| local branch | on `origin/<default>`, or the head of a closed PR and on some remote ref | deleted |
+| anything under `~/.scratch` | idle past the TTL | removed — disposable by the Nest contract, dirty or not |
+| idle build caches (`target/`) | free disk under the floor | purged, unclaimed slots first, until the floor is met |
+
+A pull request is tied to a checkout by evidence, never by a directory name
+alone: the exact `refs/pull/N/head` sha from one `git ls-remote`, the branch
+name looked up on GitHub, or a `pr-N` name hint that must be confirmed by
+fetching that PR's head and proving ancestry. Everything else is kept, and the
+log says why: uncommitted or untracked files, a commit on no remote ref, a
+process with its cwd inside or any file changed within the hold window, a
+`git worktree lock`, an open PR, a live slot claim, or a GitHub read that
+failed, was rate-limited, or ran over the per-sweep budget — a failed read is
+never treated as "closed".
+
+Knobs, read from the agent's environment (set them per agent in Buzz Desktop):
+
+| variable | default | meaning |
+|---|---|---|
+| `BUZZ_WORKSPACE_SWEEP_INTERVAL` | 86400 | seconds between sweeps while the harness lives (`--if-due`) |
+| `BUZZ_WORKSPACE_SWEEP_HOLD_MIN` | 180 | a checkout touched this recently is in use |
+| `BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS` | 7 | idle days before a `~/.scratch` checkout is removed |
+| `BUZZ_WORKSPACE_MIN_FREE_GB` | 10 | free-space floor that triggers the build-cache purge |
+| `BUZZ_WORKSPACE_SWEEP_API_BUDGET` | 40 | GitHub reads per sweep; an unauthenticated sprite has 60 an hour |
+| `GH_TOKEN` / `GITHUB_TOKEN` | unset | authenticates the sweep's GitHub reads and its `git fetch`/`ls-remote` against github.com. **Required for a private repository**: the launcher's environment carries none of the credentials an agent session sets up for itself, so without a token a private origin fails its fetch (logged) and every decision that needed GitHub stays `unknown`. A fine-grained token with `contents: read` and `pull_requests: read` is enough; it also lifts the unauthenticated rate limit |
+| `BUZZ_WORKSPACE_SWEEP_DISABLED` | unset | `1` turns the sweep off |
+
+`buzz-workspace sweep --dry-run` reports without acting; the log is
+`~/.buzz/workspace-sweep.log`. The contract is pinned end to end by
+`tests/workspace-sweep.test.sh` (a real origin with pull-request refs, the
+production script, a stub GitHub), run under `cargo test`.
+
 ## [L3] Conformance — how this binding realizes the contract
 
 The spec (`docs/remote-agents.md`, §Conformance item 6) requires every binding

@@ -119,6 +119,41 @@ mod tests {
         );
     }
 
+    /// The launcher is what makes the sweep happen without an agent turn:
+    /// once at start (a PR closed while the agent slept is cleaned on this
+    /// wake) and daily while the harness lives. Two properties keep it from
+    /// hurting the start it rides on: it runs off the election lock — fd 9
+    /// is closed inside the subshell before anything else, so the sweep can
+    /// never hold the agent lock past the harness's exit — and it is
+    /// `--if-due`, so every call but the first in a day is a stat and an
+    /// exit. Pinned as text: the script is the contract.
+    #[test]
+    fn the_launcher_sweeps_the_workspace_off_the_election_lock() {
+        let sweep = LAUNCHER_SH
+            .find(r#""$BUZZ/bin/buzz-workspace" sweep --if-due"#)
+            .expect("the launcher no longer runs the workspace sweep");
+        let subshell = LAUNCHER_SH[..sweep]
+            .rfind("(\n    exec 9>&-")
+            .expect("the sweep subshell no longer closes the election lock first");
+        let between = &LAUNCHER_SH[subshell..sweep];
+        assert!(
+            !between.contains("exec 9>\""),
+            "something re-opens fd 9 between closing it and the sweep"
+        );
+        assert!(
+            LAUNCHER_SH[sweep..].contains(r#"= "buzz-acp" ] || exit 0"#),
+            "the sweep loop no longer stops when the harness is gone"
+        );
+        assert!(
+            LAUNCHER_SH[..sweep].contains("nice -n 19"),
+            "the sweep no longer runs at the lowest priority"
+        );
+        assert!(
+            LAUNCHER_SH[..sweep].contains("exec 9>&-"),
+            "the sweep subshell no longer closes the election lock"
+        );
+    }
+
     /// The whole point is that a slot's build caches survive being handed to a
     /// new ref. `git clean -x` and a plain `rm -rf target` are the two ways to
     /// throw that away by accident, so neither may appear in the helper.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # buzz-backend-sprites workspace helper — installed at ~/.buzz/bin/buzz-workspace,
 # which the launcher puts on the agent's PATH. Hands the agent a WARM checkout of
-# a ref and prints its path.
+# a ref and prints its path; `sweep` takes back what closed pull requests left.
 #
 # The problem it exists to solve: a fresh checkout per PR is a cold Rust
 # environment, not just a cold `target/`. Hermit pins CARGO_HOME to
@@ -51,6 +51,8 @@ usage: buzz-workspace <ref> [repo] [--claim TOKEN]   print the path to a warm ch
        buzz-workspace list [repo]                    show every slot, its ref, and its build cache
        buzz-workspace gc [repo]                       prune worktrees whose directory is gone
        buzz-workspace release <ref> [repo] [--claim TOKEN]   give up a held slot early
+       buzz-workspace sweep [--dry-run] [--if-due]   reclaim checkouts, branches, slots and build
+                                                     caches that closed pull requests left behind
 
 <ref> may be a branch, tag, sha, or a pull request as `pr/19`, `#19`, or `19`.
 [repo] defaults to `buzz` and names a checkout under the Nest's REPOS/.
@@ -68,8 +70,77 @@ printed on first hand-out; a session doing repeated work against one ref
 should set BUZZ_WORKSPACE_CLAIM (or pass --claim) once so its own later calls
 are recognized as itself instead of being refused. `buzz-workspace release`
 gives up a claim early so the slot is immediately reusable by anyone.
+
+`sweep` walks every git checkout under $HOME (linked worktrees wherever they
+were registered, including /tmp), asks GitHub which pull requests are closed,
+and removes the worktrees, deletes the local branches, releases the slots and
+switches idle clones off the branches those pull requests left behind. It
+never touches a checkout with uncommitted or unpushed work, one used in the
+last BUZZ_WORKSPACE_SWEEP_HOLD_MIN minutes (default 180), or one whose pull
+request it cannot prove closed; a checkout under ~/.scratch is disposable by
+the Nest contract and is removed after BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS idle
+days (default 7) regardless. When free disk falls under
+BUZZ_WORKSPACE_MIN_FREE_GB (default 10) it also purges idle build caches,
+unclaimed slots first. The launcher runs it at every start and daily while
+the agent lives; --dry-run reports without acting, --if-due exits at once
+unless BUZZ_WORKSPACE_SWEEP_INTERVAL seconds (default 86400) have passed since
+the last completed sweep. BUZZ_WORKSPACE_SWEEP_DISABLED=1 turns it off.
 EOF
     exit 2
+}
+
+# ── Portability ──────────────────────────────────────────────────────────────
+# Sprites are Debian, but the script is also exercised on developer machines
+# and in tests; every GNU-only call goes through one of these so a BSD
+# userland reads the same answers instead of silently reading zero.
+
+mtime_of() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+# Rewind a stamp to the epoch, i.e. "never handed out".
+zero_mtime() {
+    touch -d @0 "$1" 2>/dev/null || touch -t 197001010000 "$1" 2>/dev/null || true
+}
+
+# Run a command under a wall-clock bound where coreutils provides one. A
+# network call with no bound would let one hung fetch hold the sweep (and its
+# lock) indefinitely; without `timeout` the bound is simply not enforced.
+run_timeout() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Hold the slot-selection lock (fd 9) for the rest of the process. flock is
+# what every sprite has; the mkdir fallback exists for hosts without it and
+# gives the same exclusivity, minus crash-safety — a dead holder's directory
+# is reaped by the next taker after a bounded wait.
+take_slot_lock() {
+    local lock="$1"
+    exec 9>"$lock"
+    if command -v flock >/dev/null 2>&1; then
+        flock -w 30 9 || die "another buzz-workspace is picking a slot; try again"
+        return
+    fi
+    local i=0
+    while ! mkdir "$lock.d" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 300 ]; then
+            if [ "$(($(date +%s) - $(mtime_of "$lock.d")))" -gt 120 ]; then
+                rmdir "$lock.d" 2>/dev/null || true
+                continue
+            fi
+            die "another buzz-workspace is picking a slot; try again"
+        fi
+        sleep 0.1
+    done
+    # shellcheck disable=SC2064
+    trap "rmdir '$lock.d' 2>/dev/null || true" EXIT
 }
 
 # The Nest root moved between provider versions ($HOME, then $HOME/.buzz), and
@@ -170,8 +241,11 @@ link_cache() {
     ln -sfn "$shared" "$link"
 }
 
+# Uncommitted or untracked files. `--no-optional-locks` keeps the check from
+# refreshing the index: the sweep reads index mtimes as a sign of use, and a
+# check that touched what it measures would report every checkout busy.
 slot_is_dirty() {
-    [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]
+    [ -n "$(git --no-optional-locks -C "$1" status --porcelain 2>/dev/null)" ]
 }
 
 # Slot bookkeeping lives beside the slots, never inside them: an untracked
@@ -203,7 +277,7 @@ new_claim_token() {
 # out (no stamp yet) reads as infinitely old, i.e. not held.
 hold_age() {
     local slots="$1" i="$2" now="$3" at
-    at=$(stat -c %Y "$(stamp "$slots" "$i")" 2>/dev/null || echo 0)
+    at=$(mtime_of "$(stamp "$slots" "$i")")
     printf '%s' "$((now - at))"
 }
 
@@ -232,8 +306,7 @@ cmd_path() {
 
     # Selection is the only racy part: two agent sessions asking at once must not
     # be handed the same slot. Everything after the pick is per-slot and safe.
-    exec 9>"$slots/.lock"
-    flock -w 30 9 || die "another buzz-workspace is picking a slot; try again"
+    take_slot_lock "$slots/.lock"
 
     local i slot chosen="" reused="" oldest="" oldest_at="" now
     now=$(date +%s)
@@ -270,7 +343,7 @@ cmd_path() {
                 continue
             fi
             local at
-            at=$(stat -c %Y "$(stamp "$slots" "$i")" 2>/dev/null || echo 0)
+            at=$(mtime_of "$(stamp "$slots" "$i")")
             if [ -z "$oldest_at" ] || [ "$at" -lt "$oldest_at" ]; then
                 oldest_at="$at"
                 oldest="$slot"
@@ -376,8 +449,7 @@ cmd_release() {
     slots="$(dirname "$canon")/$(basename "$canon")-slots"
     sha=$(resolve_sha "$canon" "$ref")
 
-    exec 9>"$slots/.lock"
-    flock -w 30 9 || die "another buzz-workspace is picking a slot; try again"
+    take_slot_lock "$slots/.lock"
 
     local i slot existing_claim
     for i in $(seq 1 "$SLOT_COUNT"); do
@@ -389,15 +461,802 @@ cmd_release() {
             die "$slot is claimed by another session. Pass --claim <token> or --force to release it anyway."
         fi
         rm -f "$(claim_file "$slots" "$i")"
-        touch -d @0 "$(stamp "$slots" "$i")" 2>/dev/null || true
+        zero_mtime "$(stamp "$slots" "$i")"
         note "released $slot ($ref)"
         return
     done
     note "no slot under $slots is at ${sha:0:9}; nothing to release"
 }
 
+# ── Sweep: take back what closed pull requests left behind ───────────────────
+#
+# Agents mint checkouts faster than they retire them. Measured on the fleet
+# before this existed: a reviewer with sixteen per-PR clones and worktrees
+# (1.4 GB of target/ in one), a coder whose canonical clone registered
+# fifty-six worktrees under /tmp, two abandoned worktrees carrying 2 GB of
+# node_modules each, and a second full clone idle for three weeks. Nothing on
+# a sprite ever asked whether the pull request behind a checkout was still
+# open, so nothing ever cleaned up, and sprite disks have wedged under exactly
+# that kind of growth.
+#
+# The sweep is deterministic and needs no agent turn: the launcher runs it at
+# every start and once a day while the harness lives, so a closed PR's
+# leftovers go on the next wake at the latest. It is built to be safe to run
+# beside a working agent, which is why every decision is a CLASS with a
+# reason (rule 9) rather than a boolean, and why every guard errs toward
+# keeping:
+#
+#   keep:in-use     a process has its cwd inside, or a file (or the checkout's
+#                   own index/HEAD/reflog) changed within the hold window
+#   keep:locked     `git worktree lock` — someone asked for it to stay
+#   keep:dirty      uncommitted or untracked files (git itself refuses these)
+#   keep:unpushed   a branch whose tip is on no remote ref and no PR head
+#   keep:open       an associated pull request is still open
+#   keep:unknown    no pull request could be tied to it, or GitHub could not
+#                   be asked — a failed read is never treated as "closed"
+#   keep:claimed    a slot under a live buzz-workspace claim
+#   reclaim:merged  the commit is on origin/<default>: nothing unique here
+#   reclaim:closed  every associated pull request is closed (merged or not);
+#                   a closed PR's head stays on GitHub as refs/pull/N/head
+#   reclaim:scratch idle under ~/.scratch past the TTL — disposable by the
+#                   Nest contract, so neither dirty nor open protects it
+#
+# What "reclaim" does depends on what the checkout is: a linked worktree is
+# removed (with its build caches), a slot is released (its build cache is
+# the warm pool this script exists for, so it stays unless disk pressure
+# says otherwise), a standalone clone is NEVER deleted outside ~/.scratch —
+# it is switched to the default branch so its closed branch can go and the
+# next task starts from main, which is what every coder prompt asks for. A
+# pull request is identified by evidence, never by a directory name alone:
+# the exact refs/pull/*/head sha from one `ls-remote`, a branch name looked
+# up on GitHub, or a `pr-N` name hint that must be confirmed by fetching that
+# PR's head and proving ancestry.
+
+SWEEP_DIR="$BUZZ/.workspace-sweep"
+SWEEP_LOG="$BUZZ/workspace-sweep.log"
+SWEEP_HOLD_MIN="${BUZZ_WORKSPACE_SWEEP_HOLD_MIN:-180}"
+SWEEP_SCRATCH_DAYS="${BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS:-7}"
+SWEEP_INTERVAL="${BUZZ_WORKSPACE_SWEEP_INTERVAL:-86400}"
+SWEEP_MIN_FREE_GB="${BUZZ_WORKSPACE_MIN_FREE_GB:-10}"
+SWEEP_API_BUDGET="${BUZZ_WORKSPACE_SWEEP_API_BUDGET:-40}"
+SWEEP_ROOTS="${BUZZ_WORKSPACE_SWEEP_ROOTS:-$HOME}"
+SWEEP_DEPTH="${BUZZ_WORKSPACE_SWEEP_DEPTH:-6}"
+SWEEP_DRY=0
+SWEEP_VERBOSE=0
+SWEEP_TMP=""
+# Counters for the summary line.
+SW_REMOVED=0 SW_REMOVED_KB=0 SW_BRANCHES=0 SW_RELEASED=0 SW_SWITCHED=0 SW_PURGED_KB=0
+SW_KEPT_DIRTY=0 SW_KEPT_INUSE=0 SW_KEPT_OPEN=0 SW_KEPT_UNKNOWN=0 SW_KEPT_OTHER=0
+
+sweep_log() {
+    local line
+    line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
+    printf '%s\n' "$line" >>"$SWEEP_LOG" 2>/dev/null || true
+    if [ "$SWEEP_VERBOSE" = 1 ]; then
+        printf 'buzz-workspace sweep: %s\n' "$*" >&2
+    fi
+}
+
+# Keep the log bounded: past half a megabyte, keep the newest 400 lines.
+sweep_rotate_log() {
+    local size
+    [ -f "$SWEEP_LOG" ] || return 0
+    size=$(wc -c <"$SWEEP_LOG" 2>/dev/null | tr -d ' ' || echo 0)
+    [ "${size:-0}" -gt 524288 ] || return 0
+    tail -n 400 "$SWEEP_LOG" >"$SWEEP_LOG.tmp" 2>/dev/null && mv "$SWEEP_LOG.tmp" "$SWEEP_LOG"
+}
+
+sweep_realpath() {
+    (cd "$1" 2>/dev/null && pwd -P)
+}
+
+# `owner/repo` from the CONFIGURED origin URL. Read from config, not from
+# `remote get-url`: the latter applies url.<base>.insteadOf rewrites, and the
+# rewritten transport address is not the repository's identity.
+github_slug() {
+    local url="$1"
+    case "$url" in
+        https://github.com/*) url="${url#https://github.com/}" ;;
+        http://github.com/*) url="${url#http://github.com/}" ;;
+        git@github.com:*) url="${url#git@github.com:}" ;;
+        ssh://git@github.com/*) url="${url#ssh://git@github.com/}" ;;
+        *) return 1 ;;
+    esac
+    url="${url%/}"
+    url="${url%.git}"
+    case "$url" in
+        */*/*) return 1 ;;
+        */*) printf '%s' "$url" ;;
+        *) return 1 ;;
+    esac
+}
+
+# `git` for the sweep's network calls, under a wall-clock bound ($1 seconds).
+# With GH_TOKEN/GITHUB_TOKEN in the environment, github.com is authenticated
+# through an inline credential helper that reads the token at call time — the
+# token never appears in an argument list — so a private repository's pull
+# heads, branches and default branch are reachable from the launcher's
+# environment, which carries none of the credentials an interactive agent
+# session may have set up for itself. Without a token, public repositories
+# work and a private one fails its fetch, which is logged and leaves every
+# decision that needed it `unknown`. The bound is applied in here because
+# `timeout` runs a program, not a shell function.
+sweep_git() {
+    local secs="$1" token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    shift
+    if [ -n "$token" ]; then
+        # The helper expands $GH_TOKEN when git runs it, not here.
+        # shellcheck disable=SC2016
+        GH_TOKEN="$token" run_timeout "$secs" git -c 'credential.https://github.com.helper=' \
+            -c 'credential.https://github.com.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' \
+            "$@"
+    else
+        run_timeout "$secs" git "$@"
+    fi
+}
+
+# The remote's default branch: what origin/HEAD points at, else main, else
+# master. Empty when none of those exist locally — then nothing can be called
+# merged and no clone is switched.
+default_branch() {
+    local clone="$1" head
+    if head=$(git -C "$clone" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null); then
+        printf '%s' "${head#refs/remotes/origin/}"
+        return
+    fi
+    for head in main master; do
+        if git -C "$clone" rev-parse --verify -q "refs/remotes/origin/$head" >/dev/null 2>&1; then
+            printf '%s' "$head"
+            return
+        fi
+    done
+}
+
+# One GitHub API read, budgeted per sweep so an unauthenticated sprite (60
+# requests an hour, shared with whatever the agent itself does) can never be
+# starved by its own housekeeping. Body on stdout, rc 0 only on 200. A
+# rate-limit answer spends the rest of the budget: everything after it is
+# `unknown`, never `closed`. GH_TOKEN/GITHUB_TOKEN, when the owner sets one in
+# the agent's environment, lifts the ceiling.
+# The counter is a file, not a variable: classification runs inside command
+# substitutions, and a subshell's increment would never reach the parent.
+sweep_api_used() {
+    cat "$SWEEP_TMP/api.count" 2>/dev/null || echo 0
+}
+
+sweep_api() {
+    local path="$1" out code used
+    used=$(sweep_api_used)
+    [ "$used" -lt "$SWEEP_API_BUDGET" ] || return 2
+    used=$((used + 1))
+    printf '%s' "$used" >"$SWEEP_TMP/api.count"
+    out="$SWEEP_TMP/api.$used"
+    local token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    local auth=()
+    [ -z "$token" ] || auth=(-H "Authorization: Bearer $token")
+    code=$(curl -sS -m 30 -o "$out" -w '%{http_code}' \
+        -H 'Accept: application/vnd.github+json' \
+        ${auth[@]+"${auth[@]}"} \
+        "https://api.github.com/$path" 2>/dev/null) || {
+        sweep_log "github: request failed for $path"
+        return 1
+    }
+    case "$code" in
+        200)
+            cat "$out"
+            return 0
+            ;;
+        403 | 429)
+            sweep_log "github: rate limited on $path; no more requests this sweep"
+            printf '%s' "$SWEEP_API_BUDGET" >"$SWEEP_TMP/api.count"
+            return 1
+            ;;
+        *)
+            sweep_log "github: HTTP $code for $path"
+            return 1
+            ;;
+    esac
+}
+
+# Pull request state, memoised per sweep: `open`, `closed`, `merged`, or
+# `unknown`. Merged is reported separately for the log; both are terminal.
+sweep_pr_state() {
+    local slug="$1" num="$2" memo body state merged
+    memo="$SWEEP_TMP/state.$(printf '%s' "$slug" | tr '/' '_').$num"
+    if [ -f "$memo" ]; then
+        cat "$memo"
+        return
+    fi
+    state=unknown
+    if command -v jq >/dev/null 2>&1 && body=$(sweep_api "repos/$slug/pulls/$num"); then
+        merged=$(printf '%s' "$body" | jq -r 'if .merged_at then "merged" else (.state // "unknown") end' 2>/dev/null || echo unknown)
+        case "$merged" in
+            open | closed | merged) state="$merged" ;;
+        esac
+    fi
+    printf '%s' "$state" | tee "$memo"
+}
+
+# Pull request numbers a commit belongs to, one per line, or nothing.
+#   1. the exact refs/pull/N/head sha, from the ls-remote listing (no API);
+#   2. a `pr-N` / `prN` / `#N` hint in the path's basename — confirmed, never
+#      trusted: the PR's head is fetched and the commit must be an ancestor
+#      of it, which proves the commit is on GitHub inside that PR;
+#   3. a branch name, looked up as a same-repo head (one API read).
+sweep_prs_for() {
+    local clone="$1" slug="$2" sha="$3" branch="$4" path="$5" pullheads="$6"
+    local found
+    found=$(awk -v s="$sha" '$1 == s { n = $2; sub("^refs/pull/", "", n); sub("/head$", "", n); print n }' "$pullheads" 2>/dev/null || true)
+    if [ -n "$found" ]; then
+        printf '%s\n' "$found"
+        return
+    fi
+    local hint
+    hint=$(basename "$path" | sed -n -E 's/.*(^|[^0-9a-z])pr-?([0-9]+)($|[^0-9]).*/\2/p' | head -n 1)
+    if [ -n "$hint" ] && [ -n "$slug" ]; then
+        if sweep_git 60 -C "$clone" fetch --quiet origin "refs/pull/$hint/head" 2>/dev/null &&
+            git -C "$clone" merge-base --is-ancestor "$sha" FETCH_HEAD 2>/dev/null; then
+            printf '%s\n' "$hint"
+            return
+        fi
+    fi
+    if [ -n "$branch" ] && [ -n "$slug" ] && command -v jq >/dev/null 2>&1; then
+        local owner body
+        owner="${slug%%/*}"
+        if body=$(sweep_api "repos/$slug/pulls?state=all&per_page=20&head=$owner:$branch"); then
+            printf '%s' "$body" | jq -r '.[]?.number' 2>/dev/null || true
+        fi
+    fi
+}
+
+# The commit is on GitHub: a remote-tracking ref contains it, or it is the
+# head of some pull request. Removing a checkout at such a commit loses no
+# work — the commit is recoverable from origin.
+sweep_pushed() {
+    local clone="$1" sha="$2" pullheads="$3"
+    [ -n "$(git -C "$clone" branch -r --contains "$sha" 2>/dev/null)" ] && return 0
+    awk -v s="$sha" '$1 == s { found = 1 } END { exit found ? 0 : 1 }' "$pullheads" 2>/dev/null
+}
+
+# Something is using this checkout right now: a process with its cwd inside
+# (Linux /proc — the only substrate the sprites run), or any file, or the
+# checkout's own index/HEAD/reflog, modified inside the hold window. Build
+# and dependency trees are skipped — a running build writes there, but a
+# build with no process in the tree is a finished one.
+sweep_in_use() {
+    local path="$1" gitdir="$2" p cwd
+    if [ -d /proc ]; then
+        for p in /proc/[0-9]*; do
+            cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+            case "$cwd" in
+                "$path" | "$path"/*) return 0 ;;
+            esac
+        done
+    fi
+    [ "$SWEEP_HOLD_MIN" -gt 0 ] || return 1
+    local f
+    for f in index HEAD logs/HEAD; do
+        [ -e "$gitdir/$f" ] || continue
+        [ -z "$(find "$gitdir/$f" -mmin "-$SWEEP_HOLD_MIN" -print 2>/dev/null)" ] || return 0
+    done
+    [ -n "$(find "$path" \( -name node_modules -o -name target -o -name .hermit -o -name .git \) -prune -o -mmin "-$SWEEP_HOLD_MIN" -print 2>/dev/null | head -n 1)" ]
+}
+
+# Any activity within the last N days — the scratch TTL clock. Same shape as
+# the hold check, on a coarser unit.
+sweep_touched_within_days() {
+    local path="$1" gitdir="$2" days="$3" f
+    for f in index HEAD logs/HEAD; do
+        [ -e "$gitdir/$f" ] || continue
+        [ -z "$(find "$gitdir/$f" -mtime "-$days" -print 2>/dev/null)" ] || return 0
+    done
+    [ -n "$(find "$path" \( -name node_modules -o -name target -o -name .hermit -o -name .git \) -prune -o -mtime "-$days" -print 2>/dev/null | head -n 1)" ]
+}
+
+sweep_is_scratch() {
+    case "$1" in
+        "$HOME/.scratch/"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Decide what to do with one checkout. Prints `<class> <reason>`.
+#   $1 path  $2 its git dir  $3 HEAD sha  $4 branch or ""  $5 main clone
+#   $6 owner/repo or ""  $7 default branch or ""  $8 pull-heads listing
+sweep_classify() {
+    local path="$1" gitdir="$2" sha="$3" branch="$4" clone="$5" slug="$6" default="$7" pullheads="$8"
+    if sweep_in_use "$path" "$gitdir"; then
+        echo "keep:in-use active within ${SWEEP_HOLD_MIN}m"
+        return
+    fi
+    if sweep_is_scratch "$path" && ! sweep_touched_within_days "$path" "$gitdir" "$SWEEP_SCRATCH_DAYS"; then
+        echo "reclaim:scratch idle for ${SWEEP_SCRATCH_DAYS}d under ~/.scratch"
+        return
+    fi
+    if slot_is_dirty "$path"; then
+        echo "keep:dirty uncommitted changes"
+        return
+    fi
+    if [ -n "$default" ] && git -C "$clone" merge-base --is-ancestor "$sha" "refs/remotes/origin/$default" 2>/dev/null; then
+        echo "reclaim:merged ${sha:0:9} is on origin/$default"
+        return
+    fi
+    local prs
+    prs=$(sweep_prs_for "$clone" "$slug" "$sha" "$branch" "$path" "$pullheads")
+    if [ -z "$prs" ]; then
+        echo "keep:unknown no pull request found for ${sha:0:9}${branch:+ ($branch)}"
+        return
+    fi
+    local n st open="" closed="" unknown=""
+    for n in $prs; do
+        st=$(sweep_pr_state "$slug" "$n")
+        case "$st" in
+            open) open="$open #$n" ;;
+            closed | merged) closed="$closed #$n($st)" ;;
+            *) unknown="$unknown #$n" ;;
+        esac
+    done
+    if [ -n "$open" ]; then
+        echo "keep:open pull request$open"
+        return
+    fi
+    if [ -n "$unknown" ]; then
+        echo "keep:unknown state unavailable for$unknown"
+        return
+    fi
+    if ! sweep_pushed "$clone" "$sha" "$pullheads"; then
+        echo "keep:unpushed ${sha:0:9} is on no remote ref"
+        return
+    fi
+    echo "reclaim:closed pull request$closed"
+}
+
+sweep_count_kept() {
+    case "$1" in
+        keep:dirty) SW_KEPT_DIRTY=$((SW_KEPT_DIRTY + 1)) ;;
+        keep:in-use) SW_KEPT_INUSE=$((SW_KEPT_INUSE + 1)) ;;
+        keep:open) SW_KEPT_OPEN=$((SW_KEPT_OPEN + 1)) ;;
+        keep:unknown) SW_KEPT_UNKNOWN=$((SW_KEPT_UNKNOWN + 1)) ;;
+        *) SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1)) ;;
+    esac
+}
+
+sweep_size_kb() {
+    du -sk "$1" 2>/dev/null | cut -f1 || echo 0
+}
+
+# Remove a linked worktree through git, which refuses anything dirty or
+# locked unless told otherwise — `force` is passed only for scratch, where
+# the Nest contract already declared the contents disposable.
+sweep_remove_worktree() {
+    local clone="$1" path="$2" force="$3" why="$4" kb
+    kb=$(sweep_size_kb "$path")
+    if [ "$SWEEP_DRY" = 1 ]; then
+        sweep_log "would remove worktree $path ($((kb / 1024)) MB): $why"
+        return
+    fi
+    if [ "$force" = 1 ]; then
+        git -C "$clone" worktree remove --force "$path" >/dev/null 2>&1 || true
+    else
+        git -C "$clone" worktree remove "$path" >/dev/null 2>&1 || true
+    fi
+    if [ -e "$path" ]; then
+        sweep_log "kept worktree $path: git refused to remove it"
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
+    fi
+    SW_REMOVED=$((SW_REMOVED + 1))
+    SW_REMOVED_KB=$((SW_REMOVED_KB + kb))
+    sweep_log "removed worktree $path ($((kb / 1024)) MB): $why"
+}
+
+# A whole clone goes only from ~/.scratch, only when it still is a git
+# checkout at the moment of deletion, and only when no linked worktree of
+# it survived the pass (deleting the main clone would orphan them).
+sweep_remove_scratch_clone() {
+    local clone="$1" why="$2" kb remaining
+    sweep_is_scratch "$clone" || return 0
+    [ -e "$clone/.git" ] || return 0
+    remaining=$(git -C "$clone" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
+    if [ "${remaining:-1}" -gt 1 ]; then
+        sweep_log "kept scratch clone $clone: linked worktrees remain"
+        return
+    fi
+    kb=$(sweep_size_kb "$clone")
+    if [ "$SWEEP_DRY" = 1 ]; then
+        sweep_log "would remove scratch clone $clone ($((kb / 1024)) MB): $why"
+        return
+    fi
+    rm -rf -- "$clone"
+    SW_REMOVED=$((SW_REMOVED + 1))
+    SW_REMOVED_KB=$((SW_REMOVED_KB + kb))
+    sweep_log "removed scratch clone $clone ($((kb / 1024)) MB): $why"
+}
+
+# Move an idle standalone clone off a closed branch onto the default branch,
+# fast-forwarded to origin. The clone itself is never deleted: it is the
+# agent's warm environment, and coder prompts start every task from main.
+sweep_switch_clone() {
+    local clone="$1" default="$2" why="$3"
+    if [ "$SWEEP_DRY" = 1 ]; then
+        sweep_log "would switch $clone to $default: $why"
+        return
+    fi
+    if git -C "$clone" rev-parse --verify -q "refs/heads/$default" >/dev/null 2>&1; then
+        git -C "$clone" checkout --quiet "$default" 2>/dev/null || {
+            sweep_log "kept $clone on its branch: checkout $default failed"
+            return
+        }
+        git -C "$clone" merge --quiet --ff-only "refs/remotes/origin/$default" >/dev/null 2>&1 || true
+    else
+        git -C "$clone" checkout --quiet --track -b "$default" "refs/remotes/origin/$default" 2>/dev/null || {
+            sweep_log "kept $clone on its branch: checkout $default failed"
+            return
+        }
+    fi
+    SW_SWITCHED=$((SW_SWITCHED + 1))
+    sweep_log "switched $clone to $default: $why"
+}
+
+# Release a slot whose ref's pull request is closed: drop the claim and
+# rewind the stamp so it is recycled first. The checkout and its build cache
+# stay — that cache is the whole point of the slot pool.
+sweep_release_slot() {
+    local slots="$1" i="$2" why="$3"
+    if [ "$SWEEP_DRY" = 1 ]; then
+        sweep_log "would release slot $slots/$i: $why"
+        return
+    fi
+    # Under the same lock cmd_path selects with, and only if the hold has
+    # still expired: a hand-out that landed since classification rewrote the
+    # stamp, and it — not the sweep — owns the slot now.
+    if (
+        exec 9>"$slots/.lock"
+        if command -v flock >/dev/null 2>&1; then flock -w 30 9 || exit 3; fi
+        [ "$(hold_age "$slots" "$i" "$(date +%s)")" -ge "$HOLD_SECONDS" ] || exit 2
+        rm -f "$(claim_file "$slots" "$i")"
+        zero_mtime "$(stamp "$slots" "$i")"
+    ); then
+        SW_RELEASED=$((SW_RELEASED + 1))
+        sweep_log "released slot $slots/$i: $why"
+    else
+        sweep_log "kept slot $slots/$i: handed out since it was classified"
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+    fi
+}
+
+# Parse `git worktree list --porcelain` into one record per line:
+#   <path>|<sha>|<branch or empty>|<locked:0/1>
+sweep_worktree_records() {
+    local clone="$1" path="" sha="" branch="" locked=0 line
+    { git -C "$clone" worktree list --porcelain 2>/dev/null; echo; } | while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "worktree "*)
+                path="${line#worktree }"
+                sha="" branch="" locked=0
+                ;;
+            "HEAD "*) sha="${line#HEAD }" ;;
+            "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+            locked | "locked "*) locked=1 ;;
+            "")
+                [ -z "$path" ] || printf '%s|%s|%s|%s\n' "$path" "$sha" "$branch" "$locked"
+                path=""
+                ;;
+        esac
+    done
+}
+
+# Delete local branches that are checked out nowhere and are either on the
+# default branch already or the head of a closed pull request. `-D` only
+# after the same proof a worktree needs: the tip is on origin.
+sweep_prune_branches() {
+    local clone="$1" slug="$2" default="$3" pullheads="$4" records="$5"
+    local branch tip prs n st open unknown closed why list
+    list="$SWEEP_TMP/branches.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
+    git -C "$clone" for-each-ref --format='%(refname:short)' refs/heads >"$list" 2>/dev/null || : >"$list"
+    while IFS= read -r branch; do
+        [ -n "$branch" ] || continue
+        [ "$branch" != "$default" ] || continue
+        grep -q -- "|$branch|" "$records" && continue
+        tip=$(git -C "$clone" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null) || continue
+        why=""
+        if [ -n "$default" ] && git -C "$clone" merge-base --is-ancestor "$tip" "refs/remotes/origin/$default" 2>/dev/null; then
+            why="on origin/$default"
+        else
+            prs=$(sweep_prs_for "$clone" "$slug" "$tip" "$branch" "" "$pullheads")
+            [ -n "$prs" ] || continue
+            open="" unknown="" closed=""
+            for n in $prs; do
+                st=$(sweep_pr_state "$slug" "$n")
+                case "$st" in
+                    open) open=1 ;;
+                    closed | merged) closed="$closed #$n($st)" ;;
+                    *) unknown=1 ;;
+                esac
+            done
+            [ -z "$open" ] && [ -z "$unknown" ] || continue
+            sweep_pushed "$clone" "$tip" "$pullheads" || continue
+            why="pull request$closed"
+        fi
+        if [ "$SWEEP_DRY" = 1 ]; then
+            sweep_log "would delete branch $branch in $clone: $why"
+            continue
+        fi
+        if git -C "$clone" branch -D "$branch" >/dev/null 2>&1; then
+            SW_BRANCHES=$((SW_BRANCHES + 1))
+            sweep_log "deleted branch $branch in $clone: $why"
+        fi
+    done <"$list"
+}
+
+# Every main clone under the roots, one per line, deduplicated by real path.
+# A linked worktree found on its own (its main clone elsewhere) contributes
+# that main clone, so everything registered against it is still visited.
+sweep_find_clones() {
+    local root gitpath wt common
+    for root in $SWEEP_ROOTS; do
+        [ -d "$root" ] || continue
+        find "$root" -mindepth 1 -maxdepth "$SWEEP_DEPTH" \
+            \( -name node_modules -o -name target -o -name .hermit -o -name .cache -o -name .npm \
+            -o -name .local -o -name .codex -o -name .cargo -o -name .rustup -o -name adapters \
+            -o -name .workspace-sweep \) -prune -o \
+            -name .git -prune -print 2>/dev/null
+    done | while IFS= read -r gitpath; do
+        wt="${gitpath%/.git}"
+        common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+        [ "$(basename "$common")" = ".git" ] || continue
+        sweep_realpath "$(dirname "$common")"
+    done | sort -u
+}
+
+# One clone: fetch, learn the pull heads, prune stale registrations, then
+# decide each linked worktree, the clone's own checkout, and its branches.
+sweep_clone() {
+    local clone="$1" origin slug default pullheads records key
+    key=$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')
+    origin=$(git -C "$clone" config --get remote.origin.url 2>/dev/null || true)
+    slug=$(github_slug "$origin" 2>/dev/null || true)
+    if [ -n "$origin" ]; then
+        sweep_git 120 -C "$clone" fetch --quiet --prune origin >/dev/null 2>&1 ||
+            sweep_log "$clone: fetch failed; deciding from local refs"
+    fi
+    default=$(default_branch "$clone")
+    pullheads="$SWEEP_TMP/pullheads.$key"
+    : >"$pullheads"
+    if [ -n "$origin" ]; then
+        sweep_git 120 -C "$clone" ls-remote --quiet origin 'refs/pull/*/head' >"$pullheads" 2>/dev/null ||
+            sweep_log "$clone: could not list pull request heads; commits will not be matched to pull requests"
+    fi
+    git -C "$clone" worktree prune >/dev/null 2>&1 || true
+
+    records="$SWEEP_TMP/worktrees.$key"
+    sweep_worktree_records "$clone" >"$records"
+
+    local slots
+    slots="$(dirname "$clone")/$(basename "$clone")-slots"
+
+    local rec path rp sha branch locked gitdir class reason main_class="" main_reason="" i
+    while IFS='|' read -r path sha branch locked; do
+        [ -n "$path" ] || continue
+        [ -e "$path" ] || continue
+        rp=$(sweep_realpath "$path") || continue
+        gitdir=$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || continue
+        if [ "$rp" = "$clone" ]; then
+            # The clone's own checkout. Outside ~/.scratch only a checkout
+            # off the default branch is a question at all; under it, only
+            # the scratch TTL and the hold window apply — a scratch clone
+            # sitting on main is not "merged work", it is a scratch clone.
+            if sweep_is_scratch "$clone"; then
+                if sweep_in_use "$path" "$gitdir"; then
+                    main_class="keep:in-use" main_reason="active within ${SWEEP_HOLD_MIN}m"
+                elif ! sweep_touched_within_days "$path" "$gitdir" "$SWEEP_SCRATCH_DAYS"; then
+                    main_class="reclaim:scratch" main_reason="idle for ${SWEEP_SCRATCH_DAYS}d under ~/.scratch"
+                fi
+                continue
+            fi
+            [ "$branch" != "$default" ] || continue
+            rec=$(sweep_classify "$path" "$gitdir" "$sha" "$branch" "$clone" "$slug" "$default" "$pullheads")
+            main_class="${rec%% *}"
+            main_reason="${rec#* }"
+            continue
+        fi
+        if [ "$locked" = 1 ]; then
+            sweep_log "kept worktree $path: locked"
+            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+            continue
+        fi
+        rec=$(sweep_classify "$path" "$gitdir" "$sha" "$branch" "$clone" "$slug" "$default" "$pullheads")
+        class="${rec%% *}"
+        reason="${rec#* }"
+        case "$rp" in
+            "$slots"/[0-9]*)
+                i=$(basename "$rp")
+                case "$class" in
+                    reclaim:*)
+                        if [ -s "$(claim_file "$slots" "$i")" ] && [ "$(hold_age "$slots" "$i" "$(date +%s)")" -lt "$HOLD_SECONDS" ]; then
+                            sweep_log "kept slot $path: live claim"
+                            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+                        elif [ -s "$(claim_file "$slots" "$i")" ]; then
+                            sweep_release_slot "$slots" "$i" "$reason"
+                        fi
+                        ;;
+                    *)
+                        sweep_log "kept slot $path: $class $reason"
+                        sweep_count_kept "$class"
+                        ;;
+                esac
+                ;;
+            *)
+                case "$class" in
+                    reclaim:scratch) sweep_remove_worktree "$clone" "$path" 1 "$reason" ;;
+                    reclaim:*) sweep_remove_worktree "$clone" "$path" 0 "$reason" ;;
+                    *)
+                        sweep_log "kept worktree $path: $class $reason"
+                        sweep_count_kept "$class"
+                        ;;
+                esac
+                ;;
+        esac
+    done <"$records"
+
+    case "$main_class" in
+        reclaim:scratch) sweep_remove_scratch_clone "$clone" "$main_reason" ;;
+        reclaim:*) [ -z "$default" ] || sweep_switch_clone "$clone" "$default" "$main_reason" ;;
+        "") ;;
+        *)
+            sweep_log "kept clone $clone: $main_class $main_reason"
+            sweep_count_kept "$main_class"
+            ;;
+    esac
+    [ -e "$clone/.git" ] || return 0
+
+    git -C "$clone" worktree prune >/dev/null 2>&1 || true
+    sweep_worktree_records "$clone" >"$records"
+    sweep_prune_branches "$clone" "$slug" "$default" "$pullheads" "$records"
+
+    # Build caches this clone owns, for the disk-pressure pass: unclaimed idle
+    # slots first (priority 1), then idle clones and worktrees (2). Only
+    # checkouts nothing is using right now are candidates at all.
+    while IFS='|' read -r path sha branch locked; do
+        [ -n "$path" ] && [ -e "$path" ] || continue
+        rp=$(sweep_realpath "$path") || continue
+        gitdir=$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || continue
+        sweep_in_use "$path" "$gitdir" && continue
+        local prio=2 slot_i="-" d
+        case "$rp" in
+            "$slots"/[0-9]*)
+                i=$(basename "$rp")
+                if [ -s "$(claim_file "$slots" "$i")" ] && [ "$(hold_age "$slots" "$i" "$(date +%s)")" -lt "$HOLD_SECONDS" ]; then
+                    continue
+                fi
+                prio=1 slot_i="$i"
+                ;;
+        esac
+        for d in "$rp/target" "$rp/desktop/src-tauri/target"; do
+            if [ -d "$d" ]; then
+                printf '%s %s %s %s %s\n' "$prio" "$(mtime_of "$rp")" "$slots" "$slot_i" "$d" >>"$SWEEP_TMP/builddirs"
+            fi
+        done
+    done <"$records"
+    return 0
+}
+
+sweep_free_kb() {
+    df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+# Under the free-space floor, purge build caches oldest-first within each
+# priority until the floor is met. A purge is bounded by what it measures:
+# every removal is logged with its size, and the pass stops the moment the
+# floor is satisfied.
+sweep_disk_pressure() {
+    local need_kb free_kb d kb prio at slots slot_i
+    need_kb=$((SWEEP_MIN_FREE_GB * 1024 * 1024))
+    free_kb=$(sweep_free_kb)
+    [ -n "$free_kb" ] || return 0
+    [ "$free_kb" -lt "$need_kb" ] || return 0
+    sweep_log "disk: $((free_kb / 1024 / 1024)) GB free, floor is ${SWEEP_MIN_FREE_GB} GB; purging idle build caches"
+    [ -s "$SWEEP_TMP/builddirs" ] || {
+        sweep_log "disk: no idle build cache to purge"
+        return 0
+    }
+    sort -k1,1n -k2,2n "$SWEEP_TMP/builddirs" | while read -r prio at slots slot_i d; do
+        [ -d "$d" ] || continue
+        kb=$(sweep_size_kb "$d")
+        if [ "$SWEEP_DRY" = 1 ]; then
+            sweep_log "would purge build cache $d ($((kb / 1024)) MB, priority $prio)"
+        elif [ "$prio" = 1 ]; then
+            # A slot's cache goes only under the slot lock, and only if no
+            # hand-out has claimed the slot since it was listed.
+            if (
+                exec 9>"$slots/.lock"
+                if command -v flock >/dev/null 2>&1; then flock -w 30 9 || exit 3; fi
+                [ "$(hold_age "$slots" "$slot_i" "$(date +%s)")" -ge "$HOLD_SECONDS" ] || exit 2
+                rm -rf -- "$d"
+            ); then
+                sweep_log "purged build cache $d ($((kb / 1024)) MB, priority $prio)"
+            else
+                sweep_log "kept build cache $d: its slot was handed out"
+                continue
+            fi
+        else
+            rm -rf -- "$d"
+            sweep_log "purged build cache $d ($((kb / 1024)) MB, priority $prio)"
+        fi
+        echo "$kb"
+        free_kb=$(sweep_free_kb)
+        [ "$SWEEP_DRY" = 1 ] && free_kb=$((free_kb + kb))
+        [ "${free_kb:-0}" -lt "$need_kb" ] || break
+    done | awk '{ s += $1 } END { print s + 0 }'
+}
+
+cmd_sweep() {
+    local if_due="$1"
+    if [ "${BUZZ_WORKSPACE_SWEEP_DISABLED:-0}" = 1 ]; then
+        [ "$if_due" = 1 ] || note "sweep is disabled (BUZZ_WORKSPACE_SWEEP_DISABLED=1)"
+        return 0
+    fi
+    mkdir -p "$SWEEP_DIR"
+    if [ "$if_due" = 1 ] && [ -e "$SWEEP_DIR/last-ok" ]; then
+        local age
+        age=$(($(date +%s) - $(mtime_of "$SWEEP_DIR/last-ok")))
+        [ "$age" -ge "$SWEEP_INTERVAL" ] || return 0
+    fi
+    # One sweep at a time. A lock older than two hours belonged to a sweep
+    # that died (a sweep is bounded well under that); take it over.
+    if ! mkdir "$SWEEP_DIR/lock" 2>/dev/null; then
+        if [ "$(($(date +%s) - $(mtime_of "$SWEEP_DIR/lock")))" -gt 7200 ]; then
+            rmdir "$SWEEP_DIR/lock" 2>/dev/null || true
+            mkdir "$SWEEP_DIR/lock" 2>/dev/null || {
+                note "another sweep is running"
+                return 0
+            }
+        else
+            note "another sweep is running"
+            return 0
+        fi
+    fi
+    SWEEP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/buzz-sweep.XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$SWEEP_TMP'; rmdir '$SWEEP_DIR/lock' 2>/dev/null || true" EXIT
+    : >"$SWEEP_TMP/builddirs"
+    sweep_rotate_log
+    local mode=""
+    [ "$SWEEP_DRY" = 1 ] && mode=" (dry run)"
+    sweep_log "begin$mode: roots $SWEEP_ROOTS, hold ${SWEEP_HOLD_MIN}m, scratch ttl ${SWEEP_SCRATCH_DAYS}d, floor ${SWEEP_MIN_FREE_GB} GB"
+    if [ "$SWEEP_DRY" = 1 ]; then
+        sweep_log "dry run: nothing below was changed"
+    fi
+
+    # Clones are independent: one that fails (a corrupt repository, a
+    # command the substrate lacks) is logged and the rest are still swept.
+    # Anything else that fails is fatal and says where — a sweep that ends
+    # without its "done" line is a bug, not a quiet success. No errtrace: the
+    # trap must not follow into the command substitutions whose failures are
+    # handled where they happen.
+    trap 'sweep_log "aborted: a command failed at line $LINENO"' ERR
+    local clone
+    sweep_find_clones >"$SWEEP_TMP/clones"
+    while IFS= read -r clone; do
+        [ -n "$clone" ] && [ -e "$clone/.git" ] || continue
+        if ! sweep_clone "$clone"; then
+            sweep_log "$clone: sweep of this clone failed; continuing with the others"
+        fi
+    done <"$SWEEP_TMP/clones"
+
+    local purged
+    purged=$(sweep_disk_pressure)
+    SW_PURGED_KB=${purged:-0}
+
+    local summary
+    summary="reclaimed $SW_REMOVED checkout(s) ($((SW_REMOVED_KB / 1024)) MB), $SW_BRANCHES branch(es), $SW_RELEASED slot(s), switched $SW_SWITCHED clone(s), purged $((SW_PURGED_KB / 1024)) MB of build cache; kept $SW_KEPT_DIRTY dirty, $SW_KEPT_INUSE in use, $SW_KEPT_OPEN open, $SW_KEPT_UNKNOWN unknown, $SW_KEPT_OTHER other; github reads $(sweep_api_used)/$SWEEP_API_BUDGET"
+    sweep_log "done: $summary"
+    [ "$SWEEP_DRY" = 1 ] || touch "$SWEEP_DIR/last-ok"
+    printf 'buzz-workspace sweep: %s\n' "$summary"
+}
+
 main() {
-    local force=0 claim="${BUZZ_WORKSPACE_CLAIM:-}" args=()
+    local force=0 claim="${BUZZ_WORKSPACE_CLAIM:-}" args=() if_due=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --force) force=1 ;;
@@ -406,6 +1265,12 @@ main() {
                 [ "$#" -gt 0 ] || die "--claim requires a value"
                 claim="$1"
                 ;;
+            --dry-run)
+                SWEEP_DRY=1
+                SWEEP_VERBOSE=1
+                ;;
+            --verbose) SWEEP_VERBOSE=1 ;;
+            --if-due) if_due=1 ;;
             -h | --help) usage ;;
             *) args+=("$1") ;;
         esac
@@ -417,6 +1282,7 @@ main() {
         list) cmd_list "${args[1]:-buzz}" ;;
         gc) cmd_gc "${args[1]:-buzz}" ;;
         release) cmd_release "${args[1]:-}" "${args[2]:-buzz}" "$claim" "$force" ;;
+        sweep) cmd_sweep "$if_due" ;;
         *) cmd_path "${args[0]}" "${args[1]:-buzz}" "$force" "$claim" ;;
     esac
 }

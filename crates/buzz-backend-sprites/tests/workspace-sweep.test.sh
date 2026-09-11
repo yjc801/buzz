@@ -28,8 +28,10 @@
 #   * under ~/.scratch a clone idle past the TTL is removed even though it is
 #     dirty and on an open PR; one inside the TTL is kept;
 #   * local branches: merged-into-main and closed-PR branches go, an open
-#     PR's branch and a checked-out branch stay, and one that is advanced
-#     between classification and deletion stays with its new commit intact;
+#     PR's branch and a checked-out branch stay, one that is advanced
+#     between classification and deletion stays with its new commit intact,
+#     and one that a checkout grabs in that same window stays with its new
+#     worktree's HEAD still resolvable;
 #   * --dry-run changes nothing and reports what it would do; --if-due is a
 #     no-op inside the interval and acts past it; a held lock skips the run
 #     and a stale one is taken over; the disable switch disables;
@@ -99,6 +101,12 @@ case "\$url" in
   *"head=acme:agent/w/moved")
     [ ! -e "$T/gh/advance-branch" ] ||
       git -C "$T/home/.buzz/REPOS/buzz" update-ref refs/heads/agent/w/moved "\$(cat "$T/gh/advance-to")" ;;
+  # And a concurrent CHECKOUT of a branch the sweep has already classified:
+  # bare git takes no fence, so this is the same window, with the branch
+  # becoming active in a worktree rather than moving.
+  *"head=acme:agent/w/grabbed")
+    [ ! -e "$T/gh/grab-branch" ] ||
+      git -C "$T/home/.buzz/REPOS/buzz" worktree add -q "$T/home/.buzz/REPOS/wt-grabbed" agent/w/grabbed >/dev/null 2>&1 ;;
 esac
 [ ! -e "$T/gh/down" ] || exit 7
 path="\${url#https://api.github.com/}"
@@ -171,6 +179,10 @@ git -C "$SEED" push -q origin "agent/w/open:refs/pull/13/head" agent/w/open
 git -C "$SEED" checkout -q -b agent/w/moved main
 MOVED_BASE=$(commit "$SEED" "pr14 work" fourteen)
 git -C "$SEED" push -q origin agent/w/moved
+# The same, for the branch a checkout grabs mid-classification.
+git -C "$SEED" checkout -q -b agent/w/grabbed main
+GRAB_BASE=$(commit "$SEED" "pr15 work" fifteen)
+git -C "$SEED" push -q origin agent/w/grabbed
 git -C "$SEED" checkout -q main
 MAIN=$(git -C "$SEED" rev-parse main)
 
@@ -180,6 +192,8 @@ echo '{"number":13,"state":"open","merged_at":null}' >"$T/gh/pulls_13.json"
 echo '[{"number":12}]' >"$T/gh/head_agent_w_closed-ahead.json"
 echo '{"number":14,"state":"closed","merged_at":null}' >"$T/gh/pulls_14.json"
 echo '[{"number":14}]' >"$T/gh/head_agent_w_moved.json"
+echo '{"number":15,"state":"closed","merged_at":null}' >"$T/gh/pulls_15.json"
+echo '[{"number":15}]' >"$T/gh/head_agent_w_grabbed.json"
 
 # ── the sprite's home: a canonical clone, its worktrees, slots, more clones ──
 CLONE="$HOME/.buzz/REPOS/buzz"
@@ -391,6 +405,29 @@ git -C "$CLONE" update-ref refs/heads/agent/w/moved "$MOVED_BASE"
 bash "$WS" sweep >/dev/null 2>&1
 check "still at its classified tip, the same branch is deleted" \
   "$(has_branch "$CLONE" agent/w/moved; [ $? -ne 0 ]; echo $?)"
+
+# ── a branch that becomes checked out between classification and deletion ───
+# `git worktree list` is a snapshot and bare git honours no fence of ours, so
+# a checkout can make a classified branch active before the ref goes. Deleting
+# it then leaves that worktree's HEAD pointing at a ref that does not resolve.
+# The stub checks the branch out DURING the read that classifies it.
+echo "--- branch checked out under the sweep"
+W_GRAB="$R/wt-grabbed"
+git -C "$CLONE" branch -q agent/w/grabbed "$GRAB_BASE"
+touch "$T/gh/grab-branch"
+bash "$WS" sweep >/dev/null 2>&1
+rm -f "$T/gh/grab-branch"
+check "a branch checked out after it was classified is kept" "$(has_branch "$CLONE" agent/w/grabbed; echo $?)"
+check "and the worktree that grabbed it still resolves HEAD" \
+  "$(git -C "$W_GRAB" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
+check "log says why the branch was kept" \
+  "$(grep -qF -- "kept branch agent/w/grabbed in $CLONE: " "$LOG" && grep -qi -- "delete branch 'agent/w/grabbed'" "$LOG"; echo $?)"
+# ...and the refusal is the checkout, not the classification: with the
+# worktree gone, the same branch goes.
+git -C "$CLONE" worktree remove --force "$W_GRAB"
+bash "$WS" sweep >/dev/null 2>&1
+check "with nothing holding it, the same branch is deleted" \
+  "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
 
 # ── disk pressure ────────────────────────────────────────────────────────────
 echo "--- disk pressure"

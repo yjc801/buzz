@@ -102,10 +102,14 @@ the classification that chose it was a snapshot of a machine an agent is still
 using. What no lock can cover is an agent that simply `cd`s into an old
 checkout, so nothing is ever deleted in place: a directory is first moved aside
 with a single atomic rename, and if `/proc` then shows a process inside it, it
-is moved straight back and kept. A branch deletion gets the same treatment in
-ref form: `update-ref -d <ref> <classified-sha>` refuses unless the branch
-still points where the decision was made, so a commit another session pushed
-onto it in the meantime can never be deleted by a stale verdict.
+is moved straight back and kept. A branch deletion has two conditions and
+neither is a read of ours: it goes through `git branch -D`, the delete that
+refuses a branch checked out in any worktree, so a checkout that lands after
+the classification cannot be deleted out from under its HEAD; and because
+`-D` deletes a name rather than a sha, git's own `(was <sha>)` receipt is
+compared against the classified sha and anything else is put straight back,
+so a commit another session pushed onto the branch in the meantime can never
+be lost to a stale verdict.
 
 A standalone clone outside `~/.scratch` is the one thing the sweep will not
 act on, because that guarantee cannot be extended to it. Switching it to the

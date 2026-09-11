@@ -197,22 +197,33 @@ mod tests {
             );
         }
         // Deleting a branch destroys no directory, so it has no rename to
-        // make — its equivalent is a compare-and-delete. `branch -D` deletes
-        // a NAME after a SHA was classified, which is how a concurrent push
-        // loses its commits; `update-ref -d <ref> <old>` refuses unless the
-        // ref still equals what was proved disposable.
+        // make, and its two conditions need two different mechanisms.
+        // `update-ref -d` honours an expected old value but deletes a
+        // checked-out branch, leaving that worktree's HEAD unresolvable;
+        // `branch -D` refuses a checked-out branch but deletes a NAME after
+        // a SHA was classified, which is how a concurrent push loses its
+        // commits. So the delete is `branch -D`, and the sha condition
+        // converges on git's own `(was <sha>)` receipt.
         let prune = sweep_fn_body("sweep_prune_branches");
         assert!(
             prune.contains("fence_take"),
             "sweep_prune_branches no longer takes the reclaim fence"
         );
         assert!(
-            prune.contains(r#"update-ref -d "refs/heads/$branch" "$tip""#),
-            "sweep_prune_branches no longer deletes against the classified tip"
+            prune.contains(r#"git -C "$clone" branch -D "$branch""#),
+            "sweep_prune_branches no longer deletes with the form that refuses a checked-out branch"
         );
         assert!(
-            !WORKSPACE_SH.contains(r#"branch -D ""#),
-            "workspace.sh deletes a branch by name again, without comparing the tip"
+            prune.contains(r#"(was \([0-9a-f][0-9a-f]*\))"#) && prune.contains(r#""$was"*)"#),
+            "sweep_prune_branches no longer compares what git deleted against the classified tip"
+        );
+        assert!(
+            prune.contains(r#"update-ref refs/heads/"$branch" "$moved" """#),
+            "sweep_prune_branches no longer puts back a branch that moved under it"
+        );
+        assert!(
+            !WORKSPACE_SH.contains(r#"update-ref -d "refs/heads/"#),
+            "workspace.sh deletes a ref with a form that does not refuse a checked-out branch"
         );
         // And the one operation that can be neither fenced nor undone -- a
         // branch switch rewrites the tree in place at a path an agent may

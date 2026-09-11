@@ -1114,7 +1114,7 @@ sweep_worktree_records() {
 # after the same proof a worktree needs: the tip is on origin.
 sweep_prune_branches() {
     local clone="$1" slug="$2" default="$3" pullheads="$4" records="$5"
-    local branch tip prs n st open unknown closed why list
+    local branch tip prs n st open unknown closed why list out was moved
     list="$SWEEP_TMP/branches.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
     git -C "$clone" for-each-ref --format='%(refname:short)' refs/heads >"$list" 2>/dev/null || : >"$list"
     while IFS= read -r branch; do
@@ -1150,31 +1150,57 @@ sweep_prune_branches() {
             SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
             continue
         fi
-        # Under the fence, re-establish what classification read outside it:
-        # the branch must still be checked out nowhere. `update-ref -d` does
-        # not refuse a checked-out branch the way `branch -D` does, so this
-        # check is the whole of that protection now.
-        if sweep_worktree_records "$clone" | grep -q -- "|$branch|"; then
-            fence_drop
-            sweep_log "kept branch $branch in $clone: checked out since it was classified"
-            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
-            continue
-        fi
-        # And the compare-and-delete: `branch -D` deletes a NAME, but what was
-        # classified is a SHA. Another session can advance this un-checked-out
-        # branch between the two, and then the name no longer denotes the thing
-        # that was proved disposable -- `-D` would take the new tip and its
-        # unpushed commits with it. `update-ref -d <ref> <old>` is git's atomic
-        # expected-old-value delete: it refuses unless the ref still equals the
-        # sha this decision was made about.
-        if git -C "$clone" update-ref -d "refs/heads/$branch" "$tip" 2>/dev/null; then
-            fence_drop
-            SW_BRANCHES=$((SW_BRANCHES + 1))
-            sweep_log "deleted branch $branch in $clone: $why"
-        else
+        # Two properties have to hold at the moment the ref goes, and they
+        # need different mechanisms.
+        #
+        # Checked out nowhere: `git worktree list` is a snapshot, and a plain
+        # `git checkout` or `git worktree add` takes no lock this script
+        # invented, so it can make the branch active after any scan of ours.
+        # `update-ref -d` would delete it anyway and leave that worktree's
+        # symbolic HEAD pointing at a ref that no longer resolves. `branch -D`
+        # is the delete that refuses a checked-out branch, so the deletion
+        # itself carries the condition rather than a prior read of ours.
+        #
+        # Still at its classified SHA: `branch -D` deletes a NAME, and another
+        # session can advance an un-checked-out branch, so the name may no
+        # longer denote what was proved disposable. `branch -D` has no
+        # expected-old-value form, so this one converges instead: re-read the
+        # tip first to skip the ordinary case, and treat git's own
+        # "(was <sha>)" receipt as the authority on what actually went. The
+        # abbreviation git prints is unique in this repository, so it is a
+        # prefix of the classified sha only when it names that same commit;
+        # anything else is put straight back, commits and all.
+        if [ "$(git -C "$clone" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)" != "$tip" ]; then
             fence_drop
             sweep_log "kept branch $branch in $clone: it moved since it was classified"
             SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+            continue
+        fi
+        if ! out=$(LC_ALL=C git -C "$clone" branch -D "$branch" 2>&1); then
+            fence_drop
+            sweep_log "kept branch $branch in $clone: ${out##*error: }"
+            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+            continue
+        fi
+        was=$(printf '%s\n' "$out" | sed -n 's/.*(was \([0-9a-f][0-9a-f]*\)).*/\1/p')
+        if [ -n "$was" ]; then
+            case "$tip" in
+                "$was"*)
+                    fence_drop
+                    SW_BRANCHES=$((SW_BRANCHES + 1))
+                    sweep_log "deleted branch $branch in $clone: $why"
+                    continue
+                    ;;
+            esac
+        fi
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        moved=$(git -C "$clone" rev-parse --verify -q "${was:-missing}^{commit}" 2>/dev/null || true)
+        if [ -n "$moved" ] && git -C "$clone" update-ref refs/heads/"$branch" "$moved" "" 2>/dev/null; then
+            fence_drop
+            sweep_log "kept branch $branch in $clone: it moved since it was classified"
+        else
+            fence_drop
+            sweep_log "WARNING: branch $branch in $clone moved to ${was:-an unreported sha} after it was classified and could not be put back"
         fi
     done <"$list"
 }

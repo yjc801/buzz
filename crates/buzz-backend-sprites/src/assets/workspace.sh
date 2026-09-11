@@ -1185,13 +1185,32 @@ sweep_git_working_in() {
 }
 
 # One scan answers every entry for a clone in this run.
+#
+# The cache is ONE file of `<encoded clone>|<0 or 1>` lines, looked up by an
+# exact decoded compare, rather than one file per clone named after the path.
+# A per-clone filename has to encode the path into something a filename can
+# hold, and every such encoding that is not injective merges two clones into
+# one answer: `tr -c 'A-Za-z0-9' '_'` mapped `/srv/repo-a` and `/srv/repo_a`
+# both to `_srv_repo_a`, so a quiet clone scanned first answered for a clone
+# with a checkout in flight, and that clone's only repair intent was dropped.
+# A lookup keyed by the path itself cannot collide.
 sweep_checkout_in_flight() {
-    local clone="$1" cache
-    cache="$SWEEP_TMP/inflight.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
-    if [ ! -f "$cache" ]; then
-        if sweep_git_working_in "$clone"; then printf '1' >"$cache"; else printf '0' >"$cache"; fi
+    local clone="$1" cache key line k v
+    cache="$SWEEP_TMP/inflight.cache"
+    key=$(field_encode "$clone")
+    if [ -f "$cache" ]; then
+        while IFS='|' read -r k v; do
+            [ "$k" = "$key" ] || continue
+            [ "$v" = 1 ]
+            return
+        done <"$cache"
     fi
-    [ "$(cat "$cache" 2>/dev/null)" = 1 ]
+    if sweep_git_working_in "$clone"; then
+        printf '%s|1\n' "$key" >>"$cache"
+        return 0
+    fi
+    printf '%s|0\n' "$key" >>"$cache"
+    return 1
 }
 
 journal_count() {
@@ -1326,12 +1345,22 @@ sweep_prune_branches() {
     # new ones rather than dropping any. A journal that stays at the cap means
     # git has been working in a clone across many sweeps -- visible in the log,
     # one carried line per entry.
+    #
+    # The count is re-read before EVERY delete, not once before the loop. Each
+    # delete appends an entry, so a single pre-loop reading is a bound on when
+    # the pass starts and on nothing else: starting one below the cap still
+    # admitted every eligible branch in the clone, and starting from zero
+    # admitted more than the cap outright. The cap is only a cap if the
+    # candidate that would cross it is the one refused.
     outstanding=$(journal_count)
     if [ "$outstanding" -ge "$SWEEP_JOURNAL_MAX" ]; then
         sweep_log "not pruning branches in $clone: $outstanding branch repair intents are still outstanding (cap $SWEEP_JOURNAL_MAX)"
         return
     fi
-    list="$SWEEP_TMP/branches.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
+    # A fixed name, not one derived from the clone path: the same lossy
+    # encoding that collided in the liveness cache would have two clones share
+    # this file. It is written and consumed entirely within this call.
+    list="$SWEEP_TMP/branches.list"
     git -C "$clone" for-each-ref --format='%(refname:short)' refs/heads >"$list" 2>/dev/null || : >"$list"
     while IFS= read -r branch; do
         [ -n "$branch" ] || continue
@@ -1360,6 +1389,11 @@ sweep_prune_branches() {
         if [ "$SWEEP_DRY" = 1 ]; then
             sweep_log "would delete branch $branch in $clone: $why"
             continue
+        fi
+        outstanding=$(journal_count)
+        if [ "$outstanding" -ge "$SWEEP_JOURNAL_MAX" ]; then
+            sweep_log "stopped pruning branches in $clone at branch $branch: $outstanding branch repair intents are outstanding (cap $SWEEP_JOURNAL_MAX)"
+            return
         fi
         if ! fence_take; then
             sweep_log "kept branch $branch in $clone: the reclaim fence is held"

@@ -564,6 +564,74 @@ check "and its journal entry round-trips: that exact ref is restored" \
 check "so the worktree holding it resolves HEAD" \
   "$(git -C "$W_PIPE" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
 
+# ── two clones whose paths collide under a lossy key ───────────────────────
+# One scan answers every journal entry for a clone in a run, so the answer is
+# cached -- and a cache keyed by a lossy encoding of the path is a cache shared
+# between clones. `tr -c 'A-Za-z0-9' '_'` maps `/x/repo-a` and `/x/repo_a` to
+# the same name, so a quiet clone replayed first answered for a clone with a
+# checkout still in flight, and that clone's only repair intent was dropped.
+# These two clones live outside the sweep roots: only replay visits them, which
+# is the code path the cache belongs to.
+echo "--- colliding clone paths in the journal"
+mkdir -p "$T/collide"
+CQUIET="$T/collide/repo-a"   # replayed first, nothing running in it
+CLIVE="$T/collide/repo_a"    # same lossy key, a git process still working
+for c in "$CQUIET" "$CLIVE"; do
+  git init -q "$c"
+  git -C "$c" checkout -q -b main
+  commit "$c" base f >/dev/null
+  git -C "$c" branch -q collide-x
+  git -C "$c" update-ref -d refs/heads/collide-x "$(git -C "$c" rev-parse refs/heads/main)"
+done
+: >"$JOURNAL"
+printf '%s|%s|%s|%s\n' "$CQUIET" collide-x "$(git -C "$CQUIET" rev-parse refs/heads/main)" "$(date +%s)" >>"$JOURNAL"
+printf '%s|%s|%s|%s\n' "$CLIVE" collide-x "$(git -C "$CLIVE" rev-parse refs/heads/main)" "$(date +%s)" >>"$JOURNAL"
+mkfifo "$T/holder3.fifo"
+exec 8<>"$T/holder3.fifo"
+git -C "$CLIVE" cat-file --batch <&8 >/dev/null 2>&1 &
+HOLDER=$!
+sleep 1
+bash "$WS" sweep >/dev/null 2>&1
+# True on every substrate: a clone with git working in it keeps its intent,
+# whether it was attributed by /proc or counted by the coarse `ps` fallback.
+check "the clone with git still working in it keeps its entry" \
+  "$(grep -qF -- "carrying the repair intent for branch collide-x in $CLIVE" "$LOG"; echo $?)"
+check "and that entry is still in the journal" \
+  "$(grep -qF -- "$CLIVE|collide-x|" "$JOURNAL"; echo $?)"
+# The collision itself only shows where the probe can tell the two clones
+# apart, which is /proc: the fallback ignores the clone entirely and carries
+# both, so no cached answer there can be the wrong one. Linux is the substrate
+# the sprites run on.
+if [ -d /proc ]; then
+  check "the quiet clone's entry is dropped" \
+    "$(grep -qF -- "dropped the repair intent for branch collide-x in $CQUIET" "$LOG"; echo $?)"
+  check "and it is gone from the journal, without taking the live clone's with it" \
+    "$(grep -qF -- "$CQUIET|collide-x|" "$JOURNAL"; [ $? -ne 0 ]; echo $?)"
+fi
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; exec 8>&-
+: >"$JOURNAL"
+
+# ── the journal cap is a cap on every entry, not on the first ──────────────
+# Nothing expires a repair intent, so the cap is the only bound on how many
+# can be owed at once. Reading the count once before the branch loop bounds
+# when the pass STARTS and nothing else: every branch it then admits appends
+# an entry, so one clone could journal far past the cap in a single pass.
+echo "--- journal cap inside the branch loop"
+: >"$JOURNAL"
+for n in 1 2 3 4; do git -C "$CLONE" branch -q "capped/$n" "$BASE"; done
+BUZZ_WORKSPACE_SWEEP_JOURNAL_MAX=2 bash "$WS" sweep >/dev/null 2>&1
+CAPPED_LEFT=$(for n in 1 2 3 4; do has_branch "$CLONE" "capped/$n" && echo x; done | wc -l | tr -d ' ')
+check "the cap stops the pass: no more than it were deleted" \
+  "$([ "$CAPPED_LEFT" -ge 2 ]; echo $?)"
+check "and the journal never exceeds the cap" \
+  "$([ "$(wc -l <"$JOURNAL" | tr -d ' ')" -le 2 ]; echo $?)"
+check "log names the branch the cap refused" \
+  "$(grep -qF -- "stopped pruning branches in $CLONE" "$LOG"; echo $?)"
+for n in 1 2 3 4; do
+  git -C "$CLONE" update-ref -d "refs/heads/capped/$n" "$BASE" 2>/dev/null || true
+done
+: >"$JOURNAL"
+
 # ── disk pressure ────────────────────────────────────────────────────────────
 echo "--- disk pressure"
 # Keep the clone reading as idle: the pressure pass skips anything in use.

@@ -34,7 +34,18 @@
 #   * GitHub unreachable, rate-limited, or over budget keeps everything that
 #     needed an answer — and the merged-by-ancestry path still reclaims;
 #   * under the free-space floor, idle build caches are purged, the released
-#     slot's before the clone's; above it, nothing is.
+#     slot's before the clone's -- node_modules included, since a retained
+#     standalone clone is the one place it outlives every other step; above
+#     the floor, nothing is;
+#   * a held reclaim fence keeps everything and refuses a hand-out, and a
+#     process standing in a reclaimable worktree keeps it (Linux only: the
+#     cwd evidence is /proc).
+#
+# The `df` stub is pinned ABOVE the floor for every section but the
+# disk-pressure one. Inheriting the host's real free space made this suite
+# fail on exactly the machines the sweep is for: a sprite under 10 GB free
+# purged the fixtures during the ordinary sweep, several sections before the
+# test that is about purging.
 
 set -uo pipefail
 
@@ -106,6 +117,8 @@ fi
 STUB
 chmod +x "$T/stubs/curl" "$T/stubs/df"
 export PATH="$T/stubs:$PATH"
+# Well above any floor: only the disk-pressure section overrides this.
+export FAKE_DF_FREE_KB=999999999
 
 # ── the origin: main, three pull requests, two pushed branches ───────────────
 ORIGIN="$T/origin.git"
@@ -193,6 +206,12 @@ C2="$HOME/.buzz/second"
 git clone -q https://github.com/acme/buzz.git "$C2"
 git -C "$C2" fetch -q origin refs/pull/12/head
 git -C "$C2" checkout -q -b agent/w/closed FETCH_HEAD
+# The residue that motivated the sweep: a standalone clone outside ~/.scratch
+# is switched to main and KEPT, so its node_modules outlives every other step
+# and only the disk-pressure pass can ever reclaim it. (.gitignore covers it,
+# so it does not make the clone dirty.)
+mkdir -p "$C2/node_modules/pkg"
+echo blob >"$C2/node_modules/pkg/index.js"
 
 # Scratch: one long idle (dirty, on an open PR — disposable regardless), one recent.
 S_OLD="$HOME/.scratch/old-review"
@@ -331,12 +350,18 @@ gone "with GitHub back, both closed-PR worktrees go (2)" "$W_DOWN2"
 
 # ── disk pressure ────────────────────────────────────────────────────────────
 echo "--- disk pressure"
+# The earlier sweep switched this clone to main, which touched its files and
+# made it read as in use. A real one would be days idle by the next sweep.
+age "$C2" "$OLD"
 exists "above the floor: slot build cache kept" "$S1/target/artifact"
 exists "above the floor: clone build cache kept" "$CLONE/target/artifact"
+exists "above the floor: retained clone's node_modules kept" "$C2/node_modules/pkg/index.js"
 OUT=$(FAKE_DF_FREE_KB=1 bash "$WS" sweep 2>/dev/null)
 gone "under the floor: released slot's build cache purged" "$S1/target"
 gone "under the floor: idle clone's build cache purged" "$CLONE/target"
+gone "under the floor: retained clone's node_modules purged" "$C2/node_modules"
 exists "under the floor: the slot checkout itself stays" "$S1/.git"
+exists "under the floor: the retained clone itself stays" "$C2/.git"
 slot_line=$(grep -n "purged build cache $S1/target" "$LOG" | tail -n 1 | cut -d: -f1)
 clone_line=$(grep -n "purged build cache $CLONE/target" "$LOG" | tail -n 1 | cut -d: -f1)
 check "the slot's cache goes before the clone's (slot at line ${slot_line:-none}, clone at ${clone_line:-none})" \
@@ -359,6 +384,52 @@ BUZZ_WORKSPACE_SWEEP_DISABLED=1 bash "$WS" sweep >/dev/null 2>&1
 exists "the disable switch disables" "$W_DIS"
 bash "$WS" sweep >/dev/null 2>&1
 gone "re-enabled, it sweeps" "$W_DIS"
+
+# ── the reclaim fence ────────────────────────────────────────────────────────
+# Every destructive step takes it, and a hand-out holds it start to finish, so
+# a checkout can never be reclaimed while it is being handed out. With it held
+# by somebody else, the sweep must keep what it would otherwise have removed
+# and say so, and a hand-out must refuse rather than proceed unprotected.
+echo "--- reclaim fence"
+FENCE="$HOME/.buzz/.workspace-sweep/fence"
+mkdir -p "$(dirname "$FENCE")"
+# Held by THIS shell on fd 7, so releasing it is closing a descriptor rather
+# than signalling a background process (a killed `flock -c` can leave its
+# child holding the descriptor, and the lock with it).
+if command -v flock >/dev/null 2>&1; then
+  exec 7>"$FENCE"
+  flock -n -x 7 || fail "the test could not take the reclaim fence"
+else
+  mkdir "$FENCE.d"
+fi
+W_FENCE="$R/wt-fence"; wt "$W_FENCE" "$PR12"; age "$W_FENCE" "$OLD"
+OUT=$(BUZZ_WORKSPACE_FENCE_WAIT=1 bash "$WS" sweep 2>&1)
+exists "a held fence keeps a worktree the sweep would have removed" "$W_FENCE"
+logged "kept worktree $W_FENCE: the reclaim fence is held"
+HANDOUT=$(BUZZ_WORKSPACE_FENCE_WAIT=1 bash "$WS" pr/12 2>"$T/fenced.err"); RC=$?
+check "a hand-out under a held fence refuses (rc=$RC, out=$HANDOUT)" "$([ "$RC" -ne 0 ]; echo $?)"
+check "and says why: $(cat "$T/fenced.err")" \
+  "$(grep -qF "the workspace sweep is reclaiming right now" "$T/fenced.err"; echo $?)"
+if command -v flock >/dev/null 2>&1; then exec 7>&-; else rmdir "$FENCE.d"; fi
+bash "$WS" sweep >/dev/null 2>&1
+gone "with the fence free, the same worktree goes" "$W_FENCE"
+
+# ── a process standing in the checkout ───────────────────────────────────────
+# The one thing no lock covers: an agent that just `cd`s in. The evidence is
+# /proc, so this only means anything on Linux -- which is the only substrate
+# the sprites run on.
+if [ -d /proc ]; then
+  echo "--- live cwd"
+  W_CWD="$R/wt-cwd"; wt "$W_CWD" "$PR12"; age "$W_CWD" "$OLD"
+  ( cd "$W_CWD" && exec sleep 60 ) &
+  CWD_PID=$!
+  sleep 1
+  bash "$WS" sweep >/dev/null 2>&1
+  exists "a worktree with a live process inside is kept" "$W_CWD"
+  kill "$CWD_PID" 2>/dev/null; wait "$CWD_PID" 2>/dev/null
+  bash "$WS" sweep >/dev/null 2>&1
+  gone "once nothing stands in it, the same worktree goes" "$W_CWD"
+fi
 
 echo "$PASS passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

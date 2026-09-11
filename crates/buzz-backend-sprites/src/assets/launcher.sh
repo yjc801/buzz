@@ -126,6 +126,13 @@ fi
 # no longer the harness. Lowest priority, best effort: a sweep can fail, a
 # start cannot fail because of it, and its output goes to the sweep's own
 # log rather than the session.
+#
+# This runs CONCURRENTLY with the harness by design — the exec below happens
+# straight away, because a start that waited for a sweep would miss the wake
+# that caused it. The safety that makes the concurrency acceptable lives in
+# workspace.sh, not here: every destructive step takes the reclaim fence, is
+# revalidated under it, and detaches a directory with an atomic rename before
+# deleting it. Do not turn this into a foreground call to make it "safe".
 (
     exec 9>&-
     sweep() {

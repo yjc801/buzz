@@ -80,9 +80,12 @@ last BUZZ_WORKSPACE_SWEEP_HOLD_MIN minutes (default 180), or one whose pull
 request it cannot prove closed; a checkout under ~/.scratch is disposable by
 the Nest contract and is removed after BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS idle
 days (default 7) regardless. When free disk falls under
-BUZZ_WORKSPACE_MIN_FREE_GB (default 10) it also purges idle build caches,
-unclaimed slots first. The launcher runs it at every start and daily while
-the agent lives; --dry-run reports without acting, --if-due exits at once
+BUZZ_WORKSPACE_MIN_FREE_GB (default 10) it also purges idle rebuildable
+caches -- target/ and node_modules/ -- unclaimed slots first. The launcher
+runs it at every start and daily while the agent lives; every destructive step
+is serialized against a hand-out by the reclaim fence, and a directory is
+always moved aside with one rename before it is deleted, so nothing is ever
+pulled out from under a live turn. --dry-run reports without acting, --if-due exits at once
 unless BUZZ_WORKSPACE_SWEEP_INTERVAL seconds (default 86400) have passed since
 the last completed sweep. BUZZ_WORKSPACE_SWEEP_DISABLED=1 turns it off.
 EOF
@@ -116,31 +119,86 @@ run_timeout() {
     fi
 }
 
-# Hold the slot-selection lock (fd 9) for the rest of the process. flock is
-# what every sprite has; the mkdir fallback exists for hosts without it and
-# gives the same exclusivity, minus crash-safety — a dead holder's directory
-# is reaped by the next taker after a bounded wait.
-take_slot_lock() {
-    local lock="$1"
-    exec 9>"$lock"
+# ── Locks ────────────────────────────────────────────────────────────────────
+# flock is what every sprite has; the mkdir fallback exists for hosts without
+# it (a plain macOS dev box) and gives the same exclusivity, minus
+# crash-safety — a dead holder's directory is reaped by the next taker after a
+# bounded wait. A file descriptor survives exec and is released by the kernel
+# when the process dies, which is why the fd form is preferred.
+#
+# Two locks, and they are always taken in this order when both are needed:
+#   fd 8  the RECLAIM FENCE   $BUZZ/.workspace-sweep/fence
+#   fd 9  slot selection      <repo>-slots/.lock
+LOCK_DIRS=""
+FENCE_FILE="$BUZZ/.workspace-sweep/fence"
+FENCE_WAIT="${BUZZ_WORKSPACE_FENCE_WAIT:-30}"
+
+release_lock_dirs() {
+    local d
+    for d in $LOCK_DIRS; do
+        [ -z "$d" ] || rmdir "$d" 2>/dev/null || true
+    done
+}
+
+# Take an exclusive lock on $2 and hold it on fd $1 until drop_lock. rc 1 when
+# it could not be taken within $3 seconds.
+take_lock() {
+    local fd="$1" path="$2" wait="$3" i=0
+    eval "exec $fd>\"\$path\"" 2>/dev/null || return 1
     if command -v flock >/dev/null 2>&1; then
-        flock -w 30 9 || die "another buzz-workspace is picking a slot; try again"
-        return
+        flock -w "$wait" "$fd" && return 0
+        eval "exec $fd>&-"
+        return 1
     fi
-    local i=0
-    while ! mkdir "$lock.d" 2>/dev/null; do
-        i=$((i + 1))
-        if [ "$i" -ge 300 ]; then
-            if [ "$(($(date +%s) - $(mtime_of "$lock.d")))" -gt 120 ]; then
-                rmdir "$lock.d" 2>/dev/null || true
+    while ! mkdir "$path.d" 2>/dev/null; do
+        if [ "$i" -ge "$((wait * 10))" ]; then
+            if [ "$(($(date +%s) - $(mtime_of "$path.d")))" -gt 120 ]; then
+                rmdir "$path.d" 2>/dev/null || true
                 continue
             fi
-            die "another buzz-workspace is picking a slot; try again"
+            eval "exec $fd>&-"
+            return 1
         fi
+        i=$((i + 1))
         sleep 0.1
     done
-    # shellcheck disable=SC2064
-    trap "rmdir '$lock.d' 2>/dev/null || true" EXIT
+    LOCK_DIRS="$LOCK_DIRS $path.d"
+    return 0
+}
+
+drop_lock() {
+    local fd="$1" path="$2"
+    eval "exec $fd>&-" 2>/dev/null || true
+    if ! command -v flock >/dev/null 2>&1; then
+        rmdir "$path.d" 2>/dev/null || true
+        LOCK_DIRS="${LOCK_DIRS// $path.d/}"
+    fi
+}
+
+# Hold the slot-selection lock (fd 9) for the rest of the process.
+take_slot_lock() {
+    take_lock 9 "$1" 30 || die "another buzz-workspace is picking a slot; try again"
+}
+
+# The RECLAIM FENCE (fd 8). The sweep runs beside a live harness — the
+# launcher starts it and immediately execs the agent — so every classification
+# it makes is a snapshot of a machine somebody else is still using. Holding
+# this fence is what makes a hand-out and a reclaim mutually exclusive: the
+# sweep takes it around each destructive step (revalidating underneath it,
+# because the read that chose the step happened outside), and `cmd_path` holds
+# it for a whole hand-out, so a checkout can never be reclaimed while it is
+# being handed out, nor handed out while it is being reclaimed.
+#
+# What the fence CANNOT cover is an agent that simply `cd`s into an old
+# checkout: nothing in that act is instrumented, so there is no lock for it to
+# take. That residue is closed differently — see sweep_detach_dir.
+fence_take() {
+    mkdir -p "$(dirname "$FENCE_FILE")" 2>/dev/null || true
+    take_lock 8 "$FENCE_FILE" "$FENCE_WAIT"
+}
+
+fence_drop() {
+    drop_lock 8 "$FENCE_FILE"
 }
 
 # The Nest root moved between provider versions ($HOME, then $HOME/.buzz), and
@@ -304,8 +362,13 @@ cmd_path() {
     mkdir -p "$slots/.state"
     seed_cache "$canon" "$shared"
 
-    # Selection is the only racy part: two agent sessions asking at once must not
-    # be handed the same slot. Everything after the pick is per-slot and safe.
+    # The reclaim fence first, then slot selection — always in that order.
+    # The fence keeps the sweep from reclaiming anything for as long as this
+    # hand-out runs, so the slot (or the caches under it) cannot be taken away
+    # between the pick and the checkout. Selection itself is the only racy part
+    # among hand-outs: two agent sessions asking at once must not be handed the
+    # same slot. Everything after the pick is per-slot and safe.
+    fence_take || die "the workspace sweep is reclaiming right now; try again in a moment"
     take_slot_lock "$slots/.lock"
 
     local i slot chosen="" reused="" oldest="" oldest_at="" now
@@ -398,6 +461,7 @@ cmd_path() {
     if [ -d "$chosen/target" ] || [ -d "$chosen/desktop/src-tauri/target" ]; then
         note "build cache preserved — expect an incremental build, not a cold one"
     fi
+    fence_drop
     printf '%s\n' "$chosen"
 }
 
@@ -511,6 +575,15 @@ cmd_release() {
 # the exact refs/pull/*/head sha from one `ls-remote`, a branch name looked
 # up on GitHub, or a `pr-N` name hint that must be confirmed by fetching that
 # PR's head and proving ancestry.
+#
+# Classification is a READ, and it happens on a machine the agent is still
+# using -- the launcher starts the sweep and immediately execs the harness. So
+# no decision here authorizes anything on its own: every destructive step takes
+# the reclaim fence (see fence_take), re-establishes underneath it the
+# properties that made the checkout reclaimable, and removes a directory by
+# moving it aside with one atomic rename before deleting it (see
+# sweep_detach_dir) -- the only thing that covers an agent walking into an old
+# checkout without taking any lock at all.
 
 SWEEP_DIR="$BUZZ/.workspace-sweep"
 SWEEP_LOG="$BUZZ/workspace-sweep.log"
@@ -524,6 +597,7 @@ SWEEP_DEPTH="${BUZZ_WORKSPACE_SWEEP_DEPTH:-6}"
 SWEEP_DRY=0
 SWEEP_VERBOSE=0
 SWEEP_TMP=""
+SWEEP_LOCK_HELD=0
 # Counters for the summary line.
 SW_REMOVED=0 SW_REMOVED_KB=0 SW_BRANCHES=0 SW_RELEASED=0 SW_SWITCHED=0 SW_PURGED_KB=0
 SW_KEPT_DIRTY=0 SW_KEPT_INUSE=0 SW_KEPT_OPEN=0 SW_KEPT_UNKNOWN=0 SW_KEPT_OTHER=0
@@ -718,21 +792,28 @@ sweep_pushed() {
     awk -v s="$sha" '$1 == s { found = 1 } END { exit found ? 0 : 1 }' "$pullheads" 2>/dev/null
 }
 
-# Something is using this checkout right now: a process with its cwd inside
-# (Linux /proc — the only substrate the sprites run), or any file, or the
-# checkout's own index/HEAD/reflog, modified inside the hold window. Build
-# and dependency trees are skipped — a running build writes there, but a
-# build with no process in the tree is a finished one.
+# Some process has its cwd inside $1 right now. Linux /proc only — the only
+# substrate the sprites run; elsewhere it answers "no" and the mtime half of
+# sweep_in_use below is all the evidence there is.
+sweep_cwd_inside() {
+    local path="$1" p cwd
+    [ -d /proc ] || return 1
+    for p in /proc/[0-9]*; do
+        cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+        case "$cwd" in
+            "$path" | "$path"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Something is using this checkout right now: a process with its cwd inside,
+# or any file, or the checkout's own index/HEAD/reflog, modified inside the
+# hold window. Build and dependency trees are skipped — a running build writes
+# there, but a build with no process in the tree is a finished one.
 sweep_in_use() {
-    local path="$1" gitdir="$2" p cwd
-    if [ -d /proc ]; then
-        for p in /proc/[0-9]*; do
-            cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
-            case "$cwd" in
-                "$path" | "$path"/*) return 0 ;;
-            esac
-        done
-    fi
+    local path="$1" gitdir="$2"
+    sweep_cwd_inside "$path" && return 0
     [ "$SWEEP_HOLD_MIN" -gt 0 ] || return 1
     local f
     for f in index HEAD logs/HEAD; do
@@ -825,26 +906,88 @@ sweep_size_kb() {
     du -sk "$1" 2>/dev/null | cut -f1 || echo 0
 }
 
-# Remove a linked worktree through git, which refuses anything dirty or
-# locked unless told otherwise — `force` is passed only for scratch, where
-# the Nest contract already declared the contents disposable.
+# Everything the fence cannot lock: an agent that just `cd`s into an old
+# checkout takes no lock, so no amount of re-reading before an `rm -rf` is a
+# guarantee — the process can arrive in the window between the read and the
+# first unlink, and a half-deleted tree is the worst outcome there is.
+#
+# So the removal never starts as a deletion. It starts as a single rename,
+# which is atomic: afterwards the path either exists whole or not at all, and
+# anyone arriving later gets a clean ENOENT instead of a vanishing cwd. A
+# process that was ALREADY inside keeps its cwd on the moved inode, so /proc
+# now reports it under the new path — that is the one thing no earlier read
+# could have seen, and it is why the check is repeated AFTER the rename. Such
+# a directory is renamed back and kept; only a directory nobody holds is
+# deleted, and by then it is already out of everyone's way.
+#
+# Prints the detached path; rc 1 means the caller must keep the directory.
+sweep_detach_dir() {
+    local path="$1" detached
+    detached="$(dirname "$path")/.buzz-sweep-detached.$$.$(basename "$path")"
+    rm -rf -- "$detached" 2>/dev/null || true
+    if ! mv -- "$path" "$detached" 2>/dev/null; then
+        sweep_log "kept $path: it could not be moved aside"
+        return 1
+    fi
+    printf '%s\n' "$detached" >>"$SWEEP_TMP/detached"
+    if sweep_cwd_inside "$detached"; then
+        if mv -- "$detached" "$path" 2>/dev/null; then
+            sweep_log "kept $path: a process entered it as the sweep was removing it"
+        else
+            sweep_log "WARNING: $path was moved aside and could not be restored; it is at $detached"
+        fi
+        return 1
+    fi
+    printf '%s' "$detached"
+}
+
+# Remove a linked worktree. Under the fence, and only after re-establishing
+# under it every property that made the checkout reclaimable: the read that
+# classified it happened before the fence existed, so on its own it says
+# nothing about now. `force` (scratch only, where the Nest contract already
+# declared the contents disposable) waives the dirty check exactly as
+# `git worktree remove --force` did, and nothing else.
 sweep_remove_worktree() {
-    local clone="$1" path="$2" force="$3" why="$4" kb
+    local clone="$1" path="$2" force="$3" why="$4" kb gitdir detached
     kb=$(sweep_size_kb "$path")
     if [ "$SWEEP_DRY" = 1 ]; then
         sweep_log "would remove worktree $path ($((kb / 1024)) MB): $why"
         return
     fi
-    if [ "$force" = 1 ]; then
-        git -C "$clone" worktree remove --force "$path" >/dev/null 2>&1 || true
-    else
-        git -C "$clone" worktree remove "$path" >/dev/null 2>&1 || true
-    fi
-    if [ -e "$path" ]; then
-        sweep_log "kept worktree $path: git refused to remove it"
+    if ! fence_take; then
+        sweep_log "kept worktree $path: the reclaim fence is held"
         SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
         return
     fi
+    gitdir=$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)
+    if sweep_in_use "$path" "$gitdir"; then
+        fence_drop
+        sweep_log "kept worktree $path: in use at the moment of removal"
+        SW_KEPT_INUSE=$((SW_KEPT_INUSE + 1))
+        return
+    fi
+    # `git worktree remove` refused a locked worktree; the lock is a file in
+    # the worktree's administrative directory, so the same refusal is exact.
+    if [ -n "$gitdir" ] && [ -e "$gitdir/locked" ]; then
+        fence_drop
+        sweep_log "kept worktree $path: locked"
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
+    fi
+    if [ "$force" != 1 ] && slot_is_dirty "$path"; then
+        fence_drop
+        sweep_log "kept worktree $path: uncommitted changes at the moment of removal"
+        SW_KEPT_DIRTY=$((SW_KEPT_DIRTY + 1))
+        return
+    fi
+    if ! detached=$(sweep_detach_dir "$path"); then
+        fence_drop
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
+    fi
+    git -C "$clone" worktree prune >/dev/null 2>&1 || true
+    fence_drop
+    rm -rf -- "$detached"
     SW_REMOVED=$((SW_REMOVED + 1))
     SW_REMOVED_KB=$((SW_REMOVED_KB + kb))
     sweep_log "removed worktree $path ($((kb / 1024)) MB): $why"
@@ -854,7 +997,7 @@ sweep_remove_worktree() {
 # checkout at the moment of deletion, and only when no linked worktree of
 # it survived the pass (deleting the main clone would orphan them).
 sweep_remove_scratch_clone() {
-    local clone="$1" why="$2" kb remaining
+    local clone="$1" why="$2" kb remaining detached
     sweep_is_scratch "$clone" || return 0
     [ -e "$clone/.git" ] || return 0
     remaining=$(git -C "$clone" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
@@ -867,7 +1010,27 @@ sweep_remove_scratch_clone() {
         sweep_log "would remove scratch clone $clone ($((kb / 1024)) MB): $why"
         return
     fi
-    rm -rf -- "$clone"
+    if ! fence_take; then
+        sweep_log "kept scratch clone $clone: the reclaim fence is held"
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
+    fi
+    # Same revalidation as a worktree, minus the dirty check: under ~/.scratch
+    # the Nest contract already says the contents are disposable. Being used
+    # right now is not disposable, and that is what is re-read here.
+    if sweep_in_use "$clone" "$clone/.git"; then
+        fence_drop
+        sweep_log "kept scratch clone $clone: in use at the moment of removal"
+        SW_KEPT_INUSE=$((SW_KEPT_INUSE + 1))
+        return
+    fi
+    if ! detached=$(sweep_detach_dir "$clone"); then
+        fence_drop
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
+    fi
+    fence_drop
+    rm -rf -- "$detached"
     SW_REMOVED=$((SW_REMOVED + 1))
     SW_REMOVED_KB=$((SW_REMOVED_KB + kb))
     sweep_log "removed scratch clone $clone ($((kb / 1024)) MB): $why"
@@ -877,23 +1040,56 @@ sweep_remove_scratch_clone() {
 # fast-forwarded to origin. The clone itself is never deleted: it is the
 # agent's warm environment, and coder prompts start every task from main.
 sweep_switch_clone() {
-    local clone="$1" default="$2" why="$3"
+    local clone="$1" default="$2" why="$3" before=""
     if [ "$SWEEP_DRY" = 1 ]; then
         sweep_log "would switch $clone to $default: $why"
         return
     fi
-    if git -C "$clone" rev-parse --verify -q "refs/heads/$default" >/dev/null 2>&1; then
-        git -C "$clone" checkout --quiet "$default" 2>/dev/null || {
-            sweep_log "kept $clone on its branch: checkout $default failed"
-            return
-        }
-        git -C "$clone" merge --quiet --ff-only "refs/remotes/origin/$default" >/dev/null 2>&1 || true
-    else
-        git -C "$clone" checkout --quiet --track -b "$default" "refs/remotes/origin/$default" 2>/dev/null || {
-            sweep_log "kept $clone on its branch: checkout $default failed"
-            return
-        }
+    if ! fence_take; then
+        sweep_log "kept $clone on its branch: the reclaim fence is held"
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
     fi
+    if sweep_in_use "$clone" "$clone/.git"; then
+        fence_drop
+        sweep_log "kept $clone on its branch: in use at the moment of the switch"
+        SW_KEPT_INUSE=$((SW_KEPT_INUSE + 1))
+        return
+    fi
+    if slot_is_dirty "$clone"; then
+        fence_drop
+        sweep_log "kept $clone on its branch: uncommitted changes at the moment of the switch"
+        SW_KEPT_DIRTY=$((SW_KEPT_DIRTY + 1))
+        return
+    fi
+    before=$(git -C "$clone" symbolic-ref --quiet --short HEAD 2>/dev/null ||
+        git -C "$clone" rev-parse HEAD 2>/dev/null || true)
+    if git -C "$clone" rev-parse --verify -q "refs/heads/$default" >/dev/null 2>&1; then
+        if ! git -C "$clone" checkout --quiet "$default" 2>/dev/null; then
+            fence_drop
+            sweep_log "kept $clone on its branch: checkout $default failed"
+            return
+        fi
+        git -C "$clone" merge --quiet --ff-only "refs/remotes/origin/$default" >/dev/null 2>&1 || true
+    elif ! git -C "$clone" checkout --quiet --track -b "$default" "refs/remotes/origin/$default" 2>/dev/null; then
+        fence_drop
+        sweep_log "kept $clone on its branch: checkout $default failed"
+        return
+    fi
+    # A checkout is not atomic either, and this one rewrites the tree an agent
+    # may have just walked into. The fence cannot see a bare `cd`, so read
+    # again AFTER the write and put the clone back if somebody is now standing
+    # in it — an unasked-for branch switch under a live turn is the failure
+    # this is here to avoid, and undoing it is cheap.
+    if [ -n "$before" ] && sweep_cwd_inside "$clone"; then
+        git -C "$clone" checkout --quiet --force "$before" 2>/dev/null ||
+            sweep_log "WARNING: $clone was switched to $default and could not be put back on $before"
+        fence_drop
+        sweep_log "kept $clone on $before: a process entered it as the sweep was switching"
+        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+        return
+    fi
+    fence_drop
     SW_SWITCHED=$((SW_SWITCHED + 1))
     sweep_log "switched $clone to $default: $why"
 }
@@ -1114,9 +1310,17 @@ sweep_clone() {
     sweep_worktree_records "$clone" >"$records"
     sweep_prune_branches "$clone" "$slug" "$default" "$pullheads" "$records"
 
-    # Build caches this clone owns, for the disk-pressure pass: unclaimed idle
-    # slots first (priority 1), then idle clones and worktrees (2). Only
-    # checkouts nothing is using right now are candidates at all.
+    # Rebuildable caches this clone owns, for the disk-pressure pass:
+    # unclaimed idle slots first (priority 1), then idle clones and worktrees
+    # (2). Only checkouts nothing is using right now are candidates at all.
+    #
+    # Both kinds count. `target/` is the obvious one, but a standalone clone
+    # outside ~/.scratch is deliberately never deleted — it is switched to the
+    # default branch and kept — so its `node_modules` is exactly the residue
+    # that outlives every other step, and leaving it out meant the low-disk
+    # path could not reclaim one of the trees that motivated this sweep (a
+    # retained second clone carrying 2 GB of it). Both are reproduced by a
+    # build; neither is work.
     while IFS='|' read -r path sha branch locked; do
         [ -n "$path" ] && [ -e "$path" ] || continue
         rp=$(sweep_realpath "$path") || continue
@@ -1132,11 +1336,20 @@ sweep_clone() {
                 prio=1 slot_i="$i"
                 ;;
         esac
+        local at
+        at=$(mtime_of "$rp")
         for d in "$rp/target" "$rp/desktop/src-tauri/target"; do
-            if [ -d "$d" ]; then
-                printf '%s %s %s %s %s\n' "$prio" "$(mtime_of "$rp")" "$slots" "$slot_i" "$d" >>"$SWEEP_TMP/builddirs"
-            fi
+            [ -d "$d" ] || continue
+            printf '%s %s %s %s %s %s\n' "$prio" "$at" "$slots" "$slot_i" "$rp" "$d" >>"$SWEEP_TMP/builddirs"
         done
+        # Every node_modules the checkout owns, near the top of the tree and
+        # never one nested inside another.
+        find "$rp" -maxdepth 3 \( -name target -o -name .git -o -name .hermit \) -prune -o \
+            -type d -name node_modules -prune -print 2>/dev/null |
+            while IFS= read -r d; do
+                [ -n "$d" ] || continue
+                printf '%s %s %s %s %s %s\n' "$prio" "$at" "$slots" "$slot_i" "$rp" "$d" >>"$SWEEP_TMP/builddirs"
+            done
     done <"$records"
     return 0
 }
@@ -1145,12 +1358,48 @@ sweep_free_kb() {
     df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }'
 }
 
-# Under the free-space floor, purge build caches oldest-first within each
-# priority until the floor is met. A purge is bounded by what it measures:
-# every removal is logged with its size, and the pass stops the moment the
-# floor is satisfied.
+# Purge one cache directory under the reclaim fence, revalidating everything
+# the listing pass established: its checkout must still be idle, and a slot's
+# cache additionally needs the slot's hold to still have expired (the pool's
+# build cache belongs to whoever holds the slot). The directory is moved aside
+# with one rename before it is deleted — see sweep_detach_dir — so a `rm -rf`
+# of a ten-gigabyte tree can never run underneath a process that walked in.
+sweep_purge_cache() {
+    local d="$1" rp="$2" prio="$3" slots="$4" slot_i="$5" gitdir detached
+    if ! fence_take; then
+        sweep_log "kept build cache $d: the reclaim fence is held"
+        return 1
+    fi
+    gitdir=$(git -C "$rp" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)
+    if sweep_in_use "$rp" "$gitdir"; then
+        fence_drop
+        sweep_log "kept build cache $d: its checkout is in use"
+        return 1
+    fi
+    if [ "$prio" = 1 ] && ! (
+        exec 9>"$slots/.lock"
+        if command -v flock >/dev/null 2>&1; then flock -w "$FENCE_WAIT" 9 || exit 3; fi
+        [ "$(hold_age "$slots" "$slot_i" "$(date +%s)")" -ge "$HOLD_SECONDS" ] || exit 2
+    ); then
+        fence_drop
+        sweep_log "kept build cache $d: its slot was handed out"
+        return 1
+    fi
+    if ! detached=$(sweep_detach_dir "$d"); then
+        fence_drop
+        return 1
+    fi
+    fence_drop
+    rm -rf -- "$detached"
+    return 0
+}
+
+# Under the free-space floor, purge rebuildable caches oldest-first within
+# each priority until the floor is met. A purge is bounded by what it
+# measures: every removal is logged with its size, and the pass stops the
+# moment the floor is satisfied.
 sweep_disk_pressure() {
-    local need_kb free_kb d kb prio at slots slot_i
+    local need_kb free_kb d kb prio at slots slot_i rp
     need_kb=$((SWEEP_MIN_FREE_GB * 1024 * 1024))
     free_kb=$(sweep_free_kb)
     [ -n "$free_kb" ] || return 0
@@ -1160,28 +1409,15 @@ sweep_disk_pressure() {
         sweep_log "disk: no idle build cache to purge"
         return 0
     }
-    sort -k1,1n -k2,2n "$SWEEP_TMP/builddirs" | while read -r prio at slots slot_i d; do
+    sort -k1,1n -k2,2n "$SWEEP_TMP/builddirs" | while read -r prio at slots slot_i rp d; do
         [ -d "$d" ] || continue
         kb=$(sweep_size_kb "$d")
         if [ "$SWEEP_DRY" = 1 ]; then
             sweep_log "would purge build cache $d ($((kb / 1024)) MB, priority $prio)"
-        elif [ "$prio" = 1 ]; then
-            # A slot's cache goes only under the slot lock, and only if no
-            # hand-out has claimed the slot since it was listed.
-            if (
-                exec 9>"$slots/.lock"
-                if command -v flock >/dev/null 2>&1; then flock -w 30 9 || exit 3; fi
-                [ "$(hold_age "$slots" "$slot_i" "$(date +%s)")" -ge "$HOLD_SECONDS" ] || exit 2
-                rm -rf -- "$d"
-            ); then
-                sweep_log "purged build cache $d ($((kb / 1024)) MB, priority $prio)"
-            else
-                sweep_log "kept build cache $d: its slot was handed out"
-                continue
-            fi
-        else
-            rm -rf -- "$d"
+        elif sweep_purge_cache "$d" "$rp" "$prio" "$slots" "$slot_i"; then
             sweep_log "purged build cache $d ($((kb / 1024)) MB, priority $prio)"
+        else
+            continue
         fi
         echo "$kb"
         free_kb=$(sweep_free_kb)
@@ -1216,10 +1452,10 @@ cmd_sweep() {
             return 0
         fi
     fi
+    SWEEP_LOCK_HELD=1
     SWEEP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/buzz-sweep.XXXXXX")
-    # shellcheck disable=SC2064
-    trap "rm -rf '$SWEEP_TMP'; rmdir '$SWEEP_DIR/lock' 2>/dev/null || true" EXIT
     : >"$SWEEP_TMP/builddirs"
+    : >"$SWEEP_TMP/detached"
     sweep_rotate_log
     local mode=""
     [ "$SWEEP_DRY" = 1 ] && mode=" (dry run)"
@@ -1255,7 +1491,36 @@ cmd_sweep() {
     printf 'buzz-workspace sweep: %s\n' "$summary"
 }
 
+# ONE exit handler for the whole process. There used to be a trap per lock and
+# another for the sweep's own temporaries, and the later `trap ... EXIT`
+# silently replaced the earlier one -- the sweep's run lock then outlived the
+# run that took it and every sweep after it reported "another sweep is
+# running" until the two-hour staleness took over. Everything that must be
+# given back goes through here.
+on_exit() {
+    local d
+    if [ -n "$SWEEP_TMP" ]; then
+        # Anything moved aside but not yet deleted. It is out of everyone's
+        # way and nobody is inside it: sweep_detach_dir only keeps a rename
+        # that landed on an unoccupied directory.
+        if [ -s "$SWEEP_TMP/detached" ]; then
+            while IFS= read -r d; do
+                [ -n "$d" ] || continue
+                rm -rf -- "$d" 2>/dev/null || true
+            done <"$SWEEP_TMP/detached"
+        fi
+        rm -rf -- "$SWEEP_TMP"
+    fi
+    # Only the run that took the sweep lock may give it back -- a run that
+    # exited because somebody else held it must not free it.
+    if [ "$SWEEP_LOCK_HELD" = 1 ]; then
+        rmdir "$SWEEP_DIR/lock" 2>/dev/null || true
+    fi
+    release_lock_dirs
+}
+
 main() {
+    trap on_exit EXIT
     local force=0 claim="${BUZZ_WORKSPACE_CLAIM:-}" args=() if_due=0
     while [ "$#" -gt 0 ]; do
         case "$1" in

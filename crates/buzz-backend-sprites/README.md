@@ -70,7 +70,7 @@ What it reclaims, and the evidence it needs first:
 | standalone clone | same, and it is off the default branch | switched to the default branch and fast-forwarded — **never deleted** outside `~/.scratch` |
 | local branch | on `origin/<default>`, or the head of a closed PR and on some remote ref | deleted |
 | anything under `~/.scratch` | idle past the TTL | removed — disposable by the Nest contract, dirty or not |
-| idle build caches (`target/`) | free disk under the floor | purged, unclaimed slots first, until the floor is met |
+| idle rebuildable caches (`target/`, `node_modules/`) | free disk under the floor | purged, unclaimed slots first, until the floor is met |
 
 A pull request is tied to a checkout by evidence, never by a directory name
 alone: the exact `refs/pull/N/head` sha from one `git ls-remote`, the branch
@@ -92,7 +92,18 @@ Knobs, read from the agent's environment (set them per agent in Buzz Desktop):
 | `BUZZ_WORKSPACE_MIN_FREE_GB` | 10 | free-space floor that triggers the build-cache purge |
 | `BUZZ_WORKSPACE_SWEEP_API_BUDGET` | 40 | GitHub reads per sweep; an unauthenticated sprite has 60 an hour |
 | `GH_TOKEN` / `GITHUB_TOKEN` | unset | authenticates the sweep's GitHub reads and its `git fetch`/`ls-remote` against github.com. **Required for a private repository**: the launcher's environment carries none of the credentials an agent session sets up for itself, so without a token a private origin fails its fetch (logged) and every decision that needed GitHub stays `unknown`. A fine-grained token with `contents: read` and `pull_requests: read` is enough; it also lifts the unauthenticated rate limit |
+| `BUZZ_WORKSPACE_FENCE_WAIT` | 30 | seconds to wait for the reclaim fence before keeping the checkout instead |
 | `BUZZ_WORKSPACE_SWEEP_DISABLED` | unset | `1` turns the sweep off |
+
+Every destructive step runs under a **reclaim fence** — one lock that
+`buzz-workspace <ref>` also holds for a whole hand-out — and re-establishes
+under that fence every property that made the checkout reclaimable, because
+the classification that chose it was a snapshot of a machine an agent is still
+using. What no lock can cover is an agent that simply `cd`s into an old
+checkout, so nothing is ever deleted in place: a directory is first moved aside
+with a single atomic rename, and if `/proc` then shows a process inside it, it
+is moved straight back and kept. A clone switched to the default branch is put
+back on its branch by the same check.
 
 `buzz-workspace sweep --dry-run` reports without acting; the log is
 `~/.buzz/workspace-sweep.log`. The contract is pinned end to end by

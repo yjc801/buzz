@@ -92,6 +92,20 @@ impl ProbeReport {
 
 #[cfg(test)]
 mod tests {
+
+    /// The text of one shell function in `workspace.sh`, from its `name() {`
+    /// header to the first line that is exactly `}`.
+    fn sweep_fn_body(name: &str) -> &'static str {
+        let header = format!("\n{name}() {{\n");
+        let start = WORKSPACE_SH
+            .find(&header)
+            .unwrap_or_else(|| panic!("workspace.sh no longer defines {name}()"))
+            + header.len();
+        let end = WORKSPACE_SH[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name}() is unterminated"));
+        &WORKSPACE_SH[start..start + end]
+    }
     use super::*;
 
     #[test]
@@ -151,6 +165,48 @@ mod tests {
         assert!(
             LAUNCHER_SH[..sweep].contains("exec 9>&-"),
             "the sweep subshell no longer closes the election lock"
+        );
+    }
+
+    /// The sweep runs beside a live harness — the launcher starts it and
+    /// execs the agent straight away — so classification is a snapshot of a
+    /// machine somebody else is still using. Two properties make that
+    /// acceptable, and both are structural: every destructive step takes the
+    /// reclaim fence (which a hand-out also holds end to end), and a directory
+    /// is moved aside with one atomic rename before anything is deleted, so an
+    /// agent that walked in without taking any lock is found and put back.
+    /// A step that grew an `rm -rf` in place again would look fine in every
+    /// test but the race it loses.
+    #[test]
+    fn every_destructive_sweep_step_is_fenced_and_detaches_first() {
+        for step in [
+            "sweep_remove_worktree",
+            "sweep_remove_scratch_clone",
+            "sweep_purge_cache",
+        ] {
+            let body = sweep_fn_body(step);
+            assert!(
+                body.contains("fence_take"),
+                "{step} no longer takes the reclaim fence"
+            );
+            assert!(
+                body.contains("sweep_detach_dir"),
+                "{step} no longer moves the directory aside before deleting it"
+            );
+        }
+        // The switch cannot be a rename, so it converges instead: read again
+        // after the write and put the clone back if somebody is now inside.
+        let switch = sweep_fn_body("sweep_switch_clone");
+        assert!(switch.contains("fence_take"));
+        assert!(
+            switch.contains("sweep_cwd_inside"),
+            "sweep_switch_clone no longer re-reads for a live process after switching"
+        );
+        // And the hand-out holds the same fence, or the exclusion is one-sided.
+        let path = sweep_fn_body("cmd_path");
+        assert!(
+            path.contains("fence_take") && path.contains("fence_drop"),
+            "cmd_path no longer holds the reclaim fence for the whole hand-out"
         );
     }
 

@@ -70,6 +70,8 @@ exists() { check "$1 should still exist: $2" "$([ -e "$2" ]; echo $?)"; }
 gone() { check "$1 should be gone: $2" "$([ ! -e "$2" ]; echo $?)"; }
 logged() { check "log should say: $1" "$(grep -qF -- "$1" "$HOME/.buzz/workspace-sweep.log"; echo $?)"; }
 has_branch() { git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; }
+# The branch field of the journal, for entries whose names need no decoding.
+journal_has() { [ -s "$JOURNAL" ] && cut -d'|' -f2 "$JOURNAL" | grep -qxF -- "$1"; }
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/ws-sweep.XXXXXX")
 T=$(cd "$T" && pwd -P)
@@ -424,13 +426,20 @@ check "and the worktree that grabbed it still resolves HEAD" \
   "$(git -C "$W_GRAB" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
 check "log says why the branch was kept" \
   "$(grep -qF -- "kept branch agent/w/grabbed in $CLONE: a worktree checked it out as the sweep was deleting it" "$LOG"; echo $?)"
-check "the repair leaves no journal entry behind" "$([ ! -s "$JOURNAL" ]; echo $?)"
+check "the repair leaves no journal entry for it behind" "$(journal_has agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
 # ...and the refusal is the checkout, not the classification: with the
 # worktree gone, the same branch goes.
 git -C "$CLONE" worktree remove --force "$W_GRAB"
 bash "$WS" sweep >/dev/null 2>&1
 check "with nothing holding it, the same branch is deleted" \
   "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
+# ...and THAT delete keeps its entry. The post-delete scan is a snapshot like
+# every other: a checkout that resolved the branch before the ref went can
+# publish its worktree record after the scan, and then a clean-looking scan is
+# indistinguishable from a checkout still in flight. The entry is what lets a
+# later sweep tell the difference.
+check "a clean delete carries its journal entry until it has settled" \
+  "$(journal_has agent/w/grabbed; echo $?)"
 
 # ── a sweep killed between the delete and its repair ────────────────────────
 # The repair above runs in the same pass, and that pass can itself be killed:
@@ -445,11 +454,14 @@ git -C "$CLONE" branch -q agent/w/interrupted "$GRAB_BASE"
 git -C "$CLONE" worktree add -q "$W_INT" agent/w/interrupted >/dev/null 2>&1
 INT_TIP=$(git -C "$CLONE" rev-parse refs/heads/agent/w/interrupted)
 git -C "$CLONE" update-ref -d refs/heads/agent/w/interrupted "$INT_TIP"
-# ...and one entry for a delete that DID complete: nothing holds that ref, so
-# replay must drop the entry rather than resurrect the branch.
+# ...and one entry for a delete that DID complete and has outlived the settle
+# window: nothing holds that ref and nothing can still be checking it out, so
+# replay must drop the entry rather than resurrect the branch or carry it for
+# ever. (agent/w/grabbed, deleted above, is the same shape inside the window
+# and must still be there afterwards.)
 mkdir -p "$(dirname "$JOURNAL")"
-printf '%s|%s|%s\n' "$CLONE" agent/w/interrupted "$INT_TIP" >>"$JOURNAL"
-printf '%s|%s|%s\n' "$CLONE" agent/w/grabbed "$GRAB_BASE" >>"$JOURNAL"
+printf '%s|%s|%s|%s\n' "$CLONE" agent/w/interrupted "$INT_TIP" "$(date +%s)" >>"$JOURNAL"
+printf '%s|%s|%s|%s\n' "$CLONE" agent/w/settled "$GRAB_BASE" "$(($(date +%s) - 100000))" >>"$JOURNAL"
 bash "$WS" sweep >/dev/null 2>&1
 check "an interrupted repair is finished by the next sweep" \
   "$(has_branch "$CLONE" agent/w/interrupted; echo $?)"
@@ -458,11 +470,60 @@ check "and at the sha it was classified at" \
 check "so the interrupted worktree's HEAD resolves again" \
   "$(git -C "$W_INT" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
 check "a completed delete is not resurrected by its journal entry" \
+  "$(has_branch "$CLONE" agent/w/settled; [ $? -ne 0 ]; echo $?)"
+check "and once it has settled the journal drops it" \
+  "$(journal_has agent/w/settled; [ $? -ne 0 ]; echo $?)"
+check "while an entry still inside the window is carried to the next sweep" \
+  "$(journal_has agent/w/grabbed; echo $?)"
+check "which does not resurrect it either" \
   "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
-check "and the journal does not accumulate" "$([ ! -s "$JOURNAL" ]; echo $?)"
+check "a finished repair drops its own entry" \
+  "$(journal_has agent/w/interrupted; [ $? -ne 0 ]; echo $?)"
 logged "restored branch agent/w/interrupted in $CLONE at $INT_TIP"
 git -C "$CLONE" worktree remove --force "$W_INT"
 git -C "$CLONE" update-ref -d refs/heads/agent/w/interrupted "$INT_TIP"
+
+# ── a checkout that publishes its worktree record after the delete ─────────
+# `git worktree add` resolves the branch and only then registers the worktree,
+# and the sweep's post-delete scan can fall between the two. That scan sees
+# nothing holding the ref -- the same picture a delete with no checkout at all
+# produces -- so dropping the repair intent on it left the finished checkout
+# with a symbolic HEAD whose ref is gone and no record anywhere saying so.
+# Staged the only way it can be: a real sweep deletes the branch and keeps its
+# entry, then the late checkout is made to exist.
+echo "--- checkout published after the delete"
+W_LATE="$R/wt-late"
+git -C "$CLONE" branch -q late-main "$BASE"
+bash "$WS" sweep >/dev/null 2>&1
+check "the branch is deleted" "$(has_branch "$CLONE" late-main; [ $? -ne 0 ]; echo $?)"
+check "and its repair intent is still journaled" "$(journal_has late-main; echo $?)"
+git -C "$CLONE" update-ref refs/heads/late-main "$BASE"
+git -C "$CLONE" worktree add -q "$W_LATE" late-main >/dev/null 2>&1
+git -C "$CLONE" update-ref -d refs/heads/late-main "$BASE"
+bash "$WS" sweep >/dev/null 2>&1
+check "the next sweep repairs the checkout that landed late" "$(has_branch "$CLONE" late-main; echo $?)"
+check "so its HEAD resolves" "$(git -C "$W_LATE" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
+check "and the entry is dropped once the ref is back" "$(journal_has late-main; [ $? -ne 0 ]; echo $?)"
+
+# ── a branch name carrying the record delimiter ─────────────────────
+# `git check-ref-format 'refs/heads/a|b'` exits 0, so the journal's separator
+# is valid branch-name data and a checkout path may carry it too. Split raw,
+# `wip|weird` replays as branch `wip` with a nonsense tip, the entry is dropped
+# and the worktree holding the real ref is never repaired.
+echo "--- delimiter in a branch name"
+W_PIPE="$R/wt-pipe"
+git -C "$CLONE" branch -q 'wip|weird' "$BASE"
+bash "$WS" sweep >/dev/null 2>&1
+check "a branch whose name contains the delimiter is deleted like any other" \
+  "$(has_branch "$CLONE" 'wip|weird'; [ $? -ne 0 ]; echo $?)"
+git -C "$CLONE" update-ref 'refs/heads/wip|weird' "$BASE"
+git -C "$CLONE" worktree add -q "$W_PIPE" 'wip|weird' >/dev/null 2>&1
+git -C "$CLONE" update-ref -d 'refs/heads/wip|weird' "$BASE"
+bash "$WS" sweep >/dev/null 2>&1
+check "and its journal entry round-trips: that exact ref is restored" \
+  "$(has_branch "$CLONE" 'wip|weird'; echo $?)"
+check "so the worktree holding it resolves HEAD" \
+  "$(git -C "$W_PIPE" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
 
 # ── disk pressure ────────────────────────────────────────────────────────────
 echo "--- disk pressure"

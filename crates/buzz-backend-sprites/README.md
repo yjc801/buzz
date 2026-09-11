@@ -93,6 +93,7 @@ Knobs, read from the agent's environment (set them per agent in Buzz Desktop):
 | `BUZZ_WORKSPACE_SWEEP_API_BUDGET` | 40 | GitHub reads per sweep; an unauthenticated sprite has 60 an hour |
 | `GH_TOKEN` / `GITHUB_TOKEN` | unset | authenticates the sweep's GitHub reads and its `git fetch`/`ls-remote` against github.com. **Required for a private repository**: the launcher's environment carries none of the credentials an agent session sets up for itself, so without a token a private origin fails its fetch (logged) and every decision that needed GitHub stays `unknown`. A fine-grained token with `contents: read` and `pull_requests: read` is enough; it also lifts the unauthenticated rate limit |
 | `BUZZ_WORKSPACE_FENCE_WAIT` | 30 | seconds to wait for the reclaim fence before keeping the checkout instead |
+| `BUZZ_WORKSPACE_SWEEP_JOURNAL_SETTLE` | 3600 | seconds a branch-repair journal entry is carried before it is considered settled |
 | `BUZZ_WORKSPACE_SWEEP_DISABLED` | unset | `1` turns the sweep off |
 
 Every destructive step runs under a **reclaim fence** — one lock that
@@ -113,7 +114,14 @@ in `.workspace-sweep/branch-journal` before the delete, the worktrees are
 re-read after it, and a branch some worktree grabbed in between is put back at
 the sha it was classified at. Every sweep replays that journal first, so a
 sweep killed mid-repair is finished by the next one rather than leaving a
-worktree's HEAD unresolvable.
+worktree's HEAD unresolvable. That re-read is a snapshot as well — a
+`git worktree add` resolves the branch before it registers the worktree, so a
+checkout can publish its record after the scan — so the entry is not dropped
+on the strength of one clean-looking scan: it is carried until it has outlived
+`BUZZ_WORKSPACE_SWEEP_JOURNAL_SETTLE` seconds (default 3600), and a checkout
+that surfaces inside that window is repaired by the next sweep. Journal and
+worktree records escape the `|` they are separated by, because git accepts it
+in a ref name and a checkout path may contain it.
 
 A standalone clone outside `~/.scratch` is the one thing the sweep will not
 act on, because that guarantee cannot be extended to it. Switching it to the

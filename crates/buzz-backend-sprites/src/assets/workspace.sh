@@ -587,6 +587,7 @@ cmd_release() {
 
 SWEEP_DIR="$BUZZ/.workspace-sweep"
 SWEEP_JOURNAL="$SWEEP_DIR/branch-journal"
+SWEEP_JOURNAL_SETTLE="${BUZZ_WORKSPACE_SWEEP_JOURNAL_SETTLE:-3600}"
 SWEEP_LOG="$BUZZ/workspace-sweep.log"
 SWEEP_HOLD_MIN="${BUZZ_WORKSPACE_SWEEP_HOLD_MIN:-180}"
 SWEEP_SCRATCH_DAYS="${BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS:-7}"
@@ -1089,6 +1090,38 @@ sweep_release_slot() {
     fi
 }
 
+# Records and journal entries are '|'-separated lines, and two of their fields
+# can carry that byte: git accepts it in a ref name (`git check-ref-format
+# 'refs/heads/a|b'` exits 0) and a checkout path may contain it too. So those
+# fields are encoded on the way in and decoded on the way out. Splitting them
+# raw read branch `a|b` as `a` with a tip of `b|<sha>`, which on the journal
+# meant an interrupted delete was replayed against a ref that does not exist
+# and the real one was never put back.
+field_encode() {
+    local s="${1//%/%25}"
+    printf '%s' "${s//|/%7C}"
+}
+
+field_decode() {
+    local s="${1//%7C/|}"
+    printf '%s' "${s//%25/%}"
+}
+
+# Is $2 the checked-out branch of any worktree record in the file $1? An exact
+# field compare rather than a grep for "|$branch|": a branch name is not a
+# regular expression (`release/1.2.x` matches names it does not equal), and a
+# path carrying the delimiter would match a branch nothing has checked out.
+records_have_branch() {
+    local file="$1" want="$2" b
+    [ -s "$file" ] || return 1
+    while IFS='|' read -r _ _ b _; do
+        if [ "$(field_decode "$b")" = "$want" ]; then
+            return 0
+        fi
+    done <"$file"
+    return 1
+}
+
 # The BRANCH JOURNAL. Deleting a ref has two conditions and git gives them to
 # two different primitives (see sweep_prune_branches); the one that is not
 # carried by the delete itself is repaired afterwards, and a repair that lives
@@ -1098,39 +1131,68 @@ sweep_release_slot() {
 # run's temporaries, and sweep_replay_journal finishes any entry whose sweep
 # did not. One sweep runs at a time (the run lock), so this file has a single
 # writer.
+#
+# An entry is `<clone>|<branch>|<tip>|<written-at>`, and it is NOT dropped as
+# soon as the delete looks clean: see sweep_replay_journal for why the clock
+# is in there.
 journal_add() {
     mkdir -p "$SWEEP_DIR" 2>/dev/null || true
-    printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$SWEEP_JOURNAL"
+    printf '%s|%s|%s|%s\n' "$(field_encode "$1")" "$(field_encode "$2")" "$3" "$(date +%s)" >>"$SWEEP_JOURNAL"
 }
 
 journal_forget() {
-    local keep
+    local keep pre line
     [ -f "$SWEEP_JOURNAL" ] || return 0
+    pre="$(field_encode "$1")|$(field_encode "$2")|$3|"
     keep="$SWEEP_JOURNAL.$$"
-    grep -vxF -- "$1|$2|$3" "$SWEEP_JOURNAL" >"$keep" 2>/dev/null || : >"$keep"
+    : >"$keep"
+    while IFS= read -r line; do
+        case "$line" in "$pre"*) continue ;; esac
+        printf '%s\n' "$line" >>"$keep"
+    done <"$SWEEP_JOURNAL"
     mv -- "$keep" "$SWEEP_JOURNAL" 2>/dev/null || rm -f -- "$keep"
 }
 
-# Finish what an interrupted sweep started. Every surviving entry names a ref
-# that sweep was deleting, so it asks the same question the in-pass check asks:
-# is the ref missing while a worktree still has it checked out? Then that
-# worktree's HEAD does not resolve, and the ref goes back at the sha it was
-# classified at -- a sha proved to be on a remote ref before any delete, so
-# putting it back cannot resurrect anything that was not already there.
-# Anything else is a delete that completed, and the entry is dropped. An
-# entry whose repair could not be made is kept for the next sweep and says so.
+# Finish what an interrupted sweep started, and decide which entries may go.
+# Every surviving entry names a ref that a sweep was deleting, so it asks the
+# same question the in-pass check asks: is the ref missing while a worktree
+# still has it checked out? Then that worktree's HEAD does not resolve, and
+# the ref goes back at the sha it was classified at -- a sha proved to be on a
+# remote ref before any delete, so putting it back cannot resurrect anything
+# that was not already there.
+#
+# The other outcome is the one that needs the clock. A ref that is missing
+# with no worktree naming it is what a delete that simply succeeded looks
+# like -- and it is also what a `git worktree add` that resolved the branch
+# before the delete and has not yet published its worktree record looks like.
+# One `git worktree list` cannot tell those apart, so an entry is never
+# dropped on the strength of one snapshot: it is carried until it is older
+# than SWEEP_JOURNAL_SETTLE, and every sweep in between asks again. A checkout
+# that lands inside that window is repaired by the next sweep instead of being
+# left with a symbolic HEAD whose ref no longer exists and no record anywhere
+# saying so. An entry whose repair could not be made is kept regardless and
+# says so.
 sweep_replay_journal() {
-    local clone branch tip records keep
+    local clone branch tip when now records keep
     [ -s "$SWEEP_JOURNAL" ] || return 0
     records="$SWEEP_TMP/replay.records"
     keep="$SWEEP_TMP/replay.keep"
+    now=$(date +%s)
     : >"$keep"
-    while IFS='|' read -r clone branch tip; do
+    while IFS='|' read -r clone branch tip when; do
         [ -n "$clone" ] && [ -n "$branch" ] && [ -n "$tip" ] || continue
+        clone=$(field_decode "$clone")
+        branch=$(field_decode "$branch")
+        case "$when" in '' | *[!0-9]*) when=0 ;; esac
         [ -e "$clone/.git" ] || continue
         git -C "$clone" rev-parse --verify -q "refs/heads/$branch" >/dev/null 2>&1 && continue
         sweep_worktree_records "$clone" >"$records" 2>/dev/null || : >"$records"
-        grep -q -- "|$branch|" "$records" || continue
+        if ! records_have_branch "$records" "$branch"; then
+            if [ "$((now - 10#$when))" -lt "$SWEEP_JOURNAL_SETTLE" ]; then
+                journal_line "$clone" "$branch" "$tip" "$when" >>"$keep"
+            fi
+            continue
+        fi
         if fence_take; then
             if git -C "$clone" update-ref "refs/heads/$branch" "$tip" "" 2>/dev/null; then
                 fence_drop
@@ -1139,10 +1201,14 @@ sweep_replay_journal() {
             fi
             fence_drop
         fi
-        printf '%s|%s|%s\n' "$clone" "$branch" "$tip" >>"$keep"
+        journal_line "$clone" "$branch" "$tip" "$when" >>"$keep"
         sweep_log "WARNING: branch $branch in $clone was deleted while checked out and could not be put back at $tip; will retry"
     done <"$SWEEP_JOURNAL"
     cat "$keep" >"$SWEEP_JOURNAL" 2>/dev/null || : >"$SWEEP_JOURNAL"
+}
+
+journal_line() {
+    printf '%s|%s|%s|%s\n' "$(field_encode "$1")" "$(field_encode "$2")" "$3" "$4"
 }
 
 # Parse `git worktree list --porcelain` into one record per line:
@@ -1159,7 +1225,7 @@ sweep_worktree_records() {
             "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
             locked | "locked "*) locked=1 ;;
             "")
-                [ -z "$path" ] || printf '%s|%s|%s|%s\n' "$path" "$sha" "$branch" "$locked"
+                [ -z "$path" ] || printf '%s|%s|%s|%s\n' "$(field_encode "$path")" "$sha" "$(field_encode "$branch")" "$locked"
                 path=""
                 ;;
         esac
@@ -1178,7 +1244,7 @@ sweep_prune_branches() {
     while IFS= read -r branch; do
         [ -n "$branch" ] || continue
         [ "$branch" != "$default" ] || continue
-        grep -q -- "|$branch|" "$records" && continue
+        records_have_branch "$records" "$branch" && continue
         tip=$(git -C "$clone" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null) || continue
         why=""
         if [ -n "$default" ] && git -C "$clone" merge-base --is-ancestor "$tip" "refs/remotes/origin/$default" 2>/dev/null; then
@@ -1251,7 +1317,7 @@ sweep_prune_branches() {
         fi
         grabbed="$SWEEP_TMP/grabbed.records"
         sweep_worktree_records "$clone" >"$grabbed" 2>/dev/null || : >"$grabbed"
-        if grep -q -- "|$branch|" "$grabbed"; then
+        if records_have_branch "$grabbed" "$branch"; then
             SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
             if git -C "$clone" update-ref "refs/heads/$branch" "$tip" "" 2>/dev/null; then
                 journal_forget "$clone" "$branch" "$tip"
@@ -1263,7 +1329,14 @@ sweep_prune_branches() {
             fi
             continue
         fi
-        journal_forget "$clone" "$branch" "$tip"
+        # The entry stays. This scan is a snapshot too: a `git worktree add`
+        # that resolved the branch before the delete can publish its worktree
+        # record after it, and then a clean-looking scan here is the same
+        # picture as a checkout still in flight. Dropping the entry on it
+        # erased the only durable repair intent and left that worktree with a
+        # symbolic HEAD whose ref is gone and nothing anywhere recording it.
+        # sweep_replay_journal carries the entry until it has outlived any
+        # such checkout and repairs one that appears in the meantime.
         fence_drop
         SW_BRANCHES=$((SW_BRANCHES + 1))
         sweep_log "deleted branch $branch in $clone: $why"
@@ -1319,6 +1392,8 @@ sweep_clone() {
     local rec path rp sha branch locked gitdir class reason main_class="" main_reason="" i
     while IFS='|' read -r path sha branch locked; do
         [ -n "$path" ] || continue
+        path=$(field_decode "$path")
+        branch=$(field_decode "$branch")
         [ -e "$path" ] || continue
         rp=$(sweep_realpath "$path") || continue
         gitdir=$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || continue
@@ -1407,7 +1482,9 @@ sweep_clone() {
     # retained second clone carrying 2 GB of it). Both are reproduced by a
     # build; neither is work.
     while IFS='|' read -r path sha branch locked; do
-        [ -n "$path" ] && [ -e "$path" ] || continue
+        [ -n "$path" ] || continue
+        path=$(field_decode "$path")
+        [ -e "$path" ] || continue
         rp=$(sweep_realpath "$path") || continue
         gitdir=$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || continue
         sweep_in_use "$path" "$gitdir" && continue

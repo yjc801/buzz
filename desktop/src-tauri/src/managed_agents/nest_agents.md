@@ -37,6 +37,8 @@ buzz-workspace list               # which slots hold what
 
 It recycles a small pool of fixed-path slots against a shared cargo cache, never touches `target/`, and will not recycle a slot that has uncommitted work. Each hand-out claims its slot for an hour; if you're going to call `buzz-workspace` repeatedly for the same ref, `export BUZZ_WORKSPACE_CLAIM=<anything-unique>` once so your own later calls are recognized as yours instead of refused. `buzz-workspace release <ref>` gives up a claim early.
 
+**Closed pull requests are swept automatically.** On a remote agent, `buzz-workspace sweep` runs at every start and once a day while the agent is alive. It removes linked worktrees whose pull request is closed or merged, deletes the local branches those pull requests left, releases their slots, and drops checkouts under `.scratch/` that have sat idle for a week. It never touches a checkout with uncommitted or unpushed work, one used in the last three hours, one whose pull request it cannot prove closed, or a standalone clone outside `.scratch/` — a long-lived clone keeps whatever branch you left it on, and only its idle build caches are reclaimed, and only when the disk is nearly full. So: commit and push what matters, keep long-lived clones under `REPOS/`, and expect a finished PR's worktree to be gone next time — re-create it with `buzz-workspace` if you need it back. `buzz-workspace sweep --dry-run` shows what the next sweep would do and why; the log is `~/.buzz/workspace-sweep.log`.
+
 ## Knowledge File Conventions
 
 Files in `GUIDES/`, `PLANS/`, `RESEARCH/`, `WORK_LOGS/` should include YAML frontmatter:

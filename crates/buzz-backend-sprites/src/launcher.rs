@@ -92,6 +92,20 @@ impl ProbeReport {
 
 #[cfg(test)]
 mod tests {
+
+    /// The text of one shell function in `workspace.sh`, from its `name() {`
+    /// header to the first line that is exactly `}`.
+    fn sweep_fn_body(name: &str) -> &'static str {
+        let header = format!("\n{name}() {{\n");
+        let start = WORKSPACE_SH
+            .find(&header)
+            .unwrap_or_else(|| panic!("workspace.sh no longer defines {name}()"))
+            + header.len();
+        let end = WORKSPACE_SH[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name}() is unterminated"));
+        &WORKSPACE_SH[start..start + end]
+    }
     use super::*;
 
     #[test]
@@ -116,6 +130,128 @@ mod tests {
         assert!(
             LAUNCHER_SH.contains(r#"export PATH="$BUZZ/bin:"#),
             "the launcher no longer puts $BUZZ/bin on the agent's PATH"
+        );
+    }
+
+    /// The launcher is what makes the sweep happen without an agent turn:
+    /// once at start (a PR closed while the agent slept is cleaned on this
+    /// wake) and daily while the harness lives. Two properties keep it from
+    /// hurting the start it rides on: it runs off the election lock — fd 9
+    /// is closed inside the subshell before anything else, so the sweep can
+    /// never hold the agent lock past the harness's exit — and it is
+    /// `--if-due`, so every call but the first in a day is a stat and an
+    /// exit. Pinned as text: the script is the contract.
+    #[test]
+    fn the_launcher_sweeps_the_workspace_off_the_election_lock() {
+        let sweep = LAUNCHER_SH
+            .find(r#""$BUZZ/bin/buzz-workspace" sweep --if-due"#)
+            .expect("the launcher no longer runs the workspace sweep");
+        let subshell = LAUNCHER_SH[..sweep]
+            .rfind("(\n    exec 9>&-")
+            .expect("the sweep subshell no longer closes the election lock first");
+        let between = &LAUNCHER_SH[subshell..sweep];
+        assert!(
+            !between.contains("exec 9>\""),
+            "something re-opens fd 9 between closing it and the sweep"
+        );
+        assert!(
+            LAUNCHER_SH[sweep..].contains(r#"= "buzz-acp" ] || exit 0"#),
+            "the sweep loop no longer stops when the harness is gone"
+        );
+        assert!(
+            LAUNCHER_SH[..sweep].contains("nice -n 19"),
+            "the sweep no longer runs at the lowest priority"
+        );
+        assert!(
+            LAUNCHER_SH[..sweep].contains("exec 9>&-"),
+            "the sweep subshell no longer closes the election lock"
+        );
+    }
+
+    /// The sweep runs beside a live harness — the launcher starts it and
+    /// execs the agent straight away — so classification is a snapshot of a
+    /// machine somebody else is still using. Two properties make that
+    /// acceptable, and both are structural: every destructive step takes the
+    /// reclaim fence (which a hand-out also holds end to end), and a directory
+    /// is moved aside with one atomic rename before anything is deleted, so an
+    /// agent that walked in without taking any lock is found and put back.
+    /// A destructive step with no directory to rename -- deleting a branch --
+    /// gets the equivalent in ref form, an expected-old-value delete.
+    /// A step that grew an `rm -rf` in place again would look fine in every
+    /// test but the race it loses.
+    #[test]
+    fn every_destructive_sweep_step_is_fenced_and_detaches_first() {
+        for step in [
+            "sweep_remove_worktree",
+            "sweep_remove_scratch_clone",
+            "sweep_purge_cache",
+        ] {
+            let body = sweep_fn_body(step);
+            assert!(
+                body.contains("fence_take"),
+                "{step} no longer takes the reclaim fence"
+            );
+            assert!(
+                body.contains("sweep_detach_dir"),
+                "{step} no longer moves the directory aside before deleting it"
+            );
+        }
+        // Deleting a branch destroys no directory, so it has no rename to
+        // make, and its two conditions need two different mechanisms.
+        // `branch -D` refuses a checked-out branch but deletes a NAME after a
+        // SHA was classified, and compensating afterwards from git's
+        // `(was <sha>)` receipt leaves a concurrently pushed commit with no
+        // ref at all for the length of the compensation -- a kill in that
+        // window loses it. `update-ref -d <ref> <sha>` cannot delete anything
+        // but the classified sha, so no unproven commit is ever unreferenced;
+        // the checkout it does not refuse is recoverable instead, and the
+        // recovery is journaled BEFORE the delete so it survives the process.
+        let prune = sweep_fn_body("sweep_prune_branches");
+        assert!(
+            prune.contains("fence_take"),
+            "sweep_prune_branches no longer takes the reclaim fence"
+        );
+        let delete = prune
+            .find(r#"update-ref -d "refs/heads/$branch" "$tip""#)
+            .expect("sweep_prune_branches no longer deletes with git's compare-and-delete form");
+        assert!(
+            !WORKSPACE_SH.contains(r#"branch -D ""#),
+            "workspace.sh deletes a branch by NAME again, which cannot carry the classified sha"
+        );
+        let journal = prune
+            .find(r#"journal_add "$clone" "$branch" "$tip""#)
+            .expect("sweep_prune_branches no longer records the delete durably");
+        assert!(
+            journal < delete,
+            "sweep_prune_branches journals the delete after making it; the recovery must outlive the process"
+        );
+        assert!(
+            prune.contains(r#"sweep_worktree_records "$clone" >"$grabbed""#)
+                && prune.contains(r#"update-ref "refs/heads/$branch" "$tip" """#),
+            "sweep_prune_branches no longer re-reads the worktrees after the delete and puts the ref back"
+        );
+        assert!(
+            sweep_fn_body("cmd_sweep").contains("sweep_replay_journal"),
+            "the sweep no longer finishes a repair an earlier run was killed in the middle of"
+        );
+        // And the one operation that can be neither fenced nor undone -- a
+        // branch switch rewrites the tree in place at a path an agent may
+        // have walked into, and the only way back from a late entrant is
+        // `checkout --force`, which discards that turn's edits. So the sweep
+        // does not switch a standalone clone at all; it keeps it.
+        assert!(
+            sweep_fn_body("sweep_keep_clone").contains("never switched automatically"),
+            "the sweep acts on a standalone clone again"
+        );
+        assert!(
+            !WORKSPACE_SH.contains("sweep_switch_clone"),
+            "the automatic standalone-clone switch is back; it cannot be made safe against a bare `cd`"
+        );
+        // And the hand-out holds the same fence, or the exclusion is one-sided.
+        let path = sweep_fn_body("cmd_path");
+        assert!(
+            path.contains("fence_take") && path.contains("fence_drop"),
+            "cmd_path no longer holds the reclaim fence for the whole hand-out"
         );
     }
 

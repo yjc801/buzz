@@ -115,6 +115,36 @@ fi
     done
 ) &
 
+# Workspace hygiene: take back what closed pull requests left behind (the
+# `sweep` section of workspace.sh — worktrees, branches, slots, build caches
+# under ~ that belong to a closed PR). It runs once now, so a PR closed
+# while the agent slept is cleaned on this wake, and again whenever a day
+# has passed while the harness lives; `--if-due` makes every other call a
+# stat and an exit. Detached from the election: fd 9 is closed FIRST, so
+# this subshell can never hold the agent lock past the harness's exit the
+# way an inherited descriptor would, and it stops itself once PID $SELF is
+# no longer the harness. Lowest priority, best effort: a sweep can fail, a
+# start cannot fail because of it, and its output goes to the sweep's own
+# log rather than the session.
+#
+# This runs CONCURRENTLY with the harness by design — the exec below happens
+# straight away, because a start that waited for a sweep would miss the wake
+# that caused it. The safety that makes the concurrency acceptable lives in
+# workspace.sh, not here: every destructive step takes the reclaim fence, is
+# revalidated under it, and detaches a directory with an atomic rename before
+# deleting it. Do not turn this into a foreground call to make it "safe".
+(
+    exec 9>&-
+    sweep() {
+        nice -n 19 "$BUZZ/bin/buzz-workspace" sweep --if-due >>"$BUZZ/workspace-sweep.log" 2>&1 || true
+    }
+    sweep
+    while sleep 60; do
+        [ "$(cat /proc/$SELF/comm 2>/dev/null)" = "buzz-acp" ] || exit 0
+        sweep
+    done
+) &
+
 # Same PID, same fds (the lock), same children: the harness becomes the
 # session's signal target. `buzz-acp` is the sprig multicall's harness
 # personality — invoked via its symlink so /proc/<pid>/comm reads

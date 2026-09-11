@@ -50,6 +50,98 @@ provisioning: `buzz-agent` (always installed, via the sprig multicall), or
 else — including Goose, which the sprite base image does not ship — is
 refused at deploy time, before the sprite is touched.
 
+## Workspace hygiene
+
+Agents mint checkouts faster than they retire them: before this existed the
+fleet held per-PR clones and worktrees by the dozen, several carrying gigabytes
+of `target/` or `node_modules` for pull requests closed weeks earlier, and
+nothing on a sprite ever asked whether the PR behind a checkout was still open.
+`buzz-workspace sweep` (in `src/assets/workspace.sh`) is the deterministic
+answer: the launcher runs it at every start — so a PR closed while the agent
+slept is cleaned on the next wake — and once a day while the harness lives, off
+the election lock and at the lowest priority. No agent turn is involved.
+
+What it reclaims, and the evidence it needs first:
+
+| checkout | when | action |
+|---|---|---|
+| linked worktree | every associated PR closed or merged, or the commit is on `origin/<default>` | `git worktree remove` (build caches go with it) |
+| slot (`<repo>-slots/N`) | same, and the claim has expired | claim released; the checkout and its build cache stay (that cache is the pool's purpose) |
+| standalone clone | — | **never deleted and never switched** outside `~/.scratch`; only its idle caches are reclaimable, under disk pressure |
+| local branch | on `origin/<default>`, or the head of a closed PR and on some remote ref | deleted |
+| anything under `~/.scratch` | idle past the TTL | removed — disposable by the Nest contract, dirty or not |
+| idle rebuildable caches (`target/`, `node_modules/`) | free disk under the floor | purged, unclaimed slots first, until the floor is met |
+
+A pull request is tied to a checkout by evidence, never by a directory name
+alone: the exact `refs/pull/N/head` sha from one `git ls-remote`, the branch
+name looked up on GitHub, or a `pr-N` name hint that must be confirmed by
+fetching that PR's head and proving ancestry. Everything else is kept, and the
+log says why: uncommitted or untracked files, a commit on no remote ref, a
+process with its cwd inside or any file changed within the hold window, a
+`git worktree lock`, an open PR, a live slot claim, or a GitHub read that
+failed, was rate-limited, or ran over the per-sweep budget — a failed read is
+never treated as "closed".
+
+Knobs, read from the agent's environment (set them per agent in Buzz Desktop):
+
+| variable | default | meaning |
+|---|---|---|
+| `BUZZ_WORKSPACE_SWEEP_INTERVAL` | 86400 | seconds between sweeps while the harness lives (`--if-due`) |
+| `BUZZ_WORKSPACE_SWEEP_HOLD_MIN` | 180 | a checkout touched this recently is in use |
+| `BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS` | 7 | idle days before a `~/.scratch` checkout is removed |
+| `BUZZ_WORKSPACE_MIN_FREE_GB` | 10 | free-space floor that triggers the build-cache purge |
+| `BUZZ_WORKSPACE_SWEEP_API_BUDGET` | 40 | GitHub reads per sweep; an unauthenticated sprite has 60 an hour |
+| `GH_TOKEN` / `GITHUB_TOKEN` | unset | authenticates the sweep's GitHub reads and its `git fetch`/`ls-remote` against github.com. **Required for a private repository**: the launcher's environment carries none of the credentials an agent session sets up for itself, so without a token a private origin fails its fetch (logged) and every decision that needed GitHub stays `unknown`. A fine-grained token with `contents: read` and `pull_requests: read` is enough; it also lifts the unauthenticated rate limit |
+| `BUZZ_WORKSPACE_FENCE_WAIT` | 30 | seconds to wait for the reclaim fence before keeping the checkout instead |
+| `BUZZ_WORKSPACE_SWEEP_JOURNAL_MAX` | 256 | branch-repair intents that may be outstanding at once; past it the sweep stops pruning branches rather than dropping any |
+| `BUZZ_WORKSPACE_SWEEP_DISABLED` | unset | `1` turns the sweep off |
+
+Every destructive step runs under a **reclaim fence** — one lock that
+`buzz-workspace <ref>` also holds for a whole hand-out — and re-establishes
+under that fence every property that made the checkout reclaimable, because
+the classification that chose it was a snapshot of a machine an agent is still
+using. What no lock can cover is an agent that simply `cd`s into an old
+checkout, so nothing is ever deleted in place: a directory is first moved aside
+with a single atomic rename, and if `/proc` then shows a process inside it, it
+is moved straight back and kept. A branch deletion has two conditions and
+neither is a read of ours. The sha is enforced by the delete: it goes through
+`git update-ref -d <ref> <sha>`, git's compare-and-delete, so a branch another
+session advanced after the classification cannot be removed at all and a
+commit nobody proved disposable is never left unreferenced, not even for the
+length of a compensation. The checkout is not — `update-ref -d` does not
+refuse a checked-out branch — so that one converges: the intent is journaled
+in `.workspace-sweep/branch-journal` before the delete, the worktrees are
+re-read after it, and a branch some worktree grabbed in between is put back at
+the sha it was classified at. Every sweep replays that journal first, so a
+sweep killed mid-repair is finished by the next one rather than leaving a
+worktree's HEAD unresolvable. That re-read is a snapshot as well — a
+`git worktree add` resolves the branch before it registers the worktree, so a
+checkout can publish its record after the scan — so the entry is not dropped
+on the strength of one clean-looking scan, and it does not expire on a clock
+either — a stopped checkout finishes whenever it resumes, so elapsed time says
+nothing about it. It is dropped on evidence: a checkout that could still hold
+the deleted ref was necessarily already running when the ref went, so once
+`/proc` shows no git process working in that clone, none is outstanding.
+Until then every sweep carries the entry and asks again, repairing any
+checkout that surfaces in the meantime; `BUZZ_WORKSPACE_SWEEP_JOURNAL_MAX`
+bounds how many intents may be owed at once by pausing branch pruning, never
+by discarding one. Journal and
+worktree records escape the `|` they are separated by, because git accepts it
+in a ref name and a checkout path may contain it.
+
+A standalone clone outside `~/.scratch` is the one thing the sweep will not
+act on, because that guarantee cannot be extended to it. Switching it to the
+default branch rewrites the tree in place, at the path an agent may be standing
+in; a check after the checkout cannot see an entrant that arrives just after
+it, and undoing the switch for one it does see means `checkout --force`, which
+discards whatever that live turn edited. So the clone keeps its branch, and
+that branch is not pruned while it is checked out.
+
+`buzz-workspace sweep --dry-run` reports without acting; the log is
+`~/.buzz/workspace-sweep.log`. The contract is pinned end to end by
+`tests/workspace-sweep.test.sh` (a real origin with pull-request refs, the
+production script, a stub GitHub), run under `cargo test`.
+
 ## [L3] Conformance — how this binding realizes the contract
 
 The spec (`docs/remote-agents.md`, §Conformance item 6) requires every binding

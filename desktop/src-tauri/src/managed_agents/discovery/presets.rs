@@ -110,7 +110,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         command: "buzz-pi-acp",
         args: &[],
         install_instructions_url: "https://github.com/salman1993/pi-acp",
-        install_hint: "Requires Node.js 22 or newer. Install the Pi ACP adapter with `npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main`. Restart Buzz, then select Pi as the agent harness. Run the same install command again to update the adapter.",
+        install_hint: "Requires Node.js 22 or newer. Install the Pi ACP adapter with `npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main`. Restart Waggle, then select Pi as the agent harness. Run the same install command again to update the adapter.",
         underlying_cli: Some("pi"),
         underlying_cli_install_hint: Some(
             "Install Pi with `npm install -g @earendil-works/pi-coding-agent`, then run `pi` to configure its model provider.",
@@ -434,7 +434,7 @@ mod tests {
         assert!(adapter_missing.default_args.is_empty());
         assert_eq!(
             adapter_missing.install_hint,
-            "Requires Node.js 22 or newer. Install the Pi ACP adapter with `npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main`. Restart Buzz, then select Pi as the agent harness. Run the same install command again to update the adapter."
+            "Requires Node.js 22 or newer. Install the Pi ACP adapter with `npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main`. Restart Waggle, then select Pi as the agent harness. Run the same install command again to update the adapter."
         );
         assert_eq!(
             adapter_missing.install_instructions_url,
@@ -462,7 +462,7 @@ mod tests {
         );
         assert_eq!(
             not_installed.install_hint,
-            "Install Pi with `npm install -g @earendil-works/pi-coding-agent`, then run `pi` to configure its model provider. Requires Node.js 22 or newer. Install the Pi ACP adapter with `npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main`. Restart Buzz, then select Pi as the agent harness. Run the same install command again to update the adapter."
+            "Install Pi with `npm install -g @earendil-works/pi-coding-agent`, then run `pi` to configure its model provider. Requires Node.js 22 or newer. Install the Pi ACP adapter with `npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main`. Restart Waggle, then select Pi as the agent harness. Run the same install command again to update the adapter."
         );
     }
 
@@ -600,5 +600,35 @@ mod tests {
             entry.max_parallelism, None,
             "uncapped preset (devin) must have max_parallelism: None"
         );
+    }
+
+    /// Fork branding: no preset's user-visible setup guidance may name the
+    /// upstream app. This fork ships the desktop app as Waggle
+    /// (`docs/fork-branding.md`), so an instruction to "Restart Buzz" points a
+    /// user at a different installation while the running Waggle process keeps
+    /// its stale PATH. Upstream authors these hints, so every fork sync can
+    /// reintroduce one -- assert the whole class, not just the preset that
+    /// happened to carry it. Lowercase command names (`buzz-pi-acp`,
+    /// `buzz-acp`) are binaries, not the brand, and stay allowed.
+    #[test]
+    fn preset_setup_hints_name_the_fork_app() {
+        for preset in PRESET_HARNESSES {
+            for (field, hint) in [
+                ("install_hint", Some(preset.install_hint)),
+                (
+                    "underlying_cli_install_hint",
+                    preset.underlying_cli_install_hint,
+                ),
+            ] {
+                let Some(hint) = hint else {
+                    continue;
+                };
+                assert!(
+                    !hint.contains("Buzz"),
+                    "preset `{}` {field} names the upstream app; this fork ships as Waggle: {hint}",
+                    preset.id
+                );
+            }
+        }
     }
 }

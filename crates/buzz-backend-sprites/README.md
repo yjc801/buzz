@@ -93,7 +93,7 @@ Knobs, read from the agent's environment (set them per agent in Buzz Desktop):
 | `BUZZ_WORKSPACE_SWEEP_API_BUDGET` | 40 | GitHub reads per sweep; an unauthenticated sprite has 60 an hour |
 | `GH_TOKEN` / `GITHUB_TOKEN` | unset | authenticates the sweep's GitHub reads and its `git fetch`/`ls-remote` against github.com. **Required for a private repository**: the launcher's environment carries none of the credentials an agent session sets up for itself, so without a token a private origin fails its fetch (logged) and every decision that needed GitHub stays `unknown`. A fine-grained token with `contents: read` and `pull_requests: read` is enough; it also lifts the unauthenticated rate limit |
 | `BUZZ_WORKSPACE_FENCE_WAIT` | 30 | seconds to wait for the reclaim fence before keeping the checkout instead |
-| `BUZZ_WORKSPACE_SWEEP_JOURNAL_SETTLE` | 3600 | seconds a branch-repair journal entry is carried before it is considered settled |
+| `BUZZ_WORKSPACE_SWEEP_JOURNAL_MAX` | 256 | branch-repair intents that may be outstanding at once; past it the sweep stops pruning branches rather than dropping any |
 | `BUZZ_WORKSPACE_SWEEP_DISABLED` | unset | `1` turns the sweep off |
 
 Every destructive step runs under a **reclaim fence** — one lock that
@@ -117,9 +117,15 @@ sweep killed mid-repair is finished by the next one rather than leaving a
 worktree's HEAD unresolvable. That re-read is a snapshot as well — a
 `git worktree add` resolves the branch before it registers the worktree, so a
 checkout can publish its record after the scan — so the entry is not dropped
-on the strength of one clean-looking scan: it is carried until it has outlived
-`BUZZ_WORKSPACE_SWEEP_JOURNAL_SETTLE` seconds (default 3600), and a checkout
-that surfaces inside that window is repaired by the next sweep. Journal and
+on the strength of one clean-looking scan, and it does not expire on a clock
+either — a stopped checkout finishes whenever it resumes, so elapsed time says
+nothing about it. It is dropped on evidence: a checkout that could still hold
+the deleted ref was necessarily already running when the ref went, so once
+`/proc` shows no git process working in that clone, none is outstanding.
+Until then every sweep carries the entry and asks again, repairing any
+checkout that surfaces in the meantime; `BUZZ_WORKSPACE_SWEEP_JOURNAL_MAX`
+bounds how many intents may be owed at once by pausing branch pruning, never
+by discarding one. Journal and
 worktree records escape the `|` they are separated by, because git accepts it
 in a ref name and a checkout path may contain it.
 

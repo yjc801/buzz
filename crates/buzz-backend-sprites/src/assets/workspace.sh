@@ -587,7 +587,7 @@ cmd_release() {
 
 SWEEP_DIR="$BUZZ/.workspace-sweep"
 SWEEP_JOURNAL="$SWEEP_DIR/branch-journal"
-SWEEP_JOURNAL_SETTLE="${BUZZ_WORKSPACE_SWEEP_JOURNAL_SETTLE:-3600}"
+SWEEP_JOURNAL_MAX="${BUZZ_WORKSPACE_SWEEP_JOURNAL_MAX:-256}"
 SWEEP_LOG="$BUZZ/workspace-sweep.log"
 SWEEP_HOLD_MIN="${BUZZ_WORKSPACE_SWEEP_HOLD_MIN:-180}"
 SWEEP_SCRATCH_DAYS="${BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS:-7}"
@@ -1122,6 +1122,83 @@ records_have_branch() {
     return 1
 }
 
+# Is this pid inside our own process tree? The sweep runs git constantly, and
+# a scan that counted its own children would never once see a clone quiet.
+sweep_pid_is_ours() {
+    local pid="$1" hops=0 st
+    while [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$hops" -lt 32 ]; do
+        [ "$pid" != "$$" ] || return 0
+        st=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+        st="${st#*) }" # past `pid (comm)`, whose comm may itself contain spaces
+        pid=$(printf '%s' "$st" | cut -d' ' -f2)
+        hops=$((hops + 1))
+    done
+    return 1
+}
+
+# Could a checkout that resolved a since-deleted ref still be in flight in
+# this clone?
+#
+# This is the question the journal turns on, and the only sound answer is
+# about PROCESSES, not about time. `git worktree add` resolves the branch and
+# only then registers the worktree, so a checkout in between is invisible to
+# `git worktree list`; but a checkout that started AFTER the ref went cannot
+# resolve the branch at all. Every checkout that could still surface holding
+# the deleted ref was therefore already running when it was deleted, and the
+# absence of any live git process working in this clone is positive evidence
+# that none is left. Elapsed time is not evidence of anything: a `git worktree
+# add` stopped between those two steps -- a SIGSTOP, a paused Sprite, a box
+# under heavy load -- is still going to finish, however long the sweep waits,
+# and a timer only decides how late the damage lands.
+#
+# The evidence is /proc, the substrate the sprites run on: a process counts
+# when its argv[0] is git and its arguments, its environment, its cwd or the
+# common dir its cwd resolves to name this clone. Anywhere else -- a
+# developer's macOS box running the contract test -- `ps` gives argv but never
+# a cwd, so a checkout invoked from inside the clone with relative arguments
+# could not be attributed; there every live git process counts, for every
+# clone, which is coarse but never drops an intent that is still owed.
+sweep_git_working_in() {
+    local clone="$1" p pid args argv0 cwd common
+    if [ -d /proc ]; then
+        for p in /proc/[0-9]*; do
+            pid="${p#/proc/}"
+            sweep_pid_is_ours "$pid" && continue
+            args=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null) || continue
+            [ -n "$args" ] || continue
+            argv0="${args%% *}"
+            case "${argv0##*/}" in git | git-*) ;; *) continue ;; esac
+            case "$args" in *"$clone"*) return 0 ;; esac
+            case "$(tr '\0' ' ' <"$p/environ" 2>/dev/null)" in *"$clone"*) return 0 ;; esac
+            cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+            case "$cwd" in "$clone" | "$clone"/*) return 0 ;; esac
+            [ -d "$cwd" ] || continue
+            common=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+            if [ "$(sweep_realpath "$(dirname "$common")" 2>/dev/null)" = "$clone" ]; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+    [ -n "$(ps -Ao pid=,comm= 2>/dev/null |
+        awk -v me="$$" '$1 != me { n = $2; sub(/.*\//, "", n); if (n == "git" || n ~ /^git-/) { print $1; exit } }')" ]
+}
+
+# One scan answers every entry for a clone in this run.
+sweep_checkout_in_flight() {
+    local clone="$1" cache
+    cache="$SWEEP_TMP/inflight.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
+    if [ ! -f "$cache" ]; then
+        if sweep_git_working_in "$clone"; then printf '1' >"$cache"; else printf '0' >"$cache"; fi
+    fi
+    [ "$(cat "$cache" 2>/dev/null)" = 1 ]
+}
+
+journal_count() {
+    [ -s "$SWEEP_JOURNAL" ] || { printf '0'; return; }
+    wc -l <"$SWEEP_JOURNAL" | tr -d ' '
+}
+
 # The BRANCH JOURNAL. Deleting a ref has two conditions and git gives them to
 # two different primitives (see sweep_prune_branches); the one that is not
 # carried by the delete itself is repaired afterwards, and a repair that lives
@@ -1133,8 +1210,9 @@ records_have_branch() {
 # writer.
 #
 # An entry is `<clone>|<branch>|<tip>|<written-at>`, and it is NOT dropped as
-# soon as the delete looks clean: see sweep_replay_journal for why the clock
-# is in there.
+# soon as the delete looks clean -- see sweep_replay_journal for what does
+# drop it. The timestamp is diagnostic only: nothing expires on it, because
+# age is not evidence that a checkout finished.
 journal_add() {
     mkdir -p "$SWEEP_DIR" 2>/dev/null || true
     printf '%s|%s|%s|%s\n' "$(field_encode "$1")" "$(field_encode "$2")" "$3" "$(date +%s)" >>"$SWEEP_JOURNAL"
@@ -1161,23 +1239,24 @@ journal_forget() {
 # remote ref before any delete, so putting it back cannot resurrect anything
 # that was not already there.
 #
-# The other outcome is the one that needs the clock. A ref that is missing
-# with no worktree naming it is what a delete that simply succeeded looks
-# like -- and it is also what a `git worktree add` that resolved the branch
-# before the delete and has not yet published its worktree record looks like.
-# One `git worktree list` cannot tell those apart, so an entry is never
-# dropped on the strength of one snapshot: it is carried until it is older
-# than SWEEP_JOURNAL_SETTLE, and every sweep in between asks again. A checkout
-# that lands inside that window is repaired by the next sweep instead of being
-# left with a symbolic HEAD whose ref no longer exists and no record anywhere
-# saying so. An entry whose repair could not be made is kept regardless and
-# says so.
+# The other outcome is the one that needs evidence. A ref that is missing with
+# no worktree naming it is what a delete that simply succeeded looks like --
+# and it is also what a `git worktree add` that resolved the branch before the
+# delete and has not yet published its worktree record looks like. No snapshot
+# of `git worktree list` can tell those apart, and neither can a clock: a
+# checkout stopped between resolving the ref and registering the worktree
+# still completes when it resumes, so waiting any number of seconds proves
+# nothing about it and only moves the damage later. What does settle it is
+# sweep_checkout_in_flight -- a checkout that could still hold the deleted ref
+# was necessarily already running when the ref went, so once no git process is
+# working in that clone at all, none is outstanding and the entry is owed to
+# nobody. Until then it is carried, and every sweep asks again. An entry whose
+# repair could not be made is kept regardless and says so.
 sweep_replay_journal() {
-    local clone branch tip when now records keep
+    local clone branch tip when records keep
     [ -s "$SWEEP_JOURNAL" ] || return 0
     records="$SWEEP_TMP/replay.records"
     keep="$SWEEP_TMP/replay.keep"
-    now=$(date +%s)
     : >"$keep"
     while IFS='|' read -r clone branch tip when; do
         [ -n "$clone" ] && [ -n "$branch" ] && [ -n "$tip" ] || continue
@@ -1188,8 +1267,11 @@ sweep_replay_journal() {
         git -C "$clone" rev-parse --verify -q "refs/heads/$branch" >/dev/null 2>&1 && continue
         sweep_worktree_records "$clone" >"$records" 2>/dev/null || : >"$records"
         if ! records_have_branch "$records" "$branch"; then
-            if [ "$((now - 10#$when))" -lt "$SWEEP_JOURNAL_SETTLE" ]; then
+            if sweep_checkout_in_flight "$clone"; then
                 journal_line "$clone" "$branch" "$tip" "$when" >>"$keep"
+                sweep_log "carrying the repair intent for branch $branch in $clone: git is still working there, so a checkout that resolved the ref may not have registered yet"
+            else
+                sweep_log "dropped the repair intent for branch $branch in $clone: the ref is gone, no worktree holds it and no git process is left that could still be checking it out"
             fi
             continue
         fi
@@ -1238,7 +1320,17 @@ sweep_worktree_records() {
 # `git update-ref -d <ref> <sha>` -- see the comment at it.
 sweep_prune_branches() {
     local clone="$1" slug="$2" default="$3" pullheads="$4" records="$5"
-    local branch tip prs n st open unknown closed why list out grabbed
+    local branch tip prs n st open unknown closed why list out grabbed outstanding
+    # Nothing expires a repair intent, so the one thing that has to be bounded
+    # is how many can be owed at once: past the cap the sweep stops taking on
+    # new ones rather than dropping any. A journal that stays at the cap means
+    # git has been working in a clone across many sweeps -- visible in the log,
+    # one carried line per entry.
+    outstanding=$(journal_count)
+    if [ "$outstanding" -ge "$SWEEP_JOURNAL_MAX" ]; then
+        sweep_log "not pruning branches in $clone: $outstanding branch repair intents are still outstanding (cap $SWEEP_JOURNAL_MAX)"
+        return
+    fi
     list="$SWEEP_TMP/branches.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
     git -C "$clone" for-each-ref --format='%(refname:short)' refs/heads >"$list" 2>/dev/null || : >"$list"
     while IFS= read -r branch; do
@@ -1335,8 +1427,9 @@ sweep_prune_branches() {
         # picture as a checkout still in flight. Dropping the entry on it
         # erased the only durable repair intent and left that worktree with a
         # symbolic HEAD whose ref is gone and nothing anywhere recording it.
-        # sweep_replay_journal carries the entry until it has outlived any
-        # such checkout and repairs one that appears in the meantime.
+        # sweep_replay_journal carries the entry until no git process is left
+        # in this clone that could still be that checkout, and repairs one
+        # that appears in the meantime.
         fence_drop
         SW_BRANCHES=$((SW_BRANCHES + 1))
         sweep_log "deleted branch $branch in $clone: $why"

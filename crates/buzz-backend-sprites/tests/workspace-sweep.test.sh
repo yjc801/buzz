@@ -32,7 +32,9 @@
 #     between classification and deletion stays with its new commit intact,
 #     and one that a checkout grabs in that same window stays with its new
 #     worktree's HEAD still resolvable -- including when the sweep that was
-#     repairing it was killed, which the next sweep finishes from its journal;
+#     repairing it was killed, which the next sweep finishes from its journal,
+#     and the repair intent is dropped on evidence that no checkout can still
+#     be in flight rather than on a clock;
 #   * --dry-run changes nothing and reports what it would do; --if-due is a
 #     no-op inside the interval and acts past it; a held lock skips the run
 #     and a stale one is taken over; the disable switch disables;
@@ -438,8 +440,40 @@ check "with nothing holding it, the same branch is deleted" \
 # publish its worktree record after the scan, and then a clean-looking scan is
 # indistinguishable from a checkout still in flight. The entry is what lets a
 # later sweep tell the difference.
-check "a clean delete carries its journal entry until it has settled" \
+check "a clean delete carries its journal entry" \
   "$(journal_has agent/w/grabbed; echo $?)"
+
+# ── what drops a repair intent ─────────────────────────────────────────────
+# Not a clock. A `git worktree add` stopped between resolving the branch and
+# registering its worktree -- a SIGSTOP, a paused Sprite -- finishes whenever
+# it resumes, so no amount of elapsed time says the checkout is over; a timer
+# only decides how late the unresolvable HEAD lands. What does settle it is
+# that no git process is left in the clone that could be that checkout, since
+# one that started after the ref went cannot resolve it at all. The process is
+# real, not a stub: the probe reads /proc (or `ps`), which the suite cannot
+# fake.
+echo "--- a repair intent drops on evidence, not on a clock"
+mkfifo "$T/holder.fifo"
+exec 8<>"$T/holder.fifo"
+git -C "$CLONE" cat-file --batch <&8 >/dev/null 2>&1 &
+HOLDER=$!
+sleep 1
+bash "$WS" sweep >/dev/null 2>&1
+check "an entry is carried while git is still working in that clone" \
+  "$(journal_has agent/w/grabbed; echo $?)"
+check "and the branch it names is not resurrected meanwhile" \
+  "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; exec 8>&-
+# The other half only means anything where the probe can attribute a process
+# to a clone, which is /proc: without it every live git process on the host
+# counts, so a stray one elsewhere would keep the entry. Linux is the only
+# substrate the sprites run on.
+if [ -d /proc ]; then
+  bash "$WS" sweep >/dev/null 2>&1
+  check "and dropped once no git process could still be checking it out" \
+    "$(journal_has agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
+  logged "dropped the repair intent for branch agent/w/grabbed in $CLONE"
+fi
 
 # ── a sweep killed between the delete and its repair ────────────────────────
 # The repair above runs in the same pass, and that pass can itself be killed:
@@ -454,11 +488,8 @@ git -C "$CLONE" branch -q agent/w/interrupted "$GRAB_BASE"
 git -C "$CLONE" worktree add -q "$W_INT" agent/w/interrupted >/dev/null 2>&1
 INT_TIP=$(git -C "$CLONE" rev-parse refs/heads/agent/w/interrupted)
 git -C "$CLONE" update-ref -d refs/heads/agent/w/interrupted "$INT_TIP"
-# ...and one entry for a delete that DID complete and has outlived the settle
-# window: nothing holds that ref and nothing can still be checking it out, so
-# replay must drop the entry rather than resurrect the branch or carry it for
-# ever. (agent/w/grabbed, deleted above, is the same shape inside the window
-# and must still be there afterwards.)
+# ...and one entry for a delete that DID complete: nothing holds that ref, so
+# replay must not resurrect the branch on the strength of the entry.
 mkdir -p "$(dirname "$JOURNAL")"
 printf '%s|%s|%s|%s\n' "$CLONE" agent/w/interrupted "$INT_TIP" "$(date +%s)" >>"$JOURNAL"
 printf '%s|%s|%s|%s\n' "$CLONE" agent/w/settled "$GRAB_BASE" "$(($(date +%s) - 100000))" >>"$JOURNAL"
@@ -471,11 +502,7 @@ check "so the interrupted worktree's HEAD resolves again" \
   "$(git -C "$W_INT" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
 check "a completed delete is not resurrected by its journal entry" \
   "$(has_branch "$CLONE" agent/w/settled; [ $? -ne 0 ]; echo $?)"
-check "and once it has settled the journal drops it" \
-  "$(journal_has agent/w/settled; [ $? -ne 0 ]; echo $?)"
-check "while an entry still inside the window is carried to the next sweep" \
-  "$(journal_has agent/w/grabbed; echo $?)"
-check "which does not resurrect it either" \
+check "nor the one deleted before it" \
   "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
 check "a finished repair drops its own entry" \
   "$(journal_has agent/w/interrupted; [ $? -ne 0 ]; echo $?)"
@@ -497,6 +524,18 @@ git -C "$CLONE" branch -q late-main "$BASE"
 bash "$WS" sweep >/dev/null 2>&1
 check "the branch is deleted" "$(has_branch "$CLONE" late-main; [ $? -ne 0 ]; echo $?)"
 check "and its repair intent is still journaled" "$(journal_has late-main; echo $?)"
+# A sweep that runs while that checkout is still in flight sees exactly what a
+# sweep after a delete nothing raced sees -- a missing ref and no worktree
+# naming it. The live git process is the whole difference, and what stops this
+# sweep from forgetting the repair before the checkout lands.
+mkfifo "$T/holder2.fifo"
+exec 8<>"$T/holder2.fifo"
+git -C "$CLONE" cat-file --batch <&8 >/dev/null 2>&1 &
+HOLDER=$!
+sleep 1
+bash "$WS" sweep >/dev/null 2>&1
+check "a sweep in the middle of the checkout keeps the intent" "$(journal_has late-main; echo $?)"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; exec 8>&-
 git -C "$CLONE" update-ref refs/heads/late-main "$BASE"
 git -C "$CLONE" worktree add -q "$W_LATE" late-main >/dev/null 2>&1
 git -C "$CLONE" update-ref -d refs/heads/late-main "$BASE"

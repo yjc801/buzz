@@ -21,7 +21,7 @@ import { rankUserCandidatesBySearch } from "@/features/profile/lib/userCandidate
 import { useActiveCommunityRelayUrl } from "@/features/communities/useActiveCommunityRelayUrl";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ManagedAgent, UserSearchResult } from "@/shared/api/types";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 
 /** Maximum recipients (excluding the current user) a DM can address. */
 export const NEW_MESSAGE_RECIPIENT_LIMIT = 8;
@@ -38,7 +38,7 @@ export function formatRecipientName(user: UserSearchResult) {
   return (
     user.displayName?.trim() ||
     user.nip05Handle?.trim() ||
-    truncatePubkey(user.pubkey)
+    truncateNpub(user.pubkey)
   );
 }
 

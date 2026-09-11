@@ -175,6 +175,8 @@ mod tests {
     /// reclaim fence (which a hand-out also holds end to end), and a directory
     /// is moved aside with one atomic rename before anything is deleted, so an
     /// agent that walked in without taking any lock is found and put back.
+    /// A destructive step with no directory to rename -- deleting a branch --
+    /// gets the equivalent in ref form, an expected-old-value delete.
     /// A step that grew an `rm -rf` in place again would look fine in every
     /// test but the race it loses.
     #[test]
@@ -194,13 +196,36 @@ mod tests {
                 "{step} no longer moves the directory aside before deleting it"
             );
         }
-        // The switch cannot be a rename, so it converges instead: read again
-        // after the write and put the clone back if somebody is now inside.
-        let switch = sweep_fn_body("sweep_switch_clone");
-        assert!(switch.contains("fence_take"));
+        // Deleting a branch destroys no directory, so it has no rename to
+        // make — its equivalent is a compare-and-delete. `branch -D` deletes
+        // a NAME after a SHA was classified, which is how a concurrent push
+        // loses its commits; `update-ref -d <ref> <old>` refuses unless the
+        // ref still equals what was proved disposable.
+        let prune = sweep_fn_body("sweep_prune_branches");
         assert!(
-            switch.contains("sweep_cwd_inside"),
-            "sweep_switch_clone no longer re-reads for a live process after switching"
+            prune.contains("fence_take"),
+            "sweep_prune_branches no longer takes the reclaim fence"
+        );
+        assert!(
+            prune.contains(r#"update-ref -d "refs/heads/$branch" "$tip""#),
+            "sweep_prune_branches no longer deletes against the classified tip"
+        );
+        assert!(
+            !WORKSPACE_SH.contains(r#"branch -D ""#),
+            "workspace.sh deletes a branch by name again, without comparing the tip"
+        );
+        // And the one operation that can be neither fenced nor undone -- a
+        // branch switch rewrites the tree in place at a path an agent may
+        // have walked into, and the only way back from a late entrant is
+        // `checkout --force`, which discards that turn's edits. So the sweep
+        // does not switch a standalone clone at all; it keeps it.
+        assert!(
+            sweep_fn_body("sweep_keep_clone").contains("never switched automatically"),
+            "the sweep acts on a standalone clone again"
+        );
+        assert!(
+            !WORKSPACE_SH.contains("sweep_switch_clone"),
+            "the automatic standalone-clone switch is back; it cannot be made safe against a bare `cd`"
         );
         // And the hand-out holds the same fence, or the exclusion is one-sided.
         let path = sweep_fn_body("cmd_path");

@@ -568,11 +568,11 @@ cmd_release() {
 # What "reclaim" does depends on what the checkout is: a linked worktree is
 # removed (with its build caches), a slot is released (its build cache is
 # the warm pool this script exists for, so it stays unless disk pressure
-# says otherwise), a standalone clone is NEVER deleted outside ~/.scratch —
-# it is switched to the default branch so its closed branch can go and the
-# next task starts from main, which is what every coder prompt asks for. A
-# pull request is identified by evidence, never by a directory name alone:
-# the exact refs/pull/*/head sha from one `ls-remote`, a branch name looked
+# says otherwise), and a standalone clone outside ~/.scratch is neither
+# deleted nor switched — only its build caches are reclaimable, and only
+# under disk pressure (see sweep_keep_clone for why not). A pull request is
+# identified by evidence, never by a directory name alone: the exact
+# refs/pull/*/head sha from one `ls-remote`, a branch name looked
 # up on GitHub, or a `pr-N` name hint that must be confirmed by fetching that
 # PR's head and proving ancestry.
 #
@@ -599,7 +599,7 @@ SWEEP_VERBOSE=0
 SWEEP_TMP=""
 SWEEP_LOCK_HELD=0
 # Counters for the summary line.
-SW_REMOVED=0 SW_REMOVED_KB=0 SW_BRANCHES=0 SW_RELEASED=0 SW_SWITCHED=0 SW_PURGED_KB=0
+SW_REMOVED=0 SW_REMOVED_KB=0 SW_BRANCHES=0 SW_RELEASED=0 SW_PURGED_KB=0
 SW_KEPT_DIRTY=0 SW_KEPT_INUSE=0 SW_KEPT_OPEN=0 SW_KEPT_UNKNOWN=0 SW_KEPT_OTHER=0
 
 sweep_log() {
@@ -1036,62 +1036,29 @@ sweep_remove_scratch_clone() {
     sweep_log "removed scratch clone $clone ($((kb / 1024)) MB): $why"
 }
 
-# Move an idle standalone clone off a closed branch onto the default branch,
-# fast-forwarded to origin. The clone itself is never deleted: it is the
-# agent's warm environment, and coder prompts start every task from main.
-sweep_switch_clone() {
-    local clone="$1" default="$2" why="$3" before=""
-    if [ "$SWEEP_DRY" = 1 ]; then
-        sweep_log "would switch $clone to $default: $why"
-        return
-    fi
-    if ! fence_take; then
-        sweep_log "kept $clone on its branch: the reclaim fence is held"
-        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
-        return
-    fi
-    if sweep_in_use "$clone" "$clone/.git"; then
-        fence_drop
-        sweep_log "kept $clone on its branch: in use at the moment of the switch"
-        SW_KEPT_INUSE=$((SW_KEPT_INUSE + 1))
-        return
-    fi
-    if slot_is_dirty "$clone"; then
-        fence_drop
-        sweep_log "kept $clone on its branch: uncommitted changes at the moment of the switch"
-        SW_KEPT_DIRTY=$((SW_KEPT_DIRTY + 1))
-        return
-    fi
-    before=$(git -C "$clone" symbolic-ref --quiet --short HEAD 2>/dev/null ||
-        git -C "$clone" rev-parse HEAD 2>/dev/null || true)
-    if git -C "$clone" rev-parse --verify -q "refs/heads/$default" >/dev/null 2>&1; then
-        if ! git -C "$clone" checkout --quiet "$default" 2>/dev/null; then
-            fence_drop
-            sweep_log "kept $clone on its branch: checkout $default failed"
-            return
-        fi
-        git -C "$clone" merge --quiet --ff-only "refs/remotes/origin/$default" >/dev/null 2>&1 || true
-    elif ! git -C "$clone" checkout --quiet --track -b "$default" "refs/remotes/origin/$default" 2>/dev/null; then
-        fence_drop
-        sweep_log "kept $clone on its branch: checkout $default failed"
-        return
-    fi
-    # A checkout is not atomic either, and this one rewrites the tree an agent
-    # may have just walked into. The fence cannot see a bare `cd`, so read
-    # again AFTER the write and put the clone back if somebody is now standing
-    # in it — an unasked-for branch switch under a live turn is the failure
-    # this is here to avoid, and undoing it is cheap.
-    if [ -n "$before" ] && sweep_cwd_inside "$clone"; then
-        git -C "$clone" checkout --quiet --force "$before" 2>/dev/null ||
-            sweep_log "WARNING: $clone was switched to $default and could not be put back on $before"
-        fence_drop
-        sweep_log "kept $clone on $before: a process entered it as the sweep was switching"
-        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
-        return
-    fi
-    fence_drop
-    SW_SWITCHED=$((SW_SWITCHED + 1))
-    sweep_log "switched $clone to $default: $why"
+# A standalone clone outside ~/.scratch whose branch is finished is KEPT on
+# that branch. It is not switched to the default branch, and that is a
+# deliberate refusal rather than a gap.
+#
+# Every other destructive step closes the "an agent simply `cd`s in" hole the
+# same way: move the directory aside with one atomic rename and read /proc
+# again on the moved inode (sweep_detach_dir), so the worst case is a rename
+# and a rename back. A branch switch cannot be a rename -- it rewrites the
+# tree in place, at the path the agent is standing in. A check after the
+# checkout is not a fence: it cannot see an entrant that arrives just after
+# it, and undoing the switch for one it does see means `checkout --force`,
+# which silently discards whatever that live turn edited in between. There is
+# no ordering of those two writes that is safe, so the switch is not made.
+#
+# The cost is small and bounded: the clone stays on a finished branch (every
+# coder prompt starts a task by checking out the default branch anyway), and
+# that branch is not prunable while it is checked out. The clone's build and
+# dependency trees are still reclaimable -- under disk pressure they go
+# through sweep_purge_cache, which does detach by rename.
+sweep_keep_clone() {
+    local clone="$1" why="$2"
+    sweep_log "kept clone $clone on its branch: $why, but a standalone clone is never switched automatically"
+    SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
 }
 
 # Release a slot whose ref's pull request is closed: drop the claim and
@@ -1178,9 +1145,36 @@ sweep_prune_branches() {
             sweep_log "would delete branch $branch in $clone: $why"
             continue
         fi
-        if git -C "$clone" branch -D "$branch" >/dev/null 2>&1; then
+        if ! fence_take; then
+            sweep_log "kept branch $branch in $clone: the reclaim fence is held"
+            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+            continue
+        fi
+        # Under the fence, re-establish what classification read outside it:
+        # the branch must still be checked out nowhere. `update-ref -d` does
+        # not refuse a checked-out branch the way `branch -D` does, so this
+        # check is the whole of that protection now.
+        if sweep_worktree_records "$clone" | grep -q -- "|$branch|"; then
+            fence_drop
+            sweep_log "kept branch $branch in $clone: checked out since it was classified"
+            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+            continue
+        fi
+        # And the compare-and-delete: `branch -D` deletes a NAME, but what was
+        # classified is a SHA. Another session can advance this un-checked-out
+        # branch between the two, and then the name no longer denotes the thing
+        # that was proved disposable -- `-D` would take the new tip and its
+        # unpushed commits with it. `update-ref -d <ref> <old>` is git's atomic
+        # expected-old-value delete: it refuses unless the ref still equals the
+        # sha this decision was made about.
+        if git -C "$clone" update-ref -d "refs/heads/$branch" "$tip" 2>/dev/null; then
+            fence_drop
             SW_BRANCHES=$((SW_BRANCHES + 1))
             sweep_log "deleted branch $branch in $clone: $why"
+        else
+            fence_drop
+            sweep_log "kept branch $branch in $clone: it moved since it was classified"
+            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
         fi
     done <"$list"
 }
@@ -1297,7 +1291,7 @@ sweep_clone() {
 
     case "$main_class" in
         reclaim:scratch) sweep_remove_scratch_clone "$clone" "$main_reason" ;;
-        reclaim:*) [ -z "$default" ] || sweep_switch_clone "$clone" "$default" "$main_reason" ;;
+        reclaim:*) sweep_keep_clone "$clone" "$main_reason" ;;
         "") ;;
         *)
             sweep_log "kept clone $clone: $main_class $main_reason"
@@ -1315,9 +1309,9 @@ sweep_clone() {
     # (2). Only checkouts nothing is using right now are candidates at all.
     #
     # Both kinds count. `target/` is the obvious one, but a standalone clone
-    # outside ~/.scratch is deliberately never deleted — it is switched to the
-    # default branch and kept — so its `node_modules` is exactly the residue
-    # that outlives every other step, and leaving it out meant the low-disk
+    # outside ~/.scratch is deliberately never deleted and never switched, so
+    # its `node_modules` is exactly the residue that outlives every other
+    # step, and leaving it out meant the low-disk
     # path could not reclaim one of the trees that motivated this sweep (a
     # retained second clone carrying 2 GB of it). Both are reproduced by a
     # build; neither is work.
@@ -1485,7 +1479,7 @@ cmd_sweep() {
     SW_PURGED_KB=${purged:-0}
 
     local summary
-    summary="reclaimed $SW_REMOVED checkout(s) ($((SW_REMOVED_KB / 1024)) MB), $SW_BRANCHES branch(es), $SW_RELEASED slot(s), switched $SW_SWITCHED clone(s), purged $((SW_PURGED_KB / 1024)) MB of build cache; kept $SW_KEPT_DIRTY dirty, $SW_KEPT_INUSE in use, $SW_KEPT_OPEN open, $SW_KEPT_UNKNOWN unknown, $SW_KEPT_OTHER other; github reads $(sweep_api_used)/$SWEEP_API_BUDGET"
+    summary="reclaimed $SW_REMOVED checkout(s) ($((SW_REMOVED_KB / 1024)) MB), $SW_BRANCHES branch(es), $SW_RELEASED slot(s), purged $((SW_PURGED_KB / 1024)) MB of build cache; kept $SW_KEPT_DIRTY dirty, $SW_KEPT_INUSE in use, $SW_KEPT_OPEN open, $SW_KEPT_UNKNOWN unknown, $SW_KEPT_OTHER other; github reads $(sweep_api_used)/$SWEEP_API_BUDGET"
     sweep_log "done: $summary"
     [ "$SWEEP_DRY" = 1 ] || touch "$SWEEP_DIR/last-ok"
     printf 'buzz-workspace sweep: %s\n' "$summary"

@@ -67,7 +67,7 @@ What it reclaims, and the evidence it needs first:
 |---|---|---|
 | linked worktree | every associated PR closed or merged, or the commit is on `origin/<default>` | `git worktree remove` (build caches go with it) |
 | slot (`<repo>-slots/N`) | same, and the claim has expired | claim released; the checkout and its build cache stay (that cache is the pool's purpose) |
-| standalone clone | same, and it is off the default branch | switched to the default branch and fast-forwarded — **never deleted** outside `~/.scratch` |
+| standalone clone | — | **never deleted and never switched** outside `~/.scratch`; only its idle caches are reclaimable, under disk pressure |
 | local branch | on `origin/<default>`, or the head of a closed PR and on some remote ref | deleted |
 | anything under `~/.scratch` | idle past the TTL | removed — disposable by the Nest contract, dirty or not |
 | idle rebuildable caches (`target/`, `node_modules/`) | free disk under the floor | purged, unclaimed slots first, until the floor is met |
@@ -102,8 +102,18 @@ the classification that chose it was a snapshot of a machine an agent is still
 using. What no lock can cover is an agent that simply `cd`s into an old
 checkout, so nothing is ever deleted in place: a directory is first moved aside
 with a single atomic rename, and if `/proc` then shows a process inside it, it
-is moved straight back and kept. A clone switched to the default branch is put
-back on its branch by the same check.
+is moved straight back and kept. A branch deletion gets the same treatment in
+ref form: `update-ref -d <ref> <classified-sha>` refuses unless the branch
+still points where the decision was made, so a commit another session pushed
+onto it in the meantime can never be deleted by a stale verdict.
+
+A standalone clone outside `~/.scratch` is the one thing the sweep will not
+act on, because that guarantee cannot be extended to it. Switching it to the
+default branch rewrites the tree in place, at the path an agent may be standing
+in; a check after the checkout cannot see an entrant that arrives just after
+it, and undoing the switch for one it does see means `checkout --force`, which
+discards whatever that live turn edited. So the clone keeps its branch, and
+that branch is not pruned while it is checked out.
 
 `buzz-workspace sweep --dry-run` reports without acting; the log is
 `~/.buzz/workspace-sweep.log`. The contract is pinned end to end by

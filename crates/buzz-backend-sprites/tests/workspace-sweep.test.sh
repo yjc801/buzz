@@ -22,12 +22,14 @@
 #   * a registration whose directory is gone is pruned;
 #   * a slot whose PR closed has its expired claim released and its build
 #     cache kept; a slot under a live claim is untouched;
-#   * a standalone clone is never deleted outside ~/.scratch: an idle one on
-#     a closed branch is switched to main and the branch deleted;
+#   * a standalone clone outside ~/.scratch is never deleted AND never
+#     switched: an idle one on a closed branch keeps that branch, and the
+#     branch is not pruned while it is checked out;
 #   * under ~/.scratch a clone idle past the TTL is removed even though it is
 #     dirty and on an open PR; one inside the TTL is kept;
 #   * local branches: merged-into-main and closed-PR branches go, an open
-#     PR's branch and a checked-out branch stay;
+#     PR's branch and a checked-out branch stay, and one that is advanced
+#     between classification and deletion stays with its new commit intact;
 #   * --dry-run changes nothing and reports what it would do; --if-due is a
 #     no-op inside the interval and acts past it; a held lock skips the run
 #     and a stale one is taken over; the disable switch disables;
@@ -90,6 +92,14 @@ while [ \$# -gt 0 ]; do
   shift
 done
 printf '%s%s\n' "\$url" "\$auth" >>"$T/gh/calls.log"
+# A concurrent session pushing to a branch the sweep has already classified:
+# this fires DURING the read that classifies it, which is exactly the window
+# between reading the tip and deleting the ref.
+case "\$url" in
+  *"head=acme:agent/w/moved")
+    [ ! -e "$T/gh/advance-branch" ] ||
+      git -C "$T/home/.buzz/REPOS/buzz" update-ref refs/heads/agent/w/moved "\$(cat "$T/gh/advance-to")" ;;
+esac
 [ ! -e "$T/gh/down" ] || exit 7
 path="\${url#https://api.github.com/}"
 code=404; body='{"message":"Not Found"}'
@@ -155,12 +165,21 @@ git -C "$SEED" push -q origin "agent/w/closed:refs/pull/12/head" agent/w/closed
 git -C "$SEED" checkout -q -b agent/w/open main
 PR13=$(commit "$SEED" "pr13 work" thirteen)
 git -C "$SEED" push -q origin "agent/w/open:refs/pull/13/head" agent/w/open
+# A branch pushed as an ordinary branch (no refs/pull head), so the sweep can
+# only tie it to a pull request through the branch-name lookup — the one read
+# the stub can hook to simulate a push landing mid-classification.
+git -C "$SEED" checkout -q -b agent/w/moved main
+MOVED_BASE=$(commit "$SEED" "pr14 work" fourteen)
+git -C "$SEED" push -q origin agent/w/moved
+git -C "$SEED" checkout -q main
 MAIN=$(git -C "$SEED" rev-parse main)
 
 echo '{"number":11,"state":"closed","merged_at":"2026-09-01T00:00:00Z"}' >"$T/gh/pulls_11.json"
 echo '{"number":12,"state":"closed","merged_at":null}' >"$T/gh/pulls_12.json"
 echo '{"number":13,"state":"open","merged_at":null}' >"$T/gh/pulls_13.json"
 echo '[{"number":12}]' >"$T/gh/head_agent_w_closed-ahead.json"
+echo '{"number":14,"state":"closed","merged_at":null}' >"$T/gh/pulls_14.json"
+echo '[{"number":14}]' >"$T/gh/head_agent_w_moved.json"
 
 # ── the sprite's home: a canonical clone, its worktrees, slots, more clones ──
 CLONE="$HOME/.buzz/REPOS/buzz"
@@ -207,9 +226,9 @@ git clone -q https://github.com/acme/buzz.git "$C2"
 git -C "$C2" fetch -q origin refs/pull/12/head
 git -C "$C2" checkout -q -b agent/w/closed FETCH_HEAD
 # The residue that motivated the sweep: a standalone clone outside ~/.scratch
-# is switched to main and KEPT, so its node_modules outlives every other step
-# and only the disk-pressure pass can ever reclaim it. (.gitignore covers it,
-# so it does not make the clone dirty.)
+# is KEPT, branch and all, so its node_modules outlives every other step and
+# only the disk-pressure pass can ever reclaim it. (.gitignore covers it, so
+# it does not make the clone dirty.)
 mkdir -p "$C2/node_modules/pkg"
 echo blob >"$C2/node_modules/pkg/index.js"
 
@@ -291,17 +310,19 @@ exists "slot 1 checkout kept" "$S1/.git"
 exists "slot 1 build cache kept above the floor" "$S1/target/artifact"
 check "slot 2 kept its live claim" "$([ -s "$SLOTS/.state/2.claim" ]; echo $?)"
 exists "slot 2 checkout kept" "$S2/.git"
-check "second clone switched to main" "$([ "$(git -C "$C2" rev-parse --abbrev-ref HEAD)" = main ]; echo $?)"
-check "second clone fast-forwarded to origin/main" "$([ "$(git -C "$C2" rev-parse HEAD)" = "$MAIN" ]; echo $?)"
-check "second clone's closed branch deleted" "$(has_branch "$C2" agent/w/closed; [ $? -ne 0 ]; echo $?)"
+# A branch switch rewrites the tree in place at a path an agent may have just
+# walked into, and it cannot be undone without discarding that turn's edits.
+# So the sweep leaves a standalone clone exactly as it found it.
+check "second clone kept on its branch" "$([ "$(git -C "$C2" rev-parse --abbrev-ref HEAD)" = agent/w/closed ]; echo $?)"
+check "second clone's checked-out branch kept with it" "$(has_branch "$C2" agent/w/closed; echo $?)"
+logged "kept clone $C2 on its branch"
 exists "second clone itself" "$C2/.git"
 gone "scratch clone idle past the TTL (dirty, open PR — disposable anyway)" "$S_OLD"
 exists "scratch clone inside the TTL" "$S_NEW"
 check "completion recorded" "$([ -e "$HOME/.buzz/.workspace-sweep/last-ok" ]; echo $?)"
 check "summary counts the six checkouts: $OUT" "$(printf '%s' "$OUT" | grep -qF "reclaimed 6 checkout(s)"; echo $?)"
-check "summary counts the four branches: $OUT" "$(printf '%s' "$OUT" | grep -qF ", 4 branch(es)"; echo $?)"
+check "summary counts the three branches: $OUT" "$(printf '%s' "$OUT" | grep -qF ", 3 branch(es)"; echo $?)"
 check "summary counts the released slot: $OUT" "$(printf '%s' "$OUT" | grep -qF ", 1 slot(s)"; echo $?)"
-check "summary counts the switched clone: $OUT" "$(printf '%s' "$OUT" | grep -qF "switched 1 clone(s)"; echo $?)"
 for n in 11 12 13; do
   c=$(grep -c "pulls/$n\$" "$T/gh/calls.log")
   check "PR $n asked at most once per sweep (asked $c times)" "$([ "$c" -le 1 ]; echo $?)"
@@ -348,10 +369,32 @@ OUT=$(bash "$WS" sweep 2>/dev/null)
 gone "with GitHub back, both closed-PR worktrees go" "$W_DOWN"
 gone "with GitHub back, both closed-PR worktrees go (2)" "$W_DOWN2"
 
+# ── a branch that moves between classification and deletion ─────────────────
+# `git branch -D` deletes a NAME; what the sweep classified is a SHA. Nothing
+# stops another session advancing an un-checked-out branch in between — and
+# then the name denotes commits nobody ever proved disposable. The stub pushes
+# onto this branch during the very GitHub read that classifies it.
+echo "--- branch moved under the sweep"
+MOVED_NEW=$(git -C "$W_AHEAD" rev-parse HEAD)   # a commit on no remote ref
+git -C "$CLONE" branch -q agent/w/moved "$MOVED_BASE"
+printf '%s' "$MOVED_NEW" >"$T/gh/advance-to"
+touch "$T/gh/advance-branch"
+bash "$WS" sweep >/dev/null 2>&1
+rm -f "$T/gh/advance-branch"
+check "a branch advanced after it was classified is kept" "$(has_branch "$CLONE" agent/w/moved; echo $?)"
+check "and the commit pushed onto it survives" \
+  "$([ "$(git -C "$CLONE" rev-parse refs/heads/agent/w/moved)" = "$MOVED_NEW" ]; echo $?)"
+logged "kept branch agent/w/moved in $CLONE: it moved since it was classified"
+# ...and the guard is a comparison, not a blanket refusal: back at the tip it
+# was classified at, the same branch goes.
+git -C "$CLONE" update-ref refs/heads/agent/w/moved "$MOVED_BASE"
+bash "$WS" sweep >/dev/null 2>&1
+check "still at its classified tip, the same branch is deleted" \
+  "$(has_branch "$CLONE" agent/w/moved; [ $? -ne 0 ]; echo $?)"
+
 # ── disk pressure ────────────────────────────────────────────────────────────
 echo "--- disk pressure"
-# The earlier sweep switched this clone to main, which touched its files and
-# made it read as in use. A real one would be days idle by the next sweep.
+# Keep the clone reading as idle: the pressure pass skips anything in use.
 age "$C2" "$OLD"
 exists "above the floor: slot build cache kept" "$S1/target/artifact"
 exists "above the floor: clone build cache kept" "$CLONE/target/artifact"
@@ -403,9 +446,13 @@ else
   mkdir "$FENCE.d"
 fi
 W_FENCE="$R/wt-fence"; wt "$W_FENCE" "$PR12"; age "$W_FENCE" "$OLD"
+# On origin/main, so it is classified reclaimable with no GitHub read.
+git -C "$CLONE" branch -q agent/w/fenced "$BASE"
 OUT=$(BUZZ_WORKSPACE_FENCE_WAIT=1 bash "$WS" sweep 2>&1)
 exists "a held fence keeps a worktree the sweep would have removed" "$W_FENCE"
 logged "kept worktree $W_FENCE: the reclaim fence is held"
+check "a held fence keeps a branch the sweep would have deleted" "$(has_branch "$CLONE" agent/w/fenced; echo $?)"
+logged "kept branch agent/w/fenced in $CLONE: the reclaim fence is held"
 HANDOUT=$(BUZZ_WORKSPACE_FENCE_WAIT=1 bash "$WS" pr/12 2>"$T/fenced.err"); RC=$?
 check "a hand-out under a held fence refuses (rc=$RC, out=$HANDOUT)" "$([ "$RC" -ne 0 ]; echo $?)"
 check "and says why: $(cat "$T/fenced.err")" \
@@ -413,6 +460,7 @@ check "and says why: $(cat "$T/fenced.err")" \
 if command -v flock >/dev/null 2>&1; then exec 7>&-; else rmdir "$FENCE.d"; fi
 bash "$WS" sweep >/dev/null 2>&1
 gone "with the fence free, the same worktree goes" "$W_FENCE"
+check "with the fence free, the same branch goes" "$(has_branch "$CLONE" agent/w/fenced; [ $? -ne 0 ]; echo $?)"
 
 # ── a process standing in the checkout ───────────────────────────────────────
 # The one thing no lock covers: an agent that just `cd`s in. The evidence is

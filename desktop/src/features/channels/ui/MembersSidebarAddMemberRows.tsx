@@ -4,7 +4,7 @@ import type * as React from "react";
 
 import type { UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 
@@ -15,7 +15,7 @@ export function formatAddCandidateName(user: UserSearchResult) {
   return (
     user.displayName?.trim() ||
     user.nip05Handle?.trim() ||
-    truncatePubkey(user.pubkey)
+    truncateNpub(user.pubkey)
   );
 }
 
@@ -84,7 +84,7 @@ export function AddMemberSearchResultRow({
               />
             </div>
             <span className="block truncate font-mono text-2xs text-muted-foreground">
-              {truncatePubkey(user.pubkey)}
+              {truncateNpub(user.pubkey)}
             </span>
             {ownerLabel ? (
               <span className="block truncate text-xs text-muted-foreground">

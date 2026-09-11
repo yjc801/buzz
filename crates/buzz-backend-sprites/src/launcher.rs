@@ -198,32 +198,41 @@ mod tests {
         }
         // Deleting a branch destroys no directory, so it has no rename to
         // make, and its two conditions need two different mechanisms.
-        // `update-ref -d` honours an expected old value but deletes a
-        // checked-out branch, leaving that worktree's HEAD unresolvable;
-        // `branch -D` refuses a checked-out branch but deletes a NAME after
-        // a SHA was classified, which is how a concurrent push loses its
-        // commits. So the delete is `branch -D`, and the sha condition
-        // converges on git's own `(was <sha>)` receipt.
+        // `branch -D` refuses a checked-out branch but deletes a NAME after a
+        // SHA was classified, and compensating afterwards from git's
+        // `(was <sha>)` receipt leaves a concurrently pushed commit with no
+        // ref at all for the length of the compensation -- a kill in that
+        // window loses it. `update-ref -d <ref> <sha>` cannot delete anything
+        // but the classified sha, so no unproven commit is ever unreferenced;
+        // the checkout it does not refuse is recoverable instead, and the
+        // recovery is journaled BEFORE the delete so it survives the process.
         let prune = sweep_fn_body("sweep_prune_branches");
         assert!(
             prune.contains("fence_take"),
             "sweep_prune_branches no longer takes the reclaim fence"
         );
+        let delete = prune
+            .find(r#"update-ref -d "refs/heads/$branch" "$tip""#)
+            .expect("sweep_prune_branches no longer deletes with git's compare-and-delete form");
         assert!(
-            prune.contains(r#"git -C "$clone" branch -D "$branch""#),
-            "sweep_prune_branches no longer deletes with the form that refuses a checked-out branch"
+            !WORKSPACE_SH.contains(r#"branch -D ""#),
+            "workspace.sh deletes a branch by NAME again, which cannot carry the classified sha"
+        );
+        let journal = prune
+            .find(r#"journal_add "$clone" "$branch" "$tip""#)
+            .expect("sweep_prune_branches no longer records the delete durably");
+        assert!(
+            journal < delete,
+            "sweep_prune_branches journals the delete after making it; the recovery must outlive the process"
         );
         assert!(
-            prune.contains(r#"(was \([0-9a-f][0-9a-f]*\))"#) && prune.contains(r#""$was"*)"#),
-            "sweep_prune_branches no longer compares what git deleted against the classified tip"
+            prune.contains(r#"sweep_worktree_records "$clone" >"$grabbed""#)
+                && prune.contains(r#"update-ref "refs/heads/$branch" "$tip" """#),
+            "sweep_prune_branches no longer re-reads the worktrees after the delete and puts the ref back"
         );
         assert!(
-            prune.contains(r#"update-ref refs/heads/"$branch" "$moved" """#),
-            "sweep_prune_branches no longer puts back a branch that moved under it"
-        );
-        assert!(
-            !WORKSPACE_SH.contains(r#"update-ref -d "refs/heads/"#),
-            "workspace.sh deletes a ref with a form that does not refuse a checked-out branch"
+            sweep_fn_body("cmd_sweep").contains("sweep_replay_journal"),
+            "the sweep no longer finishes a repair an earlier run was killed in the middle of"
         );
         // And the one operation that can be neither fenced nor undone -- a
         // branch switch rewrites the tree in place at a path an agent may

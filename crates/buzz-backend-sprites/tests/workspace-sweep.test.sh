@@ -31,7 +31,8 @@
 #     PR's branch and a checked-out branch stay, one that is advanced
 #     between classification and deletion stays with its new commit intact,
 #     and one that a checkout grabs in that same window stays with its new
-#     worktree's HEAD still resolvable;
+#     worktree's HEAD still resolvable -- including when the sweep that was
+#     repairing it was killed, which the next sweep finishes from its journal;
 #   * --dry-run changes nothing and reports what it would do; --if-due is a
 #     no-op inside the interval and acts past it; a held lock skips the run
 #     and a stale one is taken over; the disable switch disables;
@@ -83,6 +84,7 @@ export GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 unset GH_TOKEN GITHUB_TOKEN BUZZ_WORKSPACE_CLAIM BUZZ_WORKSPACE_SWEEP_DISABLED
 mkdir -p "$HOME/.buzz/REPOS" "$HOME/.scratch" "$T/stubs" "$T/gh"
 LOG="$HOME/.buzz/workspace-sweep.log"
+JOURNAL="$HOME/.buzz/.workspace-sweep/branch-journal"
 
 # ── stubs: curl is api.github.com, df is the disk ───────────────────────────
 cat >"$T/stubs/curl" <<STUB
@@ -384,10 +386,10 @@ gone "with GitHub back, both closed-PR worktrees go" "$W_DOWN"
 gone "with GitHub back, both closed-PR worktrees go (2)" "$W_DOWN2"
 
 # ── a branch that moves between classification and deletion ─────────────────
-# `git branch -D` deletes a NAME; what the sweep classified is a SHA. Nothing
-# stops another session advancing an un-checked-out branch in between — and
-# then the name denotes commits nobody ever proved disposable. The stub pushes
-# onto this branch during the very GitHub read that classifies it.
+# What the sweep classified is a SHA, and nothing stops another session
+# advancing an un-checked-out branch before the ref goes — at which point the
+# name denotes commits nobody ever proved disposable. The stub pushes onto this
+# branch during the very GitHub read that classifies it.
 echo "--- branch moved under the sweep"
 MOVED_NEW=$(git -C "$W_AHEAD" rev-parse HEAD)   # a commit on no remote ref
 git -C "$CLONE" branch -q agent/w/moved "$MOVED_BASE"
@@ -421,13 +423,46 @@ check "a branch checked out after it was classified is kept" "$(has_branch "$CLO
 check "and the worktree that grabbed it still resolves HEAD" \
   "$(git -C "$W_GRAB" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
 check "log says why the branch was kept" \
-  "$(grep -qF -- "kept branch agent/w/grabbed in $CLONE: " "$LOG" && grep -qi -- "delete branch 'agent/w/grabbed'" "$LOG"; echo $?)"
+  "$(grep -qF -- "kept branch agent/w/grabbed in $CLONE: a worktree checked it out as the sweep was deleting it" "$LOG"; echo $?)"
+check "the repair leaves no journal entry behind" "$([ ! -s "$JOURNAL" ]; echo $?)"
 # ...and the refusal is the checkout, not the classification: with the
 # worktree gone, the same branch goes.
 git -C "$CLONE" worktree remove --force "$W_GRAB"
 bash "$WS" sweep >/dev/null 2>&1
 check "with nothing holding it, the same branch is deleted" \
   "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
+
+# ── a sweep killed between the delete and its repair ────────────────────────
+# The repair above runs in the same pass, and that pass can itself be killed:
+# the sweep shares a Sprite with a live harness and the box pauses. What has to
+# survive is the journal entry, so the next sweep finishes the job. This stages
+# exactly the interrupted state the happy-path race cannot reach -- ref gone, a
+# worktree holding it, intent still journaled -- rather than asserting around
+# a window the test could not open.
+echo "--- interrupted branch repair"
+W_INT="$R/wt-interrupted"
+git -C "$CLONE" branch -q agent/w/interrupted "$GRAB_BASE"
+git -C "$CLONE" worktree add -q "$W_INT" agent/w/interrupted >/dev/null 2>&1
+INT_TIP=$(git -C "$CLONE" rev-parse refs/heads/agent/w/interrupted)
+git -C "$CLONE" update-ref -d refs/heads/agent/w/interrupted "$INT_TIP"
+# ...and one entry for a delete that DID complete: nothing holds that ref, so
+# replay must drop the entry rather than resurrect the branch.
+mkdir -p "$(dirname "$JOURNAL")"
+printf '%s|%s|%s\n' "$CLONE" agent/w/interrupted "$INT_TIP" >>"$JOURNAL"
+printf '%s|%s|%s\n' "$CLONE" agent/w/grabbed "$GRAB_BASE" >>"$JOURNAL"
+bash "$WS" sweep >/dev/null 2>&1
+check "an interrupted repair is finished by the next sweep" \
+  "$(has_branch "$CLONE" agent/w/interrupted; echo $?)"
+check "and at the sha it was classified at" \
+  "$([ "$(git -C "$CLONE" rev-parse refs/heads/agent/w/interrupted)" = "$INT_TIP" ]; echo $?)"
+check "so the interrupted worktree's HEAD resolves again" \
+  "$(git -C "$W_INT" rev-parse --verify -q HEAD >/dev/null 2>&1; echo $?)"
+check "a completed delete is not resurrected by its journal entry" \
+  "$(has_branch "$CLONE" agent/w/grabbed; [ $? -ne 0 ]; echo $?)"
+check "and the journal does not accumulate" "$([ ! -s "$JOURNAL" ]; echo $?)"
+logged "restored branch agent/w/interrupted in $CLONE at $INT_TIP"
+git -C "$CLONE" worktree remove --force "$W_INT"
+git -C "$CLONE" update-ref -d refs/heads/agent/w/interrupted "$INT_TIP"
 
 # ── disk pressure ────────────────────────────────────────────────────────────
 echo "--- disk pressure"

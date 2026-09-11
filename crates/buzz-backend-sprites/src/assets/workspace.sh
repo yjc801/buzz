@@ -586,6 +586,7 @@ cmd_release() {
 # checkout without taking any lock at all.
 
 SWEEP_DIR="$BUZZ/.workspace-sweep"
+SWEEP_JOURNAL="$SWEEP_DIR/branch-journal"
 SWEEP_LOG="$BUZZ/workspace-sweep.log"
 SWEEP_HOLD_MIN="${BUZZ_WORKSPACE_SWEEP_HOLD_MIN:-180}"
 SWEEP_SCRATCH_DAYS="${BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS:-7}"
@@ -1088,6 +1089,62 @@ sweep_release_slot() {
     fi
 }
 
+# The BRANCH JOURNAL. Deleting a ref has two conditions and git gives them to
+# two different primitives (see sweep_prune_branches); the one that is not
+# carried by the delete itself is repaired afterwards, and a repair that lives
+# only in a shell variable is no repair at all -- the sweep runs beside a live
+# harness on a Sprite that can be paused or killed at any moment. So the
+# intent is written here first, beside the fence in $BUZZ rather than in the
+# run's temporaries, and sweep_replay_journal finishes any entry whose sweep
+# did not. One sweep runs at a time (the run lock), so this file has a single
+# writer.
+journal_add() {
+    mkdir -p "$SWEEP_DIR" 2>/dev/null || true
+    printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$SWEEP_JOURNAL"
+}
+
+journal_forget() {
+    local keep
+    [ -f "$SWEEP_JOURNAL" ] || return 0
+    keep="$SWEEP_JOURNAL.$$"
+    grep -vxF -- "$1|$2|$3" "$SWEEP_JOURNAL" >"$keep" 2>/dev/null || : >"$keep"
+    mv -- "$keep" "$SWEEP_JOURNAL" 2>/dev/null || rm -f -- "$keep"
+}
+
+# Finish what an interrupted sweep started. Every surviving entry names a ref
+# that sweep was deleting, so it asks the same question the in-pass check asks:
+# is the ref missing while a worktree still has it checked out? Then that
+# worktree's HEAD does not resolve, and the ref goes back at the sha it was
+# classified at -- a sha proved to be on a remote ref before any delete, so
+# putting it back cannot resurrect anything that was not already there.
+# Anything else is a delete that completed, and the entry is dropped. An
+# entry whose repair could not be made is kept for the next sweep and says so.
+sweep_replay_journal() {
+    local clone branch tip records keep
+    [ -s "$SWEEP_JOURNAL" ] || return 0
+    records="$SWEEP_TMP/replay.records"
+    keep="$SWEEP_TMP/replay.keep"
+    : >"$keep"
+    while IFS='|' read -r clone branch tip; do
+        [ -n "$clone" ] && [ -n "$branch" ] && [ -n "$tip" ] || continue
+        [ -e "$clone/.git" ] || continue
+        git -C "$clone" rev-parse --verify -q "refs/heads/$branch" >/dev/null 2>&1 && continue
+        sweep_worktree_records "$clone" >"$records" 2>/dev/null || : >"$records"
+        grep -q -- "|$branch|" "$records" || continue
+        if fence_take; then
+            if git -C "$clone" update-ref "refs/heads/$branch" "$tip" "" 2>/dev/null; then
+                fence_drop
+                sweep_log "restored branch $branch in $clone at $tip: an interrupted sweep deleted it while a worktree had it checked out"
+                continue
+            fi
+            fence_drop
+        fi
+        printf '%s|%s|%s\n' "$clone" "$branch" "$tip" >>"$keep"
+        sweep_log "WARNING: branch $branch in $clone was deleted while checked out and could not be put back at $tip; will retry"
+    done <"$SWEEP_JOURNAL"
+    cat "$keep" >"$SWEEP_JOURNAL" 2>/dev/null || : >"$SWEEP_JOURNAL"
+}
+
 # Parse `git worktree list --porcelain` into one record per line:
 #   <path>|<sha>|<branch or empty>|<locked:0/1>
 sweep_worktree_records() {
@@ -1110,11 +1167,12 @@ sweep_worktree_records() {
 }
 
 # Delete local branches that are checked out nowhere and are either on the
-# default branch already or the head of a closed pull request. `-D` only
-# after the same proof a worktree needs: the tip is on origin.
+# default branch already or the head of a closed pull request, and only after
+# the same proof a worktree needs: the tip is on origin. The delete itself is
+# `git update-ref -d <ref> <sha>` -- see the comment at it.
 sweep_prune_branches() {
     local clone="$1" slug="$2" default="$3" pullheads="$4" records="$5"
-    local branch tip prs n st open unknown closed why list out was moved
+    local branch tip prs n st open unknown closed why list out grabbed
     list="$SWEEP_TMP/branches.$(printf '%s' "$clone" | tr -c 'A-Za-z0-9' '_')"
     git -C "$clone" for-each-ref --format='%(refname:short)' refs/heads >"$list" 2>/dev/null || : >"$list"
     while IFS= read -r branch; do
@@ -1153,55 +1211,62 @@ sweep_prune_branches() {
         # Two properties have to hold at the moment the ref goes, and they
         # need different mechanisms.
         #
-        # Checked out nowhere: `git worktree list` is a snapshot, and a plain
-        # `git checkout` or `git worktree add` takes no lock this script
-        # invented, so it can make the branch active after any scan of ours.
-        # `update-ref -d` would delete it anyway and leave that worktree's
-        # symbolic HEAD pointing at a ref that no longer resolves. `branch -D`
-        # is the delete that refuses a checked-out branch, so the deletion
-        # itself carries the condition rather than a prior read of ours.
+        # Still at its classified SHA -- and this one is carried by the delete
+        # itself. `git update-ref -d <ref> <sha>` is git's compare-and-delete:
+        # a branch another session advanced after the classifying read cannot
+        # be removed by it at all, so no commit nobody proved disposable is
+        # ever unreferenced, not even briefly. `git branch -D` deletes a NAME
+        # and has no expected-old-value form; reconstructing the value
+        # afterwards from git's `(was <sha>)` receipt left the advanced --
+        # possibly unpushed -- commit with no ref for the length of the
+        # compensation, and a kill, a Sprite pause, a `set -e` exit or a failed
+        # object lookup in that window dropped it for good. Recovery after the
+        # irreversible step is not a fence. The re-read below is kept only to
+        # skip the ordinary case with a clear reason in the log.
         #
-        # Still at its classified SHA: `branch -D` deletes a NAME, and another
-        # session can advance an un-checked-out branch, so the name may no
-        # longer denote what was proved disposable. `branch -D` has no
-        # expected-old-value form, so this one converges instead: re-read the
-        # tip first to skip the ordinary case, and treat git's own
-        # "(was <sha>)" receipt as the authority on what actually went. The
-        # abbreviation git prints is unique in this repository, so it is a
-        # prefix of the classified sha only when it names that same commit;
-        # anything else is put straight back, commits and all.
+        # Checked out nowhere: no primitive carries both conditions, and
+        # `update-ref -d` does not refuse a checked-out branch, so a worktree
+        # that grabbed the branch after the scan is left with a HEAD that does
+        # not resolve. Unlike a lost commit that one is recoverable -- the sha
+        # is known and was proved to be on a remote ref above -- so it
+        # converges instead: the intent is journaled durably BEFORE the delete,
+        # the worktrees are re-read AFTER it (a checkout that completed before
+        # the delete is visible there, as the `HEAD 000...` record git reports
+        # for the broken worktree), and the ref is put straight back. The
+        # journal is replayed at the start of every sweep, so the repair
+        # outlives this process, which a receipt in a shell variable did not.
         if [ "$(git -C "$clone" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)" != "$tip" ]; then
             fence_drop
             sweep_log "kept branch $branch in $clone: it moved since it was classified"
             SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
             continue
         fi
-        if ! out=$(LC_ALL=C git -C "$clone" branch -D "$branch" 2>&1); then
+        journal_add "$clone" "$branch" "$tip"
+        if ! out=$(LC_ALL=C git -C "$clone" update-ref -d "refs/heads/$branch" "$tip" 2>&1); then
+            journal_forget "$clone" "$branch" "$tip"
             fence_drop
             sweep_log "kept branch $branch in $clone: ${out##*error: }"
             SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
             continue
         fi
-        was=$(printf '%s\n' "$out" | sed -n 's/.*(was \([0-9a-f][0-9a-f]*\)).*/\1/p')
-        if [ -n "$was" ]; then
-            case "$tip" in
-                "$was"*)
-                    fence_drop
-                    SW_BRANCHES=$((SW_BRANCHES + 1))
-                    sweep_log "deleted branch $branch in $clone: $why"
-                    continue
-                    ;;
-            esac
+        grabbed="$SWEEP_TMP/grabbed.records"
+        sweep_worktree_records "$clone" >"$grabbed" 2>/dev/null || : >"$grabbed"
+        if grep -q -- "|$branch|" "$grabbed"; then
+            SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
+            if git -C "$clone" update-ref "refs/heads/$branch" "$tip" "" 2>/dev/null; then
+                journal_forget "$clone" "$branch" "$tip"
+                fence_drop
+                sweep_log "kept branch $branch in $clone: a worktree checked it out as the sweep was deleting it"
+            else
+                fence_drop
+                sweep_log "WARNING: branch $branch in $clone was checked out as the sweep deleted it and could not be put back at $tip; the journal will retry"
+            fi
+            continue
         fi
-        SW_KEPT_OTHER=$((SW_KEPT_OTHER + 1))
-        moved=$(git -C "$clone" rev-parse --verify -q "${was:-missing}^{commit}" 2>/dev/null || true)
-        if [ -n "$moved" ] && git -C "$clone" update-ref refs/heads/"$branch" "$moved" "" 2>/dev/null; then
-            fence_drop
-            sweep_log "kept branch $branch in $clone: it moved since it was classified"
-        else
-            fence_drop
-            sweep_log "WARNING: branch $branch in $clone moved to ${was:-an unreported sha} after it was classified and could not be put back"
-        fi
+        journal_forget "$clone" "$branch" "$tip"
+        fence_drop
+        SW_BRANCHES=$((SW_BRANCHES + 1))
+        sweep_log "deleted branch $branch in $clone: $why"
     done <"$list"
 }
 
@@ -1491,6 +1556,10 @@ cmd_sweep() {
     # trap must not follow into the command substitutions whose failures are
     # handled where they happen.
     trap 'sweep_log "aborted: a command failed at line $LINENO"' ERR
+    # Before anything new is decided, finish any ref repair an earlier sweep
+    # was killed in the middle of. A dry run changes nothing, this included.
+    [ "$SWEEP_DRY" = 1 ] || sweep_replay_journal
+
     local clone
     sweep_find_clones >"$SWEEP_TMP/clones"
     while IFS= read -r clone; do

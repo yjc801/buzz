@@ -103,13 +103,17 @@ using. What no lock can cover is an agent that simply `cd`s into an old
 checkout, so nothing is ever deleted in place: a directory is first moved aside
 with a single atomic rename, and if `/proc` then shows a process inside it, it
 is moved straight back and kept. A branch deletion has two conditions and
-neither is a read of ours: it goes through `git branch -D`, the delete that
-refuses a branch checked out in any worktree, so a checkout that lands after
-the classification cannot be deleted out from under its HEAD; and because
-`-D` deletes a name rather than a sha, git's own `(was <sha>)` receipt is
-compared against the classified sha and anything else is put straight back,
-so a commit another session pushed onto the branch in the meantime can never
-be lost to a stale verdict.
+neither is a read of ours. The sha is enforced by the delete: it goes through
+`git update-ref -d <ref> <sha>`, git's compare-and-delete, so a branch another
+session advanced after the classification cannot be removed at all and a
+commit nobody proved disposable is never left unreferenced, not even for the
+length of a compensation. The checkout is not — `update-ref -d` does not
+refuse a checked-out branch — so that one converges: the intent is journaled
+in `.workspace-sweep/branch-journal` before the delete, the worktrees are
+re-read after it, and a branch some worktree grabbed in between is put back at
+the sha it was classified at. Every sweep replays that journal first, so a
+sweep killed mid-repair is finished by the next one rather than leaving a
+worktree's HEAD unresolvable.
 
 A standalone clone outside `~/.scratch` is the one thing the sweep will not
 act on, because that guarantee cannot be extended to it. Switching it to the

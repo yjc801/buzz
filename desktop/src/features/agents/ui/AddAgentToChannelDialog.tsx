@@ -7,7 +7,11 @@ import {
   useChannelsQuery,
 } from "@/features/channels/hooks";
 import type { Channel, ChannelRole, ManagedAgent } from "@/shared/api/types";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import {
+  canonicalNpub,
+  normalizePubkey,
+  UNAVAILABLE_KEY_LABEL,
+} from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
 import {
   Dialog,
@@ -84,6 +88,10 @@ export function AddAgentToChannelDialog({
       (member) => normalizePubkey(member.pubkey) === normalized,
     );
   }, [agent?.pubkey, membersQuery.data]);
+
+  // The agent's public key displays as its full canonical npub; an
+  // unencodable key renders the neutral label and is not copyable.
+  const agentNpub = agent?.pubkey ? canonicalNpub(agent.pubkey) : null;
 
   const selectedChannel =
     channels.find((channel) => channel.id === channelId) ?? null;
@@ -184,10 +192,12 @@ export function AddAgentToChannelDialog({
               </p>
               <div className="mt-3 flex items-center justify-between gap-3">
                 <code className="min-w-0 flex-1 break-all rounded-xl border border-border/70 bg-background/80 px-3 py-2 text-xs">
-                  {agent?.pubkey ?? "No agent selected"}
+                  {agent
+                    ? (agentNpub ?? UNAVAILABLE_KEY_LABEL)
+                    : "No agent selected"}
                 </code>
-                {agent ? (
-                  <CopyButton label="Copy pubkey" value={agent.pubkey} />
+                {agent && agentNpub ? (
+                  <CopyButton label="Copy pubkey" value={agentNpub} />
                 ) : null}
               </div>
             </div>

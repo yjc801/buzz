@@ -47,17 +47,20 @@ jobs:
 
       - name: Bootstrap the script while main has none
         env:
+          GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Fetched over the API, not git: the checkout keeps no credentials, and
+        # an unauthenticated git fetch fails on a private repository.
         run: |
           if [ -f .github/scripts/pr-size.js ] && [ -f .github/pr-size.json ]; then
             echo "Using the base branch's pr-size.js and pr-size.json."
             exit 0
           fi
           echo "::notice::The base branch has no PR size script yet; using this pull request's copy."
-          git fetch --no-tags --depth=1 origin "$HEAD_SHA"
           mkdir -p .github/scripts
-          git show "$HEAD_SHA:.github/scripts/pr-size.js" > .github/scripts/pr-size.js
-          git show "$HEAD_SHA:.github/pr-size.json" > .github/pr-size.json
+          for f in .github/scripts/pr-size.js .github/pr-size.json; do
+            gh api -H "Accept: application/vnd.github.raw" "repos/${GITHUB_REPOSITORY}/contents/${f}?ref=${HEAD_SHA}" > "$f"
+          done
 
       - name: Size the pull request
         env:

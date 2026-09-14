@@ -87,6 +87,9 @@ test("justification: only prose counts — not code, link targets or placeholder
   assert.equal(size.hasJustification("## Why not split\n\n``" + placeholder + "``"), false);
   assert.equal(size.hasJustification("## Why not split\n\n[See discussion](https://example.test/issues/1234)"), false);
   assert.equal(size.hasJustification("## Why not split\n\nhttps://example.test/issues/1234"), false);
+  // Code is not a reason even when it reads like one, whatever the fence style.
+  assert.equal(size.hasJustification("## Why not split\n\n~~~\nThe migration and its backfill must deploy together.\n~~~"), false);
+  assert.equal(size.hasJustification("## Why not split\n\n````md\nA `wire` change both sides must ship at once, really.\n````"), false);
   // Link text and prose around a snippet are the author's own words: they count.
   assert.equal(size.hasJustification("## Why not split\n\n[The migration and its backfill must deploy together](https://example.test/1)"), true);
   assert.equal(size.hasJustification("## Why not split\n\n```ts\ntype Wire = 2;\n```\n\nBoth sides of the wire move at once, so splitting breaks every frame."), true);

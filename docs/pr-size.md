@@ -98,9 +98,12 @@ and the code that cannot run without it. Add to the description:
 <One or two sentences: what breaks if these land separately.>
 ```
 
-The section needs real text (at least a sentence); an empty heading or a
-template comment does not count. The check re-runs when you edit the
-description.
+Paste the section itself, not the fence around it, and replace the
+placeholder. The check counts only prose you wrote: text inside code fences or
+backticks, HTML comments, `<placeholders>` and link targets are removed before
+it looks for the heading and measures the section, so the template pasted
+unedited reads as empty and still fails. Link text and a sentence next to a
+snippet do count. The check re-runs when you edit the description.
 
 ## Fork pull requests
 

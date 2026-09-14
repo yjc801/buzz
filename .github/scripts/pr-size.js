@@ -28,7 +28,7 @@ const LOCKFILES = new Set([
   "Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lockb",
   "pubspec.lock", "Gemfile.lock", "poetry.lock", "uv.lock", "go.sum", "flake.lock", "Podfile.lock",
 ]);
-// A justification is a heading named "Why not split" followed by real text.
+// A justification is a heading named "Why not split" followed by real prose.
 const JUSTIFICATION = /^#{2,6}\s*why not split\s*\??\s*$/im;
 const MIN_JUSTIFICATION_CHARS = 30;
 
@@ -72,14 +72,46 @@ function tierFor(lines, thresholds) {
   return "XL";
 }
 
+// Drop fenced code blocks, including the fence lines. An unclosed fence eats
+// the rest of the body, which is what a Markdown renderer does too.
+function stripFences(text) {
+  const kept = [];
+  let fence = null;
+  for (const line of text.split("\n")) {
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence === null) {
+      if (m) fence = m[1];
+      else kept.push(line);
+    } else if (m && m[1][0] === fence[0] && m[1].length >= fence.length && m[2].trim() === "") {
+      fence = null;
+    }
+  }
+  return kept.join("\n");
+}
+
+// What is left after removing everything that is not prose the author wrote:
+// code (the template in docs/pr-size.md is a fenced block, so pasting it
+// unedited leaves nothing), HTML comments, angle-bracket placeholders such as
+// "<One or two sentences: ...>", and URLs. Link text survives, link targets do
+// not — a bare link is a pointer, not a reason. Anything ambiguous is dropped:
+// under-counting only ever asks the author for another sentence.
+function prose(body) {
+  return stripFences(String(body || ""))
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/(`+)[^`]*\1/g, "")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/<[^<>]*>/g, "")
+    .replace(/\bhttps?:\/\/\S+/gi, "");
+}
+
 function hasJustification(body) {
-  const text = body || "";
+  const text = prose(body);
   const match = JUSTIFICATION.exec(text);
   if (!match) return false;
   const rest = text.slice(match.index + match[0].length);
   const nextHeading = rest.search(/^#{1,6}\s/m);
   const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
-  return section.replace(/<!--[\s\S]*?-->/g, "").replace(/\s+/g, "").length >= MIN_JUSTIFICATION_CHARS;
+  return section.replace(/\s+/g, "").length >= MIN_JUSTIFICATION_CHARS;
 }
 
 function summarize(files, config, generatedPaths, body) {
@@ -102,7 +134,7 @@ function renderComment(result, config, repo) {
   const head = result.tier === "XL"
     ? (result.justified
       ? `**size/XL — ${lines.counted} reviewable lines.** The "Why not split" section is present, so this check passes. Reviewers still read ${lines.counted} lines in one pass; a split is usually cheaper than extra review rounds.`
-      : `**size/XL — ${lines.counted} reviewable lines, over the ${t.L}-line limit.** Split this pull request, or add a \`## Why not split\` section to the description explaining why it has to land as one change. This check fails until one of those happens.`)
+      : `**size/XL — ${lines.counted} reviewable lines, over the ${t.L}-line limit.** Split this pull request, or add a \`## Why not split\` section to the description explaining why it has to land as one change. The section has to be your own sentences: the template pasted unedited, a code block or a bare link does not count. This check fails until one of those happens.`)
     : `**size/L — ${lines.counted} reviewable lines, over the ${t.M}-line budget.** Consider splitting it; if it has to stay whole, say why in the description so the reviewer knows.`;
   return [
     MARKER,
@@ -252,7 +284,7 @@ async function main() {
   });
   console.log(JSON.stringify(result));
   if (result.fails) {
-    console.error(`size/XL: ${result.lines.counted} counted lines and no "Why not split" section in the description.`);
+    console.error(`size/XL: ${result.lines.counted} counted lines and no "Why not split" section written as prose in the description.`);
     process.exitCode = 1;
   } else if (result.presentation === "failed") {
     // The size verdict passed, but a write this run was supposed to be able to

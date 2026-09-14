@@ -9,9 +9,9 @@ const test = require("node:test");
 
 const size = require("./pr-size.js");
 
-// This file is identical in every repository that carries the check; only
-// .github/pr-size.json differs. Behaviour is pinned against a fixed config so
-// the tests do not depend on one repository's paths.
+// The same check runs in open-velvet/velvet, which carries no fork handling
+// (a private repository has no fork pull requests). Behaviour is pinned
+// against a fixed config so the tests do not depend on one repository's paths.
 const SHIPPED = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "pr-size.json"), "utf8"));
 const CONFIG = {
   thresholds: { S: 200, M: 400, L: 800 },
@@ -78,6 +78,31 @@ test("justification: a real 'Why not split' section, not the bare heading or a c
   assert.equal(size.hasJustification("## Why not split\n<!-- explain why this cannot be split into smaller PRs -->\n"), false);
   assert.equal(size.hasJustification("Why not split: because"), false);
   assert.equal(size.hasJustification(null), false);
+});
+
+test("justification: only prose counts — not code, link targets or placeholders", () => {
+  const placeholder = "## Why not split\n\n<One or two sentences: what breaks if these land separately.>";
+  assert.equal(size.hasJustification(placeholder), false);
+  assert.equal(size.hasJustification("## Why not split\n\n`" + placeholder + "`"), false);
+  assert.equal(size.hasJustification("## Why not split\n\n``" + placeholder + "``"), false);
+  assert.equal(size.hasJustification("## Why not split\n\n[See discussion](https://example.test/issues/1234)"), false);
+  assert.equal(size.hasJustification("## Why not split\n\nhttps://example.test/issues/1234"), false);
+  // Link text and prose around a snippet are the author's own words: they count.
+  assert.equal(size.hasJustification("## Why not split\n\n[The migration and its backfill must deploy together](https://example.test/1)"), true);
+  assert.equal(size.hasJustification("## Why not split\n\n```ts\ntype Wire = 2;\n```\n\nBoth sides of the wire move at once, so splitting breaks every frame."), true);
+});
+
+// The check and docs/pr-size.md must not drift: the template the docs tell
+// people to paste has to fail until they replace the placeholder with a reason.
+test("justification: the documented template does not count until it is filled in", () => {
+  const doc = fs.readFileSync(path.join(__dirname, "..", "..", "docs", "pr-size.md"), "utf8");
+  const blocks = [...doc.matchAll(/^ {0,3}(?:`{3,}|~{3,})[^\n]*\n([\s\S]*?)^ {0,3}(?:`{3,}|~{3,})[ \t]*$/gm)];
+  const template = blocks.find((m) => /^#{2,6}\s*why not split\s*\??\s*$/im.test(m[1]));
+  assert.ok(template, "docs/pr-size.md must document a fenced '## Why not split' template");
+  assert.equal(size.hasJustification(`Some context.\n\n${template[0]}\n`), false, "pasting the fenced template must not pass");
+  assert.equal(size.hasJustification(template[1]), false, "the unfilled template must not pass");
+  const filled = template[1].replace(/<[^<>]*>/g, "The migration and its backfill must deploy together or rows go missing.");
+  assert.equal(size.hasJustification(filled), true, "the filled-in template must pass");
 });
 
 test("XL fails without a justification and passes with one", () => {

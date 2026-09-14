@@ -132,6 +132,8 @@ jobs:
         run: just security-review-check
       - name: PR auto-merge contract
         run: just auto-merge-check
+      - name: PR size contract
+        run: just pr-size-check
       - name: Rust cache contract
         run: |
           scripts/test-rust-cache-contract.sh

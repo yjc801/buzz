@@ -1,0 +1,23 @@
+{
+  "thresholds": { "S": 200, "M": 400, "L": 800 },
+  "tests": [
+    "**/tests/**",
+    "**/test/**",
+    "**/__tests__/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*_test.rs",
+    "**/*_test.dart",
+    "**/*.test.sh",
+    "**/*.test.py",
+    "crates/buzz-test-client/**",
+    "test-fixtures/**"
+  ],
+  "generated": [
+    "**/*.g.dart",
+    "**/*.freezed.dart",
+    "**/*.mocks.dart",
+    "desktop/src-tauri/gen/**",
+    "**/__snapshots__/**"
+  ]
+}

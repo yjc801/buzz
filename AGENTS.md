@@ -153,6 +153,15 @@ non-hook commands.
 
 **Commit with `git commit -s`.** The required **DCO Check** fails any PR with a commit missing a `Signed-off-by` trailer, and `just hooks` installs a `commit-msg` hook that adds it to commits you create locally (`git rebase` and `git cherry-pick` still need `--signoff`) — if you build commit commands programmatically, include `-s` every time. To repair a branch that already has unsigned commits: `git rebase --signoff main`, then force-push.
 
+**Keep pull requests small and coherent.** The `PR size` check labels every
+PR by the lines a reviewer has to read (tests, generated files and lockfiles
+excluded): aim for `size/S` (≤ 200), explain anything over 400 in the
+description, and a `size/XL` PR (> 800) fails until it is split or carries a
+`## Why not split` section. Before writing a change you expect to exceed 200
+lines, plan it as an ordered series of PRs, each with one intent that leaves
+`main` green. See [docs/pr-size.md](docs/pr-size.md) for what counts and how
+to split without breaking coherence.
+
 Additional rules:
 - No `unsafe` code
 - Do not introduce new `unwrap()` or `expect()` in production paths — use `?` and proper error types

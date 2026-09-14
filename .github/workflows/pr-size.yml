@@ -1,0 +1,80 @@
+name: PR size
+
+# Labels every pull request size/S|M|L|XL by the lines a reviewer has to read,
+# keeps one explanatory comment on L and XL, and fails for XL unless the
+# description carries a "Why not split" section. Contract: docs/pr-size.md.
+#
+# WHY THIS EXISTS. Across 328 reviewed merges (Aug–Sep 2026, both repos)
+# round-one approvals fell from 80% under 50 lines to 40% at 200–399 and 26%
+# at 800–1599, and PRs with three or more review rounds were 29% of merges but
+# 57% of open-to-merge hours. Size is the cheapest lever on review rounds.
+#
+# THE SCRIPT RUNS FROM THE BASE BRANCH. The job checks out the base commit
+# and runs that copy of .github/scripts/pr-size.js and .github/pr-size.json, so
+# a pull request cannot loosen the check that judges it by editing them. The
+# limit of that fence: `pull_request` runs the workflow file from the pull
+# request itself, so a PR that edits THIS file can still change what runs.
+# Workflow files floor high in the auto-merge risk table for that reason, and
+# the reviewer reads them. Bootstrap: while main has no script yet (only the
+# pull request introducing it), the job falls back to the head's copy and says
+# so in the log.
+#
+# WHAT IT WRITES. Size labels and one marker comment on the pull request,
+# with this run's GITHUB_TOKEN. Nothing else, and never code.
+#
+# FORK PULL REQUESTS. GitHub downgrades GITHUB_TOKEN to read-only for
+# fork-originated `pull_request` runs, so the label and comment writes cannot
+# succeed there. Sizing and enforcement are read-only and run regardless: the
+# job computes the tier, writes the job summary, and fails an unjustified XL
+# exactly as it does for a branch pull request. Only the presentation writes
+# are skipped, and the step says so. The skip is decided from the event
+# payload (head repository vs. this one), never from a failed write, so a 403
+# on a same-repository run still fails the job loudly.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Bootstrap the script while main has none
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Fetched over the API, not git: the checkout keeps no credentials, and
+        # an unauthenticated git fetch fails on a private repository.
+        run: |
+          if [ -f .github/scripts/pr-size.js ] && [ -f .github/pr-size.json ]; then
+            echo "Using the base branch's pr-size.js and pr-size.json."
+            exit 0
+          fi
+          echo "::notice::The base branch has no PR size script yet; using this pull request's copy."
+          mkdir -p .github/scripts
+          for f in .github/scripts/pr-size.js .github/pr-size.json; do
+            gh api -H "Accept: application/vnd.github.raw" "repos/${GITHUB_REPOSITORY}/contents/${f}?ref=${HEAD_SHA}" > "$f"
+          done
+
+      - name: Size the pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # False for a fork pull request, whose token is read-only.
+          PR_SIZE_CAN_WRITE: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: node .github/scripts/pr-size.js

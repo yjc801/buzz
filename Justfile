@@ -111,6 +111,12 @@ security-review-check:
 # wire them together. This — not `just gate` — is the gate that covers a
 # change to any of them: `gate` maps .github/**, scripts/** and docs/** to
 # "nothing to run".
+# PR size gate: workflow lint + the script's contract tests (docs/pr-size.md).
+pr-size-check:
+    actionlint .github/workflows/pr-size.yml
+    node --check .github/scripts/pr-size.js
+    node --test .github/scripts/pr-size.test.js
+
 auto-merge-check:
     actionlint .github/workflows/buzz-pr-auto-merge.yml
     actionlint .github/workflows/buzz-pr-review-watchdog.yml

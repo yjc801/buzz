@@ -9,14 +9,22 @@ const test = require("node:test");
 
 const size = require("./pr-size.js");
 
-const CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "pr-size.json"), "utf8"));
+// This file is identical in every repository that carries the check; only
+// .github/pr-size.json differs. Behaviour is pinned against a fixed config so
+// the tests do not depend on one repository's paths.
+const SHIPPED = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "pr-size.json"), "utf8"));
+const CONFIG = {
+  thresholds: { S: 200, M: 400, L: 800 },
+  tests: ["**/tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.rs"],
+  generated: ["**/*.g.dart", "**/migrations/meta/**"],
+};
 const file = (filename, additions, deletions = 0, status = "modified") => ({ filename, additions, deletions, status });
 const NONE = new Set();
 
-test("the shipped config is well formed", () => {
-  assert.deepEqual(Object.keys(CONFIG.thresholds), ["S", "M", "L"]);
-  assert.ok(CONFIG.thresholds.S < CONFIG.thresholds.M && CONFIG.thresholds.M < CONFIG.thresholds.L);
-  for (const g of [...CONFIG.tests, ...CONFIG.generated]) assert.doesNotThrow(() => size.globToRegExp(g));
+test("the shipped config is well formed and matches docs/pr-size.md", () => {
+  assert.deepEqual(SHIPPED.thresholds, { S: 200, M: 400, L: 800 });
+  assert.ok(Array.isArray(SHIPPED.tests) && Array.isArray(SHIPPED.generated));
+  for (const g of [...SHIPPED.tests, ...SHIPPED.generated]) assert.doesNotThrow(() => size.globToRegExp(g));
 });
 
 test("globs: ** spans directories, * stays inside one", () => {
@@ -34,6 +42,7 @@ test("buckets: deletions, lockfiles, generated, binary, tests, counted", () => {
   assert.equal(cls(file("Cargo.lock", 900)), "lockfile");
   assert.equal(cls(file("desktop/pnpm-lock.yaml", 900)), "lockfile");
   assert.equal(cls(file("mobile/lib/model.g.dart", 300)), "generated");
+  assert.equal(cls(file("packages/db/migrations/meta/0042_snapshot.json", 3000)), "generated");
   assert.equal(cls(file("schema/custom.sql", 300), new Set(["schema/custom.sql"])), "generated");
   assert.equal(cls(file("desktop/public/logo.png", 0, 0)), "binary");
   assert.equal(cls(file("crates/a/src/old.rs", 0, 0, "renamed")), "counted");
@@ -86,17 +95,17 @@ function fakeApi(state) {
   return { api, calls };
 }
 
-const repo = "yjc801/buzz";
+const repo = "owner/repo";
 
 test("reconcile: one size label, stale tiers removed, L comment posted once", async () => {
   const state = { comments: [] };
   const { api, calls } = fakeApi(state);
   const result = size.summarize([file("crates/a/src/lib.rs", 500)], CONFIG, NONE, "");
   await size.reconcile({ api, repo, number: 7, result, config: CONFIG, labels: ["size/S", "bug"], comments: [] });
-  assert.ok(calls.includes("DELETE /repos/yjc801/buzz/issues/7/labels/size%2FS"));
+  assert.ok(calls.includes("DELETE /repos/owner/repo/issues/7/labels/size%2FS"));
   assert.ok(!calls.some((c) => c.includes("labels/bug")));
-  assert.ok(calls.includes("POST /repos/yjc801/buzz/issues/7/labels"));
-  assert.ok(calls.includes("POST /repos/yjc801/buzz/issues/7/comments"));
+  assert.ok(calls.includes("POST /repos/owner/repo/issues/7/labels"));
+  assert.ok(calls.includes("POST /repos/owner/repo/issues/7/comments"));
   assert.ok(state.comments[0].body.startsWith(size.MARKER));
 });
 
@@ -111,8 +120,8 @@ test("reconcile: unchanged comment is not rewritten; shrinking to M deletes it",
   const shrunk = size.summarize([file("crates/a/src/lib.rs", 300)], CONFIG, NONE, "");
   const gone = fakeApi({ comments: [] });
   await size.reconcile({ api: gone.api, repo, number: 7, result: shrunk, config: CONFIG, labels: ["size/L"], comments: [{ id: 5, body, user: bot }, { id: 6, body: "unrelated", user: bot }, { id: 7, body, user: { login: "someone" } }] });
-  assert.ok(gone.calls.includes("DELETE /repos/yjc801/buzz/issues/comments/5"));
-  assert.ok(!gone.calls.includes("DELETE /repos/yjc801/buzz/issues/comments/6"));
+  assert.ok(gone.calls.includes("DELETE /repos/owner/repo/issues/comments/5"));
+  assert.ok(!gone.calls.includes("DELETE /repos/owner/repo/issues/comments/6"));
   // A human's comment that happens to start with the marker is never touched.
   assert.ok(!gone.calls.some((c) => c.endsWith("/comments/7")));
 });

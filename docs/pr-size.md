@@ -102,6 +102,15 @@ The section needs real text (at least a sentence); an empty heading or a
 template comment does not count. The check re-runs when you edit the
 description.
 
+## Fork pull requests
+
+GitHub gives a fork-originated `pull_request` run a read-only token, so the
+check cannot label or comment on a pull request opened from a fork. It still
+sizes it: the tier and the full breakdown go to the job summary and the log,
+and an unjustified `size/XL` still fails, so enforcement is identical. The
+only difference is that no `size/*` label appears and no comment is posted;
+the step logs a notice saying so.
+
 ## Trust
 
 The job checks out the base commit and runs `main`'s copy of

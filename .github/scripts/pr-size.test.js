@@ -21,6 +21,13 @@ const CONFIG = {
 const file = (filename, additions, deletions = 0, status = "modified") => ({ filename, additions, deletions, status });
 const NONE = new Set();
 
+// generatedByAttribute shells out to git, so `run` needs a real repository.
+function tempRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pr-size-"));
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  return dir;
+}
+
 test("the shipped config is well formed and matches docs/pr-size.md", () => {
   assert.deepEqual(SHIPPED.thresholds, { S: 200, M: 400, L: 800 });
   assert.ok(Array.isArray(SHIPPED.tests) && Array.isArray(SHIPPED.generated));
@@ -127,8 +134,7 @@ test("reconcile: unchanged comment is not rewritten; shrinking to M deletes it",
 });
 
 test("run: end to end through the API seam, with .gitattributes-generated files excluded", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pr-size-"));
-  execFileSync("git", ["init", "-q"], { cwd: dir });
+  const dir = tempRepo();
   fs.writeFileSync(path.join(dir, ".gitattributes"), "schema/*.sql linguist-generated=true\n");
   const state = {
     pr: { changed_files: 3, body: "", labels: [] },
@@ -149,6 +155,45 @@ test("run: refuses to size a truncated file list", async () => {
   const state = { pr: { changed_files: 3500, body: "", labels: [] }, files: [file("a.rs", 1)], comments: [] };
   const { api } = fakeApi(state);
   await assert.rejects(size.run({ api, repo, number: 1, config: CONFIG, cwd: os.tmpdir(), writeSummary: () => {} }), /3500 files/);
+});
+
+test("run: a read-only (fork) token still sizes and still fails XL, and writes nothing", async () => {
+  const state = { pr: { changed_files: 1, body: "", labels: [] }, files: [file("crates/a/src/lib.rs", 900)], comments: [] };
+  const { api, calls } = fakeApi(state);
+  const logged = [];
+  let summary = "";
+  const result = await size.run({
+    api, repo, number: 4, config: CONFIG, cwd: tempRepo(), canWrite: false,
+    writeSummary: (s) => { summary = s; }, log: (m) => logged.push(m),
+  });
+  assert.equal(result.tier, "XL");
+  assert.equal(result.fails, true);
+  assert.equal(result.presentation, "skipped");
+  assert.ok(!calls.some((c) => !c.startsWith("GET ")), `wrote on a read-only run: ${calls.join(", ")}`);
+  assert.equal(state.comments.length, 0);
+  assert.match(summary, /read-only token/);
+  assert.ok(logged.some((m) => m.startsWith("::notice::")));
+});
+
+test("run: a failed presentation write never buries the size verdict", async () => {
+  const state = { pr: { changed_files: 1, body: "", labels: [] }, files: [file("crates/a/src/lib.rs", 900)], comments: [] };
+  const { api } = fakeApi(state);
+  const denied = async (method, route, body, opts) => {
+    if (method !== "GET") throw new Error(`${method} ${route} failed: HTTP 403 Resource not accessible by integration`);
+    return api(method, route, body, opts);
+  };
+  const logged = [];
+  let summary = "";
+  const result = await size.run({
+    api: denied, repo, number: 5, config: CONFIG, cwd: tempRepo(), canWrite: true,
+    writeSummary: (s) => { summary = s; }, log: (m) => logged.push(m),
+  });
+  assert.equal(result.tier, "XL");
+  assert.equal(result.fails, true);
+  assert.equal(result.presentation, "failed");
+  assert.match(result.presentationError, /HTTP 403/);
+  assert.match(summary, /could not be written/);
+  assert.ok(logged.some((m) => m.startsWith("::error::")));
 });
 
 test("makeApi: non-allowed HTTP errors throw with the status", async () => {

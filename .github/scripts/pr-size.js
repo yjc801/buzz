@@ -189,7 +189,14 @@ function generatedByAttribute(filenames, cwd) {
   return generated;
 }
 
-async function run({ api, repo, number, config, cwd, writeSummary }) {
+// Sizing and enforcement are read-only; labels and the comment are
+// presentation. GitHub hands fork-originated `pull_request` runs a read-only
+// GITHUB_TOKEN, so on those the writes cannot succeed and are skipped up
+// front — the verdict still lands in the log, the job summary and the exit
+// code. `canWrite` comes from the event payload (head repo === base repo),
+// not from a failed write, so a 403 on a same-repository run stays a loud
+// misconfiguration rather than being swallowed as "probably a fork".
+async function run({ api, repo, number, config, cwd, writeSummary, canWrite = true, log = console.log }) {
   const pr = await api("GET", `/repos/${repo}/pulls/${number}`);
   const files = await paginate(api, `/repos/${repo}/pulls/${number}/files`);
   if (pr.changed_files > files.length) {
@@ -199,8 +206,22 @@ async function run({ api, repo, number, config, cwd, writeSummary }) {
   }
   const generated = generatedByAttribute(files.map((f) => f.filename), cwd);
   const result = summarize(files, config, generated, pr.body);
-  const comments = await paginate(api, `/repos/${repo}/issues/${number}/comments`);
-  await reconcile({ api, repo, number, result, config, labels: pr.labels.map((l) => l.name), comments });
+  if (!canWrite) {
+    result.presentation = "skipped";
+    log(`::notice::Read-only token (fork pull request): size/${result.tier} computed but the label and comment were not written. The check verdict is unaffected.`);
+  } else {
+    const comments = await paginate(api, `/repos/${repo}/issues/${number}/comments`);
+    try {
+      await reconcile({ api, repo, number, result, config, labels: pr.labels.map((l) => l.name), comments });
+      result.presentation = "written";
+    } catch (err) {
+      // Never let a presentation write bury the verdict: record it, report it
+      // below, and fail the run for it after the size result is out.
+      result.presentation = "failed";
+      result.presentationError = err.message;
+      log(`::error::Could not write the size label or comment: ${err.message}`);
+    }
+  }
   writeSummary(renderSummary(result, config));
   return result;
 }
@@ -213,6 +234,8 @@ function renderSummary(result, config) {
     `${lines.counted} counted lines in ${files.counted} files (S ≤ ${config.thresholds.S}, M ≤ ${config.thresholds.M}, L ≤ ${config.thresholds.L}).`,
     `Not counted: tests ${lines.test}, generated ${lines.generated}, lockfiles ${lines.lockfile}, binary files ${files.binary}, whole-file deletions ${lines.deleted}.`,
     result.tier === "XL" ? (result.justified ? "XL with a \"Why not split\" section: passes." : "XL without a \"Why not split\" section: fails.") : "",
+    result.presentation === "skipped" ? "Label and comment skipped: this run has a read-only token (fork pull request)." : "",
+    result.presentation === "failed" ? `Label and comment could not be written: ${result.presentationError}` : "",
   ].join("\n");
 }
 
@@ -224,12 +247,19 @@ async function main() {
   const config = JSON.parse(fs.readFileSync(process.env.PR_SIZE_CONFIG || ".github/pr-size.json", "utf8"));
   const result = await run({
     api: makeApi(token), repo, number, config, cwd: process.cwd(),
+    canWrite: process.env.PR_SIZE_CAN_WRITE !== "false",
     writeSummary: (text) => process.env.GITHUB_STEP_SUMMARY && fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`),
   });
   console.log(JSON.stringify(result));
   if (result.fails) {
     console.error(`size/XL: ${result.lines.counted} counted lines and no "Why not split" section in the description.`);
     process.exitCode = 1;
+  } else if (result.presentation === "failed") {
+    // The size verdict passed, but a write this run was supposed to be able to
+    // make did not land. That is a repository/permissions fault, not the
+    // author's: report it rather than passing green on a half-applied state.
+    console.error(`size/${result.tier}: sized, but the label or comment write failed: ${result.presentationError}`);
+    process.exitCode = 2;
   }
 }
 

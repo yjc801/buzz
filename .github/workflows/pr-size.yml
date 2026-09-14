@@ -21,6 +21,15 @@ name: PR size
 #
 # WHAT IT WRITES. Size labels and one marker comment on the pull request,
 # with this run's GITHUB_TOKEN. Nothing else, and never code.
+#
+# FORK PULL REQUESTS. GitHub downgrades GITHUB_TOKEN to read-only for
+# fork-originated `pull_request` runs, so the label and comment writes cannot
+# succeed there. Sizing and enforcement are read-only and run regardless: the
+# job computes the tier, writes the job summary, and fails an unjustified XL
+# exactly as it does for a branch pull request. Only the presentation writes
+# are skipped, and the step says so. The skip is decided from the event
+# payload (head repository vs. this one), never from a failed write, so a 403
+# on a same-repository run still fails the job loudly.
 
 on:
   pull_request:
@@ -66,4 +75,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # False for a fork pull request, whose token is read-only.
+          PR_SIZE_CAN_WRITE: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: node .github/scripts/pr-size.js

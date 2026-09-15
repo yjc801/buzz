@@ -303,6 +303,7 @@ export type ManagedAgentRuntimeStatus = {
 // (and imported back for local use) so the consumer import surface is
 // unchanged.
 export type {
+  AcpSessionPolicy,
   ManagedAgent,
   ManagedAgentBackend,
   RespondToMode,

@@ -21,6 +21,7 @@ function createCatalogEvent(input: {
   shared?: boolean;
   avatarUrl?: string;
   description?: string;
+  sessionPolicy?: unknown;
 }): RelayEvent {
   const ownerPrivateKey =
     input.ownerPrivateKey ??
@@ -49,6 +50,7 @@ function createCatalogEvent(input: {
         model: null,
         provider: null,
         name_pool: [],
+        session_policy: input.sessionPolicy ?? "channel",
       }),
     },
     hexToBytes(ownerPrivateKey),
@@ -1990,6 +1992,7 @@ test("a community member can discover and add another member's catalog agent", a
         sourcePersonaId: personaId,
         displayName: "Alice’s Reviewer",
         systemPrompt: "Review changes for the whole community.",
+        sessionPolicy: "thread",
       }),
     ],
   });
@@ -2021,6 +2024,7 @@ test("a community member can discover and add another member's catalog agent", a
       display_name: string;
       system_prompt: string;
       shared: boolean;
+      session_policy: "channel" | "thread";
       catalog_source: { owner_pubkey: string; persona_id: string } | null;
     }>
   >(page, "list_personas");
@@ -2029,6 +2033,7 @@ test("a community member can discover and add another member's catalog agent", a
   ).toMatchObject({
     system_prompt: "Review changes for the whole community.",
     shared: false,
+    session_policy: "thread",
     // Provenance is what lets the catalog recognise the copy on the next open.
     catalog_source: {
       owner_pubkey: TEST_IDENTITIES.alice.pubkey,
@@ -2056,6 +2061,46 @@ test("a community member can discover and add another member's catalog agent", a
   await expect(addedTarget).toBeDisabled();
   await expect(addedTarget).toHaveText("Added to My Agents");
   expect(await countCommandInvocations(page, "create_persona")).toBe(1);
+});
+
+test("catalog defaults an unknown session policy without dropping the agent", async ({
+  page,
+}) => {
+  const personaId = "future-policy-reviewer";
+  await installMockBridge(page, {
+    personaCatalogEvents: [
+      createCatalogEvent({
+        ownerPubkey: TEST_IDENTITIES.alice.pubkey,
+        sourcePersonaId: personaId,
+        displayName: "Future Policy Reviewer",
+        systemPrompt: "Review using a policy from a newer client.",
+        sessionPolicy: "future-policy",
+      }),
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+  await openPersonaCatalog(page);
+
+  await page
+    .getByTestId(
+      `community-catalog-agent-catalog:${TEST_IDENTITIES.alice.pubkey}:${personaId}`,
+    )
+    .click();
+  await page
+    .getByRole("button", {
+      name: "Add Future Policy Reviewer from Community Catalog",
+    })
+    .click();
+
+  const imported = await invokeTauri<
+    Array<{ display_name: string; session_policy: "channel" | "thread" }>
+  >(page, "list_personas");
+  expect(
+    imported.find(
+      (persona) => persona.display_name === "Future Policy Reviewer",
+    ),
+  ).toMatchObject({ session_policy: "channel" });
 });
 
 test("catalog detail shows Community member when the publisher profile cannot be resolved", async ({

@@ -4,6 +4,9 @@ export type ManagedAgentBackend =
   | { type: "local" }
   | { type: "provider"; id: string; config: Record<string, unknown> };
 
+/** ACP conversation boundary configured on an agent definition. */
+export type AcpSessionPolicy = "channel" | "thread";
+
 /**
  * A provider deployment the agent has moved off but which still exists — and
  * still holds a copy of its private key. Buzz has no `undeploy` operation, so
@@ -53,6 +56,7 @@ export type ManagedAgent = {
   idleTimeoutSeconds: number | null;
   maxTurnDurationSeconds: number | null;
   parallelism: number;
+  sessionPolicy: AcpSessionPolicy;
   systemPrompt: string | null;
   avatarUrl: string | null;
   model: string | null;

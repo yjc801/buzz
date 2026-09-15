@@ -2676,11 +2676,17 @@ mod tests {
     fn test_format_prompt_interrupt_framing() {
         let batch = make_merged_batch(Some(CancelReason::Interrupt));
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt));
+        let new_section_tag = format!("<{}>", framing.new_tag);
 
         // Interrupt framing: the new request supersedes the previous one.
         assert!(
-            prompt.contains("<new-request-supersedes-previous>"),
+            prompt.contains(&new_section_tag),
             "interrupt prompt should use supersede framing: {prompt}"
+        );
+        assert!(
+            include_str!("base_prompt.md").contains(&new_section_tag),
+            "base prompt should document the production interrupt tag: {new_section_tag}"
         );
         assert!(
             prompt.contains("<previous-request-interrupted-before-completion>"),

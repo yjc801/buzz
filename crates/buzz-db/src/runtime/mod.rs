@@ -1,6 +1,13 @@
+mod connection_observability;
 pub mod migration;
 pub(crate) mod observability;
 pub mod replica_fence;
+
+pub use connection_observability::{DbConnectionOutcome, DbConnectionStep};
+pub(crate) use connection_observability::{
+    CONNECTION_DURATION_STEPS, CONNECTION_RAW_SERIES_PER_POD, CONNECTION_STARTED_STEPS,
+    CONNECTION_TERMINALS,
+};
 
 use crate::{deletion, event, DbError, EventQuery, Result};
 use buzz_datastore_tracing::datastore_span;
@@ -630,6 +637,10 @@ impl Db {
     /// constructor so they inherit the timeout, floor-guard, and isolation
     /// policy installed by [`Db::new`].
     pub async fn connect_writer_pool(config: &DbConfig) -> Result<PgPool> {
+        use connection_observability::{
+            classify_pool_outcome, record_milestone, DbConnectionStep, DbConnectionStepAttempt,
+        };
+
         let lock_timeout_ms = config.lock_timeout_ms;
         let idle_txn_timeout_ms = config.idle_txn_timeout_ms;
         let statement_timeout_ms = config.statement_timeout_ms;
@@ -641,11 +652,27 @@ impl Db {
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
+                    // SQLx 0.9 exposes no callback immediately before each raw
+                    // physical dial. Entering `after_connect` is the truthful
+                    // point at which DNS/network/TLS/authentication succeeded.
+                    record_milestone(DbPoolRole::Writer, DbConnectionStep::PhysicalConnect);
+
                     // `SET` cannot take bind parameters; `set_config` can.
-                    sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
+                    let floor = DbConnectionStepAttempt::start(
+                        DbPoolRole::Writer,
+                        DbConnectionStep::CreatedAtFloor,
+                    );
+                    if let Err(error) =
+                        sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
                         .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
                         .execute(&mut *conn)
-                        .await?;
+                        .await
+                    {
+                        floor.fail();
+                        return Err(error);
+                    }
+                    floor.succeed();
+
                     // `lock_timeout` fails the waiting statement; it does not
                     // cancel the holder. `idle_in_transaction_session_timeout`
                     // reaps only holders idling inside an open transaction,
@@ -654,7 +681,11 @@ impl Db {
                     // milliseconds. Migration/schema-destruction connections
                     // reset lock and statement timeouts before their intentional
                     // long wait (see `with_exclusive_schema_destruction_lock`).
-                    sqlx::query(
+                    let timeouts = DbConnectionStepAttempt::start(
+                        DbPoolRole::Writer,
+                        DbConnectionStep::SessionTimeouts,
+                    );
+                    if let Err(error) = sqlx::query(
                         "SELECT set_config('lock_timeout', $1, false), \
                                 set_config('idle_in_transaction_session_timeout', $2, false), \
                                 set_config('statement_timeout', $3, false)",
@@ -663,11 +694,29 @@ impl Db {
                     .bind(idle_txn_timeout_ms.to_string())
                     .bind(statement_timeout_ms.to_string())
                     .execute(&mut *conn)
-                    .await?;
-                    let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+                    .await
+                    {
+                        timeouts.fail();
+                        return Err(error);
+                    }
+                    timeouts.succeed();
+
+                    let isolation_step = DbConnectionStepAttempt::start(
+                        DbPoolRole::Writer,
+                        DbConnectionStep::Isolation,
+                    );
+                    let isolation: String = match sqlx::query_scalar("SHOW transaction_isolation")
                         .fetch_one(&mut *conn)
-                        .await?;
+                        .await
+                    {
+                        Ok(isolation) => isolation,
+                        Err(error) => {
+                            isolation_step.fail();
+                            return Err(error);
+                        }
+                    };
                     if isolation != "read committed" {
+                        isolation_step.fail();
                         return Err(sqlx::Error::Configuration(
                             format!(
                                 "writer pool requires READ COMMITTED transaction isolation, got {isolation}"
@@ -675,10 +724,29 @@ impl Db {
                             .into(),
                         ));
                     }
+                    isolation_step.succeed();
+                    record_milestone(DbPoolRole::Writer, DbConnectionStep::Ready);
                     Ok(())
                 })
             });
-        Ok(options.connect(&config.database_url).await?)
+
+        let pool_attempt =
+            DbConnectionStepAttempt::start(DbPoolRole::Writer, DbConnectionStep::WriterPool);
+        match options.connect(&config.database_url).await {
+            Ok(pool) => {
+                pool_attempt.succeed();
+                Ok(pool)
+            }
+            Err(error) => {
+                let outcome = classify_pool_outcome(&error);
+                if outcome == connection_observability::DbConnectionOutcome::TimedOut {
+                    pool_attempt.time_out();
+                } else {
+                    pool_attempt.fail();
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Reader acquire timeout — deliberately far below the writer's

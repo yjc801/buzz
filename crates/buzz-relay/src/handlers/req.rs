@@ -57,8 +57,7 @@ pub async fn handle_req(
     state: Arc<AppState>,
 ) {
     let (conn_id, pubkey_bytes, token_channel_ids) = {
-        let auth = conn.auth_state.read().await;
-        match &*auth {
+        match conn.auth_state_snapshot() {
             AuthState::Authenticated { ctx, .. } => {
                 if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
                     conn.send(RelayMessage::notice("restricted: insufficient scope"));
@@ -1746,7 +1745,7 @@ mod tests {
             conn_id,
             tenant,
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: tokio::sync::RwLock::new(AuthState::Authenticated {
+            auth_state: std::sync::Mutex::new(AuthState::Authenticated {
                 ctx: buzz_auth::AuthContext {
                     pubkey,
                     scopes: Vec::new(),

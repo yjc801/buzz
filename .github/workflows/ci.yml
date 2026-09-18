@@ -85,7 +85,6 @@ jobs:
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
               - 'desktop/**'
-              - '!desktop/src-tauri/**'
               - 'pnpm-lock.yaml'
             desktop-rust:
               - 'desktop/src-tauri/**'
@@ -142,6 +141,8 @@ jobs:
         run: scripts/test-ci-required-context-isolation.sh
       - name: Path filter contract
         run: scripts/test-path-filter-contract.sh
+      - name: CI path selection regression tests
+        run: node --test scripts/ci-selection.test.mjs
       - name: File size policy
         run: just file-size-check
 

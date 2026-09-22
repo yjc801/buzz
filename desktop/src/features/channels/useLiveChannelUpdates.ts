@@ -116,6 +116,17 @@ function isExternalMentionEvent(event: RelayEvent, currentPubkey: string) {
   );
 }
 
+type LiveChannelEntry = {
+  controller: AbortController;
+  pending: Promise<boolean>;
+  dispose?: () => Promise<void>;
+};
+
+function retireLiveChannel(entry: LiveChannelEntry) {
+  entry.controller.abort();
+  void entry.dispose?.().catch(() => {});
+}
+
 const SEEN_NOTIFICATION_EVENT_LIMIT = 5_000;
 
 export function trackSeenEvent(
@@ -367,7 +378,15 @@ export function useLiveChannelUpdates(
     });
   }, [queryClient]);
 
-  const liveSubsRef = React.useRef(new Map<string, () => Promise<void>>());
+  React.useEffect(
+    () =>
+      relayClient.subscribeToChannelAccessRevocations(
+        invalidateChannelsDebounced,
+      ),
+    [invalidateChannelsDebounced],
+  );
+
+  const liveSubsRef = React.useRef(new Map<string, LiveChannelEntry>());
 
   React.useEffect(() => {
     let isCancelled = false;
@@ -378,10 +397,10 @@ export function useLiveChannelUpdates(
       const activeSubs = liveSubsRef.current;
       const targetIds = new Set(channelIdsKey ? channelIdsKey.split(",") : []);
 
-      for (const [channelId, dispose] of activeSubs) {
+      for (const [channelId, entry] of activeSubs) {
         if (!targetIds.has(channelId)) {
           activeSubs.delete(channelId);
-          void dispose().catch(() => {});
+          retireLiveChannel(entry);
         }
       }
 
@@ -391,37 +410,55 @@ export function useLiveChannelUpdates(
         dmSubscriptionStartedAtRef.current = Math.floor(Date.now() / 1000);
       }
 
-      let anyFailed = false;
-      const additions = Array.from(targetIds)
-        .filter((channelId) => !activeSubs.has(channelId))
-        .map(async (channelId) => {
-          try {
-            const dispose = await relayClient.subscribeLive(
-              {
-                kinds: [...CHANNEL_EVENT_KINDS],
-                "#h": [channelId],
-                limit: 1000,
-                since: Math.floor(Date.now() / 1_000),
-              },
-              (event) =>
-                handleIncomingMessage(withChannelTagFallback(event, channelId)),
-            );
-            if (isCancelled) {
+      const pending = Array.from(targetIds).map((channelId) => {
+        const existing = activeSubs.get(channelId);
+        if (existing) return existing.pending;
+        const entry: LiveChannelEntry = {
+          controller: new AbortController(),
+          pending: Promise.resolve(true),
+        };
+        // Claim before the first await so a membership rerun retains this work.
+        activeSubs.set(channelId, entry);
+        entry.pending = relayClient
+          .subscribeLive(
+            {
+              kinds: [...CHANNEL_EVENT_KINDS],
+              "#h": [channelId],
+              limit: 1000,
+              since: Math.floor(Date.now() / 1_000),
+            },
+            (event) => {
+              if (activeSubs.get(channelId) === entry) {
+                handleIncomingMessage(withChannelTagFallback(event, channelId));
+              }
+            },
+            undefined,
+            undefined,
+            entry.controller.signal,
+          )
+          .then((dispose) => {
+            if (activeSubs.get(channelId) !== entry) {
               void dispose().catch(() => {});
-              return;
+            } else {
+              entry.dispose = dispose;
             }
-            activeSubs.set(channelId, dispose);
-          } catch (err) {
-            anyFailed = true;
+            return true;
+          })
+          .catch((err) => {
+            if (activeSubs.get(channelId) !== entry) return true;
+            activeSubs.delete(channelId);
+            if (err instanceof DOMException && err.name === "AbortError")
+              return true;
             console.error(
               "Failed to subscribe to live channel updates",
               channelId,
               err,
             );
-          }
-        });
-      await Promise.allSettled(additions);
-      return !anyFailed;
+            return false;
+          });
+        return entry.pending;
+      });
+      return (await Promise.all(pending)).every(Boolean);
     };
 
     const runSync = async () => {
@@ -456,8 +493,8 @@ export function useLiveChannelUpdates(
     return () => {
       channelsInvalidateRef.current?.cancel();
 
-      for (const dispose of liveSubsRef.current.values()) {
-        void dispose().catch(() => {});
+      for (const entry of liveSubsRef.current.values()) {
+        retireLiveChannel(entry);
       }
       liveSubsRef.current.clear();
     };

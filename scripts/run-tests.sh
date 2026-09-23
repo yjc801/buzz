@@ -93,10 +93,18 @@ run_unit_tests() {
   run_test_step "buzz-cli tests" \
     cargo test -p buzz-cli -- --nocapture
 
+  # buzz-sdk builder/validation unit tests: pure event-builder and input
+  # validation, no infra. Mirrors the nextest path in `just test-unit` — the
+  # two lists must stay in step. `--lib` matches the nextest invocation and
+  # avoids the full-package rustdoc dependency-resolution flake.
+  run_test_step "buzz-sdk unit tests" \
+    cargo test -p buzz-sdk --lib -- --nocapture
+
   # Keep the relay-to-agent trust-boundary regressions in the fallback path
   # when cargo-nextest is unavailable.
   run_test_step "buzz-acp tests" \
     cargo test -p buzz-acp -- --nocapture
+
 
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator

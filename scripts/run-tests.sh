@@ -152,6 +152,10 @@ run_unit_tests() {
   # loopback sockets). Keep in step with the nextest path.
   run_test_step "buzz-webhook-bridge tests" \
     cargo test -p buzz-webhook-bridge -- --nocapture
+  # Keep fallback parity with `just test-unit`: one LaunchDarkly-feature run
+  # exercises both default and feature-gated buzz-feature-flags tests.
+  run_test_step "buzz-feature-flags tests (launchdarkly)" \
+    cargo test -p buzz-feature-flags --features launchdarkly -- --nocapture
 
   # buzz-agent model-capabilities corpus: the Rust half of the cross-language
   # drift guard. model_capabilities.rs embeds scripts/model-capabilities.json +

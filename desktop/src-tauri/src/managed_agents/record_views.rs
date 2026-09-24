@@ -23,7 +23,9 @@ impl AgentDefinition {
             // community-bound (stamped at creation).
             community_relay_url: None,
             avatar_url: self.avatar_url,
-            acp_command: DEFAULT_ACP_COMMAND.to_string(),
+            acp_command: self
+                .acp_command
+                .unwrap_or_else(|| DEFAULT_ACP_COMMAND.to_string()),
             agent_command: String::new(),
             agent_command_override: None,
             agent_args: Vec::new(),
@@ -97,6 +99,8 @@ impl ManagedAgentRecord {
             avatar_url: self.avatar_url.clone(),
             description: self.description.clone(),
             system_prompt: self.system_prompt.clone().unwrap_or_default(),
+            acp_command: (self.acp_command != DEFAULT_ACP_COMMAND)
+                .then(|| self.acp_command.clone()),
             runtime: self.runtime.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),

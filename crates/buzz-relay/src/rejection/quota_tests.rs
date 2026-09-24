@@ -32,13 +32,17 @@ async fn state_with_limits(messages: u64, agent_messages: u64, ws: u64) -> AppSt
 }
 
 fn connection(agent: bool) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
-    let AuthState::Authenticated(mut auth) = authenticated_state() else {
+    let AuthState::Authenticated {
+        ctx: mut auth,
+        class,
+    } = authenticated_state()
+    else {
         unreachable!()
     };
     if agent {
         auth.agent_owner_pubkey = Some(Keys::generate().public_key());
     }
-    test_conn_with_auth(AuthState::Authenticated(auth))
+    test_conn_with_auth(AuthState::Authenticated { ctx: auth, class })
 }
 
 fn event(kind: u16) -> ClientMessage {
@@ -49,7 +53,7 @@ fn event(kind: u16) -> ClientMessage {
 }
 
 fn pubkey(conn: &ConnectionState) -> nostr::PublicKey {
-    let AuthState::Authenticated(auth) = conn.auth_state_snapshot() else {
+    let AuthState::Authenticated { ctx: auth, .. } = conn.auth_state_snapshot() else {
         unreachable!()
     };
     auth.pubkey

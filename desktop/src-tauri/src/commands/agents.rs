@@ -1,7 +1,6 @@
+use super::managed_agent_definition::validate_create_definition;
 use nostr::{Keys, ToBech32};
 use tauri::{AppHandle, State};
-
-use super::managed_agent_definition::validate_create_definition;
 
 use crate::{
     app_state::AppState,
@@ -628,9 +627,10 @@ pub async fn create_managed_agent(
             relay_url: resolved_relay_url.clone(),
             community_relay_url,
             avatar_url: resolved_avatar_url.clone(),
-            acp_command: input
-                .acp_command
-                .as_deref()
+            acp_command: linked_persona
+                .as_ref()
+                .and_then(|persona| persona.acp_command.as_deref())
+                .or(input.acp_command.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(DEFAULT_ACP_COMMAND)

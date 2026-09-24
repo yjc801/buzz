@@ -917,7 +917,7 @@ pub fn resolve_provider_binary(provider_id: &str) -> Result<PathBuf, String> {
 }
 
 /// Check if a file is executable (Unix: mode bits; other platforms: always true).
-fn is_executable(path: &Path) -> bool {
+pub fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

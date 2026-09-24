@@ -16,7 +16,7 @@ use crate::{
 
 use super::claude_config::apply_claude_model_env;
 mod git_credentials;
-use git_credentials::apply_git_credential_env;
+use git_credentials::apply_custom_acp_git_credentials;
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
@@ -738,7 +738,18 @@ pub fn spawn_agent_child(
 
     command.env("BUZZ_ACP_RELAY_OBSERVER", "true");
 
-    apply_git_credential_env(&mut command, record, &effective_relay_url);
+    // buzz-acp owns Git identity, scoped credentials, signing and key cleanup.
+    // An advanced custom ACP command bypasses that harness, so retain the
+    // earlier Desktop credential setup for that supported override.
+    if record.acp_command != super::DEFAULT_ACP_COMMAND {
+        apply_custom_acp_git_credentials(
+            &mut command,
+            &record.acp_command,
+            &record.private_key_nsec,
+            &effective_relay_url,
+            resolve_command("git-credential-nostr").as_deref(),
+        );
+    }
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
     // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.

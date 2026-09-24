@@ -23,6 +23,11 @@ pub struct AgentDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub system_prompt: String,
+    /// ACP transport command selected alongside the runtime before deployment.
+    /// `None` preserves legacy definitions that predate persona-owned ACP
+    /// selection; linked instances then fall back to their stored command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_command: Option<String>,
     /// Preferred ACP runtime ID (e.g., 'goose', 'claude', 'codex'). Determines which agent binary
     /// Buzz spawns. When deploying from this persona, this runtime is pre-selected in the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]

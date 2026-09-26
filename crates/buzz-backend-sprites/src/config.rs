@@ -32,7 +32,7 @@ pub const DEFAULT_SPRIG_VERSION: &str = "sprig-latest";
 
 /// Pinned npm versions of the ACP adapters provisioned when the corresponding
 /// `install_*_adapter` flag is on. Baked provider state, like the sprig pins.
-pub const CLAUDE_ADAPTER_VERSION: &str = "0.73.0";
+pub const CLAUDE_ADAPTER_VERSION: &str = "0.81.2";
 
 /// Held at 1.1.7 deliberately: `env.rs` realizes
 /// `provider_config.preapprove_agent_tools = false` as

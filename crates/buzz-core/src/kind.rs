@@ -194,6 +194,38 @@ pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 30180;
 /// exact constraint that produced this envelope.
 pub const KIND_WAKER_BUNDLE_ENVELOPE: u32 = KIND_GIFT_WRAP;
 
+/// buzz-waker start request: an owner asking the daemon to start one agent
+/// now, with no mention to wake it.
+///
+/// Like [`KIND_WAKER_LAUNCH_BUNDLE`], this names the payload, not the wire:
+/// it travels inside a [`KIND_GIFT_WRAP`] addressed (`#p`) to the agent,
+/// NIP-44 encrypted to the agent's key, so it needs no relay change. The
+/// payload is a `SignedStartRequest` (`buzz-waker::start_request`) carrying
+/// the owner's own BIP-340 signature, checked against the enrolment-pinned
+/// owner — that signature, not the envelope's, is the trust boundary.
+///
+/// # Why this envelope is not signed by the owner's own key
+///
+/// The opposite choice from [`KIND_WAKER_BUNDLE_ENVELOPE`], for the reason
+/// that one gives: the bundle tap's query pins `authors` to the owner and
+/// keeps only its newest few envelopes. Owner-signed start requests would
+/// match that query and, one per Start press, push the agent's launch
+/// bundle out of its window — a daemon restarted after enough presses would
+/// never find a bundle to deploy with.
+///
+/// Nor by a throwaway key: the daemon's query would then have no `authors`
+/// to pin, and anyone's gift wraps tagged to the agent would share its
+/// `limit` — enough newer junk hides a real request from a reconnecting
+/// daemon. The signer is instead a key derived from the owner↔agent ECDH
+/// shared secret (`buzz-waker::start_request::start_request_envelope_keys`):
+/// only the owner and the agent can sign as it, so the query can pin it and
+/// the relay's own signature check keeps everyone else out of the result
+/// set. The cost is that these envelopes cannot practically be deleted:
+/// the relay takes a deletion only from the signer it authenticated, which is
+/// the owner, not this key. They are small, carry nothing once stale, and
+/// are refused past their freshness window.
+pub const KIND_WAKER_START_REQUEST: u32 = 30181;
+
 /// Kinds whose stored events are readable only by their author.
 ///
 /// The relay must never reveal the existence, count, tags, content, schedule,

@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nostr::{Keys, Tag};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -47,7 +48,7 @@ use uuid::Uuid;
 use crate::attempt::{
     run_wake_attempt, ClaimingTrigger, WakeAttemptState, WakeOutcome, WAKE_STRANDED_RETRY_DELAY_MS,
 };
-use crate::cursor::{CursorStore, Resume, DEFAULT_COMPLETED_RING};
+use crate::cursor::{Admission, CursorStore, Resume, DEFAULT_COMPLETED_RING};
 use crate::decide::{normalize_pubkey, TriggerEvent};
 use crate::effects::RealWakeEffects;
 use crate::feed::{
@@ -201,12 +202,55 @@ async fn next_park_due(
     }
 }
 
+/// The next start request to claim: one a failed claim left behind, before
+/// anything new from the bundle tap. Cancel-safe for `tokio::select!` — a
+/// held request is taken only by the poll that returns it.
+async fn next_start_request(
+    unclaimed: &mut Option<TriggerEvent>,
+    start_requests: &mut mpsc::Receiver<TriggerEvent>,
+) -> Option<TriggerEvent> {
+    match unclaimed.take() {
+        Some(request) => Some(request),
+        None => start_requests.recv().await,
+    }
+}
+
+/// Claim an owner start request in the durable cursor, as a mention is
+/// claimed by [`step`].
+///
+/// `Ok(None)` is a request already claimed or completed — a replayed
+/// envelope, recognised by its event id — which must not start the agent
+/// again. `Ok(Some(undeliverable))` is a fresh claim to run.
+///
+/// # Errors
+/// The claim could not be made durable; the request must not be acted on.
+fn claim_start_request(
+    cursor: &mut CursorStore,
+    request: &TriggerEvent,
+    now: u64,
+) -> Result<Option<bool>, crate::cursor::CursorError> {
+    Ok(match cursor.admit(&request.id, request.created_at, now)? {
+        Admission::Duplicate => None,
+        Admission::Fresh => Some(false),
+        Admission::FreshButUndeliverable { .. } => Some(true),
+    })
+}
+
 /// Run one agent's wake loop until `cancel` fires.
 ///
 /// Owns the agent's [`CursorStore`] for the lifetime of the call: opens it
 /// once, outliving every individual connection attempt, and closes it (via
 /// `Drop`) only when this function returns.
-pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
+///
+/// `start_requests` carries owner start requests the bundle tap admitted
+/// ([`crate::start_request`]). Each is claimed in the same cursor and run as
+/// the same attempt a mention gets, so it collapses with concurrent mentions
+/// and gets the same one re-drive.
+pub async fn run_wake_loop(
+    config: WakeLoopConfig,
+    mut start_requests: mpsc::Receiver<TriggerEvent>,
+    cancel: CancellationToken,
+) {
     let agent_pubkey = config.keys.public_key().to_hex();
 
     let mut cursor = match CursorStore::open_or_start(
@@ -232,6 +276,10 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
     // claim survives regardless — that is on disk — but re-driving it depends
     // on this buffer.
     let mut stranded: Vec<StrandedTrigger> = Vec::new();
+    // A start request the cursor could not claim, retried first after the
+    // reconnect that failure forces. Outside the loop for the same reason as
+    // `stranded`: nothing else would re-deliver it (see the claim's `Err` arm).
+    let mut unclaimed_start: Option<TriggerEvent> = None;
     let mut consecutive_failures = 0u32;
 
     'reconnect: while !cancel.is_cancelled() {
@@ -473,6 +521,53 @@ pub async fn run_wake_loop(config: WakeLoopConfig, cancel: CancellationToken) {
                             agent = %agent_pubkey, %channel_id,
                             "buzz-waker: re-subscribed a channel parked by rate limiting"
                         );
+                    }
+                }
+
+                // Only polled while the mention feed is connected, on purpose:
+                // `CursorStore::admit` records live coverage through `now`,
+                // which is true only while the feed is up. A request that
+                // arrives during a reconnect waits in the channel.
+                Some(request) = next_start_request(&mut unclaimed_start, &mut start_requests) => {
+                    match claim_start_request(&mut cursor, &request, now_secs()) {
+                        Ok(None) => {}
+                        Ok(Some(undeliverable)) => {
+                            tracing::info!(
+                                agent = %agent_pubkey,
+                                event_id = %request.id,
+                                "buzz-waker: starting the agent on an owner start request"
+                            );
+                            spawn_attempt(
+                                &mut attempts,
+                                request,
+                                undeliverable,
+                                false,
+                                agent_pubkey.clone(),
+                                Arc::clone(&attempt_state),
+                                Arc::clone(&config.presence_state),
+                                config.watch_list.clone(),
+                                config.bundle_state.current(),
+                                config.provider_env.clone(),
+                                cancel.clone(),
+                            );
+                        }
+                        Err(error) => {
+                            // Not claimed, so not acted on — and not dropped
+                            // either: the bundle tap has already handed it over
+                            // and will not send it again unless its own
+                            // connection happens to cycle. Hold it, and treat
+                            // this like the mention path's cursor failure.
+                            tracing::error!(
+                                agent = %agent_pubkey,
+                                event_id = %request.id,
+                                %error,
+                                "buzz-waker: cursor could not be made durable; holding an \
+                                 owner start request and reconnecting"
+                            );
+                            unclaimed_start = Some(request);
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            continue 'reconnect;
+                        }
                     }
                 }
 
@@ -1087,6 +1182,73 @@ mod tests {
 
     fn author_b() -> String {
         "b".repeat(64)
+    }
+
+    #[test]
+    fn a_replayed_start_request_never_starts_the_agent_twice() {
+        // The bundle tap re-sends every in-window request on each reconnect.
+        // The cursor claim, keyed by envelope id, is the only thing that
+        // stops a replay from spending a second deploy — while in flight
+        // and after completion alike.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cursor = store(&dir);
+        let request = trigger("start-1");
+
+        assert_eq!(
+            claim_start_request(&mut cursor, &request, NOW).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            claim_start_request(&mut cursor, &request, NOW + 5).unwrap(),
+            None
+        );
+        cursor.complete(&request.id).unwrap();
+        assert_eq!(
+            claim_start_request(&mut cursor, &request, NOW + 60).unwrap(),
+            None
+        );
+
+        // A restarted daemon reading the same cursor file refuses it too.
+        drop(cursor);
+        let mut reopened = store(&dir);
+        assert_eq!(
+            claim_start_request(&mut reopened, &request, NOW + 90).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_request_whose_claim_failed_is_offered_again_before_new_ones() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(trigger("start-new")).await.unwrap();
+        let mut unclaimed = Some(trigger("start-held"));
+
+        assert_eq!(
+            next_start_request(&mut unclaimed, &mut rx)
+                .await
+                .unwrap()
+                .id,
+            "start-held"
+        );
+        assert!(unclaimed.is_none());
+        assert_eq!(
+            next_start_request(&mut unclaimed, &mut rx)
+                .await
+                .unwrap()
+                .id,
+            "start-new"
+        );
+    }
+
+    #[test]
+    fn an_old_start_request_is_claimed_as_undeliverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cursor = store(&dir);
+        let old = trigger_at("start-old", NOW - crate::WAKE_DELIVERABLE_AGE_SECS - 1);
+        assert_eq!(
+            claim_start_request(&mut cursor, &old, NOW).unwrap(),
+            Some(true)
+        );
     }
 
     fn report(id: &str, outcome: WakeOutcome, retried: bool) -> AttemptReport {

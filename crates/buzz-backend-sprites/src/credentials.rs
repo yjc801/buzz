@@ -37,8 +37,14 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-const FAIL_REMEDY: &str = "Run `sprite login` (stores the token in the macOS keychain), or set \
-     SPRITE_TOKEN in the environment Buzz Desktop is launched from.";
+/// Shared by every caller of this provider: Buzz Desktop deploying directly,
+/// and `buzz-waker`, which runs it with its own inherited environment. So it
+/// names both places a token can be missing, and the member's way out.
+const FAIL_REMEDY: &str = "Set SPRITE_TOKEN (an API token from https://sprites.dev/account) in \
+     the environment of whatever runs this provider — the buzz-waker daemon on a waker host, or \
+     the environment Buzz Desktop is launched from — or run `sprite login` (stores the token in \
+     the macOS keychain). A member of a community that runs a waker needs neither: turn on \
+     Remote wake for this agent and the waker deploys it with the operator's token.";
 
 /// Resolve a credential from the real process environment, home directory,
 /// and keychain.
@@ -318,6 +324,9 @@ mod tests {
             "SPRITES_TOKEN",
             "~/.sprites",
             "sprite login",
+            "Remote wake",
+            "buzz-waker daemon",
+            "Buzz Desktop",
         ] {
             assert!(err.contains(needle), "missing {needle}: {err}");
         }

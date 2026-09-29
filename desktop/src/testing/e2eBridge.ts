@@ -1597,6 +1597,9 @@ declare global {
      *  armed `startManagedAgentErrors` rejection) without waiting out the
      *  delay. Returns the number of holds flushed. */
     __BUZZ_E2E_RELEASE_MANAGED_AGENT_STARTS__?: () => number;
+    /** Pubkeys `start_managed_agent` handed to the community waker instead
+     *  of deploying (Remote wake on), in call order. */
+    __BUZZ_E2E_WAKER_START_REQUESTS__?: () => string[];
     /** Release every `sync_agents_to_active_huddle` currently held behind
      *  `syncAgentsToActiveHuddleDelayMs`, letting it resolve without waiting
      *  out the delay. Returns the number of holds flushed. */
@@ -1772,6 +1775,7 @@ let heldUsersBatchReleases: Array<() => void> = [];
 // start across a community round-trip needs the hold long enough to be
 // deterministic AND a way to settle it on demand afterwards.
 let heldManagedAgentStartReleases: Array<() => void> = [];
+let mockWakerStartRequests: string[] = [];
 // Huddle agent syncs currently held behind `syncAgentsToActiveHuddleDelayMs`,
 // releasable early via `__BUZZ_E2E_RELEASE_HUDDLE_AGENT_SYNCS__()`. The hold
 // must outlast the mid-send mutation a spec injects, then settle on demand
@@ -9820,7 +9824,11 @@ async function handleStartManagedAgent(
     expectedSignerPubkey?: string | null;
   },
   config?: E2eConfig,
-): Promise<{ agent: RawManagedAgent; fresh_generation: boolean | null }> {
+): Promise<{
+  agent: RawManagedAgent;
+  fresh_generation: boolean | null;
+  requested_via_waker: boolean;
+}> {
   const delayMs = config?.mock?.startManagedAgentDelayMs ?? 0;
   if (delayMs > 0) {
     await new Promise<void>((resolve) => {
@@ -9866,6 +9874,17 @@ async function handleStartManagedAgent(
     }
   }
 
+  // Remote wake on: production publishes a start request to the community's
+  // waker and deploys nothing here, so the record is left as it was.
+  if (agent.backend.type === "provider" && agent.waker_enabled) {
+    mockWakerStartRequests.push(agent.pubkey);
+    return {
+      agent: cloneManagedAgent(agent),
+      fresh_generation: null,
+      requested_via_waker: true,
+    };
+  }
+
   const now = new Date().toISOString();
   // Captured BEFORE this call mutates the record: production provider
   // deploys are idempotent, and one against an already-running generation
@@ -9905,6 +9924,7 @@ async function handleStartManagedAgent(
     agent: cloneManagedAgent(agent),
     fresh_generation:
       agent.backend.type === "provider" ? !wasAlreadyDeployedProvider : null,
+    requested_via_waker: false,
   };
 }
 
@@ -11908,6 +11928,8 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_DEFER_GET_EVENT__ = null;
   deferredGetEventQueue = [];
   heldManagedAgentStartReleases = [];
+  mockWakerStartRequests = [];
+  window.__BUZZ_E2E_WAKER_START_REQUESTS__ = () => [...mockWakerStartRequests];
   window.__BUZZ_E2E_RELEASE_MANAGED_AGENT_STARTS__ = () => {
     const held = heldManagedAgentStartReleases.splice(0);
     for (const release of held) release();

@@ -22,6 +22,22 @@ stale, and a stale one pins adapter versions that disagree with the release
 the remote-wake daemon runs, reprovisioning every sprite on each deploy
 (`docs/waker-provider-digest-gap.md`). Rebuild it if you rely on it.
 
+**Who holds the Sprites token.** In a community that runs `buzz-waker`, the
+operator does: an agent with Remote wake on is deployed by the waker — on a
+mention, or when its owner presses Start, which sends the waker a signed start
+request instead of deploying (`crates/buzz-waker/src/start_request.rs`) — with
+the waker's own `SPRITE_TOKEN`, read from the daemon's environment because the
+waker runs this provider with no per-member credential. Members hold no Sprites
+credential and need none. The rest of this section applies to whichever process
+runs the provider: the waker daemon, or Buzz Desktop for an agent with Remote
+wake off. The missing-credential error names both, because the provider cannot
+tell which one called it.
+
+This deliberately places the credential with the community operator rather
+than the member deploying, which `VISION_REMOTE_AGENTS.md` ("You bring the
+substrate") leaves to whoever runs it; that document is shared with upstream,
+where the waker does not exist, so the choice is recorded here instead.
+
 Credentials come from the ambient environment, never from the agent's
 configuration (spec I2). The provider looks for `SPRITE_TOKEN`, then
 `SPRITES_TOKEN`, then the sprite CLI's keychain entry — but **prefer an API

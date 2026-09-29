@@ -22,6 +22,7 @@ use crate::{
 use super::agent_create_support::{
     normalize_relay_mesh, resolve_created_avatar_url, trim_to_optional_string,
 };
+use super::agents_waker_start::StartRoute;
 
 /// Read the workspace owner pubkey without holding the lock. Used to populate `BUZZ_ACP_AGENT_OWNER`
 /// as a fallback for legacy agent records that have no NIP-OA `auth_tag`.
@@ -842,6 +843,28 @@ pub async fn create_managed_agent(
     })
 }
 
+/// The refreshed summary a successful start returns.
+fn summarize_started(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+) -> Result<ManagedAgentSummary, String> {
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let records = load_managed_agents(app)?;
+    let runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let record = records
+        .iter()
+        .find(|r| r.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+    summarize_from_disk(app, record, &runtimes)
+}
+
 #[tauri::command]
 pub async fn start_managed_agent(
     pubkey: String,
@@ -882,6 +905,11 @@ pub async fn start_managed_agent(
     )?;
     enum StartTarget {
         Local,
+        /// Remote wake is on: ask the community's waker to deploy it.
+        Waker {
+            name: String,
+            requested_at: u64,
+        },
         Provider {
             backend: BackendKind,
             cached_binary_path: Option<String>,
@@ -926,14 +954,28 @@ pub async fn start_managed_agent(
             reconcile_relay.as_str(),
         ));
 
-        let target = if record.backend == BackendKind::Local {
-            StartTarget::Local
-        } else {
-            StartTarget::Provider {
+        let target = match super::agents_waker_start::start_route(record) {
+            StartRoute::Local => StartTarget::Local,
+            StartRoute::Waker => {
+                let now = super::agents_waker_start::now_unix()?;
+                super::agents_waker_start::ensure_bundle_live(
+                    &record.name,
+                    crate::managed_agents::waker_bundle::bundle_expiry_for(&app, record),
+                    now,
+                )?;
+                // The request's time is the new harness's replay floor, so a
+                // caller's earlier floor (a publish-first mention) wins.
+                let floor = replay_floor_unix.or(wake_replay_floor);
+                StartTarget::Waker {
+                    name: record.name.clone(),
+                    requested_at: floor.map_or(now, |floor| floor.min(now)),
+                }
+            }
+            StartRoute::Provider => StartTarget::Provider {
                 backend: record.backend.clone(),
                 cached_binary_path: record.provider_binary_path.clone(),
                 agent_json: build_deploy_payload(&app, &state, record, wake_replay_floor)?,
-            }
+            },
         };
 
         (target, reconcile)
@@ -953,7 +995,25 @@ pub async fn start_managed_agent(
         .map(|agent| StartManagedAgentOutcome {
             agent,
             fresh_generation: None,
+            requested_via_waker: false,
         }),
+        StartTarget::Waker { name, requested_at } => {
+            super::agents_waker_start::request_waker_start(
+                &app,
+                &state,
+                &name,
+                &pubkey,
+                requested_at,
+                reconcile_relay.as_str(),
+                &owner_hex,
+            )
+            .await?;
+            summarize_started(&app, &state, &pubkey).map(|agent| StartManagedAgentOutcome {
+                agent,
+                fresh_generation: None,
+                requested_via_waker: true,
+            })
+        }
         StartTarget::Provider {
             backend: BackendKind::Provider { id, config },
             cached_binary_path,
@@ -980,23 +1040,10 @@ pub async fn start_managed_agent(
             )
             .await?;
 
-            // Return updated summary.
-            let _store_guard = state
-                .managed_agents_store_lock
-                .lock()
-                .map_err(|e| e.to_string())?;
-            let records = load_managed_agents(&app)?;
-            let runtimes = state
-                .managed_agent_processes
-                .lock()
-                .map_err(|e| e.to_string())?;
-            let record = records
-                .iter()
-                .find(|r| r.pubkey == pubkey)
-                .ok_or_else(|| format!("agent {pubkey} not found"))?;
-            summarize_from_disk(&app, record, &runtimes).map(|agent| StartManagedAgentOutcome {
+            summarize_started(&app, &state, &pubkey).map(|agent| StartManagedAgentOutcome {
                 agent,
                 fresh_generation,
+                requested_via_waker: false,
             })
         }
         StartTarget::Provider { backend, .. } => Err(format!(

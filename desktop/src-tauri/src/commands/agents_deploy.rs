@@ -29,6 +29,10 @@ use crate::{
 pub struct StartManagedAgentOutcome {
     pub agent: ManagedAgentSummary,
     pub fresh_generation: Option<bool>,
+    /// The start was handed to the community's `buzz-waker` (Remote wake is
+    /// on) rather than performed here, so the agent comes online when the
+    /// waker's deploy does — see `agents_waker_start`.
+    pub requested_via_waker: bool,
 }
 
 /// Deploy an agent to a provider backend. Resolves the binary, calls deploy via

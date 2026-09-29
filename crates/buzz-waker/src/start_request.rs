@@ -10,17 +10,21 @@
 //!
 //! # Wire
 //!
-//! A [`KIND_GIFT_WRAP`] `#p`-tagged to the agent and signed by a throwaway key
-//! (see [`KIND_WAKER_START_REQUEST`] for why not the owner's), its content
-//! NIP-44 encrypted throwaway→agent, its plaintext a [`SignedStartRequest`].
-//! The daemon reads it on the bundle tap's connection under its own
-//! subscription, [`START_REQUEST_SUBSCRIPTION_ID`], bounded by `since` to the
-//! freshness window — see [`start_request_req`].
+//! A [`KIND_GIFT_WRAP`] `#p`-tagged to the agent and signed by the pair's
+//! **envelope key** ([`start_request_envelope_keys`]; see
+//! [`KIND_WAKER_START_REQUEST`] for why not the owner's own), its content
+//! NIP-44 encrypted envelope key→agent, its plaintext a
+//! [`SignedStartRequest`]. The daemon reads it on the bundle tap's connection
+//! under its own subscription, [`START_REQUEST_SUBSCRIPTION_ID`], with
+//! `authors` pinned to that envelope key and `since` bounded to the freshness
+//! window — see [`start_request_req`].
 //!
 //! # Trust
 //!
-//! Only the inner signature counts; anyone may publish a gift wrap tagged to
-//! the agent. [`SignedStartRequest::verify`] checks, in order: the pinned
+//! Only the inner signature counts. The envelope key is what keeps the relay
+//! query to the owner's own traffic — only the owner and the agent can derive
+//! it, and the relay refuses an event whose signature does not match its
+//! `pubkey` — but it grants nothing. [`SignedStartRequest::verify`] checks, in order: the pinned
 //! owner, the BIP-340 signature, the body, the target agent, and freshness.
 //! An accepted request becomes an ordinary [`TriggerEvent`] authored by the
 //! owner and dated `requested_at`, and takes the mention path from there: the
@@ -34,7 +38,7 @@ use nostr::hashes::sha256::Hash as Sha256Hash;
 use nostr::hashes::Hash as _;
 use nostr::secp256k1::schnorr::Signature;
 use nostr::secp256k1::{Keypair, Message, XOnlyPublicKey};
-use nostr::{Event, Keys, SECP256K1};
+use nostr::{Event, Keys, PublicKey, SecretKey, SECP256K1};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -45,6 +49,10 @@ use crate::decide::{normalize_pubkey, TriggerEvent};
 /// [`crate::bundle::BUNDLE_DOMAIN`] and the enrolment domains, so no other
 /// owner signature can be replayed as a start request.
 pub const START_REQUEST_DOMAIN: &[u8] = b"buzz-waker:start-request:v1\0";
+
+/// Domain separator for the envelope key derived from the owner↔agent shared
+/// secret ([`start_request_envelope_keys`]).
+pub const START_REQUEST_ENVELOPE_DOMAIN: &[u8] = b"buzz-waker:start-request-envelope:v1\0";
 
 /// Subscription id for the start-request half of the bundle tap's connection.
 pub const START_REQUEST_SUBSCRIPTION_ID: &str = "buzz-waker-start";
@@ -60,9 +68,11 @@ pub const START_REQUEST_MAX_AGE_SECS: u64 = crate::WAKE_DELIVERABLE_AGE_SECS;
 /// owner's machine and this daemon, not a scheduling feature.
 pub const START_REQUEST_MAX_SKEW_SECS: u64 = 60;
 
-/// Bound on how many envelopes one (re)subscribe can replay. Start requests
-/// are one per Start press and the window is minutes, so this is generous;
-/// it exists so junk tagged to the agent cannot make a reconnect unbounded.
+/// Bound on how many envelopes one (re)subscribe can replay. The query is
+/// pinned to the pair's envelope key, so everything it can return is the
+/// owner's own — one per Start press, over a window of minutes. The limit
+/// only bounds the owner; nobody else can place an envelope in this result
+/// set and push a real request out of it.
 const START_REQUEST_QUERY_LIMIT: u32 = 64;
 
 /// What can go wrong turning a delivered envelope into a trusted request.
@@ -86,6 +96,14 @@ pub enum StartRequestError {
     /// BIP-340 verification failed over the received body bytes.
     #[error("start request signature verification failed")]
     BadSignature,
+    /// The envelope was not signed by this owner↔agent pair's envelope key.
+    /// The relay query pins that key, so this is a relay that ignored the
+    /// filter; refused rather than trusted to the inner signature alone.
+    #[error("start request envelope signed by {found}, not the pair's envelope key")]
+    WrongEnvelopeSigner {
+        /// The key that signed the envelope.
+        found: String,
+    },
     /// The envelope or the signed body is not the expected shape.
     #[error("malformed start request: {0}")]
     Malformed(String),
@@ -222,19 +240,55 @@ impl SignedStartRequest {
     }
 }
 
+/// The keys that sign start-request envelopes for one owner↔agent pair.
+///
+/// `SHA-256(START_REQUEST_ENVELOPE_DOMAIN || x(ECDH))`, where the ECDH is the
+/// same x-only shared point NIP-44 uses. It is symmetric, so the owner derives
+/// it from `(owner secret, agent pubkey)` and this daemon from `(agent secret,
+/// owner pubkey)`, and nobody without one of those two secrets can sign as it.
+/// That is what lets [`start_request_req`] pin `authors`: the relay verifies
+/// every event's signature at ingest, so a stranger's gift wraps tagged to the
+/// agent cannot enter the result set and crowd a real request out of its
+/// `limit`. It is a separate key rather than the owner's own so that start
+/// requests stay out of the bundle tap's owner-pinned window (see
+/// [`KIND_WAKER_START_REQUEST`]).
+///
+/// # Errors
+/// [`StartRequestError::Malformed`] if `peer` is not a valid key, or (with
+/// negligible probability) the digest is not a valid secret key.
+pub fn start_request_envelope_keys(
+    own_secret: &SecretKey,
+    peer: &PublicKey,
+) -> Result<Keys, StartRequestError> {
+    let shared = nostr::util::generate_shared_key(own_secret, peer)
+        .map_err(|e| StartRequestError::Malformed(format!("envelope key agreement: {e}")))?;
+    let mut preimage = Vec::with_capacity(START_REQUEST_ENVELOPE_DOMAIN.len() + shared.len());
+    preimage.extend_from_slice(START_REQUEST_ENVELOPE_DOMAIN);
+    preimage.extend_from_slice(&shared);
+    let secret = SecretKey::from_slice(&Sha256Hash::hash(&preimage).to_byte_array())
+        .map_err(|e| StartRequestError::Malformed(format!("envelope key derivation: {e}")))?;
+    Ok(Keys::new(secret))
+}
+
 /// The REQ for one agent's start requests, sent on the bundle tap's
 /// connection at every (re)connect.
 ///
-/// No `authors`: the envelope's signer is a throwaway key by design. `since`
-/// keeps a reconnect from replaying anything [`SignedStartRequest::verify`]
-/// would refuse as stale anyway; the cursor refuses the in-window rest as
+/// `authors` is the pair's envelope key ([`start_request_envelope_keys`]), so
+/// only the owner's envelopes count against `limit`. `since` keeps a
+/// reconnect from replaying anything [`SignedStartRequest::verify`] would
+/// refuse as stale anyway; the cursor refuses the in-window rest as
 /// duplicates.
-pub(crate) fn start_request_req(agent_pubkey: &str, now: u64) -> serde_json::Value {
+pub(crate) fn start_request_req(
+    agent_pubkey: &str,
+    envelope_author: &PublicKey,
+    now: u64,
+) -> serde_json::Value {
     json!([
         "REQ",
         START_REQUEST_SUBSCRIPTION_ID,
         {
             "kinds": [KIND_GIFT_WRAP],
+            "authors": [envelope_author.to_hex()],
             "#p": [agent_pubkey],
             "since": now.saturating_sub(START_REQUEST_MAX_AGE_SECS),
             "limit": START_REQUEST_QUERY_LIMIT,
@@ -270,9 +324,9 @@ pub(crate) fn start_request_frame(message: &RelayMessage) -> StartRequestFrame<'
 
 /// Turn one delivered envelope into a wake trigger, or say why not.
 ///
-/// `Ok(None)` is an envelope that is not a start request at all — the owner's
-/// own launch bundles match this subscription's filter too (they are gift
-/// wraps tagged to the agent), and are admitted on the bundle subscription.
+/// `envelope_author` is [`start_request_envelope_keys`]' public key for this
+/// agent and its owner. `Ok(None)` is an event that is not a gift wrap at
+/// all.
 ///
 /// # Errors
 /// A [`StartRequestError`] for anything that looked like a request and was
@@ -281,13 +335,17 @@ pub(crate) fn start_request_frame(message: &RelayMessage) -> StartRequestFrame<'
 pub(crate) fn admit_start_request(
     keys: &Keys,
     owner_pubkey: &str,
+    envelope_author: &PublicKey,
     event: &Event,
     now: u64,
 ) -> Result<Option<TriggerEvent>, StartRequestError> {
-    if buzz_core::kind::event_kind_u32(event) != KIND_GIFT_WRAP
-        || normalize_pubkey(&event.pubkey.to_hex()) == normalize_pubkey(owner_pubkey)
-    {
+    if buzz_core::kind::event_kind_u32(event) != KIND_GIFT_WRAP {
         return Ok(None);
+    }
+    if event.pubkey != *envelope_author {
+        return Err(StartRequestError::WrongEnvelopeSigner {
+            found: event.pubkey.to_hex(),
+        });
     }
     buzz_core::verify_event(event).map_err(|e| StartRequestError::Malformed(e.to_string()))?;
     if !NIP44_CONTENT_LEN_RANGE.contains(&event.content.len()) {
@@ -327,8 +385,26 @@ mod tests {
         SignedStartRequest::sign(&body, &owner.secret_key().keypair(SECP256K1)).unwrap()
     }
 
-    /// A start-request envelope the way the desktop publishes it: a gift wrap
-    /// signed by `signer`, NIP-44 from `signer` to the agent.
+    /// The pair's envelope key, derived from the owner's side as the desktop
+    /// does.
+    fn envelope_keys(owner: &Keys, agent: &Keys) -> Keys {
+        start_request_envelope_keys(owner.secret_key(), &agent.public_key()).unwrap()
+    }
+
+    /// Admit from the daemon's side, with the envelope key it derives.
+    fn admit(
+        agent: &Keys,
+        owner: &Keys,
+        event: &Event,
+    ) -> Result<Option<TriggerEvent>, StartRequestError> {
+        let author = start_request_envelope_keys(agent.secret_key(), &owner.public_key())
+            .unwrap()
+            .public_key();
+        admit_start_request(agent, &owner.public_key().to_hex(), &author, event, NOW)
+    }
+
+    /// A start-request envelope: a gift wrap signed by `signer`, NIP-44 from
+    /// `signer` to the agent. The desktop's `signer` is [`envelope_keys`].
     fn envelope(signer: &Keys, agent: &Keys, signed: &SignedStartRequest) -> Event {
         let plaintext = serde_json::to_string(signed).unwrap();
         let content = nip44::encrypt(
@@ -347,10 +423,14 @@ mod tests {
 
     #[test]
     fn a_fresh_owner_request_becomes_a_trigger_dated_when_the_owner_asked() {
-        let (owner, agent, throwaway) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let event = envelope(&throwaway, &agent, &signed_for(&owner, &agent, NOW - 30));
+        let (owner, agent) = (Keys::generate(), Keys::generate());
+        let event = envelope(
+            &envelope_keys(&owner, &agent),
+            &agent,
+            &signed_for(&owner, &agent, NOW - 30),
+        );
 
-        let trigger = admit_start_request(&agent, &owner.public_key().to_hex(), &event, NOW)
+        let trigger = admit(&agent, &owner, &event)
             .unwrap()
             .expect("a start request");
         assert_eq!(trigger.id, event.id.to_hex());
@@ -367,12 +447,12 @@ mod tests {
     fn a_request_signed_by_anyone_but_the_pinned_owner_is_refused() {
         let (owner, stranger, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
         let event = envelope(
-            &Keys::generate(),
+            &envelope_keys(&owner, &agent),
             &agent,
             &signed_for(&stranger, &agent, NOW),
         );
         assert!(matches!(
-            admit_start_request(&agent, &owner.public_key().to_hex(), &event, NOW),
+            admit(&agent, &owner, &event),
             Err(StartRequestError::WrongOwner { .. })
         ));
     }
@@ -398,9 +478,13 @@ mod tests {
     fn a_request_for_another_agent_is_refused() {
         let (owner, agent, other) = (Keys::generate(), Keys::generate(), Keys::generate());
         // Encrypted to `agent`, but the owner signed it for `other`.
-        let event = envelope(&Keys::generate(), &agent, &signed_for(&owner, &other, NOW));
+        let event = envelope(
+            &envelope_keys(&owner, &agent),
+            &agent,
+            &signed_for(&owner, &other, NOW),
+        );
         assert!(matches!(
-            admit_start_request(&agent, &owner.public_key().to_hex(), &event, NOW),
+            admit(&agent, &owner, &event),
             Err(StartRequestError::WrongAgent { .. })
         ));
     }
@@ -428,27 +512,46 @@ mod tests {
     }
 
     #[test]
-    fn the_owners_own_bundle_envelopes_are_passed_over_not_refused() {
-        // Bundles are owner-signed gift wraps tagged to the agent, so they
-        // match this subscription too. They must be skipped quietly — the
-        // bundle subscription is the one that admits them.
+    fn owner_and_daemon_derive_the_same_envelope_key_and_nobody_else_does() {
         let (owner, agent) = (Keys::generate(), Keys::generate());
-        let event = envelope(&owner, &agent, &signed_for(&owner, &agent, NOW));
-        assert_eq!(
-            admit_start_request(&agent, &owner.public_key().to_hex(), &event, NOW),
-            Ok(None)
-        );
+        let from_owner = envelope_keys(&owner, &agent);
+        let from_daemon =
+            start_request_envelope_keys(agent.secret_key(), &owner.public_key()).unwrap();
+        assert_eq!(from_owner.public_key(), from_daemon.public_key());
+        assert_ne!(from_owner.public_key(), owner.public_key());
+
+        // Another owner of the same agent (or another agent of this owner)
+        // gets a different key, so the pin is per pair.
+        let other_owner = envelope_keys(&Keys::generate(), &agent);
+        assert_ne!(other_owner.public_key(), from_owner.public_key());
     }
 
     #[test]
-    fn the_req_is_time_bounded_and_carries_no_authors_pin() {
-        let agent = Keys::generate().public_key().to_hex();
-        let req = start_request_req(&agent, NOW);
+    fn an_envelope_not_signed_by_the_pairs_key_is_refused_even_if_the_body_is_genuine() {
+        // The owner's own key (a launch bundle's signer) and a stranger's
+        // both fail: the query pins the envelope key, and admission holds the
+        // same line rather than trusting a relay to have applied the filter.
+        let (owner, agent) = (Keys::generate(), Keys::generate());
+        let signed = signed_for(&owner, &agent, NOW);
+        for signer in [owner.clone(), Keys::generate()] {
+            assert!(matches!(
+                admit(&agent, &owner, &envelope(&signer, &agent, &signed)),
+                Err(StartRequestError::WrongEnvelopeSigner { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_req_is_time_bounded_and_pinned_to_the_pairs_envelope_key() {
+        let (owner, agent) = (Keys::generate(), Keys::generate());
+        let author = envelope_keys(&owner, &agent).public_key();
+        let agent_hex = agent.public_key().to_hex();
+        let req = start_request_req(&agent_hex, &author, NOW);
         let filter = &req[2];
         assert_eq!(req[1], START_REQUEST_SUBSCRIPTION_ID);
         assert_eq!(filter["kinds"], json!([KIND_GIFT_WRAP]));
-        assert_eq!(filter["#p"], json!([agent]));
+        assert_eq!(filter["authors"], json!([author.to_hex()]));
+        assert_eq!(filter["#p"], json!([agent_hex]));
         assert_eq!(filter["since"], json!(NOW - START_REQUEST_MAX_AGE_SECS));
-        assert!(filter.get("authors").is_none());
     }
 }

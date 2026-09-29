@@ -202,6 +202,19 @@ async fn next_park_due(
     }
 }
 
+/// The next start request to claim: one a failed claim left behind, before
+/// anything new from the bundle tap. Cancel-safe for `tokio::select!` — a
+/// held request is taken only by the poll that returns it.
+async fn next_start_request(
+    unclaimed: &mut Option<TriggerEvent>,
+    start_requests: &mut mpsc::Receiver<TriggerEvent>,
+) -> Option<TriggerEvent> {
+    match unclaimed.take() {
+        Some(request) => Some(request),
+        None => start_requests.recv().await,
+    }
+}
+
 /// Claim an owner start request in the durable cursor, as a mention is
 /// claimed by [`step`].
 ///
@@ -263,6 +276,10 @@ pub async fn run_wake_loop(
     // claim survives regardless — that is on disk — but re-driving it depends
     // on this buffer.
     let mut stranded: Vec<StrandedTrigger> = Vec::new();
+    // A start request the cursor could not claim, retried first after the
+    // reconnect that failure forces. Outside the loop for the same reason as
+    // `stranded`: nothing else would re-deliver it (see the claim's `Err` arm).
+    let mut unclaimed_start: Option<TriggerEvent> = None;
     let mut consecutive_failures = 0u32;
 
     'reconnect: while !cancel.is_cancelled() {
@@ -511,7 +528,7 @@ pub async fn run_wake_loop(
                 // `CursorStore::admit` records live coverage through `now`,
                 // which is true only while the feed is up. A request that
                 // arrives during a reconnect waits in the channel.
-                Some(request) = start_requests.recv() => {
+                Some(request) = next_start_request(&mut unclaimed_start, &mut start_requests) => {
                     match claim_start_request(&mut cursor, &request, now_secs()) {
                         Ok(None) => {}
                         Ok(Some(undeliverable)) => {
@@ -535,16 +552,21 @@ pub async fn run_wake_loop(
                             );
                         }
                         Err(error) => {
-                            // Not claimed, so not acted on. The envelope is
-                            // still on the relay: the bundle tap re-delivers
-                            // it on its next reconnect while it is fresh.
+                            // Not claimed, so not acted on — and not dropped
+                            // either: the bundle tap has already handed it over
+                            // and will not send it again unless its own
+                            // connection happens to cycle. Hold it, and treat
+                            // this like the mention path's cursor failure.
                             tracing::error!(
                                 agent = %agent_pubkey,
                                 event_id = %request.id,
                                 %error,
-                                "buzz-waker: cursor could not be made durable; dropping an \
-                                 owner start request"
+                                "buzz-waker: cursor could not be made durable; holding an \
+                                 owner start request and reconnecting"
                             );
+                            unclaimed_start = Some(request);
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            continue 'reconnect;
                         }
                     }
                 }
@@ -1192,6 +1214,29 @@ mod tests {
         assert_eq!(
             claim_start_request(&mut reopened, &request, NOW + 90).unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_request_whose_claim_failed_is_offered_again_before_new_ones() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(trigger("start-new")).await.unwrap();
+        let mut unclaimed = Some(trigger("start-held"));
+
+        assert_eq!(
+            next_start_request(&mut unclaimed, &mut rx)
+                .await
+                .unwrap()
+                .id,
+            "start-held"
+        );
+        assert!(unclaimed.is_none());
+        assert_eq!(
+            next_start_request(&mut unclaimed, &mut rx)
+                .await
+                .unwrap()
+                .id,
+            "start-new"
         );
     }
 

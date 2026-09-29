@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 
 import {
   connectAcpRuntime,
@@ -599,7 +600,15 @@ export function useStartManagedAgentMutation() {
             expectedSignerPubkey: input.expectedSignerPubkey,
             replayFloorUnix: input.replayFloorUnix,
           }),
-    onSuccess: ({ agent: updated }) => {
+    onSuccess: ({ agent: updated, requestedViaWaker }) => {
+      if (requestedViaWaker) {
+        // Nothing is running yet: the community's waker deploys it, which
+        // takes a few minutes. Say so, or a Start that "succeeded" onto an
+        // offline agent reads as a silent failure.
+        toast.info(`Asked your community to start ${updated.name}`, {
+          description: "It usually comes online within a few minutes.",
+        });
+      }
       queryClient.setQueryData<ManagedAgent[]>(
         managedAgentsQueryKey,
         (current) => {

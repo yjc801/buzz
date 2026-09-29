@@ -18,6 +18,10 @@ export type StartManagedAgentOutcome = {
    * no provider evidence (local starts, providers predating the field).
    * Consumers must treat `null` as "unproven", never as either answer. */
   freshGeneration: boolean | null;
+  /** The start was handed to the community's waker (Remote wake is on)
+   * instead of performed here: the agent comes online when the waker's
+   * deploy does, so presence — not this result — says when it is up. */
+  requestedViaWaker: boolean;
 };
 
 export async function startManagedAgent(
@@ -45,6 +49,7 @@ export async function startManagedAgent(
   const response = await invokeTauri<{
     agent: RawManagedAgent;
     fresh_generation: boolean | null;
+    requested_via_waker?: boolean;
   }>("start_managed_agent", {
     pubkey,
     wakeReplayFloor: options?.wakeReplayFloorTs ?? null,
@@ -55,6 +60,7 @@ export async function startManagedAgent(
   return {
     agent: fromRawManagedAgent(response.agent),
     freshGeneration: response.fresh_generation ?? null,
+    requestedViaWaker: response.requested_via_waker ?? false,
   };
 }
 

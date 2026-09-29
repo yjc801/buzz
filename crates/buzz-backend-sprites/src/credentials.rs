@@ -37,8 +37,10 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-const FAIL_REMEDY: &str = "Run `sprite login` (stores the token in the macOS keychain), or set \
-     SPRITE_TOKEN in the environment Buzz Desktop is launched from.";
+const FAIL_REMEDY: &str = "If your community runs a waker, turn on Remote wake for this agent: \
+     the waker deploys it with the operator's token and this machine needs none. Otherwise run \
+     `sprite login` (stores the token in the macOS keychain), or set SPRITE_TOKEN in the \
+     environment Buzz Desktop is launched from.";
 
 /// Resolve a credential from the real process environment, home directory,
 /// and keychain.
@@ -318,6 +320,7 @@ mod tests {
             "SPRITES_TOKEN",
             "~/.sprites",
             "sprite login",
+            "Remote wake",
         ] {
             assert!(err.contains(needle), "missing {needle}: {err}");
         }

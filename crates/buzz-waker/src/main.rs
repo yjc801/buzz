@@ -602,8 +602,8 @@ fn spawn_agent_watch(
 
     let presence_state = Arc::new(PresenceState::new());
     let bundle_state = Arc::new(BundleState::new());
-    // Bundle tap → wake loop. Bounded: when it is full the tap waits for room
-    // rather than dropping a request (see `forward_start_request`).
+    // Bundle tap → wake loop. Bounded: when it is full the tap holds requests
+    // in its own backlog and keeps reading bundles (see `run_bundle_tap`).
     let (start_request_tx, start_request_rx) = tokio::sync::mpsc::channel(16);
 
     tracing::info!(agent = %pubkey, owner = %owner_pubkey, "buzz-waker: watching agent");

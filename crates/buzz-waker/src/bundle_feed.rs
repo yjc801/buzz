@@ -361,11 +361,13 @@ fn decrypt_verify_and_admit(
 /// subscription ([`crate::start_request`]): the same authentication, the same
 /// envelope kind, so no extra socket per agent. An admitted request goes to
 /// the wake loop over `start_requests`; the loop is what claims and acts on it.
-/// Handing one over waits for room in that channel rather than dropping it,
-/// which pauses this tap while the wake loop is not taking requests (its
-/// mention feed is reconnecting). Nothing here is lost by the pause: a
-/// bundle or request that arrives meanwhile is read once the loop catches up,
-/// or replayed on resubscribe if the relay drops the idle socket.
+/// A request waits in [`PendingStartRequests`] until that channel has room,
+/// and the wait is one arm of the same `select!` that reads the socket, so a
+/// wake loop that is not taking requests (its mention feed is reconnecting)
+/// never stops this tap reading bundles. That ordering is load-bearing: a
+/// revocation read behind a stalled handoff would reach [`BundleState`] only
+/// after the wake loop had taken the request and snapshotted the revoked
+/// bundle.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_bundle_tap(
     relay_url: &str,
@@ -397,6 +399,9 @@ pub async fn run_bundle_tap(
         }
     };
     let mut consecutive_failures = 0u32;
+    // Outlives a reconnect: a request read before the socket dropped is still
+    // the owner's.
+    let mut pending = PendingStartRequests::default();
 
     while !cancel.is_cancelled() {
         if consecutive_failures > 0 {
@@ -441,29 +446,30 @@ pub async fn run_bundle_tap(
         consecutive_failures = 0;
 
         loop {
+            // `next_event` is cancel-safe (it only awaits the stream's `next`),
+            // so losing this race to a handoff permit drops no frame.
             let next = tokio::select! {
                 result = connection.next_event(Duration::from_secs(BUNDLE_TAP_IDLE_TIMEOUT_SECS)) => result,
+                permit = start_requests.reserve(), if !pending.is_empty() => {
+                    pending.hand_over(permit, &agent_pubkey);
+                    continue;
+                }
                 () = cancel.cancelled() => return,
             };
 
             let message = match next {
                 Ok(message) => match start_request_frame(&message) {
                     StartRequestFrame::Event(event) => {
-                        let Some(author) = &envelope_author else {
-                            continue;
-                        };
-                        let handed_over = forward_start_request(
-                            keys,
-                            &owner_pubkey,
-                            author,
-                            event,
-                            start_requests,
-                            &agent_pubkey,
-                            cancel,
-                        )
-                        .await;
-                        if !handed_over {
-                            return;
+                        if let Some(author) = &envelope_author {
+                            if let Some(trigger) = verify_start_request(
+                                keys,
+                                &owner_pubkey,
+                                author,
+                                event,
+                                &agent_pubkey,
+                            ) {
+                                pending.push(trigger, &agent_pubkey);
+                            }
                         }
                         continue;
                     }
@@ -559,32 +565,88 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Verify one start-request envelope and hand it to the wake loop.
+/// How many verified start requests the tap holds while the wake loop is not
+/// taking them — the recovery query's own window, so one full replay fits.
+const START_REQUEST_BACKLOG: usize = 64;
+
+/// Verified start requests read off the socket and not yet taken by the wake
+/// loop.
 ///
-/// Every refusal is logged and dropped — see [`run_bundle_tap`] on junk. A
-/// verified request is never dropped: when the channel is full this waits
-/// for room. A full channel is exactly when dropping would be wrong — it
-/// fills while the wake loop's mention feed is reconnecting, often with
-/// replays the cursor will refuse as duplicates, and nothing would
-/// re-deliver a dropped request before it went stale (a quiet tap keeps its
-/// connection and never resubscribes).
-///
-/// Returns `false` only when `cancel` fired while waiting — the tap should
-/// stop. A wake loop that is gone is not this tap's exit to report: its own
-/// task exit already is, so the request is logged and the tap carries on.
-async fn forward_start_request(
+/// Bounded, deduplicated by event id, and full means dropping the OLDEST.
+/// Every request asks for the same thing — start this agent — so a newer one
+/// does whatever an older one would; and only the owner/agent pair can author
+/// one ([`start_request_envelope_keys`] pins the envelope signer, the inner
+/// signature pins the owner), so filling this takes the owner's own presses.
+/// Dropping the newest instead is the round-1 failure: a backlog of replays
+/// the cursor already holds crowding out the press that matters.
+#[derive(Debug, Default)]
+struct PendingStartRequests {
+    queue: std::collections::VecDeque<TriggerEvent>,
+}
+
+impl PendingStartRequests {
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn push(&mut self, trigger: TriggerEvent, agent_pubkey: &str) {
+        if self.queue.iter().any(|queued| queued.id == trigger.id) {
+            return;
+        }
+        if self.queue.len() >= START_REQUEST_BACKLOG {
+            if let Some(dropped) = self.queue.pop_front() {
+                tracing::warn!(
+                    agent = %agent_pubkey,
+                    event_id = %dropped.id,
+                    "start request backlog full; dropping the oldest request for a newer one"
+                );
+            }
+        }
+        self.queue.push_back(trigger);
+    }
+
+    /// Hand the oldest request to the wake loop through `permit`. A wake loop
+    /// that has stopped is not this tap's exit to report — its own task exit
+    /// already is — so the backlog is discarded and the tap carries on.
+    fn hand_over(
+        &mut self,
+        permit: Result<mpsc::Permit<'_, TriggerEvent>, mpsc::error::SendError<()>>,
+        agent_pubkey: &str,
+    ) {
+        match permit {
+            Ok(permit) => {
+                if let Some(trigger) = self.queue.pop_front() {
+                    tracing::info!(
+                        agent = %agent_pubkey,
+                        event_id = %trigger.id,
+                        "bundle tap handed an owner start request to the wake loop"
+                    );
+                    permit.send(trigger);
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    agent = %agent_pubkey,
+                    dropped = self.queue.len(),
+                    "the wake loop has stopped; bundle tap cannot hand over start requests"
+                );
+                self.queue.clear();
+            }
+        }
+    }
+}
+
+/// Verify one start-request envelope. Every refusal is logged and dropped —
+/// see [`run_bundle_tap`] on junk.
+fn verify_start_request(
     keys: &Keys,
     owner_pubkey: &str,
     envelope_author: &nostr::PublicKey,
     event: &nostr::Event,
-    start_requests: &mpsc::Sender<TriggerEvent>,
     agent_pubkey: &str,
-    cancel: &CancellationToken,
-) -> bool {
-    let trigger = match admit_start_request(keys, owner_pubkey, envelope_author, event, now_secs())
-    {
-        Ok(Some(trigger)) => trigger,
-        Ok(None) => return true,
+) -> Option<TriggerEvent> {
+    match admit_start_request(keys, owner_pubkey, envelope_author, event, now_secs()) {
+        Ok(trigger) => trigger,
         Err(error) => {
             tracing::warn!(
                 agent = %agent_pubkey,
@@ -592,36 +654,15 @@ async fn forward_start_request(
                 %error,
                 "bundle tap refused a start request"
             );
-            return true;
+            None
         }
-    };
-    let event_id = trigger.id.clone();
-    tokio::select! {
-        sent = start_requests.send(trigger) => match sent {
-            Ok(()) => {
-                tracing::info!(
-                    agent = %agent_pubkey,
-                    %event_id,
-                    "bundle tap admitted an owner start request"
-                );
-                true
-            }
-            Err(_) => {
-                tracing::warn!(
-                    agent = %agent_pubkey,
-                    %event_id,
-                    "the wake loop has stopped; bundle tap cannot hand over a start request"
-                );
-                true
-            }
-        },
-        () = cancel.cancelled() => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::start_request::START_REQUEST_SUBSCRIPTION_ID;
     use nostr::{EventBuilder, Kind};
 
     /// A start-request envelope signed by the pair's envelope key, carrying a
@@ -661,92 +702,188 @@ mod tests {
             .public_key()
     }
 
-    #[tokio::test]
-    async fn a_verified_start_request_reaches_the_wake_loop_and_junk_does_not() {
+    #[test]
+    fn only_a_start_request_the_owner_signed_is_admitted() {
         let (owner, agent) = (Keys::generate(), Keys::generate());
         let owner_hex = owner.public_key().to_hex();
         let author = envelope_author(&owner, &agent);
-        let cancel = CancellationToken::new();
-        let (tx, mut rx) = mpsc::channel(4);
 
-        // Signed by someone other than the pinned owner: dropped.
         let forged = start_envelope(&owner, &agent, &Keys::generate(), now_secs());
-        assert!(
-            forward_start_request(&agent, &owner_hex, &author, &forged, &tx, "agent", &cancel)
-                .await
-        );
-        assert!(rx.try_recv().is_err());
+        assert!(verify_start_request(&agent, &owner_hex, &author, &forged, "agent").is_none());
 
         let genuine = start_envelope(&owner, &agent, &owner, now_secs());
-        assert!(
-            forward_start_request(&agent, &owner_hex, &author, &genuine, &tx, "agent", &cancel)
-                .await
-        );
-        let trigger = rx.try_recv().expect("the wake loop receives the request");
+        let trigger = verify_start_request(&agent, &owner_hex, &author, &genuine, "agent")
+            .expect("the owner's request is admitted");
         assert_eq!(trigger.id, genuine.id.to_hex());
         assert_eq!(trigger.author, owner_hex);
     }
 
-    #[tokio::test]
-    async fn a_fresh_request_waits_out_a_queue_full_of_duplicates_instead_of_being_dropped() {
-        // Round 1 of #170: a reconnect replays requests the cursor already
-        // holds, they fill the channel while the wake loop's mention feed is
-        // down, and the owner's new press arrives behind them. It must reach
-        // the loop once the backlog drains, however long that takes.
-        let (owner, agent) = (Keys::generate(), Keys::generate());
-        let owner_hex = owner.public_key().to_hex();
-        let author = envelope_author(&owner, &agent);
-        let cancel = CancellationToken::new();
-        let (tx, mut rx) = mpsc::channel(2);
-
-        let replayed: Vec<_> = (0..2)
-            .map(|i| start_envelope(&owner, &agent, &owner, now_secs() - 60 - i))
-            .collect();
-        for event in &replayed {
-            assert!(
-                forward_start_request(&agent, &owner_hex, &author, event, &tx, "agent", &cancel)
-                    .await
-            );
+    fn trigger(id: &str) -> TriggerEvent {
+        TriggerEvent {
+            id: id.to_string(),
+            author: String::new(),
+            kind: 0,
+            p_tags: Vec::new(),
+            created_at: 0,
         }
-
-        let fresh = start_envelope(&owner, &agent, &owner, now_secs());
-        let mut handoff = std::pin::pin!(forward_start_request(
-            &agent, &owner_hex, &author, &fresh, &tx, "agent", &cancel
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), handoff.as_mut())
-                .await
-                .is_err(),
-            "a full channel must hold the handoff open, not complete it by dropping"
-        );
-
-        // The loop comes back and drains the duplicates; the fresh request
-        // follows them.
-        for event in &replayed {
-            assert_eq!(rx.recv().await.unwrap().id, event.id.to_hex());
-        }
-        assert!(handoff.await);
-        assert_eq!(rx.recv().await.unwrap().id, fresh.id.to_hex());
     }
 
+    #[test]
+    fn a_fresh_request_survives_a_backlog_full_of_replays() {
+        // Round 1 of #170: a reconnect replays requests the cursor already
+        // holds, and the owner's new press arrives behind them. The backlog
+        // drops the oldest, never the newest, and ignores a second copy.
+        let mut pending = PendingStartRequests::default();
+        for i in 0..START_REQUEST_BACKLOG {
+            pending.push(trigger(&format!("replay-{i}")), "agent");
+        }
+        pending.push(trigger("replay-5"), "agent");
+        pending.push(trigger("fresh"), "agent");
+
+        assert_eq!(pending.queue.len(), START_REQUEST_BACKLOG);
+        assert_eq!(pending.queue.front().unwrap().id, "replay-1");
+        assert_eq!(pending.queue.back().unwrap().id, "fresh");
+    }
+
+    fn sealed_bundle(owner: &Keys, agent: &Keys, version: u64, revoked: bool) -> String {
+        use crate::bundle::{LaunchBundleBody, ProviderEnvelope};
+        let body = LaunchBundleBody {
+            agent_pubkey: agent.public_key().to_hex(),
+            agent_json: serde_json::json!({"launch": {"policy_env": {}}}),
+            provider: ProviderEnvelope {
+                provider_id: "sprites".to_string(),
+                provider_config: serde_json::json!({}),
+                provider_binary_sha256_by_target: crate::bundle::test_digests(&"b".repeat(64)),
+            },
+            bundle_version: version,
+            issued_at: 0,
+            expires_at: u64::MAX,
+            owner_only_access: true,
+            revoked,
+        };
+        let keypair =
+            nostr::secp256k1::Keypair::from_secret_key(nostr::SECP256K1, owner.secret_key());
+        let signed = SignedLaunchBundle::sign(&body, &keypair).unwrap();
+        nostr::nips::nip44::encrypt(
+            owner.secret_key(),
+            &agent.public_key(),
+            serde_json::to_string(&signed).unwrap(),
+            nostr::nips::nip44::Version::V2,
+        )
+        .unwrap()
+    }
+
+    /// A relay double that completes NIP-42, waits for the tap's two REQs,
+    /// then delivers `frames` in order and holds the socket open.
+    async fn scripted_relay(frames: Vec<Value>) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = json!(["AUTH", "challenge"]).to_string();
+            ws.send(WsMessage::Text(challenge.into())).await.unwrap();
+            let mut reqs = 0;
+            while reqs < 2 {
+                let Some(Ok(WsMessage::Text(text))) = ws.next().await else {
+                    return;
+                };
+                let frame: Vec<Value> = serde_json::from_str(&text).unwrap();
+                match frame[0].as_str() {
+                    Some("AUTH") => {
+                        let ok = json!(["OK", frame[1]["id"], true, ""]).to_string();
+                        ws.send(WsMessage::Text(ok.into())).await.unwrap();
+                    }
+                    Some("REQ") => reqs += 1,
+                    _ => {}
+                }
+            }
+            for frame in frames {
+                ws.send(WsMessage::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            while ws.next().await.is_some() {}
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Round 2 of #170, P1. The wake loop is not taking requests, the owner
+    /// presses Start, then revokes the bundle. The tap must still read the
+    /// revocation, so that by the time the loop takes the request there is no
+    /// bundle left for the attempt to deploy.
     #[tokio::test]
-    async fn a_blocked_handoff_still_stops_on_cancel() {
+    async fn a_revocation_behind_a_stalled_request_handoff_still_clears_the_bundle() {
         let (owner, agent) = (Keys::generate(), Keys::generate());
         let owner_hex = owner.public_key().to_hex();
-        let author = envelope_author(&owner, &agent);
-        let cancel = CancellationToken::new();
-        let (tx, _rx) = mpsc::channel(1);
-        let first = start_envelope(&owner, &agent, &owner, now_secs());
-        assert!(
-            forward_start_request(&agent, &owner_hex, &author, &first, &tx, "agent", &cancel).await
+        let agent_hex = agent.public_key().to_hex();
+        let dir = tempfile::tempdir().unwrap();
+        let mut floor_store =
+            FloorStore::enroll(dir.path().join("floor.json"), &owner_hex).unwrap();
+        let state = Arc::new(BundleState::new());
+        let admitted = decrypt_verify_and_admit(
+            &agent,
+            &owner_hex,
+            &sealed_bundle(&owner, &agent, 1, false),
+            &mut floor_store,
         );
+        let Ok(BundleOutcome::Delivered(body)) = admitted else {
+            panic!("the first bundle is admitted: {admitted:?}");
+        };
+        state.set(body);
+
+        let press = start_envelope(&owner, &agent, &owner, now_secs());
+        let revocation = bundle_event(&owner, &sealed_bundle(&owner, &agent, 2, true), &agent_hex);
+        let relay = scripted_relay(vec![
+            json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press]),
+            json!(["EVENT", BUNDLE_TAP_SUBSCRIPTION_ID, revocation]),
+        ])
+        .await;
+
+        // One slot, already taken: the wake loop is not draining.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(trigger("backlog")).await.unwrap();
+        let cancel = CancellationToken::new();
+        let tap = tokio::spawn({
+            let (state, cancel) = (Arc::clone(&state), cancel.clone());
+            async move {
+                run_bundle_tap(
+                    &relay,
+                    &agent,
+                    None,
+                    &owner_hex,
+                    &mut floor_store,
+                    &state,
+                    &tx,
+                    &cancel,
+                )
+                .await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.current().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a stalled request handoff must not stop the tap reading the revocation");
+
+        // The loop comes back: the press is still delivered, and the bundle
+        // an attempt would snapshot for it is already gone.
+        assert_eq!(rx.recv().await.unwrap().id, "backlog");
+        let taken = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, press.id.to_hex());
+        assert!(state.current().is_none());
 
         cancel.cancel();
-        let second = start_envelope(&owner, &agent, &owner, now_secs());
-        assert!(
-            !forward_start_request(&agent, &owner_hex, &author, &second, &tx, "agent", &cancel)
-                .await
-        );
+        tap.await.unwrap();
     }
 
     fn bundle_event(owner: &Keys, ciphertext: &str, agent_pubkey: &str) -> nostr::Event {

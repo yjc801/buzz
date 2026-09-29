@@ -26,9 +26,12 @@ the remote-wake daemon runs, reprovisioning every sprite on each deploy
 operator does: an agent with Remote wake on is deployed by the waker — on a
 mention, or when its owner presses Start, which sends the waker a signed start
 request instead of deploying (`crates/buzz-waker/src/start_request.rs`) — with
-the waker's own `SPRITE_TOKEN`. Members hold no Sprites credential and need
-none. The rest of this section is only about deploying *from this machine*,
-which is what happens for an agent with Remote wake off.
+the waker's own `SPRITE_TOKEN`, read from the daemon's environment because the
+waker runs this provider with no per-member credential. Members hold no Sprites
+credential and need none. The rest of this section applies to whichever process
+runs the provider: the waker daemon, or Buzz Desktop for an agent with Remote
+wake off. The missing-credential error names both, because the provider cannot
+tell which one called it.
 
 This deliberately places the credential with the community operator rather
 than the member deploying, which `VISION_REMOTE_AGENTS.md` ("You bring the

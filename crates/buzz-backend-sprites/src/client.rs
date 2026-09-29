@@ -239,11 +239,12 @@ impl SpritesClient {
         let detail = match self.credential_source {
             "keychain" => {
                 "the token stored by the sprite CLI (macOS keychain) was rejected. That \
-                 entry is not always an API token the Sprites API accepts. If your \
-                 community runs a waker, turn on Remote wake for this agent instead: the \
-                 waker deploys it with the operator's token and this machine needs none. \
-                 Otherwise create an API token at https://sprites.dev/account and set \
-                 SPRITE_TOKEN in the environment Buzz Desktop is launched from"
+                 entry is not always an API token the Sprites API accepts. Create an API \
+                 token at https://sprites.dev/account and set SPRITE_TOKEN in the \
+                 environment of whatever runs this provider (the buzz-waker daemon, or \
+                 Buzz Desktop). A member of a community that runs a waker needs neither: \
+                 turn on Remote wake for this agent and the waker deploys it with the \
+                 operator's token"
             }
             "env:SPRITE_TOKEN" => {
                 "SPRITE_TOKEN was rejected — it may be expired, revoked, or for a \
@@ -719,6 +720,7 @@ mod tests {
         assert!(message.contains("SPRITE_TOKEN"), "{message}");
         assert!(message.contains("sprites.dev/account"), "{message}");
         assert!(message.contains("Remote wake"), "{message}");
+        assert!(message.contains("buzz-waker daemon"), "{message}");
 
         client.credential_source = "env:SPRITE_TOKEN";
         let SubstrateError(message) = client.auth_error(403).expect("403 should map");

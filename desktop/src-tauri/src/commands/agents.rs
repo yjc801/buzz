@@ -998,7 +998,6 @@ pub async fn start_managed_agent(
             requested_via_waker: false,
         }),
         StartTarget::Waker { name, requested_at } => {
-            let owner_keys = state.signing_keys()?;
             super::agents_waker_start::request_waker_start(
                 &app,
                 &state,
@@ -1006,7 +1005,7 @@ pub async fn start_managed_agent(
                 &pubkey,
                 requested_at,
                 reconcile_relay.as_str(),
-                &owner_keys,
+                &owner_hex,
             )
             .await?;
             summarize_started(&app, &state, &pubkey).map(|agent| StartManagedAgentOutcome {

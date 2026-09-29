@@ -17,6 +17,7 @@ use nostr::{EventBuilder, Keys, Kind, Tag};
 use tauri::AppHandle;
 
 use crate::app_state::AppState;
+use crate::managed_agents::retention::RetentionScope;
 use crate::managed_agents::{BackendKind, ManagedAgentRecord};
 
 /// Same bound the retained-event flush uses for a one-shot WebSocket publish.
@@ -103,46 +104,100 @@ pub(crate) fn build_start_request_envelope(
         .map_err(|e| format!("failed to sign start request envelope: {e}"))
 }
 
-/// Publish a start request for `agent_pubkey` to `relay_url`, authenticated as
-/// the owner.
+/// Pin the retention scope a waker start runs in: the active `(relay, owner)`
+/// and its database, resolved ONCE and refused unless it is the scope the
+/// caller already validated.
 ///
-/// The agent's launch bundle is flushed first: it is retained locally and
-/// published on a sweep, so a bundle issued moments ago (Remote wake just
-/// turned on, or a setting just changed) may not be on the relay yet — and a
-/// waker without it has nothing to deploy. A bundle still pending after the
-/// flush fails the start rather than sending a request the waker cannot act
-/// on.
+/// Every step after this crosses an `.await`, and resolving the active scope
+/// again at each step would let a community or identity switch in between
+/// split them — flushing and checking community B's launch bundle while the
+/// request goes to community A, whose bundle may never have left this machine.
+/// [`request_waker_start_in`] keeps the returned scope for the flush, the
+/// check and the publish alike.
+fn pin_start_scope(
+    app: &AppHandle,
+    state: &AppState,
+    expected_relay_url: &str,
+    expected_owner_hex: &str,
+) -> Result<RetentionScope, String> {
+    ensure_start_scope(
+        crate::managed_agents::retention::active_retention_scope(app, state)?,
+        expected_relay_url,
+        expected_owner_hex,
+    )
+}
+
+/// [`pin_start_scope`]'s check, apart from the `AppHandle` it resolves with.
+fn ensure_start_scope(
+    scope: RetentionScope,
+    expected_relay_url: &str,
+    expected_owner_hex: &str,
+) -> Result<RetentionScope, String> {
+    let owner_matches = scope.owner_keys.public_key().to_hex() == expected_owner_hex;
+    crate::managed_agents::retention::scope_for_arrival(scope, expected_relay_url)
+        .filter(|_| owner_matches)
+        .ok_or_else(|| {
+            "the active community or identity changed while this agent was starting; \
+             try again"
+                .to_string()
+        })
+}
+
+/// Ask the community waker to start `agent_pubkey`, in the scope the caller
+/// validated: `expected_relay_url` and `expected_owner_hex`. Fails closed if
+/// that is no longer the active scope; see [`pin_start_scope`].
 pub(crate) async fn request_waker_start(
     app: &AppHandle,
     state: &AppState,
     agent_name: &str,
     agent_pubkey: &str,
     requested_at: u64,
-    relay_url: &str,
-    owner_keys: &Keys,
+    expected_relay_url: &str,
+    expected_owner_hex: &str,
 ) -> Result<(), String> {
-    if let Err(error) =
-        crate::managed_agents::persona_events::flush_active_pending_events(app, state).await
+    let scope = pin_start_scope(app, state, expected_relay_url, expected_owner_hex)?;
+    request_waker_start_in(state, &scope, agent_name, agent_pubkey, requested_at).await
+}
+
+/// Publish a start request for `agent_pubkey`, entirely within `scope`: its
+/// relay, authenticated as its owner.
+///
+/// The agent's launch bundle is flushed first: it is retained locally and
+/// published on a sweep, so a bundle issued moments ago (Remote wake just
+/// turned on, or a setting just changed) may not be on the relay yet — and a
+/// waker without it has nothing to deploy. A bundle still pending after the
+/// flush fails the start rather than sending a request the waker cannot act
+/// on. The flush, that check and the publish all use `scope` — never the
+/// active one, which may have moved on by now (see [`pin_start_scope`]).
+async fn request_waker_start_in(
+    state: &AppState,
+    scope: &RetentionScope,
+    agent_name: &str,
+    agent_pubkey: &str,
+    requested_at: u64,
+) -> Result<(), String> {
+    if let Err(error) = crate::managed_agents::persona_events::flush_pending_events_at(
+        &scope.db_path,
+        state,
+        &scope.relay_url,
+        &scope.owner_keys,
+    )
+    .await
     {
         eprintln!("buzz-desktop: waker-start: pending-event flush failed: {error}");
     }
-    if crate::managed_agents::persona_events::active_pending_event(
-        app,
-        state,
-        KIND_WAKER_BUNDLE_ENVELOPE,
-        agent_pubkey,
-    )? {
+    if bundle_pending(scope, agent_pubkey)? {
         return Err(format!(
             "{agent_name}'s Remote wake launch bundle has not reached the relay yet, so the \
              community waker has nothing to start. Try again in a moment."
         ));
     }
 
-    let event = build_start_request_envelope(owner_keys, agent_pubkey, requested_at)?;
+    let event = build_start_request_envelope(&scope.owner_keys, agent_pubkey, requested_at)?;
     let ok = buzz_ws_client_pkg::publish_event(
-        relay_url,
+        &scope.relay_url,
         event,
-        owner_keys,
+        &scope.owner_keys,
         None,
         START_REQUEST_PUBLISH_TIMEOUT_SECS,
     )
@@ -155,6 +210,20 @@ pub(crate) async fn request_waker_start(
         ));
     }
     Ok(())
+}
+
+/// Whether `agent_pubkey`'s launch bundle is still waiting to be published
+/// from `scope`'s store.
+fn bundle_pending(scope: &RetentionScope, agent_pubkey: &str) -> Result<bool, String> {
+    use crate::managed_agents::retention::{get_retained_event, open_retention_db};
+    let conn = open_retention_db(&scope.db_path)?;
+    Ok(get_retained_event(
+        &conn,
+        KIND_WAKER_BUNDLE_ENVELOPE,
+        &scope.owner_keys.public_key().to_hex(),
+        agent_pubkey,
+    )?
+    .is_some_and(|event| event.pending_sync))
 }
 
 #[cfg(test)]
@@ -195,6 +264,73 @@ mod tests {
         assert!(ensure_bundle_live("Chris", Some(100), 100).is_err());
         assert!(ensure_bundle_live("Chris", Some(101), 100).is_ok());
         assert!(ensure_bundle_live("Chris", None, 100).is_ok());
+    }
+
+    fn scope_at(dir: &std::path::Path, relay_url: &str, owner_keys: Keys) -> RetentionScope {
+        RetentionScope {
+            db_path: dir.join("retention.db"),
+            relay_url: relay_url.to_string(),
+            owner_keys,
+        }
+    }
+
+    #[test]
+    fn a_start_scope_other_than_the_validated_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let scope = || scope_at(dir.path(), "wss://a.example/", owner.clone());
+
+        assert!(ensure_start_scope(scope(), "wss://a.example", &owner_hex).is_ok());
+        assert!(ensure_start_scope(scope(), "wss://b.example", &owner_hex).is_err());
+        let other_owner = Keys::generate().public_key().to_hex();
+        assert!(ensure_start_scope(scope(), "wss://a.example", &other_owner).is_err());
+    }
+
+    /// Round 1's race: the pinned community's bundle flush fails, then the
+    /// active community switches to one with nothing pending. The pending
+    /// check must still read the PINNED store and refuse, not the active one.
+    #[tokio::test]
+    async fn a_bundle_still_pending_in_the_pinned_scope_refuses_after_a_switch() {
+        use crate::managed_agents::retention::{open_retention_db, retain_event, RetainedEvent};
+        use nostr::JsonUtil;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (owner_a, agent) = (Keys::generate(), Keys::generate());
+        let agent_hex = agent.public_key().to_hex();
+        // Nothing listens here, so the pinned scope's flush fails.
+        let scope_a = scope_at(dir.path(), "ws://127.0.0.1:1", owner_a.clone());
+        let bundle = EventBuilder::new(Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16), "sealed")
+            .tags([Tag::parse(["d", agent_hex.as_str()]).unwrap()])
+            .sign_with_keys(&owner_a)
+            .unwrap();
+        retain_event(
+            &open_retention_db(&scope_a.db_path).unwrap(),
+            &RetainedEvent {
+                kind: KIND_WAKER_BUNDLE_ENVELOPE,
+                pubkey: owner_a.public_key().to_hex(),
+                d_tag: agent_hex.clone(),
+                content: bundle.content.to_string(),
+                created_at: bundle.created_at.as_secs() as i64,
+                raw_event: bundle.as_json(),
+                pending_sync: true,
+            },
+        )
+        .unwrap();
+
+        // The workspace has since switched to community B, identity B.
+        let state = crate::app_state::build_app_state();
+        *state.keys.lock().unwrap() = Keys::generate();
+        *state.relay_url_override.lock().unwrap() = Some("ws://127.0.0.1:2".to_string());
+
+        let error = request_waker_start_in(&state, &scope_a, "Chris", &agent_hex, 1_800_000_000)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("has not reached the relay yet"),
+            "unexpected error: {error}"
+        );
+        assert!(bundle_pending(&scope_a, &agent_hex).unwrap());
     }
 
     /// The envelope is exactly what the waker's tap accepts: the owner's

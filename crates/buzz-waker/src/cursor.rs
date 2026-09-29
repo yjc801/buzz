@@ -242,6 +242,13 @@ impl CursorStore {
     /// into an outage. Starting at `now` is the honest default: nothing before
     /// this moment is claimed to have been seen.
     ///
+    /// Not the same as "nothing before `now` is fetched": [`CursorStore::resume`]
+    /// reaches back [`crate::RECONNECT_OVERLAP_SECS`] from the checkpoint, fresh
+    /// or not. That is what covers enrolment — a mention published while the
+    /// owner's roster and credential were still on their way to the relay
+    /// predates the daemon discovering the agent, and is replayed on its first
+    /// connect.
+    ///
     /// A *corrupt* cursor is still an error: that is a damaged file, not a
     /// first run, and guessing a resume point from it would silently skip
     /// history.
@@ -703,6 +710,28 @@ mod tests {
         assert_eq!(
             s.resume(NOW),
             Resume::Since(NOW - crate::RECONNECT_OVERLAP_SECS)
+        );
+    }
+
+    /// Remote wake hand-off: the desktop stops waking an agent as soon as its
+    /// Remote-wake flag is saved, but this daemon only discovers the agent once
+    /// the enrolment the desktop publishes afterwards reaches it. A mention in
+    /// between predates this fresh cursor and must still be claimed.
+    #[test]
+    fn a_fresh_cursor_replays_a_mention_that_predates_enrolment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        let before_enrolment = NOW - 60;
+        let Resume::Since(since) = s.resume(NOW) else {
+            panic!("a fresh cursor has no coverage gap");
+        };
+        assert!(
+            since <= before_enrolment,
+            "the first REQ must reach back to it"
+        );
+        assert_eq!(
+            s.admit("m", before_enrolment, NOW).expect("admit"),
+            Admission::Fresh
         );
     }
 

@@ -166,6 +166,7 @@ export default defineConfig({
         "**/agent-provider-dropdowns.spec.ts",
         "**/agent-lifecycle-feedback.spec.ts",
         "**/waker-toggle.spec.ts",
+        "**/waker-start.spec.ts",
         "**/agent-access-warning.spec.ts",
         "**/edit-agent-run-on.spec.ts",
         "**/inbox-live-update.spec.ts",

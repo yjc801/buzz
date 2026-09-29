@@ -156,8 +156,28 @@ const WAKE_TRIGGER_KINDS = new Set<number>(HOME_MENTION_EVENT_KINDS);
 /// callers can pass a fixture instead of a whole agent.
 export type WakeCandidateAgent = Pick<
   ManagedAgent,
-  "pubkey" | "name" | "status" | "backend" | "respondTo" | "respondToAllowlist"
+  | "pubkey"
+  | "name"
+  | "status"
+  | "backend"
+  | "respondTo"
+  | "respondToAllowlist"
+  | "wakerEnabled"
 >;
+
+/// May THIS desktop wake the agent by deploying it itself?
+///
+/// Only provider agents qualify — the desktop owns a local agent's process
+/// and already has a start path for it. And only while Remote wake is off:
+/// an enrolled agent is woken by the community's `buzz-waker`, which deploys
+/// with the operator's substrate credential. A second deploy from here would
+/// race it and spend whatever credential this machine happens to hold — a
+/// member of a hosted community holds none, so it can only fail.
+export function isDesktopWakeable(
+  agent: Pick<WakeCandidateAgent, "backend" | "wakerEnabled">,
+) {
+  return agent.backend.type === "provider" && !agent.wakerEnabled;
+}
 
 type AddressingEvent = Pick<RelayEvent, "pubkey" | "tags" | "kind">;
 
@@ -248,9 +268,8 @@ export function eventAddressesAgent(
 /// still unresolved (undefined) the gate refuses everything — a wake spent
 /// on an unverified author is a deploy that may feed the loop.
 ///
-/// Local agents are excluded as candidates: the desktop owns their processes
-/// and already has a start path for them. This is only for agents whose
-/// infrastructure outlives their harness, which is every provider backend.
+/// Only agents this desktop may wake itself are candidates — see
+/// `isDesktopWakeable` for why local and Remote-wake agents are excluded.
 export function selectWakeCandidates(
   event: AddressingEvent,
   agents: readonly WakeCandidateAgent[],
@@ -274,7 +293,7 @@ export function selectWakeCandidates(
     return [];
   }
   return agents.filter((agent) => {
-    if (agent.backend.type !== "provider") {
+    if (!isDesktopWakeable(agent)) {
       return false;
     }
     if (!eventAddressesAgent(event, agent.pubkey)) {
@@ -294,10 +313,10 @@ export function selectWakeCandidates(
 /// Deploy is idempotent — a live agent is a strict no-op — so this check is
 /// about not spending a round trip, not about safety.
 export function shouldWakeAgent(
-  agent: Pick<WakeCandidateAgent, "status" | "backend">,
+  agent: Pick<WakeCandidateAgent, "status" | "backend" | "wakerEnabled">,
   presence: PresenceStatus | null | undefined,
 ) {
-  if (agent.backend.type !== "provider") {
+  if (!isDesktopWakeable(agent)) {
     return false;
   }
   return !isManagedAgentLive(agent, presence);
@@ -352,7 +371,8 @@ export function createLiveEvidenceTracker(
 /// agent p-tag. While the managed set is still loading (`agents`
 /// undefined), ANY p-tag qualifies — the whole point of buffering is that
 /// the sets needed for a precise answer have not resolved yet; once the
-/// managed records exist, only events addressing a provider agent qualify.
+/// managed records exist, only events addressing a desktop-wakeable agent
+/// qualify.
 export function isWakeShapedEvent(
   event: AddressingEvent,
   agents: readonly WakeCandidateAgent[] | undefined,
@@ -367,8 +387,7 @@ export function isWakeShapedEvent(
   }
   return agents.some(
     (agent) =>
-      agent.backend.type === "provider" &&
-      eventAddressesAgent(event, agent.pubkey),
+      isDesktopWakeable(agent) && eventAddressesAgent(event, agent.pubkey),
   );
 }
 

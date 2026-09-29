@@ -12,6 +12,7 @@ import { mergeKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import {
   computeWakeReplayFloor,
   createWakeAttemptState,
+  isDesktopWakeable,
   isPresumedDeliveredByFloor,
   isWakeShapedEvent,
   pushBoundedPendingTrigger,
@@ -54,6 +55,11 @@ const SEEN_WAKE_EVENT_LIMIT = 500;
  * revives it on the infrastructure it already has. Deploy *is* wake. Every
  * conforming backend therefore gets this for free — nothing here is specific
  * to one substrate.
+ *
+ * Agents with Remote wake on are not this hook's to wake: the community's
+ * `buzz-waker` watches the same mentions and deploys them with the
+ * operator's credential, so a member's desktop never needs one. See
+ * `isDesktopWakeable`.
  *
  * Mounted once in the shell so a mention wakes the agent regardless of which
  * screen is open, and regardless of whether the channel is being viewed.
@@ -576,14 +582,12 @@ export function useAgentWakeOnMention(enabled: boolean) {
     }
   });
 
-  // Only provider-backed agents can be woken this way. While the managed
-  // set is still loading we listen anyway (buffering), because the tap
-  // cannot replay what we decline; once it resolves with no provider
-  // agents there is nothing to listen for.
+  // Only desktop-wakeable agents (provider-backed, Remote wake off) can be
+  // woken this way. While the managed set is still loading we listen anyway
+  // (buffering), because the tap cannot replay what we decline; once it
+  // resolves with none there is nothing to listen for.
   const managedResolved = managedAgents !== undefined;
-  const hasWakeableAgents = (managedAgents ?? []).some(
-    (agent) => agent.backend.type === "provider",
-  );
+  const hasWakeableAgents = (managedAgents ?? []).some(isDesktopWakeable);
 
   const prerequisitesReady =
     knownAgentAuthors !== undefined &&

@@ -6,7 +6,10 @@
 //! found; each carries the reason so a future reader does not "simplify" one
 //! away. The desktop keeps its copy — it still wakes agents while it is
 //! running — so **this is a second implementation of one decision, and the
-//! two must not drift.**
+//! two must not drift.** The two copies split the agents between them rather
+//! than both acting on each: the desktop wakes only agents with Remote wake
+//! off (`isDesktopWakeable`), and this daemon wakes only agents enrolled with
+//! it — the Remote-wake ones.
 //!
 //! Everything here is pure: no clock, no I/O, no relay. That is deliberate.
 //! The decision is the part worth testing exhaustively, and keeping it free of

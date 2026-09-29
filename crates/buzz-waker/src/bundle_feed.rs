@@ -446,15 +446,22 @@ pub async fn run_bundle_tap(
         consecutive_failures = 0;
 
         loop {
-            // `next_event` is cancel-safe (it only awaits the stream's `next`),
-            // so losing this race to a handoff permit drops no frame.
+            // Bundles and requests share this socket and are read in relay
+            // order, so a revocation the relay sent before a request is
+            // applied before that request is even queued. `biased` also puts
+            // any frame the runtime has already reported ahead of a handoff.
+            // A revocation the relay sent after the request is causally
+            // later — the owner revoking just after the start, not before it.
+            // `next_event` is cancel-safe (it only awaits the stream's
+            // `next`), so losing to a permit drops no frame.
             let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
                 result = connection.next_event(Duration::from_secs(BUNDLE_TAP_IDLE_TIMEOUT_SECS)) => result,
                 permit = start_requests.reserve(), if !pending.is_empty() => {
                     pending.hand_over(permit, &agent_pubkey);
                     continue;
                 }
-                () = cancel.cancelled() => return,
             };
 
             let message = match next {
@@ -811,19 +818,14 @@ mod tests {
         format!("ws://{addr}")
     }
 
-    /// Round 2 of #170, P1. The wake loop is not taking requests, the owner
-    /// presses Start, then revokes the bundle. The tap must still read the
-    /// revocation, so that by the time the loop takes the request there is no
-    /// bundle left for the attempt to deploy.
-    #[tokio::test]
-    async fn a_revocation_behind_a_stalled_request_handoff_still_clears_the_bundle() {
+    /// Owner, agent, and a floor store that has admitted bundle 1, which is
+    /// also the tap's cached bundle.
+    fn admitted_bundle_fixture() -> (Keys, Keys, tempfile::TempDir, FloorStore, Arc<BundleState>) {
         let (owner, agent) = (Keys::generate(), Keys::generate());
         let owner_hex = owner.public_key().to_hex();
-        let agent_hex = agent.public_key().to_hex();
         let dir = tempfile::tempdir().unwrap();
         let mut floor_store =
             FloorStore::enroll(dir.path().join("floor.json"), &owner_hex).unwrap();
-        let state = Arc::new(BundleState::new());
         let admitted = decrypt_verify_and_admit(
             &agent,
             &owner_hex,
@@ -833,7 +835,45 @@ mod tests {
         let Ok(BundleOutcome::Delivered(body)) = admitted else {
             panic!("the first bundle is admitted: {admitted:?}");
         };
+        let state = Arc::new(BundleState::new());
         state.set(body);
+        (owner, agent, dir, floor_store, state)
+    }
+
+    fn spawn_tap(
+        relay: String,
+        agent: Keys,
+        owner_hex: String,
+        mut floor_store: FloorStore,
+        state: &Arc<BundleState>,
+        tx: mpsc::Sender<TriggerEvent>,
+        cancel: &CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let (state, cancel) = (Arc::clone(state), cancel.clone());
+        tokio::spawn(async move {
+            run_bundle_tap(
+                &relay,
+                &agent,
+                None,
+                &owner_hex,
+                &mut floor_store,
+                &state,
+                &tx,
+                &cancel,
+            )
+            .await;
+        })
+    }
+
+    /// Round 2 of #170, P1. The wake loop is not taking requests, the owner
+    /// presses Start, then revokes the bundle. The tap must still read the
+    /// revocation, so that by the time the loop takes the request there is no
+    /// bundle left for the attempt to deploy.
+    #[tokio::test]
+    async fn a_revocation_behind_a_stalled_request_handoff_still_clears_the_bundle() {
+        let (owner, agent, _dir, floor_store, state) = admitted_bundle_fixture();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
 
         let press = start_envelope(&owner, &agent, &owner, now_secs());
         let revocation = bundle_event(&owner, &sealed_bundle(&owner, &agent, 2, true), &agent_hex);
@@ -847,22 +887,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.send(trigger("backlog")).await.unwrap();
         let cancel = CancellationToken::new();
-        let tap = tokio::spawn({
-            let (state, cancel) = (Arc::clone(&state), cancel.clone());
-            async move {
-                run_bundle_tap(
-                    &relay,
-                    &agent,
-                    None,
-                    &owner_hex,
-                    &mut floor_store,
-                    &state,
-                    &tx,
-                    &cancel,
-                )
-                .await;
-            }
-        });
+        let tap = spawn_tap(relay, agent, owner_hex, floor_store, &state, tx, &cancel);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.current().is_some() {
@@ -881,6 +906,41 @@ mod tests {
             .unwrap();
         assert_eq!(taken.id, press.id.to_hex());
         assert!(state.current().is_none());
+
+        cancel.cancel();
+        tap.await.unwrap();
+    }
+
+    /// Round 3 of #170. A revocation the relay sent before a request is
+    /// applied before that request can reach the wake loop, even when the
+    /// loop is waiting on the channel and would snapshot at once.
+    #[tokio::test]
+    async fn a_revocation_sent_before_a_request_is_applied_before_it_is_handed_over() {
+        let (owner, agent, _dir, floor_store, state) = admitted_bundle_fixture();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+
+        let press = start_envelope(&owner, &agent, &owner, now_secs());
+        let revocation = bundle_event(&owner, &sealed_bundle(&owner, &agent, 2, true), &agent_hex);
+        let relay = scripted_relay(vec![
+            json!(["EVENT", BUNDLE_TAP_SUBSCRIPTION_ID, revocation]),
+            json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press]),
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let tap = spawn_tap(relay, agent, owner_hex, floor_store, &state, tx, &cancel);
+
+        let taken = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, press.id.to_hex());
+        assert!(
+            state.current().is_none(),
+            "the attempt for this press would snapshot the revoked bundle"
+        );
 
         cancel.cancel();
         tap.await.unwrap();

@@ -48,6 +48,8 @@ pub(crate) async fn retire_locked(
 ) {
     subs.remove(sub_id);
     if let Some(removed) = state.sub_registry.remove_subscription(conn.conn_id, sub_id) {
+        #[cfg(test)]
+        test_seam::pause_at(&test_seam::RELEASE_PAUSE).await;
         release_scope_topics(state, &conn.tenant, &removed.scope).await;
     }
 }
@@ -70,7 +72,7 @@ pub(crate) async fn close_if_owner(
     }
     retire_locked(&mut subs, sub_id, conn, state).await;
     #[cfg(test)]
-    test_seam::pause().await;
+    test_seam::pause_at(&test_seam::PAUSE).await;
     if let Some(reason) = closed {
         if !conn.send(RelayMessage::closed(sub_id, reason)) {
             // The outbound channel is full or closed: the terminal frame is
@@ -111,8 +113,10 @@ pub(crate) async fn release_scope_topics(
     }
 }
 
-/// Test-only pause point inside `close_if_owner`, between teardown and the
-/// terminal frame, scoped to one task so parallel tests don't interfere.
+/// Test-only pause points, scoped to one task so parallel tests don't
+/// interfere: `PAUSE` inside `close_if_owner` between teardown and the
+/// terminal frame, `RELEASE_PAUSE` inside `retire_locked` between the
+/// registry removal and the topic release.
 #[cfg(test)]
 pub(crate) mod test_seam {
     use std::sync::Arc;
@@ -126,10 +130,11 @@ pub(crate) mod test_seam {
 
     tokio::task_local! {
         pub(crate) static PAUSE: Arc<Pause>;
+        pub(crate) static RELEASE_PAUSE: Arc<Pause>;
     }
 
-    pub(super) async fn pause() {
-        if let Ok(pause) = PAUSE.try_with(Arc::clone) {
+    pub(super) async fn pause_at(point: &'static tokio::task::LocalKey<Arc<Pause>>) {
+        if let Ok(pause) = point.try_with(Arc::clone) {
             pause.reached.notify_one();
             pause.resume.notified().await;
         }

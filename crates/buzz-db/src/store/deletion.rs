@@ -709,6 +709,28 @@ pub struct DeletionStore {
     pool: PgPool,
 }
 
+/// Client-side bound on one serving-write lease call, writer checkout included.
+///
+/// Serving paths hold session effect permits across these calls, so each must
+/// end by construction: `statement_timeout` bounds server execution but not a
+/// stalled connection or an unanswered response.
+pub const SERVING_WRITE_LEASE_SQL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Server-side bound, below the client bound so an ordinary slow statement ends
+/// as a normal error on a connection that stays reusable.
+const SERVING_WRITE_LEASE_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '1500ms'";
+
+/// Begin a lease transaction whose statements carry the lease statement bound.
+async fn serving_lease_transaction(
+    connection: &mut PgConnection,
+) -> Result<Transaction<'_, Postgres>> {
+    let mut tx = sqlx::Connection::begin(connection).await?;
+    sqlx::query(SERVING_WRITE_LEASE_STATEMENT_TIMEOUT_SQL)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 impl Db {
     /// Validate the minimum deletion fence catalog required by serving paths.
     pub async fn validate_deletion_serving_catalog(&self) -> Result<()> {
@@ -2932,6 +2954,37 @@ impl DeletionStore {
         Ok(())
     }
 
+    /// Run one serving-lease SQL operation within `budget`, checkout included.
+    ///
+    /// On timeout the connection is detached and closed rather than returned:
+    /// its protocol state is unknown, so no later writer may inherit it. A
+    /// commit cut off this way may still land; the row then self-expires at
+    /// `lease_until` and grants nothing, as after a crash mid-operation.
+    async fn bounded_serving_lease_sql<T>(
+        &self,
+        budget: Duration,
+        operation: impl AsyncFnOnce(&mut PgConnection) -> Result<T>,
+    ) -> Result<T> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut connection = crate::observability::acquire_writer_until(
+            &self.pool,
+            crate::observability::WriterOperation::EventWrite,
+            deadline,
+        )
+        .await?;
+        match tokio::time::timeout_at(deadline, operation(&mut connection)).await {
+            Ok(result) => result,
+            Err(_) => {
+                drop(connection.detach());
+                Err(sqlx::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "serving write lease SQL exceeded its deadline",
+                ))
+                .into())
+            }
+        }
+    }
+
     /// Acquire a durable, expiring lease for an external serving side effect.
     ///
     /// The short transaction shares the same advisory lock as the destructive
@@ -2945,59 +2998,57 @@ impl DeletionStore {
         lease_duration: Duration,
     ) -> Result<ServingWriteLease> {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
-        let connection = crate::observability::acquire_writer(
-            &self.pool,
-            crate::observability::WriterOperation::EventWrite,
-        )
-        .await?;
-        let mut tx = sqlx::Transaction::begin(connection, None).await?;
-        // The assertion owns both the shared ordering lock and the supported
-        // READ COMMITTED check. The lease table is trigger-excluded, so this
-        // explicit admission is its database-enforced write fence.
-        if let Err(error) = sqlx::query("SELECT assert_community_write_allowed($1)")
-            .bind(community.as_uuid())
-            .execute(&mut *tx)
-            .await
-        {
-            if error.as_database_error().is_some_and(|database_error| {
-                database_error.code().as_deref() == Some("55000")
-                    && database_error.message().starts_with("community write")
-            }) {
-                return Err(DbError::AccessDenied(format!(
-                    "community {community} is write-fenced or missing"
-                )));
+        self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT, async |connection| {
+            let mut tx = serving_lease_transaction(connection).await?;
+            // The assertion owns both the shared ordering lock and the supported
+            // READ COMMITTED check. The lease table is trigger-excluded, so this
+            // explicit admission is its database-enforced write fence.
+            if let Err(error) = sqlx::query("SELECT assert_community_write_allowed($1)")
+                .bind(community.as_uuid())
+                .execute(&mut *tx)
+                .await
+            {
+                if error.as_database_error().is_some_and(|database_error| {
+                    database_error.code().as_deref() == Some("55000")
+                        && database_error.message().starts_with("community write")
+                }) {
+                    return Err(DbError::AccessDenied(format!(
+                        "community {community} is write-fenced or missing"
+                    )));
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-        let row = sqlx::query(
-            "INSERT INTO community_serving_write_leases \
+            let row = sqlx::query(
+                "INSERT INTO community_serving_write_leases \
              (community_id, operation, owner, fence_generation, lease_until) \
              SELECT id, $2, $3, deletion_fence_generation, \
                     now() + make_interval(secs => $4) \
              FROM communities WHERE id = $1 AND deletion_state = 'active' \
                AND deleted_at IS NULL \
              RETURNING id, generation, fence_generation, lease_until",
-        )
-        .bind(community.as_uuid())
-        .bind(operation)
-        .bind(owner)
-        .bind(lease_seconds)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            DbError::AccessDenied(format!("community {community} is write-fenced or missing"))
-        })?;
-        let lease = ServingWriteLease {
-            id: row.try_get("id")?,
-            community_id: community,
-            operation: operation.to_owned(),
-            owner: owner.to_owned(),
-            generation: row.try_get("generation")?,
-            fence_generation: row.try_get("fence_generation")?,
-            lease_until: row.try_get("lease_until")?,
-        };
-        tx.commit().await?;
-        Ok(lease)
+            )
+            .bind(community.as_uuid())
+            .bind(operation)
+            .bind(owner)
+            .bind(lease_seconds)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::AccessDenied(format!("community {community} is write-fenced or missing"))
+            })?;
+            let lease = ServingWriteLease {
+                id: row.try_get("id")?,
+                community_id: community,
+                operation: operation.to_owned(),
+                owner: owner.to_owned(),
+                generation: row.try_get("generation")?,
+                fence_generation: row.try_get("fence_generation")?,
+                lease_until: row.try_get("lease_until")?,
+            };
+            tx.commit().await?;
+            Ok(lease)
+        })
+        .await
     }
 
     /// Renew an already-admitted external side-effect lease while the community
@@ -3052,25 +3103,25 @@ impl DeletionStore {
 
     /// Release a serving side-effect lease. A stale release is harmless.
     pub async fn release_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<bool> {
-        let mut connection = crate::observability::acquire_writer(
-            &self.pool,
-            crate::observability::WriterOperation::EventWrite,
-        )
-        .await?;
-        let deleted = sqlx::query(
-            "DELETE FROM community_serving_write_leases \
+        self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT, async |connection| {
+            let mut tx = serving_lease_transaction(connection).await?;
+            let deleted = sqlx::query(
+                "DELETE FROM community_serving_write_leases \
              WHERE id = $1 AND community_id = $2 AND owner = $3 AND generation = $4 \
                AND fence_generation = $5",
-        )
-        .bind(lease.id)
-        .bind(lease.community_id.as_uuid())
-        .bind(&lease.owner)
-        .bind(lease.generation)
-        .bind(lease.fence_generation)
-        .execute(&mut *connection)
-        .await?
-        .rows_affected();
-        Ok(deleted == 1)
+            )
+            .bind(lease.id)
+            .bind(lease.community_id.as_uuid())
+            .bind(&lease.owner)
+            .bind(lease.generation)
+            .bind(lease.fence_generation)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            Ok(deleted == 1)
+        })
+        .await
     }
 
     /// Check that an external side-effect lease remains current for finalization.
@@ -3079,15 +3130,11 @@ impl DeletionStore {
     /// work remains blocked, preserving an accurate drain without abandoning an
     /// admitted remote effect.
     pub async fn verify_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<()> {
-        let connection = crate::observability::acquire_writer(
-            &self.pool,
-            crate::observability::WriterOperation::EventWrite,
-        )
-        .await?;
-        let mut tx = sqlx::Transaction::begin(connection, None).await?;
-        lock_community_deletion_shared(&mut tx, lease.community_id).await?;
-        let valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM community_serving_write_leases lease \
+        self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT, async |connection| {
+            let mut tx = serving_lease_transaction(connection).await?;
+            lock_community_deletion_shared(&mut tx, lease.community_id).await?;
+            let valid: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM community_serving_write_leases lease \
              JOIN communities community ON community.id = lease.community_id \
              WHERE lease.id = $1 AND lease.community_id = $2 AND lease.owner = $3 \
                AND lease.generation = $4 AND lease.fence_generation = $5 \
@@ -3095,23 +3142,25 @@ impl DeletionStore {
                AND community.deleted_at IS NULL \
                AND community.deletion_state IN ('active', 'quiescing') \
                AND community.deletion_fence_generation = lease.fence_generation)",
-        )
-        .bind(lease.id)
-        .bind(lease.community_id.as_uuid())
-        .bind(&lease.owner)
-        .bind(lease.generation)
-        .bind(lease.fence_generation)
-        .fetch_one(&mut *tx)
-        .await?;
-        if valid {
-            tx.commit().await?;
-            Ok(())
-        } else {
-            Err(DbError::AccessDenied(format!(
-                "stale serving write lease {}",
-                lease.id
-            )))
-        }
+            )
+            .bind(lease.id)
+            .bind(lease.community_id.as_uuid())
+            .bind(&lease.owner)
+            .bind(lease.generation)
+            .bind(lease.fence_generation)
+            .fetch_one(&mut *tx)
+            .await?;
+            if valid {
+                tx.commit().await?;
+                Ok(())
+            } else {
+                Err(DbError::AccessDenied(format!(
+                    "stale serving write lease {}",
+                    lease.id
+                )))
+            }
+        })
+        .await
     }
 
     /// Delete expired serving leases in a bounded batch.
@@ -6428,6 +6477,84 @@ mod postgres_tests {
                 Some("25000")
             );
         }
+    }
+
+    /// A lease operation that outlives its client-side budget returns a timeout
+    /// and its connection is never handed to a later writer.
+    ///
+    /// Mutation oracle: return the connection to the pool instead of detaching
+    /// it → the stalled backend is checked out again → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_lease_sql_timeout_discards_the_connection() {
+        let (db, store) = store().await;
+        let stalled_pid = std::sync::Arc::new(std::sync::Mutex::new(None::<i32>));
+        let recorded = std::sync::Arc::clone(&stalled_pid);
+        let started = std::time::Instant::now();
+        let error = store
+            .bounded_serving_lease_sql(Duration::from_millis(200), async move |connection| {
+                let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                *recorded.lock().unwrap() = Some(pid);
+                let mut tx = serving_lease_transaction(connection).await?;
+                sqlx::query("SELECT pg_sleep(1)").execute(&mut *tx).await?;
+                Ok(())
+            })
+            .await
+            .expect_err("stalled lease SQL must time out");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "client bound must fire first"
+        );
+        assert!(
+            matches!(&error, DbError::Sqlx(sqlx::Error::Io(io)) if io.kind() == std::io::ErrorKind::TimedOut),
+            "unexpected error: {error:?}"
+        );
+        let stalled_pid = stalled_pid.lock().unwrap().expect("operation ran");
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            let mut connection = db.pool().acquire().await.expect("acquire");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("pid");
+            assert_ne!(
+                pid, stalled_pid,
+                "timed-out connection returned to the pool"
+            );
+            held.push(connection);
+        }
+    }
+
+    /// The lease transaction's own statement bound ends a slow statement as an
+    /// ordinary query cancellation, well inside the client budget.
+    ///
+    /// Mutation oracle: drop the `SET LOCAL statement_timeout` → the sleep
+    /// runs to completion → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_lease_statement_timeout_cancels_slow_statement() {
+        let (_db, store) = store().await;
+        let error = store
+            .bounded_serving_lease_sql(Duration::from_secs(5), async |connection| {
+                let mut tx = serving_lease_transaction(connection).await?;
+                sqlx::query("SELECT pg_sleep(3)").execute(&mut *tx).await?;
+                Ok(())
+            })
+            .await
+            .expect_err("slow statement must be cancelled");
+        let DbError::Sqlx(sqlx_error) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(
+            sqlx_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("57014"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]

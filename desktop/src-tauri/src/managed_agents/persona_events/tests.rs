@@ -1031,6 +1031,168 @@ mod flush_barrier {
         assert_ne!(fresh.as_json(), stale.as_json());
     }
 
+    /// Stub WebSocket relay for kinds that require WS ingest: answers NIP-42
+    /// AUTH, then accepts an `EVENT` only if its `created_at` is inside the
+    /// relay's ±900s ingest window — `OK false` otherwise, as
+    /// `crates/buzz-relay/src/handlers/ingest.rs` does. Every accepted event
+    /// is sent on the returned channel.
+    async fn spawn_ws_stub_relay() -> (String, tokio::sync::mpsc::UnboundedReceiver<nostr::Event>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws stub relay");
+        let url = format!("ws://{}", listener.local_addr().expect("ws stub addr"));
+        let (accepted_tx, accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let accepted_tx = accepted_tx.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    let challenge = serde_json::json!(["AUTH", "stub"]).to_string();
+                    if ws.send(Message::Text(challenge.into())).await.is_err() {
+                        return;
+                    }
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let ok = match frame[0].as_str() {
+                            Some("AUTH") => serde_json::json!(["OK", frame[1]["id"], true, ""]),
+                            Some("EVENT") => {
+                                let event = nostr::Event::from_json(frame[1].to_string())
+                                    .expect("stub relay got a valid event");
+                                let now = nostr::Timestamp::now().as_secs() as i64;
+                                let skew = event.created_at.as_secs() as i64 - now;
+                                if skew.abs() > 900 {
+                                    serde_json::json!([
+                                        "OK",
+                                        event.id.to_hex(),
+                                        false,
+                                        "invalid: event timestamp too far from server time"
+                                    ])
+                                } else {
+                                    let id = event.id.to_hex();
+                                    let _ = accepted_tx.send(event);
+                                    serde_json::json!(["OK", id, true, ""])
+                                }
+                            }
+                            _ => continue,
+                        };
+                        if ws.send(Message::Text(ok.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, accepted_rx)
+    }
+
+    /// Remote wake enrolment retained through a relay outage longer than the
+    /// ingest window must still reach the relay once it is back: the flush
+    /// re-dates the waker envelope instead of republishing a timestamp the
+    /// relay refuses on every sweep. Without it buzz-waker never watches the
+    /// agent while the desktop has already stopped waking it.
+    #[tokio::test]
+    async fn a_waker_envelope_retained_through_a_long_outage_still_publishes() {
+        use buzz_core_pkg::kind::KIND_WAKER_BUNDLE_ENVELOPE;
+
+        let keys = nostr::Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let recipient = nostr::Keys::generate().public_key().to_hex();
+        let d_tag = "credential:agent";
+        let signed_at = nostr::Timestamp::now().as_secs() as i64 - 3600;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("retention.db");
+        {
+            let conn = open_retention_db(&db_path).expect("open db");
+            retain_signed(
+                &conn,
+                &keys,
+                KIND_WAKER_BUNDLE_ENVELOPE,
+                d_tag,
+                EventBuilder::new(
+                    Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16),
+                    "ciphertext",
+                )
+                .tags(vec![
+                    Tag::parse(["d", "agent"]).unwrap(),
+                    Tag::parse(["p", &recipient]).unwrap(),
+                ])
+                .custom_created_at(nostr::Timestamp::from(signed_at as u64)),
+                signed_at,
+            );
+        }
+
+        let (relay_url, mut accepted) = spawn_ws_stub_relay().await;
+        let state = build_app_state();
+        *state.keys.lock().unwrap() = keys;
+        *state.relay_url_override.lock().unwrap() = Some(relay_url);
+
+        let flushed = flush_pending_events(&db_path, &state).await.expect("flush");
+        assert_eq!(flushed, 1, "the stale envelope must be accepted");
+
+        let published = accepted.try_recv().expect("the relay accepted an event");
+        assert_eq!(published.content, "ciphertext");
+        assert_eq!(published.pubkey.to_hex(), pubkey);
+        assert!(published
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["p", recipient.as_str()]));
+        assert!(published.verify_signature());
+
+        let conn = open_retention_db(&db_path).expect("reopen db");
+        let row = get_retained_event(&conn, KIND_WAKER_BUNDLE_ENVELOPE, &pubkey, d_tag)
+            .unwrap()
+            .unwrap();
+        assert!(!row.pending_sync, "accepted row is marked synced");
+    }
+
+    /// A WebSocket `OK false` is a refusal, not a delivery: the row stays
+    /// pending for the next sweep instead of being marked synced and dropped.
+    #[tokio::test]
+    async fn a_refused_websocket_publish_stays_pending() {
+        use buzz_core_pkg::kind::KIND_WAKER_BUNDLE_ENVELOPE;
+
+        let keys = nostr::Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        // Far enough ahead that no re-dating can bring it into the window.
+        let signed_at = nostr::Timestamp::now().as_secs() as i64 + 3600;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("retention.db");
+        {
+            let conn = open_retention_db(&db_path).expect("open db");
+            retain_signed(
+                &conn,
+                &keys,
+                KIND_WAKER_BUNDLE_ENVELOPE,
+                "agent",
+                EventBuilder::new(
+                    Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16),
+                    "ciphertext",
+                )
+                .tags(vec![Tag::parse(["d", "agent"]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(signed_at as u64)),
+                signed_at,
+            );
+        }
+
+        let (relay_url, _accepted) = spawn_ws_stub_relay().await;
+        let state = build_app_state();
+        *state.keys.lock().unwrap() = keys;
+        *state.relay_url_override.lock().unwrap() = Some(relay_url);
+
+        let flushed = flush_pending_events(&db_path, &state).await.expect("flush");
+        assert_eq!(flushed, 0);
+        let conn = open_retention_db(&db_path).expect("reopen db");
+        let row = get_retained_event(&conn, KIND_WAKER_BUNDLE_ENVELOPE, &pubkey, "agent")
+            .unwrap()
+            .unwrap();
+        assert!(row.pending_sync, "a refused row must stay pending");
+    }
+
     /// The mid-sweep barrier: a tombstone the relay rejects must defer its
     /// own replacement to the next sweep (still pending, not counted as
     /// flushed) while unrelated rows in the same sweep publish normally.

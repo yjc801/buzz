@@ -40,6 +40,7 @@ function agent(overrides = {}) {
     backend: { type: "provider", id: "sprites", config: {} },
     respondTo: "owner-only",
     respondToAllowlist: [],
+    wakerEnabled: false,
     ...overrides,
   };
 }
@@ -192,6 +193,34 @@ test("local agents are never wake candidates", () => {
     }),
     [],
   );
+});
+
+test("a Remote-wake agent is left to the waker, never deployed from here", () => {
+  // The community's buzz-waker deploys it with the operator's credential.
+  // A desktop deploy would race that one and spend whatever credential
+  // this machine holds — for a member of a hosted community, none.
+  const enrolled = agent({ wakerEnabled: true });
+  assert.deepEqual(
+    selectWakeCandidates(mention(), [enrolled], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }),
+    [],
+  );
+  assert.equal(shouldWakeAgent(enrolled, "offline"), false);
+  assert.equal(isWakeShapedEvent(mention(), [enrolled]), false);
+
+  // Remote wake off: the desktop is still the one that wakes it.
+  const unenrolled = agent({ wakerEnabled: false });
+  assert.deepEqual(
+    selectWakeCandidates(mention(), [unenrolled], {
+      ownerPubkey: OWNER,
+      ...RAW_ACCESS,
+    }).map((candidate) => candidate.pubkey),
+    [AGENT],
+  );
+  assert.equal(shouldWakeAgent(unenrolled, "offline"), true);
+  assert.equal(isWakeShapedEvent(mention(), [unenrolled]), true);
 });
 
 test("an agent's own traffic never wakes it or a p-tagged peer", () => {

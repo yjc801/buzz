@@ -49,6 +49,11 @@ use crate::start_request::{
 /// old subscription rather than piling up a fresh one.
 pub const BUNDLE_TAP_SUBSCRIPTION_ID: &str = "buzz-waker-bundle";
 
+/// Subscription id for the tap's bundle re-query, the fence a start request
+/// waits behind ([`run_bundle_tap`]). At most one is in flight per
+/// connection, so its EOSE is never ambiguous.
+pub const BUNDLE_SYNC_SUBSCRIPTION_ID: &str = "buzz-waker-bundle-sync";
+
 /// How long to wait for a frame before treating the tap connection as idle.
 ///
 /// Wider than the presence tap's own timeout: a bundle is reissued on
@@ -112,6 +117,20 @@ pub fn bundle_req(owner_pubkey: &str, agent_pubkey: &str) -> Value {
     ])
 }
 
+/// The REQ frame re-querying the bundle history under
+/// [`BUNDLE_SYNC_SUBSCRIPTION_ID`] — same filter as [`bundle_req`].
+fn bundle_sync_req(owner_pubkey: &str, agent_pubkey: &str) -> Value {
+    json!([
+        "REQ",
+        BUNDLE_SYNC_SUBSCRIPTION_ID,
+        bundle_filter(owner_pubkey, agent_pubkey)
+    ])
+}
+
+fn is_bundle_subscription(subscription_id: &str) -> bool {
+    subscription_id == BUNDLE_TAP_SUBSCRIPTION_ID || subscription_id == BUNDLE_SYNC_SUBSCRIPTION_ID
+}
+
 /// Shared, thread-safe cache of the current admitted bundle.
 ///
 /// This is the whole answer to "how does [`crate::wake_loop`] get a bundle
@@ -170,6 +189,8 @@ enum BundleFrame {
     Rejected { event_id: String, reason: String },
     /// This subscription was closed by the relay.
     Closed { message: String },
+    /// The bundle re-query has delivered all of its history.
+    SyncComplete,
     /// A frame for a subscription this tap did not open, an event whose
     /// kind or author doesn't match (should be excluded by the filter
     /// already — checked again here as the same defense-in-depth the
@@ -191,7 +212,7 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
         RelayMessage::Event {
             subscription_id,
             event,
-        } if subscription_id == BUNDLE_TAP_SUBSCRIPTION_ID => {
+        } if is_bundle_subscription(&subscription_id) => {
             if let Err(error) = buzz_core::verify_event(&event) {
                 return BundleFrame::Rejected {
                     event_id: event.id.to_hex(),
@@ -211,7 +232,12 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
         RelayMessage::Closed {
             subscription_id,
             message,
-        } if subscription_id == BUNDLE_TAP_SUBSCRIPTION_ID => BundleFrame::Closed { message },
+        } if is_bundle_subscription(&subscription_id) => BundleFrame::Closed { message },
+        RelayMessage::Eose { subscription_id }
+            if subscription_id == BUNDLE_SYNC_SUBSCRIPTION_ID =>
+        {
+            BundleFrame::SyncComplete
+        }
         _ => BundleFrame::Ignored,
     }
 }
@@ -368,6 +394,14 @@ fn decrypt_verify_and_admit(
 /// revocation read behind a stalled handoff would reach [`BundleState`] only
 /// after the wake loop had taken the request and snapshotted the revoked
 /// bundle.
+///
+/// A request is also held until a bundle re-query ([`BundleSync`]) issued
+/// after the request was read has reached EOSE. Sharing a socket does not
+/// order the two subscriptions: the relay runs each REQ's history and each
+/// event's live fan-out in its own task, so a revocation the relay stored
+/// before a request can still reach this tap after it. A query issued after
+/// the request arrived is not subject to that: its history includes every
+/// revocation the relay had stored by then, and its EOSE comes last.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_bundle_tap(
     relay_url: &str,
@@ -425,6 +459,10 @@ pub async fn run_bundle_tap(
             () = cancel.cancelled() => break,
         };
 
+        // Per connection: a re-query sent on a dropped socket answers nothing,
+        // so every request still held waits for one on this socket.
+        let mut sync = BundleSync::default();
+        pending.require_sync(1);
         if let Err(error) = connection
             .send_raw(&bundle_req(&owner_pubkey, &agent_pubkey))
             .await
@@ -446,19 +484,27 @@ pub async fn run_bundle_tap(
         consecutive_failures = 0;
 
         loop {
-            // Bundles and requests share this socket and are read in relay
-            // order, so a revocation the relay sent before a request is
-            // applied before that request is even queued. `biased` also puts
-            // any frame the runtime has already reported ahead of a handoff.
-            // A revocation the relay sent after the request is causally
-            // later — the owner revoking just after the start, not before it.
-            // `next_event` is cancel-safe (it only awaits the stream's
-            // `next`), so losing to a permit drops no frame.
+            if pending.needs_sync(&sync) {
+                if let Err(error) = connection
+                    .send_raw(&bundle_sync_req(&owner_pubkey, &agent_pubkey))
+                    .await
+                {
+                    tracing::warn!(agent = %agent_pubkey, %error, "bundle re-query failed; reconnecting");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    break;
+                }
+                sync.issued += 1;
+                sync.in_flight = true;
+            }
+
+            // `biased` puts any frame the runtime has already reported ahead
+            // of a handoff. `next_event` is cancel-safe (it only awaits the
+            // stream's `next`), so losing to a permit drops no frame.
             let next = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
                 result = connection.next_event(Duration::from_secs(BUNDLE_TAP_IDLE_TIMEOUT_SECS)) => result,
-                permit = start_requests.reserve(), if !pending.is_empty() => {
+                permit = start_requests.reserve(), if pending.ready(&sync) => {
                     pending.hand_over(permit, &agent_pubkey);
                     continue;
                 }
@@ -475,7 +521,7 @@ pub async fn run_bundle_tap(
                                 event,
                                 &agent_pubkey,
                             ) {
-                                pending.push(trigger, &agent_pubkey);
+                                pending.push(trigger, &sync, &agent_pubkey);
                             }
                         }
                         continue;
@@ -550,6 +596,18 @@ pub async fn run_bundle_tap(
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         break;
                     }
+                    BundleFrame::SyncComplete => {
+                        sync.completed = sync.issued;
+                        sync.in_flight = false;
+                        if let Err(error) = connection
+                            .send_raw(&json!(["CLOSE", BUNDLE_SYNC_SUBSCRIPTION_ID]))
+                            .await
+                        {
+                            tracing::warn!(agent = %agent_pubkey, %error, "bundle re-query close failed; reconnecting");
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            break;
+                        }
+                    }
                     BundleFrame::Ignored => {}
                 },
                 Err(WsClientError::Timeout) => {
@@ -586,22 +644,56 @@ const START_REQUEST_BACKLOG: usize = 64;
 /// signature pins the owner), so filling this takes the owner's own presses.
 /// Dropping the newest instead is the round-1 failure: a backlog of replays
 /// the cursor already holds crowding out the press that matters.
+///
+/// Each request carries the number of the bundle re-query it waits for on
+/// this connection ([`BundleSync`]); the queue is in read order, so those
+/// numbers never decrease front to back.
 #[derive(Debug, Default)]
 struct PendingStartRequests {
-    queue: std::collections::VecDeque<TriggerEvent>,
+    queue: std::collections::VecDeque<(TriggerEvent, u64)>,
+}
+
+/// The bundle re-queries issued on one connection, counted from 1.
+#[derive(Debug, Default)]
+struct BundleSync {
+    issued: u64,
+    completed: u64,
+    in_flight: bool,
 }
 
 impl PendingStartRequests {
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+    /// Whether a re-query must be sent now: a held request waits for one not
+    /// yet issued, and none is in flight (one at a time keeps EOSE
+    /// unambiguous; a request read meanwhile waits for the next).
+    fn needs_sync(&self, sync: &BundleSync) -> bool {
+        !sync.in_flight
+            && self
+                .queue
+                .back()
+                .is_some_and(|(_, needs)| *needs > sync.issued)
     }
 
-    fn push(&mut self, trigger: TriggerEvent, agent_pubkey: &str) {
-        if self.queue.iter().any(|queued| queued.id == trigger.id) {
+    /// Whether the oldest request's re-query has completed.
+    fn ready(&self, sync: &BundleSync) -> bool {
+        self.queue
+            .front()
+            .is_some_and(|(_, needs)| *needs <= sync.completed)
+    }
+
+    /// Make every held request wait for re-query `needs` (a new connection).
+    fn require_sync(&mut self, needs: u64) {
+        for (_, queued) in &mut self.queue {
+            *queued = needs;
+        }
+    }
+
+    /// Hold `trigger` until a re-query issued after this call has completed.
+    fn push(&mut self, trigger: TriggerEvent, sync: &BundleSync, agent_pubkey: &str) {
+        if self.queue.iter().any(|(queued, _)| queued.id == trigger.id) {
             return;
         }
         if self.queue.len() >= START_REQUEST_BACKLOG {
-            if let Some(dropped) = self.queue.pop_front() {
+            if let Some((dropped, _)) = self.queue.pop_front() {
                 tracing::warn!(
                     agent = %agent_pubkey,
                     event_id = %dropped.id,
@@ -609,7 +701,7 @@ impl PendingStartRequests {
                 );
             }
         }
-        self.queue.push_back(trigger);
+        self.queue.push_back((trigger, sync.issued + 1));
     }
 
     /// Hand the oldest request to the wake loop through `permit`. A wake loop
@@ -622,7 +714,7 @@ impl PendingStartRequests {
     ) {
         match permit {
             Ok(permit) => {
-                if let Some(trigger) = self.queue.pop_front() {
+                if let Some((trigger, _)) = self.queue.pop_front() {
                     tracing::info!(
                         agent = %agent_pubkey,
                         event_id = %trigger.id,
@@ -741,15 +833,42 @@ mod tests {
         // holds, and the owner's new press arrives behind them. The backlog
         // drops the oldest, never the newest, and ignores a second copy.
         let mut pending = PendingStartRequests::default();
+        let sync = BundleSync::default();
         for i in 0..START_REQUEST_BACKLOG {
-            pending.push(trigger(&format!("replay-{i}")), "agent");
+            pending.push(trigger(&format!("replay-{i}")), &sync, "agent");
         }
-        pending.push(trigger("replay-5"), "agent");
-        pending.push(trigger("fresh"), "agent");
+        pending.push(trigger("replay-5"), &sync, "agent");
+        pending.push(trigger("fresh"), &sync, "agent");
 
         assert_eq!(pending.queue.len(), START_REQUEST_BACKLOG);
-        assert_eq!(pending.queue.front().unwrap().id, "replay-1");
-        assert_eq!(pending.queue.back().unwrap().id, "fresh");
+        assert_eq!(pending.queue.front().unwrap().0.id, "replay-1");
+        assert_eq!(pending.queue.back().unwrap().0.id, "fresh");
+    }
+
+    #[test]
+    fn a_request_waits_for_a_re_query_issued_after_it_was_read() {
+        let mut pending = PendingStartRequests::default();
+        let mut sync = BundleSync::default();
+        pending.push(trigger("first"), &sync, "agent");
+        assert!(!pending.ready(&sync));
+        assert!(pending.needs_sync(&sync));
+
+        // Re-query 1 goes out; a request read while it is in flight needs 2.
+        sync.issued = 1;
+        sync.in_flight = true;
+        pending.push(trigger("second"), &sync, "agent");
+        assert!(!pending.needs_sync(&sync), "one re-query at a time");
+
+        sync.completed = 1;
+        sync.in_flight = false;
+        assert!(pending.ready(&sync), "the first request's re-query is done");
+        assert!(pending.needs_sync(&sync), "the second still needs its own");
+
+        // A reconnect starts the count again: nothing held is ready.
+        pending.require_sync(1);
+        let sync = BundleSync::default();
+        assert!(!pending.ready(&sync));
+        assert!(pending.needs_sync(&sync));
     }
 
     fn sealed_bundle(owner: &Keys, agent: &Keys, version: u64, revoked: bool) -> String {
@@ -781,8 +900,9 @@ mod tests {
     }
 
     /// A relay double that completes NIP-42, waits for the tap's two REQs,
-    /// then delivers `frames` in order and holds the socket open.
-    async fn scripted_relay(frames: Vec<Value>) -> String {
+    /// then delivers `frames` in order and holds the socket open. It answers
+    /// every bundle re-query with `sync_events`, then EOSE.
+    async fn scripted_relay(frames: Vec<Value>, sync_events: Vec<nostr::Event>) -> String {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -813,7 +933,23 @@ mod tests {
                     .await
                     .unwrap();
             }
-            while ws.next().await.is_some() {}
+            while let Some(Ok(message)) = ws.next().await {
+                let WsMessage::Text(text) = message else {
+                    continue;
+                };
+                let frame: Vec<Value> = serde_json::from_str(&text).unwrap();
+                if frame[0] != "REQ" || frame[1] != BUNDLE_SYNC_SUBSCRIPTION_ID {
+                    continue;
+                }
+                for event in &sync_events {
+                    let frame = json!(["EVENT", BUNDLE_SYNC_SUBSCRIPTION_ID, event]);
+                    ws.send(WsMessage::Text(frame.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                let eose = json!(["EOSE", BUNDLE_SYNC_SUBSCRIPTION_ID]).to_string();
+                ws.send(WsMessage::Text(eose.into())).await.unwrap();
+            }
         });
         format!("ws://{addr}")
     }
@@ -877,10 +1013,13 @@ mod tests {
 
         let press = start_envelope(&owner, &agent, &owner, now_secs());
         let revocation = bundle_event(&owner, &sealed_bundle(&owner, &agent, 2, true), &agent_hex);
-        let relay = scripted_relay(vec![
-            json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press]),
-            json!(["EVENT", BUNDLE_TAP_SUBSCRIPTION_ID, revocation]),
-        ])
+        let relay = scripted_relay(
+            vec![
+                json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press]),
+                json!(["EVENT", BUNDLE_TAP_SUBSCRIPTION_ID, revocation]),
+            ],
+            Vec::new(),
+        )
         .await;
 
         // One slot, already taken: the wake loop is not draining.
@@ -922,10 +1061,50 @@ mod tests {
 
         let press = start_envelope(&owner, &agent, &owner, now_secs());
         let revocation = bundle_event(&owner, &sealed_bundle(&owner, &agent, 2, true), &agent_hex);
-        let relay = scripted_relay(vec![
-            json!(["EVENT", BUNDLE_TAP_SUBSCRIPTION_ID, revocation]),
-            json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press]),
-        ])
+        let relay = scripted_relay(
+            vec![
+                json!(["EVENT", BUNDLE_TAP_SUBSCRIPTION_ID, revocation]),
+                json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press]),
+            ],
+            Vec::new(),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let tap = spawn_tap(relay, agent, owner_hex, floor_store, &state, tx, &cancel);
+
+        let taken = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, press.id.to_hex());
+        assert!(
+            state.current().is_none(),
+            "the attempt for this press would snapshot the revoked bundle"
+        );
+
+        cancel.cancel();
+        tap.await.unwrap();
+    }
+
+    /// Round 4 of #170, P1. The relay runs each REQ in its own task, so on a
+    /// reconnect the start-request history can arrive before the bundle
+    /// history, even though the owner revoked before pressing Start. Here the
+    /// bundle subscription never delivers the revocation at all: only the
+    /// re-query the request waits for carries it.
+    #[tokio::test]
+    async fn a_request_read_ahead_of_an_earlier_revocation_waits_for_it() {
+        let (owner, agent, _dir, floor_store, state) = admitted_bundle_fixture();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+
+        let press = start_envelope(&owner, &agent, &owner, now_secs());
+        let revocation = bundle_event(&owner, &sealed_bundle(&owner, &agent, 2, true), &agent_hex);
+        let relay = scripted_relay(
+            vec![json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press])],
+            vec![revocation],
+        )
         .await;
 
         let (tx, mut rx) = mpsc::channel(1);

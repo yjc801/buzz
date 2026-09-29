@@ -31,13 +31,17 @@ use buzz_core::kind::KIND_WAKER_BUNDLE_ENVELOPE;
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Keys, Tag};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
 use crate::bundle::{LaunchBundleBody, SignedLaunchBundle};
-use crate::decide::normalize_pubkey;
+use crate::decide::{normalize_pubkey, TriggerEvent};
 use crate::feed::reconnect_delay_ms;
 use crate::floors::FloorStore;
+use crate::start_request::{
+    admit_start_request, start_request_frame, start_request_req, StartRequestFrame,
+};
 
 /// Subscription id for one agent's bundle-delivery tap. Fixed, like the
 /// mention feed's and the presence tap's own ids — a reconnect replaces the
@@ -351,6 +355,11 @@ fn decrypt_verify_and_admit(
 /// skipped, not a reconnect — an attacker (or a stale bundle replayed after
 /// a legitimate reissue) publishing junk tagged to this agent must not be
 /// able to knock this tap offline.
+///
+/// The same connection carries this agent's start requests on a second
+/// subscription ([`crate::start_request`]): the same authentication, the same
+/// envelope kind, so no extra socket per agent. An admitted request goes to
+/// the wake loop over `start_requests`; the loop is what claims and acts on it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_bundle_tap(
     relay_url: &str,
@@ -359,6 +368,7 @@ pub async fn run_bundle_tap(
     owner_pubkey: &str,
     floor_store: &mut FloorStore,
     state: &BundleState,
+    start_requests: &mpsc::Sender<TriggerEvent>,
     cancel: &CancellationToken,
 ) {
     let agent_pubkey = keys.public_key().to_hex();
@@ -395,6 +405,14 @@ pub async fn run_bundle_tap(
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue;
         }
+        if let Err(error) = connection
+            .send_raw(&start_request_req(&agent_pubkey, now_secs()))
+            .await
+        {
+            tracing::warn!(agent = %agent_pubkey, %error, "start request subscribe failed; reconnecting");
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            continue;
+        }
         consecutive_failures = 0;
 
         loop {
@@ -403,7 +421,33 @@ pub async fn run_bundle_tap(
                 () = cancel.cancelled() => return,
             };
 
-            match next {
+            let message = match next {
+                Ok(message) => match start_request_frame(&message) {
+                    StartRequestFrame::Event(event) => {
+                        forward_start_request(
+                            keys,
+                            &owner_pubkey,
+                            event,
+                            start_requests,
+                            &agent_pubkey,
+                        );
+                        continue;
+                    }
+                    StartRequestFrame::Closed(reason) => {
+                        tracing::warn!(
+                            agent = %agent_pubkey,
+                            %reason,
+                            "start request subscription closed by relay; reconnecting"
+                        );
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        break;
+                    }
+                    StartRequestFrame::NotOurs => Ok(message),
+                },
+                Err(error) => Err(error),
+            };
+
+            match message {
                 Ok(message) => match bundle_frame(&owner_pubkey, message) {
                     BundleFrame::Delivered { ciphertext } => {
                         match decrypt_verify_and_admit(
@@ -474,10 +518,97 @@ pub async fn run_bundle_tap(
     }
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify one start-request envelope and hand it to the wake loop.
+///
+/// Every refusal is logged and dropped — see [`run_bundle_tap`] on junk. A
+/// full channel drops too: the loop is at most a debounce window behind, and
+/// a request it never saw is re-delivered on this tap's next reconnect while
+/// it is still fresh.
+fn forward_start_request(
+    keys: &Keys,
+    owner_pubkey: &str,
+    event: &nostr::Event,
+    start_requests: &mpsc::Sender<TriggerEvent>,
+    agent_pubkey: &str,
+) {
+    match admit_start_request(keys, owner_pubkey, event, now_secs()) {
+        Ok(Some(trigger)) => {
+            let event_id = trigger.id.clone();
+            match start_requests.try_send(trigger) {
+                Ok(()) => tracing::info!(
+                    agent = %agent_pubkey,
+                    %event_id,
+                    "bundle tap admitted an owner start request"
+                ),
+                Err(error) => tracing::warn!(
+                    agent = %agent_pubkey,
+                    %event_id,
+                    %error,
+                    "bundle tap could not hand a start request to the wake loop; dropping it"
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            agent = %agent_pubkey,
+            event_id = %event.id,
+            %error,
+            "bundle tap refused a start request"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Kind};
+
+    #[test]
+    fn a_verified_start_request_reaches_the_wake_loop_and_junk_does_not() {
+        use crate::start_request::{SignedStartRequest, StartRequestBody};
+
+        let (owner, agent, throwaway) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let owner_hex = owner.public_key().to_hex();
+        let wrap = |signer: &Keys, body: &StartRequestBody| {
+            let signed =
+                SignedStartRequest::sign(body, &signer.secret_key().keypair(nostr::SECP256K1))
+                    .unwrap();
+            let content = nostr::nips::nip44::encrypt(
+                throwaway.secret_key(),
+                &agent.public_key(),
+                serde_json::to_string(&signed).unwrap(),
+                nostr::nips::nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16), content)
+                .tags([nostr::Tag::public_key(agent.public_key())])
+                .sign_with_keys(&throwaway)
+                .unwrap()
+        };
+        let body = StartRequestBody {
+            agent_pubkey: agent.public_key().to_hex(),
+            requested_at: now_secs(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+
+        // Signed by someone other than the pinned owner: dropped.
+        let forged = wrap(&Keys::generate(), &body);
+        forward_start_request(&agent, &owner_hex, &forged, &tx, "agent");
+        assert!(rx.try_recv().is_err());
+
+        let genuine = wrap(&owner, &body);
+        forward_start_request(&agent, &owner_hex, &genuine, &tx, "agent");
+        let trigger = rx.try_recv().expect("the wake loop receives the request");
+        assert_eq!(trigger.id, genuine.id.to_hex());
+        assert_eq!(trigger.author, owner_hex);
+    }
 
     fn bundle_event(owner: &Keys, ciphertext: &str, agent_pubkey: &str) -> nostr::Event {
         EventBuilder::new(Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16), ciphertext)

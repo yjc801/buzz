@@ -30,6 +30,10 @@
 //!   that decrypts, verifies (against [`floors::FloorStore`]'s pinned
 //!   owner), and admits a signed launch bundle without ever needing a new
 //!   network path to the desktop.
+//! - [`start_request`] — the **start request**: an owner-signed "start this
+//!   agent now", read on the bundle tap's connection and handed to the wake
+//!   loop as an ordinary trigger, so pressing Start deploys with this
+//!   daemon's substrate credential rather than the owner's own.
 //! - [`effects`] — [`effects::RealWakeEffects`], the production
 //!   [`attempt::WakeEffects`] implementation wiring the presence tap and the
 //!   bundle tap's admitted state in, and `start_managed_agent` to the
@@ -72,6 +76,7 @@ pub mod floors;
 pub mod presence_feed;
 pub mod relay_feed;
 pub mod roster_feed;
+pub mod start_request;
 pub mod wake_loop;
 pub mod watch_list;
 
@@ -92,6 +97,7 @@ pub use enrolment::{
     SignedCredential, SignedRoster,
 };
 pub use floors::{FloorError, FloorStore, Floors};
+pub use start_request::{SignedStartRequest, StartRequestBody, StartRequestError};
 
 /// Seconds of overlap to subtract from the persisted cursor when re-issuing a
 /// REQ after a reconnect — **G4**.

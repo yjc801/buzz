@@ -194,6 +194,30 @@ pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 30180;
 /// exact constraint that produced this envelope.
 pub const KIND_WAKER_BUNDLE_ENVELOPE: u32 = KIND_GIFT_WRAP;
 
+/// buzz-waker start request: an owner asking the daemon to start one agent
+/// now, with no mention to wake it.
+///
+/// Like [`KIND_WAKER_LAUNCH_BUNDLE`], this names the payload, not the wire:
+/// it travels inside a [`KIND_GIFT_WRAP`] addressed (`#p`) to the agent,
+/// NIP-44 encrypted to the agent's key, so it needs no relay change. The
+/// payload is a `SignedStartRequest` (`buzz-waker::start_request`) carrying
+/// the owner's own BIP-340 signature, checked against the enrolment-pinned
+/// owner — that signature, not the envelope's, is the trust boundary.
+///
+/// # Why this envelope *is* signed by a throwaway key
+///
+/// The opposite choice from [`KIND_WAKER_BUNDLE_ENVELOPE`], for the reason
+/// that one gives: the bundle tap's query pins `authors` to the owner and
+/// keeps only its newest few envelopes. Owner-signed start requests would
+/// match that query and, one per Start press, push the agent's launch
+/// bundle out of its window — a daemon restarted after enough presses would
+/// never find a bundle to deploy with. A throwaway signer keeps them out of
+/// that query entirely; the daemon reads them on a separate, time-bounded
+/// subscription instead. The cost is that these envelopes cannot be deleted
+/// by the owner (NIP-09 is author-only). They are small, carry nothing once
+/// stale, and are refused past their freshness window.
+pub const KIND_WAKER_START_REQUEST: u32 = 30181;
+
 /// Kinds whose stored events are readable only by their author.
 ///
 /// The relay must never reveal the existence, count, tags, content, schedule,

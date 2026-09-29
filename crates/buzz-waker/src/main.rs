@@ -602,6 +602,9 @@ fn spawn_agent_watch(
 
     let presence_state = Arc::new(PresenceState::new());
     let bundle_state = Arc::new(BundleState::new());
+    // Bundle tap → wake loop. Bounded: a request the loop cannot take right
+    // away is dropped and re-delivered on the tap's next reconnect.
+    let (start_request_tx, start_request_rx) = tokio::sync::mpsc::channel(16);
 
     tracing::info!(agent = %pubkey, owner = %owner_pubkey, "buzz-waker: watching agent");
 
@@ -645,6 +648,7 @@ fn spawn_agent_watch(
                 &owner_pubkey,
                 &mut floor_store,
                 &bundle_state,
+                &start_request_tx,
                 &cancel,
             )
             .await;
@@ -671,7 +675,7 @@ fn spawn_agent_watch(
         let generation = cancel.clone();
         let pubkey = pubkey.clone();
         tasks.spawn(async move {
-            run_wake_loop(config, cancel).await;
+            run_wake_loop(config, start_request_rx, cancel).await;
             TaskExit::Agent {
                 pubkey,
                 task: "wake_loop",

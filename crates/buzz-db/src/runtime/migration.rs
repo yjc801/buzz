@@ -705,13 +705,14 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 54);
+        assert_eq!(migrations.len(), 55);
         assert_eq!(migrations[48].version, 49);
         assert_eq!(migrations[49].version, 50);
         assert_eq!(migrations[50].version, 51);
         assert_eq!(migrations[51].version, 52);
         assert_eq!(migrations[52].version, 53);
         assert_eq!(migrations[53].version, 54);
+        assert_eq!(migrations[54].version, 55);
         assert!(migrations[48]
             .sql
             .as_str()
@@ -729,6 +730,10 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("community_deletion_requests_owner_quota_reservations"));
+        assert!(migrations[54]
+            .sql
+            .as_str()
+            .contains("idx_relay_admin_actions_direct_request"));
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -2475,9 +2480,9 @@ mod postgres_tests {
             .await
             .expect("connect migrated probe database");
         MIGRATOR
-            .run_to(47, &migrated)
+            .run_to(55, &migrated)
             .await
-            .expect("apply migrations 1-47");
+            .expect("apply migrations 1-55");
 
         for table in [
             "relay_admin_actions",
@@ -3000,5 +3005,37 @@ mod postgres_tests {
             .validate_catalog()
             .await
             .expect("deletion catalog validates after migration 0044");
+    }
+
+    /// Migration 0055's `relay_admin_actions_direct_shape` rejects a direct
+    /// timeout carrying only one of duration and expiry on the migrated
+    /// schema. The desired-state (pgschema + reconcile) path is covered by
+    /// `direct_timeout_shape_check_holds_on_desired_state_schema` in buzz-relay.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migration_0055_rejects_half_filled_direct_timeout() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(55, &pool)
+            .await
+            .expect("apply migrations 1-55");
+        for (secs, until) in [(Some(60i64), None), (None, Some(chrono::Utc::now()))] {
+            let err = sqlx::query(
+                "INSERT INTO relay_admin_actions (report_community_id, request_id, actor_pubkey, \
+                 actor_role, action, timeout_secs, timeout_until, enforcement_target_pubkey) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'operator', 'timeout', $2, $3, $1)",
+            )
+            .bind([9u8; 32].as_slice())
+            .bind(secs)
+            .bind(until)
+            .execute(&pool)
+            .await
+            .expect_err("half-filled timeout must violate the CHECK");
+            assert!(
+                err.to_string().contains("relay_admin_actions_direct_shape"),
+                "{err}"
+            );
+        }
     }
 }

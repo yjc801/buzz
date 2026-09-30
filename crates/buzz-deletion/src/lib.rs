@@ -89,6 +89,18 @@ impl ServingWriteGuard {
     where
         F: std::future::Future<Output = T>,
     {
+        let (output, verified) = self.protect_landed(operation).await?;
+        verified?;
+        Ok(output)
+    }
+
+    /// Like [`Self::protect`], but a completed operation's output survives a
+    /// failed post-operation verification, returned beside that failure, so a
+    /// caller can compensate for an effect that landed before the proof lapsed.
+    pub async fn protect_landed<F, T>(&self, operation: F) -> Result<(T, Result<()>)>
+    where
+        F: std::future::Future<Output = T>,
+    {
         self.verify().await?;
         let output = tokio::select! {
             biased;
@@ -100,8 +112,8 @@ impl ServingWriteGuard {
                 .into())
             }
         };
-        self.verify().await?;
-        Ok(output)
+        let verified = self.verify().await;
+        Ok((output, verified))
     }
 
     /// Whether an error represents loss of a durable serving-write lease.

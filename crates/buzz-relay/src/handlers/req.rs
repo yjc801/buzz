@@ -210,12 +210,36 @@ pub async fn handle_req(
     }
 
     if filters_are_huddle_liveness_only(&filters) {
-        handle_huddle_liveness_req(
-            &sub_id,
-            &filters,
-            authorized_requested_channels.as_deref().unwrap_or_default(),
+        // P1-a: acquire an effect permit before the liveness query + emission,
+        // exactly as the search and normal REQ branches do. Without this, a
+        // frame accepted just before expiry can complete DB reads and sign
+        // EVENTs after the NIP-FI deadline. [FI-TRACE-LEASE-BOUND]
+        //
+        // Test hook: fires immediately before acquire_effect.
+        // [nip_fi_test_hooks::liveness_req_hook]
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::before_liveness_req(conn.tenant.community()).await;
+        let _liveness_permit = match conn.nip_fi_gate.acquire_effect().await {
+            Ok(permit) => permit,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                // Fix 4: [FI-TRACE-DENIAL-ORACLE] gate is off_mode when no assertion
+                // exists, so SessionExpired here always implies an active FI session.
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted: authorization denied",
+                ));
+                return;
+            }
+        };
+        unless_cancelled(
             &conn,
-            &state,
+            handle_huddle_liveness_req(
+                &sub_id,
+                &filters,
+                authorized_requested_channels.as_deref().unwrap_or_default(),
+                &conn,
+                &state,
+            ),
         )
         .await;
         return;
@@ -267,26 +291,70 @@ pub async fn handle_req(
             ));
             return;
         }
+        // IMPORTANT 6: acquire a REQ effect permit before the search query and
+        // hold it through historical delivery/EOSE, just as the normal REQ branch
+        // does around registration/history. Without this, an authenticated frame
+        // can finish validation after the deadline and return history without an
+        // authoritative seam check. [FI-TRACE-LEASE-BOUND, NIP-50 search seam]
+        let _search_permit = match conn.nip_fi_gate.acquire_effect().await {
+            Ok(permit) => permit,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                // Fix 4: [FI-TRACE-DENIAL-ORACLE]
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "restricted: authorization denied",
+                ));
+                return;
+            }
+        };
         let Some(owner) = claim_search_subscription(&sub_id, &conn, &state).await else {
             return;
         };
-        handle_search_req(
-            &sub_id,
-            owner,
-            &filters,
-            &accessible_channels,
-            token_channel_ids.is_none(),
-            &conn.tenant,
-            &pubkey_bytes,
-            &conn,
-            &state,
-            trace_state.as_ref(),
-        )
-        .await;
+        let search = async {
+            #[cfg(test)]
+            crate::nip_fi_test_hooks::before_search_query(conn.tenant.community()).await;
+            handle_search_req(
+                &sub_id,
+                owner,
+                &filters,
+                &accessible_channels,
+                token_channel_ids.is_none(),
+                &conn.tenant,
+                &pubkey_bytes,
+                &conn,
+                &state,
+                trace_state.as_ref(),
+            )
+            .await;
+        };
+        if unless_cancelled(&conn, search).await.is_none() {
+            drop(_search_permit);
+        }
         // One-shot: drop the claim unless a newer REQ already took the ID.
         super::close::close_if_owner(&sub_id, owner, None, &conn, &state).await;
         return;
     }
+
+    // B2: acquire effect permit immediately before the first subscription-map
+    // mutation. The permit is held through map insert, sub_registry registration,
+    // topic retain, historical delivery, and EOSE. Off-mode: proceed
+    // unconditionally. [FI-TRACE-LEASE-BOUND, B2 seam: REQ registration]
+    //
+    // Test hook: fires immediately before acquire_effect.
+    // [nip_fi_test_hooks::req_registration_hook]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_req_registration(conn.tenant.community()).await;
+    let _req_permit = match conn.nip_fi_gate.acquire_effect().await {
+        Ok(permit) => permit,
+        Err(crate::nip_fi_gate::SessionExpired) => {
+            // Fix 4: [FI-TRACE-DENIAL-ORACLE]
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "restricted: authorization denied",
+            ));
+            return;
+        }
+    };
 
     let Some(owner) = claim_live_subscription(
         &sub_id,
@@ -302,191 +370,242 @@ pub async fn handle_req(
 
     debug!(conn_id = %conn_id, sub_id = %sub_id, "Subscription registered");
 
-    // NIP-01 OR semantics: execute one DB query per filter and deduplicate results
-    // by event ID. Collapsing all filters into a single query would merge their
-    // time windows and limits, causing under-fetching when filters have different
-    // per-filter limits or non-overlapping time windows.
-    let mut seen_ids: HashSet<nostr::EventId> = HashSet::new();
-    let mut total_sent: usize = 0;
+    // Registration above is one uncancellable unit; the history read below is
+    // read-only delivery and races gate cancellation, so expiry drops it and
+    // releases the permit without sending another EVENT or EOSE. It returns
+    // whether a statement timeout ended it: retirement then runs after the
+    // race, because a dropped retirement would leak its unreleased topics.
+    let history = async {
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::before_req_history(conn.tenant.community()).await;
 
-    // Phase 1 — pure query construction, in filter order.
-    let filter_queries: Vec<(usize, Option<uuid::Uuid>, EventQuery)> = filters
-        .iter()
-        .enumerate()
-        .map(|(idx, filter)| {
-            // Use per-filter #h channel scope when available, falling back to the
-            // subscription-level channel_id. This prevents unrelated accessible-channel
-            // rows from consuming the LIMIT when filters target specific channels but
-            // the subscription is global (multiple distinct #h values across filters).
-            let per_filter_channel = {
-                let h = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
-                filter
-                    .generic_tags
-                    .get(&h)
-                    .and_then(|vs| {
-                        if vs.len() == 1 {
-                            vs.iter().next()?.parse::<uuid::Uuid>().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .or(channel_id)
-            };
-            let mut params =
-                filter_to_query_params(filter, per_filter_channel, conn.tenant.community());
-            params.before_id = before_ids.get(idx).cloned().flatten();
-            apply_channel_scope_to_query(
-                &mut params,
-                filter,
-                per_filter_channel,
-                &accessible_channels,
-            );
-            // Shared-gated visibility pushdown: set reader bytes so query_events
-            // appends the SQL visibility clause before ORDER/LIMIT, preventing
-            // newer private events from starving older shared ones off the page.
-            if filter_can_match_shared_gated_kinds(filter) {
-                params.shared_gated_reader = Some(pubkey_bytes.clone());
-            }
-            (idx, per_filter_channel, params)
-        })
-        .collect();
+        // NIP-01 OR semantics: execute one DB query per filter and deduplicate results
+        // by event ID. Collapsing all filters into a single query would merge their
+        // time windows and limits, causing under-fetching when filters have different
+        // per-filter limits or non-overlapping time windows.
+        let mut seen_ids: HashSet<nostr::EventId> = HashSet::new();
+        let mut total_sent: usize = 0;
 
-    // Phase 2 — DB reads, bounded-concurrent. `buffered` (not `buffer_unordered`)
-    // yields results in input order, so phase 3 observes filters in their
-    // original order and NIP-01 dedupe / conformance-trace / error semantics are
-    // byte-identical to the previous serial loop.
-    use futures_util::stream::{self, StreamExt};
-    let db = state.db.clone();
-    let mut results = stream::iter(filter_queries.into_iter().map(
-        |(idx, per_filter_channel, params)| {
-            let db = db.clone();
-            async move {
-                let filter_events = db.query_events_routed("req_historical", &params).await;
-                (idx, per_filter_channel, filter_events)
-            }
-        },
-    ))
-    .buffered(FILTER_QUERY_CONCURRENCY);
-
-    // Phase 3 — post-processing, strictly in filter order.
-    while let Some((idx, per_filter_channel, filter_events)) = results.next().await {
-        let filter = &filters[idx];
-        let events = match filter_events {
-            Ok(evs) => evs,
-            Err(e) => {
-                warn!(conn_id = %conn_id, sub_id = %sub_id, "Historical query failed: {e}");
-                // A failed page must never look like a drained one — a bare
-                // EOSE here is indistinguishable from "no more events" to a
-                // paging client (e.g. buzz-waker's backfill), which would
-                // treat a transient DB error as a clean end of backlog. Close
-                // the subscription instead so the client's retry sees a fresh
-                // REQ rather than a duplicate sub_id.
-                if e.is_statement_cancelled() {
-                    close_timed_out_subscription(&sub_id, owner, &conn, &state).await;
-                } else {
-                    super::close::close_if_owner(
-                        &sub_id,
-                        owner,
-                        Some("error: database error"),
-                        &conn,
-                        &state,
-                    )
-                    .await;
+        // Phase 1 — pure query construction, in filter order.
+        let filter_queries: Vec<(usize, Option<uuid::Uuid>, EventQuery)> = filters
+            .iter()
+            .enumerate()
+            .map(|(idx, filter)| {
+                // Use per-filter #h channel scope when available, falling back to the
+                // subscription-level channel_id. This prevents unrelated accessible-channel
+                // rows from consuming the LIMIT when filters target specific channels but
+                // the subscription is global (multiple distinct #h values across filters).
+                let per_filter_channel = {
+                    let h = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
+                    filter
+                        .generic_tags
+                        .get(&h)
+                        .and_then(|vs| {
+                            if vs.len() == 1 {
+                                vs.iter().next()?.parse::<uuid::Uuid>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .or(channel_id)
+                };
+                let mut params =
+                    filter_to_query_params(filter, per_filter_channel, conn.tenant.community());
+                params.before_id = before_ids.get(idx).cloned().flatten();
+                apply_channel_scope_to_query(
+                    &mut params,
+                    filter,
+                    per_filter_channel,
+                    &accessible_channels,
+                );
+                // Shared-gated visibility pushdown: set reader bytes so query_events
+                // appends the SQL visibility clause before ORDER/LIMIT, preventing
+                // newer private events from starving older shared ones off the page.
+                if filter_can_match_shared_gated_kinds(filter) {
+                    params.shared_gated_reader = Some(pubkey_bytes.clone());
                 }
-                return;
-            }
-        };
+                (idx, per_filter_channel, params)
+            })
+            .collect();
 
-        // Conformance read-seam emit (non-search lane). Project each row's
-        // true community label via a per-channel lookup independent of the
-        // query's WHERE clause — see `record_read_message_rows` for the
-        // (B) projection strategy and the missing-lookup ImplBug
-        // guard-rail. Skipped silently if `trace_state` is `None` (only
-        // happens on malformed pubkey, a separate failure path).
-        // `tracer.enabled()` short-circuits the whole block on the production
-        // `NoopTracer`: the `communities_of_channels` lookup below is a
-        // `channels` read whose only consumer is `record_read_message_rows`,
-        // and this emit runs once PER FILTER. Gating on `trace_state` alone was
-        // not enough — that is `Some` for every well-formed request.
-        if let Some(state_snap) = trace_state.as_ref().filter(|_| state.tracer.enabled()) {
-            let row_channels: Vec<Option<uuid::Uuid>> =
-                events.iter().map(|e| e.channel_id).collect();
-            let distinct: Vec<uuid::Uuid> = {
-                let mut s: std::collections::BTreeSet<uuid::Uuid> =
-                    std::collections::BTreeSet::new();
-                for c in row_channels.iter().flatten() {
-                    s.insert(*c);
+        // Phase 2 — DB reads, bounded-concurrent. `buffered` (not `buffer_unordered`)
+        // yields results in input order, so phase 3 observes filters in their
+        // original order and NIP-01 dedupe / conformance-trace / error semantics are
+        // byte-identical to the previous serial loop.
+        use futures_util::stream::{self, StreamExt};
+        let db = state.db.clone();
+        let mut results = stream::iter(filter_queries.into_iter().map(
+            |(idx, per_filter_channel, params)| {
+                let db = db.clone();
+                async move {
+                    let filter_events = db.query_events_routed("req_historical", &params).await;
+                    (idx, per_filter_channel, filter_events)
                 }
-                s.into_iter().collect()
-            };
-            let channel_communities = match state.db.communities_of_channels(&distinct).await {
-                Ok(m) => m,
+            },
+        ))
+        .buffered(FILTER_QUERY_CONCURRENCY);
+
+        // Phase 3 — post-processing, strictly in filter order.
+        while let Some((idx, per_filter_channel, filter_events)) = results.next().await {
+            let filter = &filters[idx];
+            let events = match filter_events {
+                Ok(evs) => evs,
                 Err(e) => {
-                    warn!(
-                        conn_id = %conn_id, sub_id = %sub_id,
-                        "conformance row-community lookup failed: {e}"
-                    );
-                    std::collections::HashMap::new()
+                    warn!(conn_id = %conn_id, sub_id = %sub_id, "Historical query failed: {e}");
+                    // A failed page must never look like a drained one — a bare
+                    // EOSE here is indistinguishable from "no more events" to a
+                    // paging client (e.g. buzz-waker's backfill), which would
+                    // treat a transient DB error as a clean end of backlog. Close
+                    // the subscription instead (after the race, like the timeout
+                    // retirement) so the client's retry sees a fresh REQ rather
+                    // than a duplicate sub_id.
+                    if e.is_statement_cancelled() {
+                        return HistoryEnd::TimedOut;
+                    }
+                    return HistoryEnd::Failed;
                 }
             };
-            crate::conformance::record_read_message_rows(
-                &state.tracer,
-                state_snap,
-                per_filter_channel,
-                &row_channels,
-                &channel_communities,
-            );
-        }
 
-        for stored in &events {
-            // Per-filter NIP-01 matching — use the current filter only, not the
-            // full filter set. OR semantics across filters are handled by the outer
-            // loop (each filter gets its own DB query).
-            if !filters_match(std::slice::from_ref(filter), stored) {
-                continue;
+            // Conformance read-seam emit (non-search lane). Project each row's
+            // true community label via a per-channel lookup independent of the
+            // query's WHERE clause — see `record_read_message_rows` for the
+            // (B) projection strategy and the missing-lookup ImplBug
+            // guard-rail. Skipped silently if `trace_state` is `None` (only
+            // happens on malformed pubkey, a separate failure path).
+            // `tracer.enabled()` short-circuits the whole block on the production
+            // `NoopTracer`: the `communities_of_channels` lookup below is a
+            // `channels` read whose only consumer is `record_read_message_rows`,
+            // and this emit runs once PER FILTER. Gating on `trace_state` alone was
+            // not enough — that is `Some` for every well-formed request.
+            if let Some(state_snap) = trace_state.as_ref().filter(|_| state.tracer.enabled()) {
+                let row_channels: Vec<Option<uuid::Uuid>> =
+                    events.iter().map(|e| e.channel_id).collect();
+                let distinct: Vec<uuid::Uuid> = {
+                    let mut s: std::collections::BTreeSet<uuid::Uuid> =
+                        std::collections::BTreeSet::new();
+                    for c in row_channels.iter().flatten() {
+                        s.insert(*c);
+                    }
+                    s.into_iter().collect()
+                };
+                let channel_communities = match state.db.communities_of_channels(&distinct).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            conn_id = %conn_id, sub_id = %sub_id,
+                            "conformance row-community lookup failed: {e}"
+                        );
+                        std::collections::HashMap::new()
+                    }
+                };
+                crate::conformance::record_read_message_rows(
+                    &state.tracer,
+                    state_snap,
+                    per_filter_channel,
+                    &row_channels,
+                    &channel_communities,
+                );
             }
 
-            if let Some(ch_id) = stored.channel_id {
-                if !accessible_channels.contains(&ch_id) {
+            for stored in &events {
+                // Per-filter NIP-01 matching — use the current filter only, not the
+                // full filter set. OR semantics across filters are handled by the outer
+                // loop (each filter gets its own DB query).
+                if !filters_match(std::slice::from_ref(filter), stored) {
                     continue;
                 }
-            }
 
-            // Result-level read auth: a viewer-private snapshot (kind:30622) is
-            // delivered only to its owner, even if reached via a kindless
-            // `ids:[…]` subscription that skips the filter-level `#p` gate.
-            // Also enforces author-only kinds (30300/30350) and the persona
-            // shared-gate (kind:30175 without ["shared","true"]). Single call
-            // covers all three gated event classes.
-            if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
-                continue;
-            }
+                if let Some(ch_id) = stored.channel_id {
+                    if !accessible_channels.contains(&ch_id) {
+                        continue;
+                    }
+                }
 
-            // Dedup AFTER acceptance — an event that fails filter A's constraints
-            // must remain eligible for filter B (NIP-01 OR semantics).
-            if !seen_ids.insert(stored.event.id) {
-                continue;
-            }
+                // Result-level read auth: a viewer-private snapshot (kind:30622) is
+                // delivered only to its owner, even if reached via a kindless
+                // `ids:[…]` subscription that skips the filter-level `#p` gate.
+                // Also enforces author-only kinds (30300/30350) and the persona
+                // shared-gate (kind:30175 without ["shared","true"]). Single call
+                // covers all three gated event classes.
+                if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
+                    continue;
+                }
 
-            let msg = RelayMessage::event(&sub_id, &stored.event);
-            if !conn.send(msg) {
-                return;
-            }
-            total_sent += 1;
-            if total_sent.is_multiple_of(100) {
-                tokio::task::yield_now().await;
+                // Dedup AFTER acceptance — an event that fails filter A's constraints
+                // must remain eligible for filter B (NIP-01 OR semantics).
+                if !seen_ids.insert(stored.event.id) {
+                    continue;
+                }
+
+                let msg = RelayMessage::event(&sub_id, &stored.event);
+                if !conn.send(msg) {
+                    return HistoryEnd::Done;
+                }
+                total_sent += 1;
+                if total_sent.is_multiple_of(100) {
+                    tokio::task::yield_now().await;
+                }
             }
         }
+
+        conn.send(RelayMessage::eose(&sub_id));
+
+        debug!(
+            conn_id = %conn_id,
+            sub_id = %sub_id,
+            count = total_sent,
+            "EOSE sent after historical delivery"
+        );
+        HistoryEnd::Done
+    };
+    let outcome = unless_cancelled(&conn, history).await;
+    drop(_req_permit);
+    match outcome {
+        Some(HistoryEnd::Done) => {}
+        Some(HistoryEnd::TimedOut) => {
+            close_timed_out_subscription(&sub_id, owner, &conn, &state).await
+        }
+        Some(HistoryEnd::Failed) => {
+            super::close::close_if_owner(
+                &sub_id,
+                owner,
+                Some("error: database error"),
+                &conn,
+                &state,
+            )
+            .await;
+        }
+        None => {
+            super::close::close_if_owner(&sub_id, owner, None, &conn, &state).await;
+        }
     }
+}
 
-    conn.send(RelayMessage::eose(&sub_id));
+/// How the historical read of a REQ ended, when cancellation did not win.
+enum HistoryEnd {
+    /// Nothing is left to retire: every page was delivered and EOSE sent, or
+    /// the connection stopped accepting frames.
+    Done,
+    /// A statement timeout ended the read; the subscription must be retired.
+    TimedOut,
+    /// A database error ended the read; the subscription must be CLOSED, never
+    /// EOSEd, so a paging client cannot mistake the failure for a drained page.
+    Failed,
+}
 
-    debug!(
-        conn_id = %conn_id,
-        sub_id = %sub_id,
-        count = total_sent,
-        "EOSE sent after historical delivery"
-    );
+/// Run read-only work held under an effect permit, racing it against the
+/// session gate's cancellation (NIP-FI expiry or external close). Returns
+/// `None` when cancellation won: the work is dropped at its pending await, so
+/// it sends nothing further, and the caller releases the permit.
+async fn unless_cancelled<T>(
+    conn: &ConnectionState,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = conn.nip_fi_gate.cancelled() => None,
+        out = work => Some(out),
+    }
 }
 
 /// FTS candidate hits fetched per page. Pages are always full regardless of
@@ -1209,6 +1328,10 @@ async fn handle_huddle_liveness_req(
     }
 
     let session_ids = huddle_liveness_session_ids(filters);
+    // P1-a instrumentation: increments before the DB boundary so the witness
+    // can confirm the query was (or was not) attempted. [nip_fi_test_hooks::liveness_query_counter]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_liveness_query(conn.tenant.community());
     let linked_sessions = match state
         .db
         .huddle_started_links(conn.tenant.community(), parent_channel_ids, &session_ids)
@@ -1671,6 +1794,7 @@ mod tests {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel(8);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
         let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let cancel = tokio_util::sync::CancellationToken::new();
         let conn = ConnectionState {
             conn_id: uuid::Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(community, "t.local".to_string()),
@@ -1679,9 +1803,13 @@ mod tests {
             subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             send_tx,
             ctrl_tx,
-            cancel: tokio_util::sync::CancellationToken::new(),
+            terminal_ctrl_tx: tokio::sync::mpsc::channel(1).0,
+            cancel: cancel.clone(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
         };
         (conn, send_rx)
     }
@@ -2038,6 +2166,7 @@ mod tests {
         let (send_tx, mut send_rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
         let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let cancel = tokio_util::sync::CancellationToken::new();
         let conn = Arc::new(ConnectionState {
             conn_id: uuid::Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(community, "t.local".to_string()),
@@ -2046,9 +2175,13 @@ mod tests {
             subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             send_tx,
             ctrl_tx,
-            cancel: tokio_util::sync::CancellationToken::new(),
+            terminal_ctrl_tx: tokio::sync::mpsc::channel(1).0,
+            cancel: cancel.clone(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
         });
 
         // Claim, then fill the send buffer so the next `send` returns false.
@@ -2092,6 +2225,7 @@ mod tests {
         let (send_tx, mut send_rx) = tokio::sync::mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
         let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let cancel = tokio_util::sync::CancellationToken::new();
         let conn = Arc::new(ConnectionState {
             conn_id: uuid::Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(community, "t.local".to_string()),
@@ -2100,9 +2234,13 @@ mod tests {
             subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             send_tx: send_tx.clone(),
             ctrl_tx,
-            cancel: tokio_util::sync::CancellationToken::new(),
+            terminal_ctrl_tx: tokio::sync::mpsc::channel(1).0,
+            cancel: cancel.clone(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
         });
         // Register in conn_manager so evict_conn_channel_subscriptions can
         // find the connection for cancel_conn.
@@ -2313,6 +2451,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(16);
         let conn_id = uuid::Uuid::new_v4();
+        let cancel = tokio_util::sync::CancellationToken::new();
         let conn = Arc::new(ConnectionState {
             conn_id,
             tenant,
@@ -2330,9 +2469,13 @@ mod tests {
             subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             send_tx: tx,
             ctrl_tx,
-            cancel: tokio_util::sync::CancellationToken::new(),
+            terminal_ctrl_tx: tokio::sync::mpsc::channel(1).0,
+            cancel: cancel.clone(),
             backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel),
         });
 
         let sub_id = "sub-under-test".to_string();
@@ -2469,7 +2612,7 @@ mod tests {
         crate::nip11::RelayInfo::build(
             None,
             None,
-            false,
+            crate::nip11::RelayCapabilityFlags::default(),
             crate::config::DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
@@ -3368,5 +3511,559 @@ mod tests {
         ));
         // No #p tag — fallback required.
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+
+    // ── W3: B2 REQ gate — barrier expiry mid-flight blocks subscription registration
+    //
+    // Arms `before_req_registration` — the hook immediately before `acquire_effect()`
+    // in the REQ registration path. Dispatches `handle_req` with a live (not-yet-
+    // cancelled) gate, waits for the hook to signal the handler reached the permit
+    // boundary, fires expiry (cancel), then releases the hook. The handler tries
+    // `acquire_effect()` and gets `SessionExpired`, sends CLOSED without inserting
+    // the subscription.
+    //
+    // Hook location: `handlers/req.rs`, immediately before `acquire_effect()`.
+    //
+    // Mutation evidence:
+    //   A) Delete `#[cfg(test)] before_req_registration(...)` from req.rs →
+    //      hook never fires → `arrived_rx` times out → test panics.
+    //   B) Remove `acquire_effect()` from req.rs → handler inserts the subscription
+    //      despite the cancelled gate → `subs.is_empty()` assertion panics.
+    //   C) Change gate to `off_mode` → `acquire_effect()` succeeds after cancel
+    //      → subscription IS inserted → `subs.is_empty()` assertion panics.
+
+    async fn w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration_body() {
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // Live gate — NOT pre-cancelled. acquire_effect succeeds unless we fire expiry.
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+                class: crate::connection::ConnectionClass::Interactive,
+            }),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
+        });
+
+        let state = crate::state::tests::test_state().await;
+        let sub_id = "w3-barrier-test".to_string();
+        // Kind:1 (TextNote) — not p-gated — so the filter clears all pre-gate
+        // authorization checks and reaches the `before_req_registration` hook.
+        let filters = vec![Filter::new().kind(nostr::Kind::TextNote).limit(1)];
+
+        // Arm the barrier: fires when handle_req reaches before_req_registration.
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::req_registration_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let handle =
+            tokio::spawn(async move { handle_req(sub_id, filters, vec![], conn2, state2).await });
+
+        // Wait for the handler to reach the permit boundary.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("W3: handler must reach before_req_registration within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry: cancel so acquire_effect returns SessionExpired.
+        cancel.cancel();
+
+        // Release — handler resumes, calls acquire_effect(), gets SessionExpired.
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("W3: handle_req must return within 5s after hook release")
+            .expect("handle_req task must not panic");
+
+        // The subscription map must be empty — the gate blocked the handler
+        // before any map insertion.
+        let subs = subscriptions.lock().await;
+        assert!(
+            subs.is_empty(),
+            "W3: expired gate must prevent subscription registration; subs = {subs:?}"
+        );
+
+        // A CLOSED frame must have been sent with the authorization denied message.
+        let frame = send_rx
+            .try_recv()
+            .expect("W3: handler must send CLOSED on expired gate");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("authorization denied"),
+                    "W3: CLOSED message must contain 'authorization denied'; got: {t}"
+                );
+            }
+            other => panic!("W3: expected Text CLOSED frame, got {other:?}"),
+        }
+    }
+
+    // ── P1-a: huddle-liveness REQ gate — barrier expiry blocks query + emission ──────
+    //
+    // Arms `before_liveness_req` — the hook immediately before `acquire_effect()`
+    // in the `filters_are_huddle_liveness_only` branch of `handle_req`. Dispatches
+    // `handle_req` with a KIND_HUDDLE_LIVENESS filter with an authorized `#h` channel
+    // (pre-populated in accessible_channels_cache so no DB call is needed) and a live
+    // gate. Waits for the hook, fires expiry, then releases. The handler must return
+    // CLOSED "authorization denied" and the `liveness_query_counter` must remain 0 —
+    // proving the permit gate stopped execution before the `huddle_started_links` DB
+    // call boundary, not merely at the denial-text seam.
+    //
+    // Hook location: `handlers/req.rs`, immediately before `acquire_effect()`
+    // in the liveness branch.
+    //
+    // Mutation evidence:
+    //   A) Delete `#[cfg(test)] before_liveness_req(...)` from req.rs →
+    //      hook never fires → `arrived_rx` times out → test panics.
+    //   B) Remove `acquire_effect()` from the liveness branch →
+    //      handler proceeds past the gate into `handle_huddle_liveness_req` →
+    //      `before_liveness_query` fires → `liveness_query_counter` = 1 →
+    //      `assert_eq!(query_count, 0)` panics.
+    //   C) Change gate to `off_mode` → `acquire_effect()` always succeeds →
+    //      same as (B).
+    #[tokio::test]
+    async fn p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission() {
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        // Use a distinct community UUID for this test to avoid interference with
+        // other tests that also use Uuid::nil(). The liveness_query_counter and
+        // liveness_req_hook are keyed per community.
+        let community =
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::from_u128(0x0000_0001_1500_0000));
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+                class: crate::connection::ConnectionClass::Interactive,
+            }),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
+        });
+
+        let state = crate::state::tests::test_state().await;
+
+        // Pre-populate the accessible_channels_cache so the handle_req
+        // membership check succeeds without a real DB connection.
+        let channel_uuid = Uuid::from_u128(0xDEAD_BEEF_CAFE_1500);
+        let pubkey_bytes = keys.public_key().to_bytes().to_vec();
+        state
+            .accessible_channels_cache
+            .insert((community, pubkey_bytes), vec![channel_uuid]);
+
+        // Register the liveness query counter — proves the DB call boundary.
+        let query_count = crate::nip_fi_test_hooks::liveness_query_counter::register(community);
+
+        let sub_id = "p1a-liveness-barrier-test".to_string();
+
+        // KIND_HUDDLE_LIVENESS with #h = channel_uuid:
+        //   - `filters_are_huddle_liveness_only` → true (kind-only check)
+        //   - `extract_channel_ids_from_filters_limited` → Some([channel_uuid])
+        //   - accessible_channels_cache hit → channel is authorized
+        //   - `authorized_requested_channels` = Some([channel_uuid]) → non-empty
+        //   - handler enters the liveness branch, reaches before_liveness_req hook
+        let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
+        let mut filter = Filter::new().kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_HUDDLE_LIVENESS as u16,
+        ));
+        filter
+            .generic_tags
+            .entry(h_tag)
+            .or_default()
+            .insert(channel_uuid.to_string());
+        let filters = vec![filter];
+
+        // Arm the barrier: fires when handle_req reaches before_liveness_req.
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::liveness_req_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let handle =
+            tokio::spawn(async move { handle_req(sub_id, filters, vec![], conn2, state2).await });
+
+        // Wait for the handler to reach the permit boundary.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("P1-a: handler must reach before_liveness_req within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry.
+        cancel.cancel();
+
+        // Release — handler tries acquire_effect(), gets SessionExpired.
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("P1-a: handle_req must return within 5s after hook release")
+            .expect("handle_req task must not panic");
+
+        // The liveness_query_counter must be 0 — the permit gate must have
+        // blocked the handler before the `huddle_started_links` DB call.
+        let count = query_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count, 0,
+            "P1-a: `huddle_started_links` must NOT be called when gate is expired; count = {count}"
+        );
+        crate::nip_fi_test_hooks::liveness_query_counter::deregister(community);
+
+        // A CLOSED frame must have been sent with the authorization denied message.
+        let frame = send_rx
+            .try_recv()
+            .expect("P1-a: handler must send CLOSED on expired gate");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("authorization denied"),
+                    "P1-a: CLOSED message must contain 'authorization denied'; got: {t}"
+                );
+            }
+            other => panic!("P1-a: expected Text CLOSED frame, got {other:?}"),
+        }
+    }
+
+    // ── Expiry during a stalled read under a REQ/search permit ────────────────
+    //
+    // Drives the production `handle_req` path to a hook inside the read-only
+    // delivery (after the permit and, for REQ, after registration), stalls there
+    // as a hung DB read would, then fires `gate.expire`. `expire` returns only
+    // once every effect permit is dropped, so a bounded return proves the
+    // permit was released. The subscription must be gone and no EOSE sent.
+    //
+    // Mutation evidence: replace `unless_cancelled(&conn, history|search)` with
+    // a plain `.await` → the handler stays parked at the hook holding the
+    // permit → `expire` does not return within the bound → test panics.
+    async fn expiry_during_stalled_read_releases_permit(community_bits: u128, search: bool) {
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::from_u128(community_bits));
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+                class: crate::connection::ConnectionClass::Interactive,
+            }),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: Arc::clone(&gate),
+        });
+        let state = crate::state::tests::test_state().await;
+        state
+            .accessible_channels_cache
+            .insert((community, keys.public_key().to_bytes().to_vec()), vec![]);
+
+        let mut filter = Filter::new().kind(nostr::Kind::TextNote).limit(1);
+        let (arrived_rx, _release) = if search {
+            filter = filter.search("stall");
+            crate::nip_fi_test_hooks::search_query_hook::arm(community)
+        } else {
+            crate::nip_fi_test_hooks::req_history_hook::arm(community)
+        };
+
+        let handle = tokio::spawn(handle_req(
+            "stalled-read".to_string(),
+            vec![filter],
+            vec![],
+            Arc::clone(&conn),
+            state,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("handler must reach the stalled read")
+            .expect("arrived channel closed");
+        assert!(
+            subscriptions.lock().await.contains_key("stalled-read"),
+            "the read under test must run after the claim"
+        );
+
+        // Never release the hook: the read stays stalled. Expiry must still
+        // reach quiescence, which requires the permit to be dropped.
+        tokio::time::timeout(Duration::from_secs(2), gate.expire(|| {}))
+            .await
+            .expect("expiry must quiesce within 2s: the stalled read still holds its permit");
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_req must return after cancellation wins")
+            .expect("handle_req task must not panic");
+
+        assert!(
+            subscriptions.lock().await.is_empty(),
+            "cancellation after registration must clean the claim up"
+        );
+        while let Ok(frame) = send_rx.try_recv() {
+            if let axum::extract::ws::Message::Text(t) = frame {
+                assert!(
+                    !t.contains("EOSE"),
+                    "no EOSE after cancellation won; got {t}"
+                );
+                assert!(
+                    !t.contains("\"EVENT\""),
+                    "no EVENT after cancellation won; got {t}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_during_stalled_history_read_releases_permit_and_claim() {
+        expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0001, false).await;
+    }
+
+    #[tokio::test]
+    async fn expiry_during_stalled_search_read_releases_permit_and_claim() {
+        expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0002, true).await;
+    }
+
+    // ── History statement timeout racing expiry ───────────────────────────────
+    //
+    // Drives the production history read into a real statement timeout (a lock
+    // on `events` outlasts the session `statement_timeout`), pauses retirement
+    // after the map/registry removal but before the topic release (as a
+    // contended `desired_topics` lock would), then expires the gate. Retirement
+    // must still finish: every retained topic returns to zero.
+    //
+    // Mutation evidence: move `close_timed_out_subscription` back inside the
+    // `history` future raced by `unless_cancelled` → expiry drops the paused
+    // retirement → both channel topics stay retained at 1 → test panics.
+    async fn history_timeout_retirement_survives_expiry_body() {
+        use super::super::close::test_seam::{Pause, RELEASE_PAUSE};
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let url = crate::test_support::database_url();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|c, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '200ms'")
+                        .execute(c)
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect to test DB");
+        let state = crate::state::tests::test_state_with_database_pool(pool).await;
+        let blocker = sqlx::PgPool::connect(&url).await.expect("connect blocker");
+        let mut lock = blocker.begin().await.expect("begin blocker");
+        sqlx::query("LOCK TABLE events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("lock events");
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+        let (send_tx, _send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated {
+                ctx: buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+                class: crate::connection::ConnectionClass::Interactive,
+            }),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: Arc::clone(&gate),
+        });
+        let channels = [Uuid::new_v4(), Uuid::new_v4()];
+        state.accessible_channels_cache.insert(
+            (community, keys.public_key().to_bytes().to_vec()),
+            channels.to_vec(),
+        );
+        let filters: Vec<Filter> = channels
+            .iter()
+            .map(|ch| {
+                Filter::new()
+                    .kind(nostr::Kind::TextNote)
+                    .custom_tag(
+                        nostr::SingleLetterTag::lowercase(nostr::Alphabet::H),
+                        ch.to_string(),
+                    )
+                    .limit(1)
+            })
+            .collect();
+        let topics = channels.map(buzz_pubsub::EventTopic::Channel);
+
+        let pause = Arc::new(Pause::default());
+        let handle = tokio::spawn(RELEASE_PAUSE.scope(
+            Arc::clone(&pause),
+            handle_req(
+                "timed-out".to_string(),
+                filters,
+                vec![],
+                Arc::clone(&conn),
+                Arc::clone(&state),
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("history timeout must reach retirement");
+        // Retirement holds the lifecycle lock here, so only the index is read.
+        assert!(!registered(&state, &conn, "timed-out"));
+        for topic in topics {
+            assert_eq!(
+                state.pubsub.topic_refcount(&conn.tenant, topic).await,
+                1,
+                "topic release must still be pending at the pause"
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), gate.expire(|| {}))
+            .await
+            .expect("expiry must quiesce while retirement is paused");
+        pause.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_req must return once retirement resumes")
+            .expect("handle_req task must not panic");
+        lock.rollback().await.expect("release events lock");
+
+        assert!(subscriptions.lock().await.is_empty());
+        assert!(!registered(&state, &conn, "timed-out"));
+        for topic in topics {
+            assert_eq!(
+                state.pubsub.topic_refcount(&conn.tenant, topic).await,
+                0,
+                "retirement must release every retained topic despite expiry"
+            );
+        }
+    }
+
+    mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration() {
+            super::w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration_body()
+                .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn history_timeout_retirement_survives_expiry() {
+            super::history_timeout_retirement_survives_expiry_body().await;
+        }
     }
 }

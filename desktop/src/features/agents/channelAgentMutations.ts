@@ -17,11 +17,8 @@ import {
   channelsQueryKey,
   upsertCachedChannelMember,
 } from "@/features/channels/hooks";
-import {
-  getChannelMembers,
-  invokeTauri,
-  listManagedAgents,
-} from "@/shared/api/tauri";
+import { getChannelMembers, listManagedAgents } from "@/shared/api/tauri";
+import { syncAgentsToActiveHuddle } from "@/shared/api/tauriChannels";
 import { listPersonas } from "@/shared/api/tauriPersonas";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type {
@@ -65,10 +62,9 @@ export function useAttachManagedAgentToChannelMutation(
           pubkey: result.agent.pubkey,
         }),
       );
-      void invokeTauri("sync_agents_to_active_huddle", {
-        channelId: effectiveChannelId,
-        agentPubkeys: [result.agent.pubkey],
-      }).catch((error) => {
+      void syncAgentsToActiveHuddle(effectiveChannelId, [
+        result.agent.pubkey,
+      ]).catch((error) => {
         console.warn("Could not sync attached agent into Huddle:", error);
       });
     },

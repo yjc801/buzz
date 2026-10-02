@@ -72,8 +72,8 @@ pub(super) fn summarize_from_disk(
 }
 
 #[cfg(feature = "mesh-llm")]
-async fn ensure_relay_mesh_for_record(
-    app: &AppHandle,
+async fn ensure_relay_mesh_for_record<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     model_id: Option<&str>,
     allow_fresh_create_start: bool,
 ) -> Result<(), String> {
@@ -81,19 +81,23 @@ async fn ensure_relay_mesh_for_record(
 }
 
 #[cfg(not(feature = "mesh-llm"))]
-async fn ensure_relay_mesh_for_record(
-    _app: &AppHandle,
+async fn ensure_relay_mesh_for_record<R: tauri::Runtime>(
+    _app: &AppHandle<R>,
     _model_id: Option<&str>,
     _allow_fresh_create_start: bool,
 ) -> Result<(), String> {
     Ok(())
 }
 
+/// Start `pubkey`'s pairs on `relay_urls`. Restart flows capture `admission`
+/// before they stop the pairs, so a community removed while the restart runs
+/// refuses its start; those relays are skipped quietly.
 pub(super) async fn start_local_agent_pairs_with_preflight(
     app: &AppHandle,
     state: &AppState,
     pubkey: &str,
     relay_urls: &[String],
+    admission: &crate::managed_agents::AdmissionSnapshot,
 ) -> Result<ManagedAgentSummary, String> {
     let record_snapshot = {
         let _store_guard = state
@@ -144,9 +148,13 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
         if let Err(error) = crate::managed_agents::start_managed_agent_runtime_pair_lazy(
             pubkey.to_string(),
             relay_url.clone(),
+            admission,
             app.clone(),
         ) {
-            errors.push(format!("{relay_url}: {error}"));
+            // A relay removed since `admission` was captured has nothing to restart.
+            if error != crate::managed_agents::RELAY_REMOVED_ERROR {
+                errors.push(format!("{relay_url}: {error}"));
+            }
         }
     }
     if !errors.is_empty() {
@@ -172,8 +180,8 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
     summarize_from_disk(app, record, &runtimes)
 }
 
-pub(super) async fn start_local_agent_with_preflight(
-    app: &AppHandle,
+pub(super) async fn start_local_agent_with_preflight<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     pubkey: &str,
     allow_fresh_create_start: bool,
@@ -181,6 +189,40 @@ pub(super) async fn start_local_agent_with_preflight(
     expected_signer_pubkey: Option<&str>,
     replay_floor_unix: Option<u64>,
 ) -> Result<ManagedAgentSummary, String> {
+    start_local_agent_after_preflight(
+        app,
+        state,
+        pubkey,
+        expected_relay_url,
+        expected_signer_pubkey,
+        replay_floor_unix,
+        |mesh_model_id| async move {
+            ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start)
+                .await
+        },
+    )
+    .await
+}
+
+/// The ordinary start with its one awaited step, mesh preflight, supplied by
+/// the caller so tests can hold it open across a removal.
+pub(super) async fn start_local_agent_after_preflight<R, P, F>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    pubkey: &str,
+    expected_relay_url: Option<&str>,
+    expected_signer_pubkey: Option<&str>,
+    replay_floor_unix: Option<u64>,
+    preflight: P,
+) -> Result<ManagedAgentSummary, String>
+where
+    R: tauri::Runtime,
+    P: FnOnce(Option<String>) -> F,
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    // Captured before mesh preflight: a community removed while it awaits
+    // refuses this start below.
+    let admission = crate::managed_agents::AdmissionSnapshot::capture(state);
     let record_snapshot = {
         let _store_guard = state
             .managed_agents_store_lock
@@ -213,7 +255,7 @@ pub(super) async fn start_local_agent_with_preflight(
             &personas,
             &global,
         );
-    ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start).await?;
+    preflight(mesh_model_id).await?;
 
     // The mesh preflight above is the suspension window Projects callbacks
     // capture their scope against: a community switch during that await
@@ -233,6 +275,14 @@ pub(super) async fn start_local_agent_with_preflight(
     let workspace_owner =
         crate::relay::bind_expected_signer(expected_signer_pubkey, workspace_owner_hex(state)?)?;
 
+    // Lock order matches `start_pair`: transition, then store, then runtime
+    // map. The transition lock is held until the pair is registered, so a
+    // removal either refuses this start or waits and its stop sweep finds it.
+    let transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let admitted = transition.admit(&admission, workspace_relay_url.as_str())?;
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -273,6 +323,7 @@ pub(super) async fn start_local_agent_with_preflight(
         &mut runtimes,
         Some(workspace_owner.as_str()),
         &workspace_relay_url,
+        &admitted,
         replay_floor_unix,
     )?;
     save_managed_agents(app, &records)?;
@@ -1251,6 +1302,9 @@ use profile::{profile_needs_sync, resolve_legacy_avatar};
 #[path = "agents_waker.rs"]
 pub(crate) mod waker;
 
+#[cfg(all(test, not(target_os = "windows")))]
+#[path = "agents_admission_tests.rs"]
+mod admission_tests;
 #[cfg(test)]
 #[path = "agents_tests.rs"]
 mod tests;

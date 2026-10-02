@@ -1,3 +1,5 @@
+import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
+import { useCommunities } from "@/features/communities/useCommunities";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -42,6 +44,7 @@ import {
 
 export function useManagedAgentActions() {
   const queryClient = useQueryClient();
+  const relayUrl = useCommunities().activeCommunity?.relayUrl;
   const { globalConfig } = useGlobalAgentConfig();
   const relayAgentsQuery = useRelayAgentsQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
@@ -212,6 +215,7 @@ export function useManagedAgentActions() {
         startManagedAgent: startMutation.mutateAsync,
       });
     } catch (error) {
+      if (isRelayRemovedError(error)) return;
       setActionErrorMessage(
         error instanceof Error ? error.message : "Failed to start agent.",
       );
@@ -234,6 +238,7 @@ export function useManagedAgentActions() {
       const channels = await getChannelsForAction();
       await respawnManagedAgentWithRules({
         agent,
+        relayUrl,
         channels,
         relayAgents: relayAgentsQuery.data ?? [],
         startManagedAgent: startMutation.mutateAsync,
@@ -241,6 +246,7 @@ export function useManagedAgentActions() {
         onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),
       });
     } catch (error) {
+      if (isRelayRemovedError(error)) return;
       setActionErrorMessage(
         error instanceof Error ? error.message : "Failed to restart agent.",
       );
@@ -279,7 +285,7 @@ export function useManagedAgentActions() {
       toast.success("Agent created");
       const notices = [...warnings];
 
-      if (created.spawnError) {
+      if (created.spawnError && !isRelayRemovedError(created.spawnError)) {
         setActionErrorMessage(created.spawnError);
       }
 
@@ -293,6 +299,7 @@ export function useManagedAgentActions() {
       void managedAgentsQuery.refetch();
       void relayAgentsQuery.refetch();
     } catch (error) {
+      if (isRelayRemovedError(error)) return;
       setActionErrorMessage(
         error instanceof Error ? error.message : "Failed to start agent.",
       );

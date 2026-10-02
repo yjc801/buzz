@@ -1810,6 +1810,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         };
         (conn, send_rx)
     }
@@ -2064,12 +2065,14 @@ mod tests {
             conn.conn_id,
             conn.send_tx.clone(),
             conn.ctrl_tx.clone(),
+            tokio::sync::mpsc::channel(1).0,
             None,
             conn.cancel.clone(),
             conn.tenant.community(),
             Arc::clone(&conn.backpressure_count),
             Arc::clone(&conn.subscriptions),
             3,
+            crate::state::CommunityConnectionControl::new(conn.cancel.clone()),
         );
         let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         claim_live_subscription("x", &text_filters(), Some(&[a]), &conn, &state)
@@ -2182,6 +2185,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
 
         // Claim, then fill the send buffer so the next `send` returns false.
@@ -2241,6 +2245,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
         // Register in conn_manager so evict_conn_channel_subscriptions can
         // find the connection for cancel_conn.
@@ -2248,12 +2253,14 @@ mod tests {
             conn.conn_id,
             send_tx,
             conn.ctrl_tx.clone(),
+            tokio::sync::mpsc::channel(1).0,
             None,
             conn.cancel.clone(),
             conn.tenant.community(),
             Arc::clone(&conn.backpressure_count),
             Arc::clone(&conn.subscriptions),
             3,
+            crate::state::CommunityConnectionControl::new(conn.cancel.clone()),
         );
 
         let channel = uuid::Uuid::new_v4();
@@ -2475,7 +2482,8 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
-            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel),
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel),
         });
 
         let sub_id = "sub-under-test".to_string();
@@ -3578,6 +3586,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: Some(deadline),
             nip_fi_gate: gate,
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
 
         let state = crate::state::tests::test_state().await;
@@ -3707,6 +3716,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: Some(deadline),
             nip_fi_gate: gate,
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
 
         let state = crate::state::tests::test_state().await;
@@ -3844,6 +3854,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: Some(deadline),
             nip_fi_gate: Arc::clone(&gate),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
         let state = crate::state::tests::test_state().await;
         state
@@ -3987,6 +3998,7 @@ mod tests {
             nip_fi_assertion: None,
             session_deadline: Some(deadline),
             nip_fi_gate: Arc::clone(&gate),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
         let channels = [Uuid::new_v4(), Uuid::new_v4()];
         state.accessible_channels_cache.insert(

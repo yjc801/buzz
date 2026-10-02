@@ -6,6 +6,8 @@ mod admission;
 mod build_info;
 mod rejection;
 
+/// Shared NIP-FI assertion evaluation, denial rendering, and key pairing.
+pub(crate) mod nip_fi_core;
 /// NIP-FI session admission gate — per-connection effect-permit and quiescence barrier.
 pub(crate) mod nip_fi_gate;
 pub(crate) mod nip_fi_session;

@@ -16,6 +16,7 @@ mod pool_lifecycle;
 mod prompt_framing;
 mod prompt_project;
 mod queue;
+mod recovery_wake;
 mod relay;
 mod run_task;
 mod runtime;
@@ -34,7 +35,6 @@ use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -3014,42 +3014,7 @@ async fn run_harness(
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
-    let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
-        SubscribeMode::Mentions => {
-            vec![SubscriptionRule {
-                name: "mentions".into(),
-                channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_else(|| {
-                    vec![
-                        KIND_STREAM_MESSAGE,
-                        KIND_WORKFLOW_APPROVAL_REQUESTED,
-                        KIND_STREAM_REMINDER,
-                    ]
-                }),
-                require_mention: !config.no_mention_filter,
-                filter: None,
-                compiled_filter: None,
-                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                prompt_tag: Some("@mention".into()),
-            }]
-        }
-        SubscribeMode::All => {
-            vec![SubscriptionRule {
-                name: "all".into(),
-                channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_default(),
-                require_mention: false,
-                filter: None,
-                compiled_filter: None,
-                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                prompt_tag: Some("all".into()),
-            }]
-        }
-        SubscribeMode::Config => {
-            // load_rules() already warns if the config file has zero rules.
-            config::load_rules(&config.config_path)?
-        }
-    };
+    let rules = startup_subscription_rules(config)?;
 
     let channel_filters = config::resolve_channel_filters(config, &channel_ids, &rules);
     if channel_filters.is_empty() {
@@ -3270,6 +3235,7 @@ async fn run_harness(
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
+        Recovery(recovery_wake::RecoveryWake),
     }
 
     loop {
@@ -3355,37 +3321,8 @@ async fn run_harness(
             }
         }
 
-        let mut respawn_collected = false;
-        while let Ok(rr) = respawn_rx.try_recv() {
-            crash_history[rr.index].respawn_in_flight = false;
-            match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
-                    let agent = OwnedAgent {
-                        index: rr.index,
-                        acp,
-                        state: SessionState::default(),
-                        model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
-                        desired_model_request_id: None,
-                        desired_model_pending_ack: false,
-                        startup_effort: config.effort_level.clone(),
-                        agent_name,
-                        goose_system_prompt_supported: None,
-                        protocol_version,
-                    };
-                    pool.return_agent(agent);
-                    tracing::info!(agent = rr.index, "respawn complete");
-                    respawn_collected = true;
-                }
-                Err(e) => {
-                    crash_history[rr.index].mark_spawn_failed();
-                    tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
-                }
-            }
-        }
         // Reap completed respawn handles from the JoinSet. Payloads are
-        // delivered out-of-band through `respawn_rx` (drained above), so the
+        // delivered out-of-band through `respawn_rx` (selected below), so the
         // JoinSet is never joined by the normal flow — Tokio retains finished
         // tasks until `join_next`, so without this the set grows on every
         // refill/crash recovery and `!respawn_tasks.is_empty()` would stay true
@@ -3395,20 +3332,14 @@ async fn run_harness(
         // slot's `respawn_in_flight` is cleared when its payload is received),
         // not JoinSet occupancy.
         while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
-        // Flush requeued events that were waiting for a live agent. Without
-        // this, batches requeued during crash recovery sit idle until the
-        // next relay event arrives — which can be minutes on quiet channels.
-        if respawn_collected {
-            for (scope, thread_tags) in dispatch_pending(
-                &mut pool,
-                &mut queue,
-                &ctx,
-                &mut last_activity,
-                observer.as_ref(),
-            ) {
-                typing_channels.insert(scope, thread_tags);
-            }
-        }
+        // Retry deadlines are actionable only with idle capacity. A busy pool
+        // wakes on its result/respawn instead of spinning on an expired retry.
+        let retry_at = if pool_ready && pool.any_idle() {
+            queue.next_retry_deadline()
+        } else {
+            None
+        };
+        let maintenance_at = pool_ready.then_some(last_maintenance + maintenance_interval);
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
@@ -3417,6 +3348,13 @@ async fn run_harness(
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("shutting down");
+                    break;
+                }
+                wake = recovery_wake::wait(&mut respawn_rx, retry_at, maintenance_at) => {
+                    Some(PoolEvent::Recovery(wake))
+                }
                 // recv() returning None means all senders dropped (pool was torn down).
                 // Break cleanly instead of panicking.
                 r = result_rx.recv(), if pool_ready => match r {
@@ -4002,14 +3940,56 @@ async fn run_harness(
                     }
                     None
                 }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("shutting down");
-                    break;
-                }
             }
         };
 
         match pool_event {
+            Some(PoolEvent::Recovery(wake)) => {
+                match wake {
+                    recovery_wake::RecoveryWake::Respawn(rr) => {
+                        crash_history[rr.index].respawn_in_flight = false;
+                        match rr.result {
+                            Ok((acp, protocol_version, agent_name)) => {
+                                let agent = OwnedAgent {
+                                    index: rr.index,
+                                    acp,
+                                    state: SessionState::default(),
+                                    model_capabilities: None,
+                                    desired_model: config.model.clone(),
+                                    model_overridden: false,
+                                    desired_model_request_id: None,
+                                    desired_model_pending_ack: false,
+                                    startup_effort: config.effort_level.clone(),
+                                    agent_name,
+                                    goose_system_prompt_supported: None,
+                                    protocol_version,
+                                };
+                                pool.return_agent(agent);
+                                tracing::info!(agent = rr.index, "respawn complete");
+                            }
+                            Err(e) => {
+                                crash_history[rr.index].mark_spawn_failed();
+                                tracing::warn!(
+                                    agent = rr.index,
+                                    "respawn failed: {e} — circuit re-opened"
+                                );
+                            }
+                        }
+                    }
+                    // Maintenance runs at the top of the next iteration.
+                    recovery_wake::RecoveryWake::Maintenance => continue,
+                    recovery_wake::RecoveryWake::Retry => {}
+                }
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
             Some(PoolEvent::Result(result)) => {
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
@@ -10156,15 +10136,182 @@ mod build_mcp_servers_tests {
         }
     }
 
-    #[test]
-    fn session_new_forwards_complete_git_block_without_duplicate_names() {
-        let mut config = test_config();
-        let git = git::GitEnvironment::install(
+    /// Restores the runner's saved variables and clears fixture ones on drop,
+    /// so a panic mid-install cannot leave the process environment altered.
+    struct EnvRestore {
+        saved: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        fixture: Vec<String>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for name in &self.fixture {
+                std::env::remove_var(name);
+            }
+            for (name, value) in &self.saved {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    /// Run `GitEnvironment::install` with `vars` set and the runner's own
+    /// `GIT_CONFIG*` / `BUZZ_GIT_IDENTITY` hidden, so an agent session's
+    /// inherited identity cannot leak into the result. Caller holds `ENV_LOCK`.
+    fn install_git_with_env(
+        config: &Config,
+        vars: &[(String, String)],
+    ) -> anyhow::Result<git::GitEnvironment> {
+        let restore = EnvRestore {
+            saved: std::env::vars_os()
+                .filter(|(name, _)| {
+                    name.to_str().is_some_and(|name| {
+                        name.starts_with("GIT_CONFIG") || name == "BUZZ_GIT_IDENTITY"
+                    })
+                })
+                .collect(),
+            fixture: vars.iter().map(|(name, _)| name.clone()).collect(),
+        };
+        for (name, _) in &restore.saved {
+            std::env::remove_var(name);
+        }
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
+        git::GitEnvironment::install(
             &config.keys,
             &config.relay_url,
             &std::env::current_exe().unwrap(),
         )
-        .unwrap();
+    }
+
+    #[test]
+    fn invalid_git_identity_mode_fails_install() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let err = install_git_with_env(
+            &test_config(),
+            &[("BUZZ_GIT_IDENTITY".into(), "human".into())],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("BUZZ_GIT_IDENTITY"), "{err}");
+    }
+
+    #[test]
+    fn user_mode_mcp_block_drops_inherited_identity_and_signing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let inherited = [
+            ("user.name", "Inherited Agent"),
+            ("USER.EMAIL", "inherited@example.invalid"),
+            ("user.signingKey", "inherited-key"),
+            ("GPG.Format", "openpgp"),
+            ("GPG.x509.PROGRAM", "inherited-signer"),
+            ("commit.gpgsign", "true"),
+            ("TAG.GPGSIGN", "true"),
+            ("Include.Path", "/tmp/identity.inc"),
+            ("INCLUDEIF.gitdir:/.PATH", "/tmp/identity.inc"),
+            ("Author.Name", "Inherited Author"),
+            ("Author.Email", "author@example.invalid"),
+            ("COMMITTER.name", "Inherited Committer"),
+            ("committer.EMAIL", "committer@example.invalid"),
+            ("gpg.X509.program", "distinct-subsection"),
+            ("core.abbrev", "12"),
+        ];
+        let mut vars = vec![
+            ("BUZZ_GIT_IDENTITY".into(), "user".into()),
+            ("GIT_CONFIG_COUNT".into(), inherited.len().to_string()),
+        ];
+        for (i, (key, value)) in inherited.iter().enumerate() {
+            vars.push((format!("GIT_CONFIG_KEY_{i}"), key.to_string()));
+            vars.push((format!("GIT_CONFIG_VALUE_{i}"), value.to_string()));
+        }
+        let mut config = test_config();
+        let git = install_git_with_env(&config, &vars).unwrap();
+        config.persona_env_vars.extend(git.env.iter().cloned());
+        let servers = build_mcp_servers(&config);
+        let env = &servers[0].env;
+        let value_of = |name: &str| {
+            env.iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.value.clone())
+        };
+        let count: usize = value_of("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        let entries: Vec<(String, String)> = (0..count)
+            .map(|i| {
+                (
+                    value_of(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    value_of(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect();
+        for (key, _) in &inherited[..13] {
+            assert!(
+                !entries.iter().any(|(forwarded, _)| forwarded == key),
+                "{key} leaked: {entries:?}"
+            );
+        }
+        for survivor in [
+            ("gpg.X509.program", "distinct-subsection"),
+            ("core.abbrev", "12"),
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(key, value)| (key.as_str(), value.as_str()) == survivor),
+                "{survivor:?} must survive unchanged: {entries:?}"
+            );
+        }
+        for absent in ["user.name", "user.email", "gpg.format", "commit.gpgSign"] {
+            assert!(
+                !entries.iter().any(|(key, _)| key == absent),
+                "user mode must not set {absent}: {entries:?}"
+            );
+        }
+        assert!(
+            entries.iter().any(|(key, _)| key == "nostr.keyfile"),
+            "{entries:?}"
+        );
+        assert_eq!(value_of("BUZZ_GIT_IDENTITY").as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn for_config_replaces_persona_git_identity_with_resolved_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut config = test_config();
+        config
+            .persona_env_vars
+            .push(("BUZZ_GIT_IDENTITY".into(), "stale".into()));
+        let restore = EnvRestore {
+            saved: std::env::vars_os()
+                .filter(|(name, _)| name == "BUZZ_GIT_IDENTITY")
+                .collect(),
+            fixture: vec!["BUZZ_GIT_IDENTITY".into()],
+        };
+        std::env::set_var("BUZZ_GIT_IDENTITY", "user");
+        let _git = git::GitEnvironment::for_config(&mut config).unwrap();
+        drop(restore);
+        let modes: Vec<_> = config
+            .persona_env_vars
+            .iter()
+            .filter(|(name, _)| name == "BUZZ_GIT_IDENTITY")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(modes, ["user"]);
+        let servers = build_mcp_servers(&config);
+        let forwarded: Vec<_> = servers[0]
+            .env
+            .iter()
+            .filter(|entry| entry.name == "BUZZ_GIT_IDENTITY")
+            .map(|entry| entry.value.as_str())
+            .collect();
+        assert_eq!(forwarded, ["user"]);
+    }
+
+    #[test]
+    fn session_new_forwards_complete_git_block_without_duplicate_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut config = test_config();
+        let git = install_git_with_env(&config, &[]).unwrap();
         config.persona_env_vars.extend(git.env.iter().cloned());
         let servers = build_mcp_servers(&config);
         let env = &servers[0].env;
@@ -10338,6 +10485,79 @@ mod build_mcp_servers_tests {
         assert_eq!(
             servers[0].name, "mcp",
             "Path::new(\".\").file_stem() is None — should fall back to \"mcp\""
+        );
+    }
+}
+
+/// Local admission rules for the normal listener. The relay subscription is
+/// derived separately (`config::resolve_channel_filters`); an event must pass
+/// both, so each default kind has to be present here too.
+fn startup_subscription_rules(config: &Config) -> Result<Vec<SubscriptionRule>> {
+    let rules = match config.subscribe_mode {
+        SubscribeMode::Mentions => {
+            vec![SubscriptionRule {
+                name: "mentions".into(),
+                channels: filter::ChannelScope::All("all".into()),
+                kinds: config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(config::default_mention_kinds),
+                require_mention: !config.no_mention_filter,
+                filter: None,
+                compiled_filter: None,
+                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                prompt_tag: Some("@mention".into()),
+            }]
+        }
+        SubscribeMode::All => {
+            vec![SubscriptionRule {
+                name: "all".into(),
+                channels: filter::ChannelScope::All("all".into()),
+                kinds: config.kinds_override.clone().unwrap_or_default(),
+                require_mention: false,
+                filter: None,
+                compiled_filter: None,
+                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                prompt_tag: Some("all".into()),
+            }]
+        }
+        SubscribeMode::Config => {
+            // load_rules() already warns if the config file has zero rules.
+            config::load_rules(&config.config_path)?
+        }
+    };
+    Ok(rules)
+}
+
+#[cfg(test)]
+mod edit_mention_admission_tests {
+    use super::*;
+    use crate::edit_routing::test_support::edit_event;
+
+    /// Default normal-mode admission: an edit that newly mentions the agent
+    /// matches the startup rule; an edit without the agent's `p` tag does not.
+    #[tokio::test]
+    async fn default_startup_rules_admit_only_edits_that_mention_the_agent() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.subscribe_mode = SubscribeMode::Mentions;
+        let agent = config.keys.public_key().to_hex();
+        let rules = startup_subscription_rules(&config).expect("mentions rules");
+        let channel_id = Uuid::new_v4();
+        let target = "ab".repeat(32);
+
+        let mentioned = edit_event(&target, &[["p", agent.as_str()]]);
+        assert!(
+            filter::match_event(&mentioned, channel_id, &rules, &agent)
+                .await
+                .is_some(),
+            "a mention added by an edit must wake the agent"
+        );
+        let unmentioned = edit_event(&target, &[]);
+        assert!(
+            filter::match_event(&unmentioned, channel_id, &rules, &agent)
+                .await
+                .is_none(),
+            "an edit that does not mention the agent must not wake it"
         );
     }
 }

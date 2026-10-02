@@ -161,7 +161,8 @@ export function AppShell() {
     [location.pathname],
   );
   const {
-    removeCommunity: handleRemoveCommunity,
+    leaveAndRemoveCommunity: handleLeaveCommunity,
+    removeCommunityFromDevice: removeFromDevice,
     switchCommunity: handleSwitchCommunity,
   } = useCommunityNavigationTransitions({
     communities: communitiesHook,
@@ -203,7 +204,10 @@ export function AppShell() {
   );
   // Data refresh, auto-restart, observer ingestion, wake-on-mention; the
   // per-service mounting rationale lives with the hook.
-  useAgentShellServices({ isHuddleRoom });
+  useAgentShellServices({
+    isHuddleRoom,
+    relayUrl: communitiesHook.activeCommunity?.relayUrl,
+  });
   // Kind 24200 is relay-ephemeral, so reconciliation runs eagerly (not
   // deferred): seeds kind 24200 for fresh identities, no-ops for explicit
   // opt-outs. Frames before the listener opens are permanently lost.
@@ -850,7 +854,8 @@ export function AppShell() {
                           onOpenAddCommunity={addCommunityDialog.openDialog}
                           onSendFeedback={() => setIsSendFeedbackOpen(true)}
                           onUpdateCommunity={communitiesHook.updateCommunity}
-                          onRemoveCommunity={handleRemoveCommunity}
+                          onLeaveCommunity={handleLeaveCommunity}
+                          onRemoveCommunityFromDevice={removeFromDevice}
                           onSwitchCommunity={handleSwitchCommunity}
                           onCreateAgent={() => requestOpenCreateAgent()}
                           selfPresenceStatus={presenceSession.currentStatus}

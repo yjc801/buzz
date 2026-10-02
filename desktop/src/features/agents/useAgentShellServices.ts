@@ -10,12 +10,15 @@ import { useAgentWakeOnMention } from "@/features/agents/useAgentWakeOnMention";
  */
 export function useAgentShellServices({
   isHuddleRoom,
+  relayUrl,
 }: {
   isHuddleRoom: boolean;
+  /** The active community's relay; a removal of it cancels pending restarts. */
+  relayUrl: string | undefined;
 }) {
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
-  useAutoRestartPolicy();
+  useAutoRestartPolicy(relayUrl);
   // Owner-global observer ingestion: receives + decrypts agent observer
   // frames and keeps derived active-turn liveness in sync app-wide, so no
   // individual screen/panel has to mount its own bridge for ingestion.

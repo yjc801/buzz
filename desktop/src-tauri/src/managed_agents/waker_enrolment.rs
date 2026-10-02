@@ -106,7 +106,9 @@ pub(crate) fn waker_identity_pubkey() -> Option<String> {
 ///
 /// # Errors
 /// Propagates a failure to resolve or create the managed agents directory.
-pub(crate) fn enrolment_ledger(app: &AppHandle) -> Result<IssuanceLedger, String> {
+pub(crate) fn enrolment_ledger<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<IssuanceLedger, String> {
     Ok(IssuanceLedger::open(
         managed_agents_base_dir(app)?.join("waker-enrolment-versions.json"),
     ))

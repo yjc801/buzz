@@ -12,6 +12,8 @@ pub(crate) use agent_env::{
 };
 mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) mod admission_test_support;
 mod backend;
 mod backend_migration;
 pub(crate) mod bestie_assignment;
@@ -27,6 +29,7 @@ pub(crate) mod git_bash;
 pub(crate) mod global_config;
 mod managed_node_paths;
 mod nest;
+mod pair_admission;
 pub(crate) mod parallelism;
 mod persona_avatars;
 pub(crate) mod persona_events;
@@ -95,6 +98,7 @@ pub(crate) use global_config::{
 };
 pub(crate) use managed_node_paths::*;
 pub use nest::*;
+pub use pair_admission::*;
 pub use parallelism::{acp_agents_value, effective_parallelism, harness_max_parallelism};
 pub use personas::*;
 #[cfg(windows)]

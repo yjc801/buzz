@@ -99,7 +99,8 @@ pub async fn ws_audio_handler(
         use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
         let mode = state.config.nip_fi.mode;
         let verifier = state.nip_fi_verifier.as_deref();
-        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+        let communities = &state.config.nip_fi.communities;
+        match check_nip_fi_at_upgrade(&headers, communities, verifier, mode) {
             NipFiUpgradeOutcome::NotRequired => None,
             NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
             NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
@@ -232,16 +233,18 @@ pub(crate) async fn handle_audio_connection(
     // the inner handler drains it via ws_send.
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) =
         tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+    let control = CommunityConnectionControl::new(cancel);
+    let drain_reason = control.disconnect_reason();
     let pre_expiry_task = audio_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             Arc::clone(&pre_gate),
+            control.clone(),
             pre_terminal_ctrl_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         )
     });
 
-    let control = CommunityConnectionControl::new(cancel);
     let community_id = tenant.community();
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
@@ -308,6 +311,16 @@ pub(crate) async fn handle_audio_connection(
                         .await;
                     }
                 }
+                // A published reason (e.g. an expiry denial) closes with its
+                // own frame, exactly as the writer would.
+                let close = drain_reason.borrow().map(|reason| reason.close_message());
+                if let Some(close) = close {
+                    let _ = tokio::time::timeout(
+                        crate::connection::WS_TERMINAL_FLUSH_TIMEOUT,
+                        futures_util::SinkExt::send(&mut ws_send, close),
+                    )
+                    .await;
+                }
                 let _ = tokio::time::timeout(
                     crate::connection::WS_TERMINAL_FLUSH_TIMEOUT,
                     futures_util::SinkExt::close(&mut ws_send),
@@ -320,27 +333,28 @@ pub(crate) async fn handle_audio_connection(
 }
 
 /// Mid-admission cancellation fence for the audio route: if `$cancel` fired,
-/// run any exit cleanup, drain the terminal channel (which holds the denial
-/// frame queued by the expiry task) through the bounded exit writer while the
-/// handler still owns the socket, and return. Used at every async boundary in
-/// the admission sequence before `send_loop` takes the socket.
+/// run any exit cleanup, write the [`terminal_exit_frames`] (the denial frame
+/// queued by the expiry task or a denial writer, then the reason's close)
+/// through the bounded exit writer while the handler still owns the socket,
+/// and return. Used at every async boundary in the admission sequence before
+/// `send_loop` takes the socket.
 macro_rules! check_cancel {
-    ($cancel:ident, $terminal_rx:ident, $ws_send:ident) => {
-        check_cancel!($cancel, $terminal_rx, $ws_send, cleanup: ())
+    ($cancel:ident, $terminal_rx:ident, $reason:ident, $ws_send:ident) => {
+        check_cancel!($cancel, $terminal_rx, $reason, $ws_send, cleanup: ())
     };
-    ($cancel:ident, $terminal_rx:ident, $ws_send:ident, cleanup: $cleanup:expr) => {
+    ($cancel:ident, $terminal_rx:ident, $reason:ident, $ws_send:ident, cleanup: $cleanup:expr) => {
         if $cancel.is_cancelled() {
             $cleanup;
             crate::connection::send_exit_frames_bounded(
                 &mut $ws_send,
-                std::iter::from_fn(|| $terminal_rx.try_recv().ok()),
+                terminal_exit_frames(&mut $terminal_rx, &$reason),
             )
             .await;
             return;
         }
     };
-    ($cancel:ident, $terminal_rx:ident, $ws_send:ident, release_lease: $lease:expr) => {
-        check_cancel!($cancel, $terminal_rx, $ws_send, cleanup: {
+    ($cancel:ident, $terminal_rx:ident, $reason:ident, $ws_send:ident, release_lease: $lease:expr) => {
+        check_cancel!($cancel, $terminal_rx, $reason, $ws_send, cleanup: {
             // Release any acquired lease before returning. Pre-guard path:
             // staged_lease may hold a lease that must be released before we
             // return, since the guard hasn't been built yet.
@@ -361,6 +375,7 @@ async fn send_challenge_unless_cancelled<S>(
     ws_send: &mut S,
     cancel: &CancellationToken,
     terminal_rx: &mut mpsc::Receiver<WsMessage>,
+    disconnect_reason: &watch::Receiver<Option<crate::state::CommunityDisconnectReason>>,
     challenge: WsMessage,
 ) -> bool
 where
@@ -371,13 +386,25 @@ where
         _ = cancel.cancelled() => {
             crate::connection::send_exit_frames_bounded(
                 ws_send,
-                std::iter::from_fn(|| terminal_rx.try_recv().ok()),
+                terminal_exit_frames(terminal_rx, disconnect_reason),
             )
             .await;
             false
         },
         sent = ws_send.send(challenge) => sent.is_ok(),
     }
+}
+
+/// Records the NIP-42-proven pubkey and its admitting NIP-FI issuer on an audio
+/// control after successful auth so the issuer-scoped NIP-FI disconnect scan
+/// can reach audio sockets alongside relay peers.  Shared by the handler and
+/// tests that register audio sockets through the production seam.
+pub(crate) fn audio_post_auth_register(
+    control: &CommunityConnectionControl,
+    pubkey_bytes: Vec<u8>,
+    nip_fi_issuer: Option<String>,
+) {
+    control.set_proven_identity(pubkey_bytes, nip_fi_issuer);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -421,7 +448,7 @@ pub(crate) async fn handle_active_audio_connection(
         )
     });
 
-    let (audio_gate, _terminal_ctrl_tx, mut terminal_ctrl_rx, mut _nip_fi_admission_expiry) =
+    let (audio_gate, terminal_ctrl_tx, mut terminal_ctrl_rx, mut _nip_fi_admission_expiry) =
         if let Some((gate, tx, rx, expiry)) = pre_built {
             // Production path: gate already armed pre-bootstrap.
             (gate, tx, rx, expiry)
@@ -437,32 +464,30 @@ pub(crate) async fn handle_active_audio_connection(
                 crate::nip_fi_session::spawn_nip_fi_expiry_task(
                     deadline,
                     std::sync::Arc::clone(&gate),
+                    control.clone(),
                     tx.clone(),
                     crate::nip_fi_session::NipFiWsRoute::Audio,
                 )
             });
             (gate, tx, rx, expiry)
         };
+    // Register the terminal sender before the proven identity becomes
+    // scan-visible, so a concurrent `disconnect_nip_fi` that finds this socket
+    // can always enqueue its denial.  [FI-TRACE-DENY-SET]
+    control.set_terminal_frame_sender(terminal_ctrl_tx);
 
     // Already-expired fast path: catch a deadline already past at upgrade time
-    // before spending the AUTH_TIMEOUT window. Send the canonical denial frame
-    // directly (do not race against the spawned expiry task via try_recv —
-    // the task may not have run yet, leaving the channel empty). [FI-TRACE-DENIAL-ORACLE]
+    // before spending the AUTH_TIMEOUT window. Deny through the shared
+    // transition directly (do not wait on the spawned expiry task — it may not
+    // have run yet); whichever of the two wins queues the one frame.
+    // [FI-TRACE-DENIAL-ORACLE]
     if let Some(deadline) = audio_session_deadline {
         if chrono::Utc::now() >= deadline {
             warn!(
                 channel_id = %channel_id,
                 "NIP-FI session deadline already expired at audio upgrade — rejecting before auth"
             );
-            crate::connection::send_exit_frames_bounded(
-                &mut ws_send,
-                [crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                )],
-            )
-            .await;
-            cancel.cancel();
+            deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
             return;
         }
     }
@@ -474,6 +499,7 @@ pub(crate) async fn handle_active_audio_connection(
         &mut ws_send,
         &cancel,
         &mut terminal_ctrl_rx,
+        &disconnect_reason,
         WsMessage::Text(challenge_msg.into()),
     )
     .await
@@ -487,7 +513,7 @@ pub(crate) async fn handle_active_audio_connection(
             // Gate or external cancel fired during auth. Drain denial frame.
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -542,7 +568,7 @@ pub(crate) async fn handle_active_audio_connection(
             // terminal channel so the denial frame reaches the client.
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -601,7 +627,8 @@ pub(crate) async fn handle_active_audio_connection(
         pubkey,
         crate::nip_fi_session::PairingDenialTarget::Audio {
             ws_send: &mut ws_send,
-            cancel: &cancel,
+            control: &control,
+            terminal_rx: &mut terminal_ctrl_rx,
             channel_id,
         },
     )
@@ -622,19 +649,49 @@ pub(crate) async fn handle_active_audio_connection(
                 pubkey = %pubkey_hex,
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
-            crate::connection::send_exit_frames_bounded(
-                &mut ws_send,
-                [crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                )],
-            )
-            .await;
-            cancel.cancel();
+            deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
             return;
         }
     }
 
+    // Register the proven key with its admitting NIP-FI issuer after pairing,
+    // then run the deny-set check: a concurrent disconnect either finds this
+    // socket in its close scan or this check finds its deny entry.
+    // [FI-TRACE-DENY-SET]
+    audio_post_auth_register(
+        &control,
+        pubkey_bytes.clone(),
+        nip_fi_assertion
+            .as_ref()
+            .map(|a| a.identity().issuer().to_owned()),
+    );
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_deny_set_check(tenant.community()).await;
+    if let Some(assertion) = &nip_fi_assertion {
+        if let (Some(asserted_key), Some(deny_map)) =
+            (assertion.asserted_key(), state.nip_fi_deny_map.as_deref())
+        {
+            if deny_map.is_denied(
+                assertion.identity().issuer(),
+                &asserted_key,
+                chrono::Utc::now(),
+            ) {
+                warn!(
+                    channel_id = %channel_id,
+                    pubkey = %pubkey_hex,
+                    "NIP-FI deny-set hit at audio post-registration check — denying"
+                );
+                deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
+                return;
+            }
+        }
+    }
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::after_deny_set_check_passed(tenant.community()).await;
+
+    // NIP-OA owner of a delegated agent: from relay membership on a closed
+    // relay, or straight from the self-proving auth tag on an open one.
+    let mut nip_oa_owner = None;
     let relay_refusal = match crate::api::relay_members::check_relay_membership(
         &state,
         tenant.community(),
@@ -648,7 +705,17 @@ pub(crate) async fn handle_active_audio_connection(
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio: relay membership denied");
             Some(buzz_auth::DenialClass::AuthorizationDenied)
         }
-        Ok(_) => None,
+        Ok(decision) => {
+            nip_oa_owner = match decision {
+                crate::api::relay_members::MembershipDecision::ViaOwner(owner) => Some(owner),
+                _ => crate::api::relay_members::extract_nip_oa_owner(
+                    pubkey.as_bytes(),
+                    auth_tag_json.as_deref(),
+                    Some(signed_auth_created_at),
+                ),
+            };
+            None
+        }
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, error = %e,
                 "audio: relay membership lookup failed, denying (fail-closed)");
@@ -657,15 +724,18 @@ pub(crate) async fn handle_active_audio_connection(
     };
     if let Some(class) = relay_refusal {
         // Off mode keeps one legacy frame for both outcomes.
-        let deny_frame = authorization_exit_frame(
+        exit_authorization_refusal(
+            &mut ws_send,
+            &control,
+            &mut terminal_ctrl_rx,
             nip_fi_assertion.is_some(),
             class,
             serde_json::json!({"type": "error", "message": "restricted: not a relay member"}),
-        );
-        crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+        )
+        .await;
         return;
     }
-    check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
     let membership_admission = match check_membership_for_admission(
@@ -680,12 +750,15 @@ pub(crate) async fn handle_active_audio_connection(
         Ok(admission) => admission,
         Err(refusal) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {refusal}");
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 refusal.denial_class(),
                 serde_json::json!({"type": "error", "message": "not a member"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
     };
@@ -697,7 +770,92 @@ pub(crate) async fn handle_active_audio_connection(
             parent_channel_id, ..
         } => *parent_channel_id,
     };
-    check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
+
+    // Record a delegated agent's owner link before admission, as root AUTH
+    // does: revoking the owner finds the agent's sockets through it, so an
+    // agent whose link cannot be recorded is refused. A persistent write, so
+    // it runs under an effect permit. [nip_fi_gate contract]
+    if let Some(owner) = nip_oa_owner {
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::before_owner_permit(tenant.community()).await;
+        let linked = {
+            let _owner_permit = match audio_gate.acquire_effect().await {
+                Ok(permit) => permit,
+                Err(crate::nip_fi_gate::SessionExpired) => {
+                    cancel.cancel();
+                    if let Some(t) = _nip_fi_admission_expiry.take() {
+                        let _ = t.await;
+                    }
+                    crate::connection::send_exit_frames_bounded(
+                        &mut ws_send,
+                        terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            crate::api::relay_members::materialize_nip_oa_owner(&state, &tenant, &pubkey, &owner)
+                .await
+        };
+        if !linked {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, nip_oa_owner = %owner.to_hex(),
+                "audio: NIP-OA owner could not be materialized, denying");
+            let deny_frame = authorization_exit_frame(
+                nip_fi_assertion.is_some(),
+                buzz_auth::DenialClass::AuthorizationUnavailable,
+                serde_json::json!({"type": "error", "message": crate::handlers::auth::OWNER_LINK_ERROR}),
+            );
+            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            return;
+        }
+    }
+
+    // Bind, then take the final ban/membership decision the root socket
+    // applies (see `final_admission_denial`), before any huddle lease. A ban
+    // or removal whose disconnect ran before the bind is seen by these fresh
+    // reads; one that runs after it cancels this socket (`check_cancel!`).
+    // Same order as root AUTH: a proven owner before the pubkey; otherwise
+    // the pubkey before the stored-owner read, so a concurrent owner link
+    // either closes this socket or is seen by the read.
+    if let Some(owner) = nip_oa_owner {
+        control.bind_owner(owner.to_bytes());
+    }
+    control.bind_pubkey(pubkey.to_bytes());
+    let owner =
+        crate::handlers::auth::admitted_owner(&state, tenant.community(), pubkey, nip_oa_owner)
+            .await;
+    if let Ok(Some(owner)) = owner {
+        control.bind_owner(owner);
+    }
+    let denial = match owner {
+        Err(denial) => Some(denial),
+        Ok(_) => {
+            crate::handlers::auth::final_admission_denial(
+                &state,
+                tenant.community(),
+                pubkey,
+                auth_tag_json.as_deref(),
+                Some(signed_auth_created_at),
+            )
+            .await
+        }
+    };
+    if let Some(denial) = denial {
+        let (class, message) = (denial.class, denial.reason);
+        warn!(channel_id = %channel_id, pubkey = %pubkey_hex, reason = message, "audio: denied at final admission check");
+        exit_authorization_refusal(
+            &mut ws_send,
+            &control,
+            &mut terminal_ctrl_rx,
+            nip_fi_assertion.is_some(),
+            class,
+            serde_json::json!({"type": "error", "message": message}),
+        )
+        .await;
+        return;
+    }
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //
@@ -752,7 +910,7 @@ pub(crate) async fn handle_active_audio_connection(
                         }
                         crate::connection::send_exit_frames_bounded(
                             &mut ws_send,
-                            std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                            terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
                         )
                         .await;
                         return;
@@ -800,7 +958,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             // I1 residual: staged_lease may now hold an acquired lease. Release
             // it (awaited, not detached) before returning on cancel.
-            check_cancel!(cancel, terminal_ctrl_rx, ws_send, release_lease: staged_lease);
+            check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send, release_lease: staged_lease);
         }
         None => {
             if !state.config.huddle_audio_available {
@@ -882,7 +1040,7 @@ pub(crate) async fn handle_active_audio_connection(
     }
     // I1 residual: staged_lease may hold an acquired lease. Release it
     // (awaited, not detached) before returning on cancel.
-    check_cancel!(cancel, terminal_ctrl_rx, ws_send, release_lease: staged_lease);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send, release_lease: staged_lease);
 
     // Reject unsupported future versions up-front so we don't accidentally
     // pin a room to a version we can't speak. Versions 1..=CURRENT are OK.
@@ -1021,7 +1179,7 @@ pub(crate) async fn handle_active_audio_connection(
             let _ = guard.release_before_commit().await; // pre-add-peer; owner_generation not set
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -1045,7 +1203,7 @@ pub(crate) async fn handle_active_audio_connection(
                 let _ = guard.release_before_commit().await; // pre-add-peer; owner_generation not set
                 crate::connection::send_exit_frames_bounded(
                     &mut ws_send,
-                    std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                    terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
                 )
                 .await;
                 return;
@@ -1210,7 +1368,7 @@ pub(crate) async fn handle_active_audio_connection(
         }
         crate::connection::send_exit_frames_bounded(
             &mut ws_send,
-            std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+            terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
         )
         .await;
         return;
@@ -1512,7 +1670,7 @@ pub(crate) async fn handle_active_audio_connection(
             // Drain the terminal denial frame (already queued by expiry task).
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -1562,12 +1720,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 buzz_auth::DenialClass::AuthorizationDenied,
                 serde_json::json!({"type": "error", "message": "error: not a member"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::HuddleLinkGone) => {
@@ -1589,12 +1750,15 @@ pub(crate) async fn handle_active_audio_connection(
                 }
             }
             // The creator-signed link is the authority for the auto-add.
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 buzz_auth::DenialClass::AuthorizationDenied,
                 serde_json::json!({"type":"error","message":"huddle has ended"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::Db(e)) => {
@@ -1614,12 +1778,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 buzz_auth::DenialClass::AuthorizationUnavailable,
                 serde_json::json!({"type":"error","message":"error: join commit failed"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
     }
@@ -2512,6 +2679,64 @@ fn authorization_exit_frame(
         crate::nip_fi_session::denial_frame(crate::nip_fi_session::NipFiWsRoute::Audio, class)
     } else {
         WsMessage::Text(off_mode.to_string().into())
+    }
+}
+
+/// Terminal `authorization_denied` exit for the audio admission path, before
+/// `send_loop` owns the socket: runs the control's first-writer-wins denial
+/// transition, then writes whatever the winner queued followed by the
+/// reason's close.  A concurrent registry scan therefore cannot add a second
+/// denial, and every audio `authorization_denied` is the same restricted frame
+/// plus 1008.  [FI-TRACE-DENIAL-ORACLE]
+pub(crate) async fn deny_audio_authorization<S>(
+    ws_send: &mut S,
+    control: &CommunityConnectionControl,
+    terminal_rx: &mut mpsc::Receiver<WsMessage>,
+) where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
+    control.disconnect_nip_fi();
+    crate::connection::send_exit_frames_bounded(
+        ws_send,
+        terminal_exit_frames(terminal_rx, &control.disconnect_reason()),
+    )
+    .await;
+}
+
+/// Exit frames for an audio socket leaving before `send_loop` owns it: every
+/// queued terminal frame, then the close for the published disconnect reason.
+/// Without a reason (plain cancellation) no close is appended, as before.
+fn terminal_exit_frames<'a>(
+    terminal_rx: &'a mut mpsc::Receiver<WsMessage>,
+    disconnect_reason: &watch::Receiver<Option<crate::state::CommunityDisconnectReason>>,
+) -> impl Iterator<Item = WsMessage> + 'a {
+    let close = disconnect_reason
+        .borrow()
+        .map(|reason| reason.close_message());
+    std::iter::from_fn(move || terminal_rx.try_recv().ok()).chain(close)
+}
+
+/// Writes an authorization refusal on the audio admission path: a NIP-FI
+/// `authorization_denied` takes [`deny_audio_authorization`]; any other
+/// refusal writes its single [`authorization_exit_frame`].
+async fn exit_authorization_refusal<S>(
+    ws_send: &mut S,
+    control: &CommunityConnectionControl,
+    terminal_rx: &mut mpsc::Receiver<WsMessage>,
+    nip_fi: bool,
+    class: buzz_auth::DenialClass,
+    off_mode: serde_json::Value,
+) where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
+    if nip_fi && class == buzz_auth::DenialClass::AuthorizationDenied {
+        deny_audio_authorization(ws_send, control, terminal_rx).await;
+    } else {
+        crate::connection::send_exit_frames_bounded(
+            ws_send,
+            [authorization_exit_frame(nip_fi, class, off_mode)],
+        )
+        .await;
     }
 }
 
@@ -3773,13 +3998,109 @@ mod tests {
         key: &nostr::Keys,
         sign_issued_challenge: bool,
     ) -> (Vec<String>, bool) {
-        use std::sync::Arc;
+        let (frames, cancelled) =
+            run_audio_auth_wire(state, assertion, key, sign_issued_challenge).await;
+        let texts = frames
+            .into_iter()
+            .filter_map(|frame| match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => Some(t.to_string()),
+                _ => None,
+            })
+            .collect();
+        (texts, cancelled)
+    }
+
+    /// [`run_audio_auth`], returning every Text and Close frame the client
+    /// received after the challenge, in wire order.
+    async fn run_audio_auth_wire(
+        state: std::sync::Arc<crate::state::AppState>,
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+        key: &nostr::Keys,
+        sign_issued_challenge: bool,
+    ) -> (Vec<tokio_tungstenite::tungstenite::Message>, bool) {
         let tenant = buzz_core::tenant::TenantContext::resolved(
             buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
             "test.local".to_string(),
         );
+        run_audio_auth_in_wire(
+            state,
+            tenant,
+            uuid::Uuid::new_v4(),
+            assertion,
+            key,
+            sign_issued_challenge,
+            None,
+        )
+        .await
+    }
+
+    /// `run_audio_auth` against a caller-chosen tenant and channel.
+    async fn run_audio_auth_in(
+        state: std::sync::Arc<crate::state::AppState>,
+        tenant: buzz_core::tenant::TenantContext,
+        channel_id: uuid::Uuid,
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+        key: &nostr::Keys,
+        sign_issued_challenge: bool,
+    ) -> (Vec<String>, bool) {
+        run_audio_auth_tagged(
+            state,
+            tenant,
+            channel_id,
+            assertion,
+            key,
+            sign_issued_challenge,
+            None,
+        )
+        .await
+    }
+
+    /// [`run_audio_auth_in`] with an optional NIP-OA `auth` tag on the AUTH event.
+    async fn run_audio_auth_tagged(
+        state: std::sync::Arc<crate::state::AppState>,
+        tenant: buzz_core::tenant::TenantContext,
+        channel_id: uuid::Uuid,
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+        key: &nostr::Keys,
+        sign_issued_challenge: bool,
+        auth_tag: Option<Vec<String>>,
+    ) -> (Vec<String>, bool) {
+        let (frames, cancelled) = run_audio_auth_in_wire(
+            state,
+            tenant,
+            channel_id,
+            assertion,
+            key,
+            sign_issued_challenge,
+            auth_tag,
+        )
+        .await;
+        let texts = frames
+            .into_iter()
+            .filter_map(|frame| match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => Some(t.to_string()),
+                _ => None,
+            })
+            .collect();
+        (texts, cancelled)
+    }
+
+    /// [`run_audio_auth_tagged`], returning every Text and Close frame.
+    async fn run_audio_auth_in_wire(
+        state: std::sync::Arc<crate::state::AppState>,
+        tenant: buzz_core::tenant::TenantContext,
+        channel_id: uuid::Uuid,
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+        key: &nostr::Keys,
+        sign_issued_challenge: bool,
+        auth_tag: Option<Vec<String>>,
+    ) -> (Vec<tokio_tungstenite::tungstenite::Message>, bool) {
+        use std::sync::Arc;
+        let relay_url =
+            crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant);
         let conn_cancel = CancellationToken::new();
         let cancel_for_assert = conn_cancel.clone();
+        let control_for_handler = crate::state::CommunityConnectionControl::new(conn_cancel);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let app = Router::new().route(
@@ -3787,14 +4108,14 @@ mod tests {
             get(move |ws: WebSocketUpgrade| {
                 let (state, tenant, assertion) =
                     (Arc::clone(&state), tenant.clone(), assertion.clone());
-                let control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+                let control = control_for_handler.clone();
                 async move {
                     ws.on_upgrade(move |socket| async move {
                         handle_active_audio_connection(
                             socket,
                             state,
                             tenant,
-                            uuid::Uuid::new_v4(),
+                            channel_id,
                             control,
                             assertion,
                             chrono::Utc::now(),
@@ -3827,10 +4148,14 @@ mod tests {
             "not-the-issued-challenge"
         };
         let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
-            .tag(nostr::Tag::parse(["relay", "ws://test.local"]).unwrap())
-            .tag(nostr::Tag::parse(["challenge", signed_challenge]).unwrap())
-            .sign_with_keys(key)
-            .unwrap();
+            .tag(nostr::Tag::parse(["relay", relay_url.as_str()]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", signed_challenge]).unwrap());
+        let auth_event = match auth_tag {
+            Some(tag) => auth_event.tag(nostr::Tag::parse(tag).unwrap()),
+            None => auth_event,
+        }
+        .sign_with_keys(key)
+        .unwrap();
         client
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 serde_json::json!({"type": "auth", "event": auth_event})
@@ -3845,17 +4170,117 @@ mod tests {
                 .await
                 .expect("handler must close the connection within the read budget");
             match next {
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
-                    frames.push(t.to_string())
+                Some(Ok(frame @ tokio_tungstenite::tungstenite::Message::Text(_))) => {
+                    frames.push(frame)
                 }
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
-                | Some(Err(_))
-                | None => break,
+                Some(Ok(frame @ tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                    frames.push(frame);
+                    break;
+                }
+                Some(Err(_)) | None => break,
                 Some(Ok(_)) => {}
             }
         }
         server.abort();
         (frames, cancel_for_assert.is_cancelled())
+    }
+
+    /// FI-TRACE-DENIAL-ORACLE: an assertion–key mismatch and an active
+    /// deny-set entry are both `authorization_denied`, so the audio client
+    /// must see byte-identical frames: the restricted JSON, then 1008.
+    ///
+    /// Mutation: send the pairing denial frame directly (bypassing
+    /// `deny_audio_authorization`) → no Close(1008) and the sequences differ.
+    #[tokio::test]
+    async fn audio_key_mismatch_and_deny_set_emit_identical_frames() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        use tokio_tungstenite::tungstenite::Message;
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let asserted = nostr::Keys::generate();
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(asserted.public_key()), vec![deadline]);
+        let (mismatch, mismatch_cancelled) = run_audio_auth_wire(
+            audio_deny_state(None).await,
+            Some(assertion),
+            &nostr::Keys::generate(),
+            true,
+        )
+        .await;
+
+        let denied = nostr::Keys::generate();
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(denied.public_key()), vec![deadline]);
+        let (deny_set, deny_set_cancelled) = run_audio_auth_wire(
+            audio_deny_state(Some(&denied.public_key())).await,
+            Some(assertion),
+            &denied,
+            true,
+        )
+        .await;
+
+        assert!(mismatch_cancelled && deny_set_cancelled);
+        assert_eq!(mismatch, deny_set);
+        assert_eq!(
+            mismatch,
+            [
+                Message::Text(audio_denial(buzz_auth::DenialClass::AuthorizationDenied).into()),
+                Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "authorization denied".into(),
+                })),
+            ]
+        );
+    }
+
+    /// Records every frame the denial writer emits for a registered audio
+    /// control, then lets a registry scan race it in `scan_first` order.
+    async fn audio_denial_with_concurrent_scan(
+        scan_first: bool,
+    ) -> (Vec<WsMessage>, mpsc::Receiver<WsMessage>) {
+        let registry = crate::state::CommunityConnectionRegistry::new();
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let key = vec![0x42u8; 32];
+        let control = CommunityConnectionControl::new(CancellationToken::new());
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        control.set_terminal_frame_sender(terminal_tx);
+        audio_post_auth_register(&control, key.clone(), Some("test-issuer".to_owned()));
+        let _guard = registry.register(uuid::Uuid::new_v4(), community, control.clone());
+
+        let mut wire = Vec::new();
+        if scan_first {
+            assert_eq!(registry.disconnect_nip_fi("test-issuer", &key), 1);
+        }
+        deny_audio_authorization(&mut wire, &control, &mut terminal_rx).await;
+        if !scan_first {
+            registry.disconnect_nip_fi("test-issuer", &key);
+        }
+        (wire, terminal_rx)
+    }
+
+    /// Winner-only enqueue: whichever of the handler's own denial and a
+    /// registry `disconnect_nip_fi` scan runs second writes nothing, so the
+    /// socket sees exactly one restricted frame and one 1008.
+    ///
+    /// Mutation: have `deny_audio_authorization` write its frames without the
+    /// reason transition → the later scan wins and queues a second denial.
+    #[tokio::test]
+    async fn audio_denial_and_registry_scan_emit_one_frame_sequence() {
+        let expected = [
+            crate::nip_fi_session::denial_frame(
+                crate::nip_fi_session::NipFiWsRoute::Audio,
+                buzz_auth::DenialClass::AuthorizationDenied,
+            ),
+            crate::state::CommunityDisconnectReason::AuthorizationDenied.close_message(),
+        ];
+        for scan_first in [false, true] {
+            let (wire, mut terminal_rx) = audio_denial_with_concurrent_scan(scan_first).await;
+            assert_eq!(wire, expected, "scan_first = {scan_first}");
+            assert!(
+                terminal_rx.try_recv().is_err(),
+                "no second denial may be queued (scan_first = {scan_first})"
+            );
+        }
     }
 
     async fn run_audio_bad_nip42_proof(
@@ -4516,7 +4941,9 @@ mod tests {
     //   - Delete/change the audio enqueue in `spawn_nip_fi_expiry_task` →
     //     output lacks or mismatches frame 0.
     //   - Revert the audio send_loop cancellation drain → output begins with
-    //     Close(None) or lacks the restricted frame entirely.
+    //     a Close or lacks the restricted frame entirely.
+    //   - Enqueue the expiry frame without the reason transition → frame 1
+    //     is Close(None), not 1008.
     //   - Replace audio's production constructor call with a copied local task →
     //     structural requirement: exactly one `spawn_nip_fi_expiry_task`
     //     definition (in `nip_fi_session`) and two production invocations (root
@@ -4528,7 +4955,7 @@ mod tests {
         use std::pin::Pin;
         use std::sync::Arc;
         use std::task::{Context, Poll};
-        use tokio::sync::{mpsc, watch};
+        use tokio::sync::mpsc;
 
         // Recording sink that stores every message in order.
         struct RecordSink(Arc<tokio::sync::Mutex<Vec<WsMessage>>>);
@@ -4569,8 +4996,9 @@ mod tests {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
         let (terminal_tx, terminal_rx) = mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
-        let (disconnect_tx, disconnect_rx) = watch::channel(None);
-        drop(disconnect_tx); // plain Close(None)
+        // The expiry publishes its reason on the socket's own control.
+        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+        let disconnect_rx = control.disconnect_reason();
 
         // Step 1: spawn audio send_loop and yield so it parks in its select.
         let send_cancel = cancel.clone();
@@ -4592,6 +5020,7 @@ mod tests {
         let expiry_handle = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             already_expired,
             gate,
+            control,
             terminal_tx,
             crate::nip_fi_session::NipFiWsRoute::Audio,
         );
@@ -4627,11 +5056,11 @@ mod tests {
             other => panic!("frame 0 must be Text(restricted JSON); got {other:?}"),
         }
 
-        // Frame 1: Close(None).
-        assert!(
-            matches!(frames[1], WsMessage::Close(None)),
-            "frame 1 must be Close(None); got {:?}",
-            frames[1]
+        // Frame 1: the `authorization_denied` 1008 close.
+        assert_eq!(
+            frames[1],
+            crate::state::CommunityDisconnectReason::AuthorizationDenied.close_message(),
+            "frame 1 must be the 1008 authorization-denied close"
         );
     }
 
@@ -5193,14 +5622,19 @@ mod tests {
         );
 
         let conn_cancel = CancellationToken::new();
-        let (pre_terminal_tx, _pre_terminal_rx) =
+        let (pre_terminal_tx, pre_terminal_rx) =
             tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+        // One control and one terminal channel shared by the expiry task and
+        // the handler, as `handle_audio_connection` wires them.
+        let control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+        let pre_terminal_rx = Arc::new(std::sync::Mutex::new(Some(pre_terminal_rx)));
         let pre_gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, conn_cancel.clone());
         // Fire the expiry task so the gate is expired and the token is
         // cancelled before the handler even inspects it.
         let pre_expiry = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             Arc::clone(&pre_gate),
+            control.clone(),
             pre_terminal_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         );
@@ -5210,7 +5644,8 @@ mod tests {
         let tenant_c = tenant.clone();
         let assertion_c = assertion.clone();
         let pre_gate_c = Arc::clone(&pre_gate);
-        let conn_cancel_c = conn_cancel.clone();
+        let control_c = control.clone();
+        let pre_terminal_rx_c = Arc::clone(&pre_terminal_rx);
         let pre_terminal_tx_c = pre_terminal_tx.clone();
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -5226,14 +5661,16 @@ mod tests {
                     let tenant_i = tenant_c.clone();
                     let assertion_i = assertion_c.clone();
                     let gate_i = Arc::clone(&pre_gate_c);
-                    let cancel_i = conn_cancel_c.clone();
+                    let control_i = control_c.clone();
+                    let rx_i = Arc::clone(&pre_terminal_rx_c);
                     let tx_i = pre_terminal_tx_c.clone();
                     move |ws: WebSocketUpgrade| {
                         let state_i = Arc::clone(&state_i);
                         let tenant_i = tenant_i.clone();
                         let assertion_i = assertion_i.clone();
                         let gate_i = Arc::clone(&gate_i);
-                        let cancel_i = cancel_i.clone();
+                        let control_i = control_i.clone();
+                        let rx_i = Arc::clone(&rx_i);
                         let tx_i = tx_i.clone();
                         let conn_time = chrono::Utc::now();
                         async move {
@@ -5241,14 +5678,17 @@ mod tests {
                                 // Provide the pre-built terminal receive end.
                                 // The expiry task was spawned in the outer scope;
                                 // pass None for the JoinHandle (cannot move across).
-                                let (_, rx) =
-                                    tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+                                let rx = rx_i
+                                    .lock()
+                                    .expect("rx slot")
+                                    .take()
+                                    .expect("single connection");
                                 handle_active_audio_connection(
                                     socket,
                                     state_i,
                                     tenant_i,
                                     uuid::Uuid::new_v4(),
-                                    crate::state::CommunityConnectionControl::new(cancel_i),
+                                    control_i,
                                     Some(assertion_i),
                                     conn_time,
                                     Some((gate_i, tx_i, rx, None)),
@@ -5300,6 +5740,19 @@ mod tests {
             ),
             other => panic!("F3-audio: expected Text(restricted JSON); got {other:?}"),
         }
+        let close = tokio::time::timeout(std::time::Duration::from_millis(500), client.next())
+            .await
+            .expect("F3-audio: close must follow the denial");
+        assert!(
+            matches!(
+                &close,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(Some(frame))))
+                    if frame.code
+                        == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+                        && frame.reason.as_str() == "authorization denied"
+            ),
+            "F3-audio: expiry is `authorization_denied` and closes 1008; got {close:?}"
+        );
 
         // Drain pre_expiry to avoid leaking tasks.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pre_expiry).await;
@@ -5445,6 +5898,1062 @@ mod tests {
     // attribute — do not remove the ignore even if a local DB is reachable,
     // so the discovery contract is not broken. (Lesson S5: test relocation
     // matters for nextest lane discovery.)
+    // ── NIP-FI S4 audio deny witnesses ──
+    /// Build a test AppState with a NipFiDenyMap wired for issuer "test-issuer".
+    /// If `denied_key` is Some, inserts a live deny entry for that key.
+    /// Uses a lazy DB (port 1) — sufficient because the deny check fires before
+    /// any DB read in `handle_active_audio_connection`.
+    async fn audio_deny_state(
+        denied_key: Option<&nostr::PublicKey>,
+    ) -> std::sync::Arc<crate::state::AppState> {
+        use std::sync::Arc;
+        let mut state = (*audio_test_state().await).clone();
+
+        let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
+            16,
+            vec![buzz_auth::IssuerCapacity {
+                issuer: "test-issuer".to_owned(),
+                capacity: 16,
+            }],
+        ));
+
+        if let Some(key) = denied_key {
+            let until = chrono::Utc::now() + chrono::Duration::seconds(3600);
+            let result =
+                deny_map.merge_cross_pod_deny("test-issuer", key, until, chrono::Utc::now());
+            assert!(
+                matches!(result, buzz_auth::CrossPodMergeResult::Merged),
+                "audio_deny_state: deny entry must be inserted for test setup"
+            );
+        }
+
+        state.nip_fi_deny_map = Some(deny_map);
+        Arc::new(state)
+    }
+
+    /// Consumes Ping/Pong until the socket terminates (Close, EOF or error)
+    /// within 5s; panics on any data frame or if termination never arrives.
+    async fn assert_terminates_without_data<S>(client: &mut S, tag: &str)
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use tokio_tungstenite::tungstenite::Message;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match client.next().await {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(other)) => {
+                        panic!(
+                            "{tag}: socket must terminate after the denial payload; got {other:?}"
+                        )
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{tag}: socket did not terminate within 5s"));
+    }
+
+    // ── W_admin_disconnect: registry disconnect_nip_fi delivers payload-then-terminate ─
+    //
+    // Witnesses that an active audio socket closed via the admin-disconnect path
+    // (`CommunityConnectionRegistry::disconnect_nip_fi`) delivers the restricted
+    // JSON payload and then terminates with no further data frame.  On main's S3
+    // pre-writer exit the terminal channel is drained and the socket dropped; no
+    // specific close code is asserted.
+    //
+    // Setup:
+    //   - Pre-create and register `CommunityConnectionControl` (so the registry
+    //     scan can find this audio session by pubkey — same pattern as straddle).
+    //   - Key absent from deny map.  Assertion carries a 1-hour deadline so the
+    //     expiry task is armed but does NOT fire during the test.
+    //   - `after_deny_set_check_passed` hook holds the handler AFTER the terminal
+    //     sender is registered and the deny-set check has passed (so the direct
+    //     map-denial branch is not what produces the frame).
+    //   - Test calls `registry.disconnect_nip_fi("test-issuer", &pubkey)` while the hook holds.
+    //     `CommunityConnectionControl::disconnect_nip_fi` enqueues the denial frame
+    //     on `terminal_frame_tx`, publishes `AuthorizationDenied`, then cancels.
+    //   - Hook is released; handler observes cancellation, drains the denial
+    //     frame from `terminal_ctrl_rx`, and drops the socket.
+    //   - Client asserts: Text(restricted JSON), then Close/EOF/error (control
+    //     frames skipped) with no further data frame.
+    //
+    // Mutation evidence (production seam, not copies):
+    //   A) Remove the `set_terminal_frame_sender` call from `handle_active_audio_connection`
+    //      → `terminal_frame_tx` slot is `None` → `disconnect_nip_fi` enqueues nothing
+    //      → client sees termination with no preceding text frame → frame-0
+    //      assertion panics.
+    //   B) Remove the `try_send` block from `CommunityConnectionControl::disconnect_nip_fi`
+    //      → same outcome as (A): enqueue suppressed → only close observed → panics.
+    //   C) Delete the terminal-channel drain on the cancellation exit → no text
+    //      frame delivered → panics.
+    //   D) Move `set_terminal_frame_sender` to AFTER `audio_post_auth_register`
+    //      → when disconnect_nip_fi fires at the `after_deny_set_check_passed`
+    //      hook (after the registration point), the sender IS registered → test
+    //      still PASSES.
+    //      Use W_admin_disconnect_at_deny_check (hook at before_deny_set_check,
+    //      the old gap) to catch this regression instead — that witness is RED
+    //      when the sender is registered after that window. (See
+    //      w_admin_disconnect_at_deny_check_delivers_payload_then_terminates below.)
+    #[tokio::test]
+    async fn admin_disconnect_nip_fi_delivers_restricted_json_then_terminates() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let key = nostr::Keys::generate();
+        // 1-hour deadline: expiry task armed but will NOT fire during this test.
+        let deadline = Utc::now() + Duration::hours(1);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+        // State with deny map; key is absent (not denied).
+        let state = audio_deny_state(None).await;
+
+        // Unique community so hook and registry slots don't collide with parallel tests.
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let tenant =
+            buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+
+        // Pre-create and register the control so the pubkey-scan can find it.
+        // `audio_post_auth_register` writes `proven_pubkey` on this same Arc;
+        // the registered entry is updated in-place. [same pattern as straddle test]
+        let conn_control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+        let conn_id = uuid::Uuid::new_v4();
+        let _conn_guard =
+            state
+                .community_connections
+                .register(conn_id, community, conn_control.clone());
+        let conn_control_for_server = conn_control.clone();
+
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("W_admin_disconnect: bind test listener");
+        let addr = listener
+            .local_addr()
+            .expect("W_admin_disconnect: test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let control_outer = conn_control_for_server.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let control_inner = control_outer.clone();
+                        let conn_time = chrono::Utc::now();
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    uuid::Uuid::new_v4(),
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("W_admin_disconnect: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("W_admin_disconnect: server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("W_admin_disconnect: connect client");
+
+        // Arm the hook BEFORE sending auth — it fires after `set_terminal_frame_sender`
+        // registers the sender and after the deny-set check has passed.
+        let (hook_arrived_rx, hook_release) =
+            crate::nip_fi_test_hooks::audio_after_deny_check_passed_hook::arm(community);
+
+        // NIP-42 challenge.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("W_admin_disconnect: challenge timeout")
+            .expect("W_admin_disconnect: challenge item")
+            .expect("W_admin_disconnect: challenge message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("W_admin_disconnect: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("W_admin_disconnect: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("W_admin_disconnect: challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("W_admin_disconnect: send auth");
+
+        // Wait for the handler to reach after_deny_set_check_passed.
+        // At this point `set_terminal_frame_sender` has already been called and
+        // the terminal sender is registered on the control.
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook_arrived_rx)
+            .await
+            .expect("W_admin_disconnect: handler must reach after_deny_set_check_passed within 5s")
+            .expect("W_admin_disconnect: hook arrived channel closed");
+
+        // Simulate admin-disconnect: call the real registry disconnect scan by pubkey.
+        // CommunityConnectionControl::disconnect_nip_fi enqueues the denial frame on
+        // the registered terminal sender, publishes AuthorizationDenied, then cancels.
+        let pubkey_bytes = key.public_key().to_bytes().to_vec();
+        let closed = state
+            .community_connections
+            .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+        assert_eq!(
+            closed, 1,
+            "W_admin_disconnect: registry scan must find exactly 1 audio session \
+             (proves audio_post_auth_register ran before the hook)"
+        );
+
+        // Release hook — handler resumes, observes cancellation, drains the
+        // enqueued denial frame, then drops the socket.
+        hook_release.notify_one();
+
+        // Frame 0: restricted JSON payload.
+        let frame0 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("W_admin_disconnect: frame 0 timeout")
+            .expect("W_admin_disconnect: frame 0 item")
+            .expect("W_admin_disconnect: frame 0 ws message");
+        let expected_json = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+        match frame0 {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                assert_eq!(
+                    t.as_str(),
+                    expected_json.as_str(),
+                    "W_admin_disconnect: frame 0 must be exact restricted JSON payload"
+                );
+            }
+            other => {
+                panic!("W_admin_disconnect: frame 0 must be Text(restricted JSON); got {other:?}")
+            }
+        }
+
+        // Pre-writer exit: main's S3 drains only the terminal channel, then
+        // drops the socket. Nothing may follow the denial payload.
+        assert_terminates_without_data(&mut client, "W_admin_disconnect").await;
+
+        assert!(
+            cancel_for_assert.is_cancelled(),
+            "W_admin_disconnect: conn_cancel must be cancelled after admin disconnect"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // ── W_admin_disconnect_at_deny_check: pre-registration-window is now closed ──
+    //
+    // Witnesses that a disconnect_nip_fi call that fires at the `before_deny_set_check`
+    // hook window — AFTER audio_post_auth_register (pubkey scan-visible) but BEFORE
+    // the deny-set check — still delivers the restricted JSON payload before the
+    // socket terminates.  If the terminal sender were registered after this point,
+    // `disconnect_nip_fi` would find `terminal_frame_tx = None` and queue nothing;
+    // registering it before `audio_post_auth_register` closes that window.
+    //
+    // Setup:
+    //   - Pre-create and register control (same pattern as straddle/admin_disconnect).
+    //   - Key absent from deny map.  1-hour deadline — expiry does not fire.
+    //   - Arm `before_deny_set_check` hook.  This hook fires AFTER both
+    //     `set_terminal_frame_sender` and `audio_post_auth_register`.
+    //   - While handler is held at the hook, call `registry.disconnect_nip_fi`.
+    //   - Release; handler observes cancellation, drains the denial frame, drops the socket.
+    //   - Client asserts Text(restricted JSON), then Close/EOF/error with no further data.
+    //
+    // Mutation evidence:
+    //   A) Move `set_terminal_frame_sender` to AFTER the hook window (into the B1
+    //      block, after the deny-set check)
+    //      → when disconnect_nip_fi fires at the before_deny_set_check window, the
+    //      slot is still `None` → nothing enqueued → the S3 drain-and-drop exit
+    //      has no frame to send → client sees termination with no preceding Text frame → frame-0
+    //      assertion panics.
+    //   B) Remove `set_terminal_frame_sender` entirely → same outcome as (A).
+    #[tokio::test]
+    async fn w_admin_disconnect_at_deny_check_delivers_payload_then_terminates() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let key = nostr::Keys::generate();
+        let deadline = Utc::now() + Duration::hours(1);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+        // State with deny map; key is absent (not denied) — the check must pass.
+        let state = audio_deny_state(None).await;
+
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let tenant =
+            buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+
+        // Pre-create and register the control so the pubkey-scan can find it.
+        let conn_control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+        let conn_id = uuid::Uuid::new_v4();
+        let _conn_guard =
+            state
+                .community_connections
+                .register(conn_id, community, conn_control.clone());
+        let conn_control_for_server = conn_control.clone();
+
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("W_addc: bind test listener");
+        let addr = listener.local_addr().expect("W_addc: test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let control_outer = conn_control_for_server.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let control_inner = control_outer.clone();
+                        let conn_time = chrono::Utc::now();
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    uuid::Uuid::new_v4(),
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("W_addc: test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("W_addc: server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("W_addc: connect client");
+
+        // Arm before_deny_set_check — fires AFTER set_terminal_frame_sender AND
+        // audio_post_auth_register (pubkey scan-visible).  This is the exact window
+        // where the old code had terminal_frame_tx = None.
+        let (hook_arrived_rx, hook_release) =
+            crate::nip_fi_test_hooks::deny_set_check_hook::arm(community);
+
+        // NIP-42 challenge.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("W_addc: challenge timeout")
+            .expect("W_addc: challenge item")
+            .expect("W_addc: challenge message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("W_addc: expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("W_addc: challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("W_addc: challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("W_addc: send auth");
+
+        // Wait for the handler to reach before_deny_set_check.
+        // At this point BOTH set_terminal_frame_sender and audio_post_auth_register
+        // have already executed — the terminal sender is registered and the pubkey
+        // is scan-visible.  (In the old code this was the gap window.)
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook_arrived_rx)
+            .await
+            .expect("W_addc: handler must reach before_deny_set_check within 5s")
+            .expect("W_addc: hook arrived channel closed");
+
+        // Simulate admin-disconnect at the exact old-gap position.
+        let pubkey_bytes = key.public_key().to_bytes().to_vec();
+        let closed = state
+            .community_connections
+            .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+        assert_eq!(
+            closed, 1,
+            "W_addc: registry scan must find exactly 1 audio session \
+             (proves audio_post_auth_register ran before the hook)"
+        );
+
+        // Release — handler resumes, observes cancellation, drains the enqueued
+        // denial frame, then drops the socket.
+        hook_release.notify_one();
+
+        // Frame 0: restricted JSON payload.
+        let frame0 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("W_addc: frame 0 timeout")
+            .expect("W_addc: frame 0 item")
+            .expect("W_addc: frame 0 ws message");
+        let expected_json = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+        match frame0 {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                assert_eq!(
+                    t.as_str(),
+                    expected_json.as_str(),
+                    "W_addc: frame 0 must be exact restricted JSON (terminal sender was \
+                     registered before scan-visibility, so the old gap is closed)"
+                );
+            }
+            other => {
+                panic!("W_addc: frame 0 must be Text(restricted JSON); got {other:?}")
+            }
+        }
+
+        // Pre-writer exit: main's S3 drains only the terminal channel, then
+        // drops the socket. Nothing may follow the denial payload.
+        assert_terminates_without_data(&mut client, "W_addc").await;
+
+        assert!(
+            cancel_for_assert.is_cancelled(),
+            "W_addc: conn_cancel must be cancelled after admin disconnect"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn w_audio_deny_absent_key_passes_deny_check_reaches_membership_gate() {
+        // A key NOT in the deny map must pass the deny-set check and reach the
+        // post-check / membership-entry gate without denial or cancellation.
+        //
+        // Two hooks bracket the deny-set check block:
+        //   1. `before_deny_set_check` (pre-check): proves the handler reached
+        //      the deny-check seam after pairing + registration; connection is
+        //      NOT cancelled here.
+        //   2. `after_deny_set_check_passed` (post-check): fires only when the
+        //      key was NOT denied — proves the handler continued past the check
+        //      without a denial or cancel. An unconditional denial immediately
+        //      after the pre-check hook would prevent this hook from firing.
+        //
+        // Mutation evidence:
+        //   A) Invert `is_denied` → absent key is denied after pre-check hook
+        //      releases → handler returns early → post-check hook NEVER fires →
+        //      `post_arrived_rx` times out → test panics.
+        //   B) Delete the `before_deny_set_check` hook → pre-check `arrived_rx`
+        //      times out → test panics (seam unreachable).
+        //   C) Delete the `after_deny_set_check_passed` hook → post-check
+        //      `post_arrived_rx` times out → test panics (pass-through unproven).
+        //   D) Remove `nip_fi_deny_map` from state → map is None → guard
+        //      short-circuits → both hooks still fire (map guard is after both
+        //      hooks are in the control path) — off-mode passes through cleanly.
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let key = nostr::Keys::generate();
+        // Different key is denied; `key` is absent from the map.
+        let other_key = nostr::Keys::generate();
+        let deadline = Utc::now() + Duration::hours(1);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+        let state = audio_deny_state(Some(&other_key.public_key())).await;
+
+        // Use a unique UUID so this test's hook slot doesn't collide with
+        // other concurrent tests (active test uses Uuid::nil()).
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let tenant =
+            buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = conn_cancel.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    uuid::Uuid::new_v4(),
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect client");
+
+        // Arm BOTH hooks before sending the auth message.
+        // Hook 1: pre-check barrier — fires when handler reaches before_deny_set_check.
+        let (pre_arrived_rx, pre_release) =
+            crate::nip_fi_test_hooks::deny_set_check_hook::arm(community);
+        // Hook 2: post-check barrier — fires when handler passes deny check (key absent).
+        let (post_arrived_rx, post_release) =
+            crate::nip_fi_test_hooks::audio_after_deny_check_passed_hook::arm(community);
+
+        // Receive challenge.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("challenge timeout")
+            .expect("challenge message")
+            .expect("challenge ws message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("send auth msg");
+
+        // === Pre-check seam ===
+        // Wait for handler to reach before_deny_set_check.
+        // Proves: pairing passed, registration happened, deny check reached.
+        tokio::time::timeout(std::time::Duration::from_secs(5), pre_arrived_rx)
+            .await
+            .expect("W_audio_deny_absent: handler must reach before_deny_set_check within 5s")
+            .expect("arrived channel closed");
+
+        // Connection is NOT cancelled at the pre-check seam.
+        assert!(
+            !cancel_for_assert.is_cancelled(),
+            "W_audio_deny_absent: connection must NOT be cancelled at the pre-check seam"
+        );
+
+        // Release pre-check hook — handler proceeds to run the deny check.
+        pre_release.notify_one();
+
+        // === Post-check seam ===
+        // Wait for handler to reach after_deny_set_check_passed.
+        // This hook ONLY fires if the key was NOT denied. An inverted `is_denied`
+        // would deny the absent key and return early, never reaching this hook.
+        tokio::time::timeout(std::time::Duration::from_secs(5), post_arrived_rx)
+            .await
+            .expect(
+                "W_audio_deny_absent: handler must reach after_deny_set_check_passed within 5s \
+                 (absent key must pass the deny check without denial)",
+            )
+            .expect("post-check arrived channel closed");
+
+        // Connection is STILL not cancelled — the absent key passed clean.
+        assert!(
+            !cancel_for_assert.is_cancelled(),
+            "W_audio_deny_absent: connection must NOT be cancelled after the deny check \
+             (absent key must pass clean)"
+        );
+
+        // Release post-check hook — handler proceeds to membership check (lazy DB).
+        post_release.notify_one();
+
+        // Allow the handler to proceed briefly (lazy-DB membership error is expected;
+        // that path is out of scope for this witness).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn w_audio_deny_active_key_refused_at_post_registration_check() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let key = nostr::Keys::generate();
+        let deadline = Utc::now() + Duration::hours(1);
+        // Assertion with "test-issuer"; the key IS in the deny map.
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+        let state = audio_deny_state(Some(&key.public_key())).await;
+
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = conn_cancel.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    uuid::Uuid::new_v4(),
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect client");
+
+        // Receive challenge.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("challenge timeout")
+            .expect("challenge message")
+            .expect("challenge ws message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("challenge field")
+            .to_string();
+
+        // Sign with the SAME key as the assertion — pairing passes.
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("send auth msg");
+
+        // Receive the denial frame.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+            .await
+            .expect("W_audio_deny_active: denial frame timeout")
+            .expect("frame")
+            .expect("ws frame");
+
+        let expected_denied = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                assert_eq!(
+                    t.as_str(),
+                    expected_denied.as_str(),
+                    "W_audio_deny_active: active deny entry must produce exact \
+                     authorization_denied frame at post-registration check"
+                );
+            }
+            other => panic!("W_audio_deny_active: expected Text(restricted JSON); got {other:?}"),
+        }
+
+        // Connection must close after denial.
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), client.next()).await;
+        assert!(
+            matches!(
+                close,
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+                    | Ok(Some(Err(_)))
+                    | Ok(None)
+            ),
+            "W_audio_deny_active: connection must close after denial; got {close:?}"
+        );
+
+        assert!(
+            cancel_for_assert.is_cancelled(),
+            "W_audio_deny_active: conn_cancel must be cancelled after denial"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn w_audio_deny_straddle_entry_inserted_between_registration_and_check_is_caught() {
+        // Arms `before_deny_set_check` — fires AFTER audio_post_auth_register and
+        // BEFORE the is_denied call. Entry starts absent; inserted during the window.
+        // The deny check finds it and closes the connection.
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let key = nostr::Keys::generate();
+        let deadline = Utc::now() + Duration::hours(1);
+        let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+        // Build state with empty deny map (key not denied yet).
+        let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
+            16,
+            vec![buzz_auth::IssuerCapacity {
+                issuer: "test-issuer".to_owned(),
+                capacity: 16,
+            }],
+        ));
+        let deny_map_for_insert = Arc::clone(&deny_map);
+
+        let mut base_state = (*audio_test_state().await).clone();
+        base_state.nip_fi_deny_map = Some(deny_map);
+        let state = Arc::new(base_state);
+
+        // Use a unique UUID so this test's hook slot doesn't collide with
+        // other concurrent tests (absent/active tests use Uuid::nil()).
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let tenant =
+            buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+
+        // Pre-create and register the CommunityConnectionControl before the server
+        // runs. audio_post_auth_register writes proven_pubkey on the control; since
+        // Clone shares the same proven_pubkey Arc, the registered entry is updated
+        // in-place and disconnect_nip_fi can find it at the close-scan assertion.
+        // The guard keeps the entry live through that assertion.
+        let conn_control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+        let conn_id_for_registration = uuid::Uuid::new_v4();
+        let _conn_guard = state.community_connections.register(
+            conn_id_for_registration,
+            community,
+            conn_control.clone(),
+        );
+        let conn_control_for_server = conn_control.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let control_outer = conn_control_for_server.clone();
+                    move |ws: WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        // Use the pre-registered control so audio_post_auth_register
+                        // writes to the registered entry (shared proven_pubkey Arc).
+                        let control_inner = control_outer.clone();
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    uuid::Uuid::new_v4(),
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("server ready");
+
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect client");
+
+        // Arm the barrier BEFORE sending auth (handler stalls when it reaches the hook).
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::deny_set_check_hook::arm(community);
+
+        // Receive challenge.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("challenge timeout")
+            .expect("challenge message")
+            .expect("challenge ws message");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("challenge field")
+            .to_string();
+
+        let relay_url = "ws://test.local";
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        let auth_msg = serde_json::json!({"type": "auth", "event": auth_event}).to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("send auth msg");
+
+        // Wait for the handler to reach before_deny_set_check (after registration).
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("W_audio_deny_straddle: handler must reach hook within 5s")
+            .expect("arrived channel closed");
+
+        // Insert the deny entry — handler is between registration and check.
+        let until = Utc::now() + Duration::seconds(3600);
+        let merge = deny_map_for_insert.merge_cross_pod_deny(
+            "test-issuer",
+            &key.public_key(),
+            until,
+            Utc::now(),
+        );
+        assert!(
+            matches!(merge, buzz_auth::CrossPodMergeResult::Merged),
+            "W_audio_deny_straddle: deny entry must be inserted during hook window"
+        );
+
+        // Close-scan side: run the real CommunityConnectionRegistry::disconnect_nip_fi
+        // now that the audio connection is registered (audio_post_auth_register fired
+        // before the hook). This proves registration is visible to the concurrent close
+        // scan — the normative invariant [FI-TRACE-DENY-SET] for the audio path.
+        // With the deny entry live, the scan finds exactly one session matching this
+        // pubkey and closes it.
+        //
+        // Mutation evidence (Mut-C: move hook before audio_post_auth_register):
+        //   disconnect_nip_fi returns 0 (not yet registered) → assertion panics.
+        //   Causally falsifies the registration-before-check invariant.
+        let pubkey_bytes = key.public_key().to_bytes().to_vec();
+        let closed = state
+            .community_connections
+            .disconnect_nip_fi("test-issuer", &pubkey_bytes);
+        assert_eq!(
+            closed, 1,
+            "W_audio_deny_straddle: close scan must find exactly 1 registered audio session \
+             (proves audio_post_auth_register is visible between the hook and the check)"
+        );
+
+        // Release — handler resumes and calls is_denied().
+        release.notify_one();
+
+        // Receive the denial frame from the server.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("W_audio_deny_straddle: denial frame timeout")
+            .expect("frame")
+            .expect("ws frame");
+
+        let expected_denied = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+        })
+        .to_string();
+
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                assert_eq!(
+                    t.as_str(),
+                    expected_denied.as_str(),
+                    "W_audio_deny_straddle: deny entry inserted between registration \
+                     and check must produce exact authorization_denied frame"
+                );
+            }
+            other => panic!("W_audio_deny_straddle: expected Text(restricted JSON); got {other:?}"),
+        }
+
+        assert!(
+            cancel_for_assert.is_cancelled(),
+            "W_audio_deny_straddle: conn_cancel must be cancelled after straddle denial"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
     mod postgres_tests {
         use super::*;
 
@@ -11522,6 +13031,541 @@ mod tests {
             );
             server.abort();
         }
+
+        /// Run audio admission over a real WebSocket for `key` (optionally with
+        /// a NIP-OA `auth` tag), registered in the community connection
+        /// registry as production does, and assert it is admitted.
+        async fn open_admitted_audio_socket(
+            state: &std::sync::Arc<crate::state::AppState>,
+            tenant: buzz_core::tenant::TenantContext,
+            channel_id: uuid::Uuid,
+            key: &nostr::Keys,
+            auth_tag: Option<Vec<String>>,
+        ) -> (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            let (mut client, server) =
+                start_audio_auth(state, tenant, channel_id, key, auth_tag, None).await;
+            // The first frame after auth is the join result; it proves admission.
+            let joined = next_audio_text(&mut client).await;
+            assert!(
+                !joined.contains("\"error\""),
+                "must be admitted; got {joined}"
+            );
+            (client, server)
+        }
+
+        /// Open a registered audio socket for `key` and send its AUTH, without
+        /// reading any reply. `assertion` admits it under NIP-FI.
+        async fn start_audio_auth(
+            state: &std::sync::Arc<crate::state::AppState>,
+            tenant: buzz_core::tenant::TenantContext,
+            channel_id: uuid::Uuid,
+            key: &nostr::Keys,
+            auth_tag: Option<Vec<String>>,
+            assertion: Option<buzz_auth::VerifiedAssertion>,
+        ) -> (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            use std::sync::Arc;
+            let relay_url =
+                crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant);
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let handler_state = Arc::clone(state);
+            let app = Router::new().route(
+                "/",
+                get(move |ws: WebSocketUpgrade| {
+                    let (state, tenant, assertion) = (
+                        Arc::clone(&handler_state),
+                        tenant.clone(),
+                        assertion.clone(),
+                    );
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            let control = crate::state::CommunityConnectionControl::new(
+                                CancellationToken::new(),
+                            );
+                            let _guard = state.community_connections.register(
+                                uuid::Uuid::new_v4(),
+                                tenant.community(),
+                                control.clone(),
+                            );
+                            handle_active_audio_connection(
+                                socket,
+                                state,
+                                tenant,
+                                channel_id,
+                                control,
+                                assertion,
+                                chrono::Utc::now(),
+                                None,
+                            )
+                            .await
+                        })
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let (mut client, _) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+            let challenge: serde_json::Value =
+                serde_json::from_str(&next_audio_text(&mut client).await).expect("challenge JSON");
+            let mut auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", relay_url.as_str()]).unwrap())
+                .tag(
+                    nostr::Tag::parse(["challenge", challenge["challenge"].as_str().unwrap()])
+                        .unwrap(),
+                );
+            if let Some(tag) = auth_tag {
+                auth_event = auth_event.tag(nostr::Tag::parse(tag).unwrap());
+            }
+            let auth_event = auth_event.sign_with_keys(key).unwrap();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"type": "auth", "event": auth_event})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send auth");
+            (client, server)
+        }
+
+        async fn next_audio_text(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> String {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("frame timeout")
+            {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => t.to_string(),
+                other => panic!("expected text frame; got {other:?}"),
+            }
+        }
+
+        async fn expect_policy_close(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) {
+            let close = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                    .await
+                    .expect("socket must close after revocation")
+                {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => break frame,
+                    Some(Ok(_)) => continue,
+                    other => panic!("expected a close frame; got {other:?}"),
+                }
+            };
+            let close = close.expect("close frame carries a reason");
+            assert_eq!(u16::from(close.code), 1008);
+            assert_eq!(close.reason.as_str(), "access revoked");
+        }
+
+        /// Adds `key` as a member of the audio fixture's channel.
+        async fn add_channel_member(
+            pool: &sqlx::PgPool,
+            tenant: &buzz_core::tenant::TenantContext,
+            channel_id: uuid::Uuid,
+            key: &nostr::Keys,
+        ) {
+            sqlx::query(
+                "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+                 VALUES ($1, $2, $3, 'member')",
+            )
+            .bind(tenant.community().as_uuid())
+            .bind(channel_id)
+            .bind(key.public_key().to_bytes().to_vec())
+            .execute(pool)
+            .await
+            .expect("seed channel member");
+        }
+
+        /// A delegated agent that has only ever authenticated on audio (no
+        /// prior `users` row or owner link) gets its owner link stored, and
+        /// its socket records that owner, so revoking the owner closes it with
+        /// no database lookup. A second member on the same channel stays
+        /// connected.
+        ///
+        /// Mutations: stop audio admission from storing the owner link → the
+        /// link assertion fails → RED; drop `control.bind_owner` → the socket
+        /// stays open once the stored link is gone → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn owner_revoke_closes_audio_only_agent() {
+            let state = audio_test_state_real_db().await.expect(
+                "PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL or start local postgres",
+            );
+            let (tenant, channel_id, bystander) = seed_audio_fixture(state.db.pool()).await;
+            let (agent, owner) = (nostr::Keys::generate(), nostr::Keys::generate());
+            add_channel_member(state.db.pool(), &tenant, channel_id, &agent).await;
+            let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+                .expect("sign NIP-OA credential");
+            let auth_tag: Vec<String> = serde_json::from_str(&auth_tag).expect("tag JSON");
+
+            let (mut agent_client, agent_server) = open_admitted_audio_socket(
+                &state,
+                tenant.clone(),
+                channel_id,
+                &agent,
+                Some(auth_tag),
+            )
+            .await;
+            let (_bystander_client, bystander_server) =
+                open_admitted_audio_socket(&state, tenant.clone(), channel_id, &bystander, None)
+                    .await;
+            assert!(
+                state
+                    .db
+                    .is_agent_owner(
+                        tenant.community(),
+                        agent.public_key().as_bytes(),
+                        owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .expect("owner link read"),
+                "audio admission stores the owner link"
+            );
+            // Clear the stored link so only the owner the socket recorded at
+            // admission can reach it.
+            sqlx::query(
+                "UPDATE users SET agent_owner_pubkey = NULL WHERE community_id = $1 AND pubkey = $2",
+            )
+            .bind(tenant.community().as_uuid())
+            .bind(agent.public_key().to_bytes().as_slice())
+            .execute(state.db.pool())
+            .await
+            .expect("clear stored owner link");
+
+            let closed = state
+                .revoke_live_access(
+                    &tenant,
+                    owner.public_key().as_bytes(),
+                    &"0".repeat(64),
+                    "blocked: you are banned from this community",
+                )
+                .await
+                .expect("revoke");
+            assert_eq!(closed, 1, "only the agent's audio socket closes");
+            expect_policy_close(&mut agent_client).await;
+            agent_server.abort();
+            bystander_server.abort();
+        }
+
+        /// Audio refuses an agent whose owner link cannot be recorded (the
+        /// agent is already linked to a different owner): revoking its NIP-OA
+        /// owner could not find it.
+        ///
+        /// Mutation: admit on a failed owner-link write → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn audio_refuses_agent_whose_owner_link_fails() {
+            let state = audio_test_state_real_db().await.expect(
+                "PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL or start local postgres",
+            );
+            let (tenant, channel_id, _member) = seed_audio_fixture(state.db.pool()).await;
+            let (agent, owner, prior_owner) = (
+                nostr::Keys::generate(),
+                nostr::Keys::generate(),
+                nostr::Keys::generate(),
+            );
+            add_channel_member(state.db.pool(), &tenant, channel_id, &agent).await;
+            for key in [&agent, &prior_owner] {
+                state
+                    .db
+                    .ensure_user_for_authorization(tenant.community(), key.public_key().as_bytes())
+                    .await
+                    .expect("seed user");
+            }
+            assert!(state
+                .db
+                .set_agent_owner_for_authorization(
+                    tenant.community(),
+                    agent.public_key().as_bytes(),
+                    prior_owner.public_key().as_bytes(),
+                )
+                .await
+                .expect("seed prior owner"));
+            let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+                .expect("sign NIP-OA credential");
+            let auth_tag: Vec<String> = serde_json::from_str(&auth_tag).expect("tag JSON");
+
+            let (frames, _) = run_audio_auth_tagged(
+                state,
+                tenant,
+                channel_id,
+                None,
+                &agent,
+                true,
+                Some(auth_tag),
+            )
+            .await;
+            assert_eq!(
+                frames,
+                vec![serde_json::json!({
+                    "type": "error",
+                    "message": crate::handlers::auth::OWNER_LINK_ERROR
+                })
+                .to_string()]
+            );
+        }
+
+        /// A community-banned member must be refused at audio join with the same
+        /// verdict the root socket gives, before any lease or durable write.
+        /// Mutation: delete the audio ban gate → the member is admitted → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn audio_join_rejects_community_banned_member() {
+            let state = audio_test_state_real_db().await.expect(
+                "PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL or start local postgres",
+            );
+            let (tenant, channel_id, member_key) = seed_audio_fixture(state.db.pool()).await;
+            state
+                .db
+                .ban_community_member(
+                    tenant.community(),
+                    &member_key.public_key().to_bytes(),
+                    &nostr::Keys::generate().public_key().to_bytes(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("seed ban");
+
+            let (frames, _) =
+                run_audio_auth_in(state, tenant, channel_id, None, &member_key, true).await;
+
+            assert_eq!(
+                frames,
+                vec![serde_json::json!({
+                    "type": "error",
+                    "message": "blocked: you are banned from this community"
+                })
+                .to_string()]
+            );
+        }
+
+        /// A ban closes a live audio socket: admission binds the socket to its
+        /// pubkey, and the ban's pod-local disconnect
+        /// (`AppState::disconnect_pubkey_local`) closes it with a policy close.
+        /// Mutation: drop `control.bind_pubkey`, or the registry half of
+        /// `disconnect_pubkey_local` → the socket stays open → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn ban_disconnect_closes_live_audio_socket() {
+            let state = audio_test_state_real_db().await.expect(
+                "PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL or start local postgres",
+            );
+            let (tenant, channel_id, member_key) = seed_audio_fixture(state.db.pool()).await;
+            let community = tenant.community();
+            let (mut client, server) =
+                open_admitted_audio_socket(&state, tenant, channel_id, &member_key, None).await;
+
+            let closed = state.disconnect_pubkey_local(
+                community,
+                &member_key.public_key().to_bytes(),
+                &"0".repeat(64),
+                "blocked: you are banned from this community",
+                false,
+            );
+            assert_eq!(closed, 1, "the ban must close the live audio socket");
+            expect_policy_close(&mut client).await;
+            server.abort();
+        }
+
+        /// Every frame up to and including the server's close.
+        async fn audio_frames_until_close(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> Vec<tokio_tungstenite::tungstenite::Message> {
+            use tokio_tungstenite::tungstenite::Message;
+            let mut frames = Vec::new();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                    .await
+                    .expect("socket must close")
+                {
+                    Some(Ok(frame @ Message::Close(_))) => {
+                        frames.push(frame);
+                        return frames;
+                    }
+                    Some(Ok(frame @ Message::Text(_))) => frames.push(frame),
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return frames,
+                }
+            }
+        }
+
+        /// The canonical NIP-FI audio denial: restricted JSON, then 1008.
+        fn nip_fi_audio_denial_frames() -> Vec<tokio_tungstenite::tungstenite::Message> {
+            use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+            use tokio_tungstenite::tungstenite::Message;
+            vec![
+                Message::Text(audio_denial(buzz_auth::DenialClass::AuthorizationDenied).into()),
+                Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "authorization denied".into(),
+                })),
+            ]
+        }
+
+        /// Pause NIP-FI audio admission at its final ban read, ban the member
+        /// and revoke its live access there (after an issuer disconnect when
+        /// `issuer_first`), then return what the client receives.
+        async fn nip_fi_audio_frames_with_ban_at_final_admission(
+            issuer_first: bool,
+        ) -> Vec<tokio_tungstenite::tungstenite::Message> {
+            let state = audio_test_state_real_db().await.expect(
+                "PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL or start local postgres",
+            );
+            let (tenant, channel_id, member) = seed_audio_fixture(state.db.pool()).await;
+            let community = tenant.community();
+            let member_bytes = member.public_key().to_bytes();
+            let assertion = buzz_auth::VerifiedAssertion::for_test(
+                Some(member.public_key()),
+                vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+            );
+            let (arrived, release) =
+                crate::nip_fi_test_hooks::stored_owner_read_hook::arm(community);
+            let (mut client, server) =
+                start_audio_auth(&state, tenant, channel_id, &member, None, Some(assertion)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived)
+                .await
+                .expect("admission reaches its final read")
+                .expect("hook armed");
+
+            if issuer_first {
+                assert_eq!(
+                    state
+                        .community_connections
+                        .disconnect_nip_fi("test-issuer", &member_bytes),
+                    1
+                );
+            }
+            state
+                .db
+                .ban_community_member(
+                    community,
+                    &member_bytes,
+                    &nostr::Keys::generate().public_key().to_bytes(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("seed ban");
+            let closed = state.disconnect_pubkey_local(
+                community,
+                &member_bytes,
+                &"0".repeat(64),
+                "blocked: you are banned from this community",
+                false,
+            );
+            assert_eq!(closed, 1, "the revoke must find the mid-admission socket");
+            release.notify_one();
+
+            let frames = audio_frames_until_close(&mut client).await;
+            server.abort();
+            frames
+        }
+
+        /// A ban landing while NIP-FI audio admission awaits its final read
+        /// must not hide the canonical denial behind a bare `access revoked`.
+        /// Mutation: restore the unconditional `AccessRevoked` in
+        /// `revoke_access` → the refusal loses its frame and closes
+        /// `access revoked` → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn nip_fi_audio_ban_during_final_admission_sends_canonical_denial() {
+            assert_eq!(
+                nip_fi_audio_frames_with_ban_at_final_admission(false).await,
+                nip_fi_audio_denial_frames()
+            );
+        }
+
+        /// A community revoke after an issuer denial was already chosen must
+        /// keep that denial's `authorization denied` close.
+        /// Mutation: restore the unconditional `AccessRevoked` in
+        /// `revoke_access` → the close becomes `access revoked` → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn nip_fi_audio_revoke_after_issuer_denial_keeps_canonical_denial() {
+            assert_eq!(
+                nip_fi_audio_frames_with_ban_at_final_admission(true).await,
+                nip_fi_audio_denial_frames()
+            );
+        }
+
+        /// A delegated NIP-FI agent whose session expires just before its
+        /// owner-link permit gets the canonical denial and its close, with no
+        /// owner write and no huddle admission.
+        /// Mutation: drain only the terminal channel at the owner-permit
+        /// refusal → the 1008 close is missing → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn nip_fi_agent_expiring_at_owner_permit_sends_denial_and_close() {
+            let state = audio_test_state_real_db().await.expect(
+                "PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL or start local postgres",
+            );
+            let (tenant, channel_id, _member) = seed_audio_fixture(state.db.pool()).await;
+            let community = tenant.community();
+            let (agent, owner) = (nostr::Keys::generate(), nostr::Keys::generate());
+            add_channel_member(state.db.pool(), &tenant, channel_id, &agent).await;
+            let deadline = chrono::Utc::now() + chrono::Duration::seconds(2);
+            let assertion =
+                buzz_auth::VerifiedAssertion::for_test(Some(agent.public_key()), vec![deadline]);
+            let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+                .expect("sign NIP-OA credential");
+            let auth_tag: Vec<String> = serde_json::from_str(&auth_tag).expect("tag JSON");
+
+            let (arrived, release) =
+                crate::nip_fi_test_hooks::audio_owner_permit_hook::arm(community);
+            let (mut client, server) = start_audio_auth(
+                &state,
+                tenant.clone(),
+                channel_id,
+                &agent,
+                Some(auth_tag),
+                Some(assertion),
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived)
+                .await
+                .expect("admission reaches the owner permit")
+                .expect("hook armed");
+            let wait = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+            tokio::time::sleep(wait + std::time::Duration::from_millis(300)).await;
+            release.notify_one();
+
+            assert_eq!(
+                audio_frames_until_close(&mut client).await,
+                nip_fi_audio_denial_frames()
+            );
+            server.abort();
+            assert!(
+                !state
+                    .db
+                    .is_agent_owner(
+                        community,
+                        agent.public_key().as_bytes(),
+                        owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .expect("owner link read"),
+                "an expired session must not write the owner link"
+            );
+        }
     }
 
     // ── Bootstrap ordering barrier (Item 1): joiner's own bootstrap must be ────
@@ -11898,9 +13942,10 @@ mod tests {
             .expect("queue terminal frame");
         let cancel = CancellationToken::new();
         cancel.cancel();
+        let disconnect_reason = tokio::sync::watch::channel(None).1;
 
         let fence = async {
-            check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+            check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
             panic!("check_cancel! must return on a cancelled token");
         };
         tokio::time::timeout(
@@ -11947,6 +13992,7 @@ mod tests {
                 &mut ws_send,
                 &cancel,
                 &mut terminal_rx,
+                &tokio::sync::watch::channel(None).1,
                 WsMessage::Text("challenge".into()),
             ),
         )

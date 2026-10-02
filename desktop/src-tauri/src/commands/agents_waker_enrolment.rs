@@ -71,8 +71,8 @@ fn credential_retention_d_tag(agent_pubkey: &str) -> String {
 /// Propagates a failure to resolve the retention scope, reserve a version,
 /// sign, or retain. Callers in the best-effort retain path log and swallow;
 /// the revocation path does not — see [`revoke_waker_enrolment_pending`].
-pub(crate) fn retain_waker_enrolment_pending(
-    app: &AppHandle,
+pub(crate) fn retain_waker_enrolment_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     record: &ManagedAgentRecord,
 ) -> Result<(), String> {
@@ -208,8 +208,8 @@ pub(crate) fn revoke_waker_enrolment_pending(
 ///
 /// `exclude` drops one agent regardless of what the store says, for the
 /// revocation path that runs before the record is saved.
-fn enrolled_credential_versions(
-    app: &AppHandle,
+fn enrolled_credential_versions<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     ledger: &crate::managed_agents::waker_bundle::IssuanceLedger,
     exclude: Option<&str>,
 ) -> Result<BTreeMap<String, u64>, String> {
@@ -254,8 +254,8 @@ fn now_unix() -> Result<u64, String> {
 }
 
 /// Build, sign, and retain this owner's full roster at its fixed coordinate.
-fn retain_roster_at(
-    app: &AppHandle,
+fn retain_roster_at<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     db_path: &std::path::Path,
     owner_keys: &Keys,
     ledger: &crate::managed_agents::waker_bundle::IssuanceLedger,

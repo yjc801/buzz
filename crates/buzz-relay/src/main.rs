@@ -549,6 +549,15 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     let pubsub_for_conn_ctrl = Arc::clone(&pubsub);
     tokio::spawn(async move { pubsub_for_conn_ctrl.run_conn_control_subscriber().await });
 
+    // Spawn Redis pub/sub subscriber for NIP-FI cross-pod disconnect commands.
+    // Remote pods publish to this global channel after accepting a disconnect
+    // command; every pod merges the deny entry and closes matching sessions.
+    // Subscribe before the Redis subscriber starts so messages buffer (up to the
+    // channel capacity) instead of being dropped until the consumer below runs.
+    let mut nip_fi_disconnect_rx = pubsub.subscribe_nip_fi_disconnect();
+    let pubsub_for_nip_fi = Arc::clone(&pubsub);
+    tokio::spawn(async move { pubsub_for_nip_fi.run_nip_fi_disconnect_subscriber().await });
+
     let auth = AuthService::new(config.auth.clone());
 
     // Postgres FTS: the searchable row IS the persisted event row (its
@@ -582,7 +591,7 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to initialize media storage: {e}"))?;
     info!("Media storage connected");
 
-    let (app_state, audit_shutdown) = AppState::new(
+    let (mut app_state, audit_shutdown) = AppState::new(
         config.clone(),
         db,
         redis_health_pool,
@@ -594,6 +603,29 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         relay_keypair,
         media_storage,
     );
+    // NIP-FI S4: construct deny map + command verifier from startup config,
+    // before Arc::new so we can mutate app_state directly. The installer does
+    // no JWKS I/O; the warm + refresh block below is the single key lifecycle
+    // owner for the shared source both verifiers read.
+    {
+        let nip_fi = &config.nip_fi;
+        if let Some(key_source) = app_state.nip_fi_jwks_source.clone() {
+            buzz_relay::api::nip_fi::install_nip_fi_command_components(
+                &mut app_state.nip_fi_deny_map,
+                &mut app_state.nip_fi_command_verifier,
+                nip_fi.mode,
+                &nip_fi.registry,
+                key_source,
+                &nip_fi.command_configs,
+            )
+            .map_err(|e| anyhow::anyhow!("NIP-FI startup failed: {e}"))?;
+        } else if nip_fi.is_enforce() {
+            return Err(anyhow::anyhow!(
+                "NIP-FI: failed to construct JWKS key source \
+                 (empty or duplicate issuer config)"
+            ));
+        }
+    }
     let state = Arc::new(app_state);
     let has_startup_partition_audit = startup_partition_audit.is_some();
     if let Some(audit) = startup_partition_audit {
@@ -1231,12 +1263,14 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
                             pubkey,
                             event_id,
                             reason,
+                            unowned_only,
                         } => {
-                            state_for_conn_ctrl.conn_manager.disconnect_pubkey(
+                            state_for_conn_ctrl.disconnect_pubkey_local(
                                 scoped.community_id,
                                 &pubkey,
                                 &event_id,
                                 &reason,
+                                unowned_only,
                             );
                         }
                     },
@@ -1246,6 +1280,41 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::error!("Connection-control broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Cross-pod NIP-FI disconnect consumer: receive deny entries from remote
+    // pods, merge them into the local deny map (same max(until) rule), and
+    // close any matching sessions.  Every pod subscribes; the publishing pod
+    // also receives its own message and applies it — this is idempotent because
+    // the deny entry was already inserted locally before the publish.
+    //
+    // The consumer delegates to `apply_nip_fi_disconnect` which owns all
+    // validation, merge, and session-close logic.  This keeps the loop body
+    // minimal and makes the exact production path testable end-to-end.
+    {
+        let state_for_nip_fi = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                match nip_fi_disconnect_rx.recv().await {
+                    Ok(msg) => {
+                        let now = chrono::Utc::now();
+                        buzz_relay::api::nip_fi::apply_nip_fi_disconnect(
+                            &state_for_nip_fi,
+                            &msg,
+                            now,
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        metrics::counter!("buzz_nip_fi_disconnect_lag_total").increment(n);
+                        tracing::warn!("NIP-FI disconnect consumer lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("NIP-FI disconnect broadcast channel closed");
                         break;
                     }
                 }

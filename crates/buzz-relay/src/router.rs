@@ -24,7 +24,7 @@ use crate::audio;
 use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
-use crate::nip_fi_http::http_denial;
+use crate::nip_fi_core::http_denial;
 use crate::readiness::{self, DependencySnapshot, ReadinessReason};
 use crate::state::AppState;
 
@@ -88,7 +88,7 @@ use crate::state::AppState;
 // middleware.  `admit_nip_fi_http_on_state` performs the full sequence.
 //
 // [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and `admit_nip_fi_http_on_state`
-// delegate to `nip_fi_http.rs`; the guard fires first.
+// evaluate the assertion through `nip_fi_core.rs`; the guard fires first.
 
 /// Path prefixes that are exempt from NIP-FI assertion enforcement.
 ///
@@ -130,6 +130,12 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     "/operator/",
     // Admin SPA backend — operator-credential gated; subtree
     "/api/admin/",
+    // NIP-FI admin disconnect — authenticated by its own command JWT
+    // (`nip-fi-command+jwt` in the same header), which the assertion verifier
+    // would reject.  No trailing slash, so the matcher exempts the exact path
+    // and its subtree (not `/api/nip-fi/disconnect-extra`); sub-paths are
+    // harmless since no routes exist beneath it.
+    "/api/nip-fi/disconnect",
     // Static assets served by the SPA fallback; subtree
     "/assets/",
     "/favicon.svg",
@@ -171,7 +177,6 @@ async fn nip_fi_assertion_guard(
     request: Request<Body>,
     next: middleware::Next,
 ) -> axum::response::Response {
-    use crate::nip_fi_http::extract_bearer_token;
     use buzz_auth::NipFiMode;
 
     // Off mode: fully transparent. [FI-INV-15]
@@ -228,31 +233,28 @@ async fn nip_fi_assertion_guard(
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
-    // Enforce mode: full offline assertion verification.
-    //
-    // Step 1 — transport: extract the Bearer token.  Rejects absent, junk,
-    // repeated, comma-combined, empty, and whitespace-containing values.
-    // [FI-TRACE-TRANSPORT-CLOSED]
-    let token = match extract_bearer_token(request.headers()) {
-        Ok(t) => t,
+    // Enforce mode, step 1: the Host must map to a configured community.
+    let community = match crate::nip_fi_core::resolve_community(
+        request.headers(),
+        &state.config.nip_fi.communities,
+    ) {
+        Ok(community) => community,
         Err(class) => return http_denial(class),
     };
 
-    // Step 2 — cryptographic: verify signature, issuer, expiry, and claims.
-    // A forgotten-gate handler that omits `admit_nip_fi_http_on_state` can
-    // only be reached with a cryptographically valid assertion.  Key pairing
-    // and deny-map are performed by `admit_nip_fi_http_on_state` in the
-    // handler, not here.  [FI-TRACE-AUTHORITY-UNIFORM]
-    let verifier = match state.nip_fi_verifier.as_deref() {
-        Some(v) => v,
-        None => {
-            // Verifier not yet constructed (startup race); fail closed.
-            return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
-        }
-    };
-    match verifier.verify_assertion(token) {
+    // Enforce mode: full offline assertion verification (transport, then
+    // signature, issuer, community, expiry and claims).  A forgotten-gate handler that
+    // omits `admit_nip_fi_http_on_state` can only be reached with a
+    // cryptographically valid assertion.  Key pairing and deny-map are
+    // performed by `admit_nip_fi_http_on_state` in the handler, not here.
+    // [FI-TRACE-TRANSPORT-CLOSED] [FI-TRACE-AUTHORITY-UNIFORM]
+    match crate::nip_fi_core::evaluate_attached_assertion(
+        request.headers(),
+        community,
+        state.nip_fi_verifier.as_deref(),
+    ) {
         Ok(_) => next.run(request).await,
-        Err(e) => http_denial(e.denial_class()),
+        Err(rejection) => http_denial(rejection.denial_class()),
     }
 }
 
@@ -360,6 +362,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::invites::accept_policy),
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
+        // NIP-FI admin command API — authenticated by signed command JWT,
+        // NOT by NIP-98.  Self-contained auth inside the handler.
+        .route("/api/nip-fi/disconnect", post(api::nip_fi::disconnect))
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
         .route("/moderation/reports", get(api::bridge::moderation_reports))
         .route("/moderation/audit", get(api::bridge::moderation_audit))
@@ -591,8 +596,8 @@ async fn nip11_or_ws_handler(
     //
     // HTTP/2 extended-CONNECT (latent — workspace Axum does not enable
     // `http2`; the `/` route uses `get()` and Axum requires CONNECT routing
-    // for h2 WebSockets): not currently reachable. The gate inside `Ok(ws)`
-    // below is structural hardening for when `http2` is enabled. [F3-H2-GATE]
+    // for h2 WebSockets): gated by the same pre-bind predicate. The gate inside
+    // `Ok(ws)` below is a backstop for any shape the predicate misses. [F3-H2-GATE]
     //
     // Together these two fire-points ensure that every shape the extractor
     // accepts is also gated — no hand-rolled predicate can diverge from the
@@ -601,9 +606,8 @@ async fn nip11_or_ws_handler(
     // Zero DB cost invariant: the active HTTP/1.1 fire-point runs before
     // `bind_community`, so denied h1 upgrades pay zero DB cost
     // [FI-TRACE-TRANSPORT-CLOSED], and tests that assert 401/503 are not
-    // pre-empted by a 404 from an unseeded DB. The latent h2 fire-point inside
-    // `Ok(ws)` runs after `bind_community`; it is unreachable until `http2`
-    // is enabled.
+    // pre-empted by a 404 from an unseeded DB. The `Ok(ws)` backstop runs after
+    // `bind_community`; it is unreachable until `http2` is enabled.
     //
     // Keying on the header pair (not on `Accept`) means an HTML Accept header
     // on a real WS upgrade is still gated correctly.
@@ -624,22 +628,55 @@ async fn nip11_or_ws_handler(
                         .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
                 })
                 .unwrap_or(false);
-        if is_h1_ws_upgrade {
+        // HTTP/2 extended-CONNECT (RFC 8441), latent until Axum's `http2` is
+        // enabled. Gated here too so an unmapped Host gets 503 before the
+        // tenant lookup's 404, matching h1 and audio. [F3-H2-GATE]
+        let is_h2_ws_connect = req.version() == axum::http::Version::HTTP_2
+            && req.method() == axum::http::Method::CONNECT;
+        if is_h1_ws_upgrade || is_h2_ws_connect {
             use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
             let mode = state.config.nip_fi.mode;
             let verifier = state.nip_fi_verifier.as_deref();
-            match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+            let communities = &state.config.nip_fi.communities;
+            match check_nip_fi_at_upgrade(&headers, communities, verifier, mode) {
                 NipFiUpgradeOutcome::NotRequired => None,
                 NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
                 NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
             }
         } else {
-            // Not an HTTP/1.1 WS upgrade — could be an HTTP/2 extended-CONNECT,
-            // a NIP-11 request, or a plain browser GET. Do not gate here; the
-            // `Ok(ws)` arm below gates any extractor-accepted h2 upgrade. [F3-H2-GATE]
+            // Not a WS upgrade shape — a NIP-11 request or a plain browser GET.
+            // The `Ok(ws)` arm below backstops any extractor-accepted shape this
+            // predicate misses. [F3-H2-GATE]
             None
         }
     };
+
+    // S4 deny-map early-bounce check: runs after assertion validation, before bind_community.
+    //
+    // This is an OPTIMIZATION (early HTTP bounce), not the correctness mechanism.
+    // Correctness is enforced in step 6 of the spec (NIP-FI.md:217-233):
+    // NIP-42 proof → key equality → register proven k → deny check → admit.
+    // That normative sequence runs in handlers/auth.rs after set_authenticated_pubkey.
+    //
+    // This pre-upgrade check provides a cheap bounce for keys already in the deny
+    // map before the connection is upgraded — pays zero DB cost and rejects before
+    // tungstenite hands the socket to the application. It is NOT race-free against
+    // a concurrent disconnect (the session isn't registered yet), which is why the
+    // normative post-registration check in auth.rs is the correctness gate.
+    //
+    // Off-mode: `nip_fi_deny_map` is `None` → the entire block is a no-op;
+    // `asserted_key` is `None` → no key to check → pass through.
+    // [FI-TRACE-DENY-SET]
+    if let Some(assertion) = &nip_fi_assertion {
+        if let Some(key) = assertion.asserted_key() {
+            if let Some(deny_map) = state.nip_fi_deny_map.as_deref() {
+                if deny_map.is_denied(assertion.identity().issuer(), &key, chrono::Utc::now()) {
+                    return http_denial(buzz_auth::DenialClass::AuthorizationDenied)
+                        .into_response();
+                }
+            }
+        }
+    }
 
     // Row zero: bind the connection to its community from the request host
     // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
@@ -649,8 +686,8 @@ async fn nip11_or_ws_handler(
     // unmapped host still gets the document (with host-scoped fields like
     // `icon` simply absent), so the doc cannot leak which hosts are mapped.
     //
-    // The active HTTP/1.1 NIP-FI gate runs above (before bind_community) so
-    // denied h1 upgrades pay zero DB cost; the latent h2 gate runs below.
+    // The NIP-FI upgrade gate runs above (before bind_community) so denied
+    // upgrades pay zero DB cost; the `Ok(ws)` backstop runs below.
     let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
         Ok(ctx) => ctx,
         Err(_) => {
@@ -684,7 +721,8 @@ async fn nip11_or_ws_handler(
                 use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
                 let mode = state.config.nip_fi.mode;
                 let verifier = state.nip_fi_verifier.as_deref();
-                match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+                let communities = &state.config.nip_fi.communities;
+                match check_nip_fi_at_upgrade(&headers, communities, verifier, mode) {
                     NipFiUpgradeOutcome::NotRequired => None,
                     NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
                     NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
@@ -939,6 +977,7 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+    use crate::nip_fi_core::tests::ScriptedVerifier;
     use crate::readiness::DependencyReport;
 
     struct ScriptedDependencyEvaluator {
@@ -2065,6 +2104,8 @@ mod tests {
             registry: IssuerRegistry::new(),
             jwks_configs: vec![],
             max_connection_lifetime_secs: 3600,
+            command_configs: Vec::new(),
+            communities: crate::nip_fi_core::test_support::any_host("https://relay.example"),
         };
 
         // Unreachable database: port 1 refuses every connection, so each
@@ -2565,6 +2606,155 @@ mod tests {
                 "F6: response body must be NIP-11 JSON with `supported_nips` field; got {body}"
             );
         }
+
+        /// Verifier whose first call admits `key` and whose second call
+        /// returns `second`. Counts every call.
+        struct TwoStepVerifier {
+            key: nostr::PublicKey,
+            second: Result<(), buzz_auth::VerifierError>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl buzz_auth::VerifyAssertion for TwoStepVerifier {
+            fn verify_assertion(
+                &self,
+                _token: &str,
+                _community: &buzz_auth::CommunityBinding,
+            ) -> Result<buzz_auth::VerifiedAssertion, buzz_auth::VerifierError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n >= 1 {
+                    self.second?;
+                }
+                Ok(buzz_auth::VerifiedAssertion::for_test(
+                    Some(self.key),
+                    vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+                ))
+            }
+        }
+
+        /// Send a NIP-98-signed, assertion-carrying GET for a workflow's runs
+        /// through the real router on a seeded Host. Returns the response and
+        /// the verifier call count.
+        async fn routed_workflow_runs(
+            second: Result<(), buzz_auth::VerifierError>,
+        ) -> (axum::http::StatusCode, Vec<u8>, usize) {
+            use axum::body::Body;
+            use axum::http::Request;
+            use base64::Engine as _;
+            use tower::ServiceExt;
+            use uuid::Uuid;
+
+            let base = real_db_state()
+                .await
+                .expect("PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL");
+            let pool = base.db.pool().clone();
+            let community_id = Uuid::new_v4();
+            let host = format!("reverify-{}.example", community_id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_id)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("seed community");
+
+            let keys = nostr::Keys::generate();
+            let verifier = Arc::new(TwoStepVerifier {
+                key: keys.public_key(),
+                second,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut state = (*base).clone();
+            let mut config = (*state.config).clone();
+            config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+            config.nip_fi.communities =
+                crate::nip_fi_core::test_support::any_host("https://relay.example");
+            state.config = Arc::new(config);
+            state.nip_fi_verifier = Some(verifier.clone());
+
+            let path = format!("/workflows/{}/runs", Uuid::new_v4());
+            let scheme = if state.config.relay_url.trim_start().starts_with("wss://") {
+                "https"
+            } else {
+                "http"
+            };
+            let url = format!("{scheme}://{host}{path}");
+            let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+                .tags([
+                    nostr::Tag::parse(["u", url.as_str()]).expect("u tag"),
+                    nostr::Tag::parse(["method", "GET"]).expect("method tag"),
+                ])
+                .sign_with_keys(&keys)
+                .expect("sign NIP-98");
+            let auth = format!(
+                "Nostr {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&event).expect("event json"))
+            );
+
+            let req = Request::get(&path)
+                .header(axum::http::header::HOST, &host)
+                .header(axum::http::header::AUTHORIZATION, auth)
+                .header("Nostr-Federated-Identity", "Bearer a.b.c")
+                .body(Body::empty())
+                .expect("request");
+            let resp = build_router(Arc::new(state))
+                .oneshot(req)
+                .await
+                .expect("router response");
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body")
+                .to_vec();
+            let calls = verifier.calls.load(std::sync::atomic::Ordering::SeqCst);
+            (status, body, calls)
+        }
+
+        // Pins guard + handler double verification on one routed request: the
+        // guard's verify succeeds, handler admission re-verifies and its
+        // failure decides the response.
+        // Mutation: reusing the guard's verdict in admission (skipping the
+        // second verify) admits the request and the count is 1.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn characterize_routed_request_reverifies_in_admission() {
+            use buzz_auth::VerifierError;
+            let rows = [
+                (
+                    VerifierError::Expired,
+                    axum::http::StatusCode::FORBIDDEN,
+                    &b"evidence rejected\n"[..],
+                ),
+                (
+                    VerifierError::KeySourceUnavailable,
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    &b"authorization unavailable\n"[..],
+                ),
+            ];
+            for (err, status, body) in rows {
+                let (got_status, got_body, calls) = routed_workflow_runs(Err(err)).await;
+                assert_eq!(calls, 2, "guard and admission each verify once: {err:?}");
+                assert_eq!(got_status, status, "{err:?}");
+                assert_eq!(got_body, body, "{err:?}");
+            }
+        }
+
+        // Control: both verifies succeed, so the request passes NIP-FI
+        // admission with two verifies and is answered by the handler's next
+        // step, rate-limit admission, which fails closed because this
+        // fixture's Redis is unreachable.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn characterize_routed_request_passes_after_two_verifies() {
+            let (status, body, calls) = routed_workflow_runs(Ok(())).await;
+            assert_eq!(calls, 2);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("rate-limit response is JSON");
+            assert_eq!(
+                body,
+                serde_json::json!({"error": "rate-limited: shared admission unavailable"})
+            );
+        }
     }
 
     // ── nip_fi_assertion_guard: fail-closed classification tests ─────────────
@@ -2913,6 +3103,8 @@ mod tests {
                 web_dir: Some(admin_dir.to_path_buf()),
             });
             config.nip_fi.mode = mode;
+            config.nip_fi.communities =
+                crate::nip_fi_core::test_support::any_host("https://relay.example");
 
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
             let db = buzz_db::Db::from_pool(pool.clone());
@@ -3139,7 +3331,7 @@ mod tests {
     // 403 into 401 (handler's NIP-98 auth fires instead).
     #[test]
     fn guard_rejects_junk_assertion_not_just_absent_header() {
-        use crate::nip_fi_http::extract_bearer_token;
+        use crate::nip_fi_core::extract_bearer_token;
         use axum::http::HeaderMap;
         use buzz_auth::CLIENT_ATTACHED_HEADER;
 
@@ -3217,5 +3409,475 @@ mod tests {
             !is_exempt("/internal/other"),
             "/internal/other must NOT be exempt (no /internal/ subtree entry)"
         );
+    }
+
+    // ── NIP-FI S4 deny witnesses ──
+    // ES256 key pair — same as command.rs / api/nip_fi.rs test material.
+    const DENY_TEST_PRIVATE_KEY_PEM: &str =
+        "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcnxDM4EiirH9dHUE\nWZc759TX4s5PAn8kO5ovXSnGxCWhRANCAARFb6ZnsfkqOOXyEhj3KBQphGKF4vTa\nzhebbavbZ1ZoklqkF1cGg+jTO7rONAVEzXvXUWtV6CdDV+rybiVmFP2w\n-----END PRIVATE KEY-----\n";
+
+    const DENY_TEST_ISS: &str = "https://nip-fi-deny-test.example.com";
+    const DENY_TEST_AUD: &str = "https://relay.example";
+    const DENY_TEST_KID: &str = "deny-test-key-1";
+
+    fn deny_test_public_jwk() -> jsonwebtoken::jwk::Jwk {
+        serde_json::from_value(serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
+            "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA",
+            "alg": "ES256",
+            "use": "sig",
+            "kid": DENY_TEST_KID
+        }))
+        .expect("valid deny-test JWK")
+    }
+
+    /// Mint a valid ES256 `nip-fi+jwt` assertion for `nostr_pubkey = key_hex`,
+    /// signed by the deny-test key pair.
+    fn mint_deny_test_token(key_hex: &str) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": DENY_TEST_ISS,
+            "aud": DENY_TEST_AUD,
+            "sub": "test-subject",
+            "iat": now,
+            "exp": now + 600,
+            "nostr_pubkey": key_hex,
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("nip-fi+jwt".to_owned());
+        header.kid = Some(DENY_TEST_KID.to_owned());
+        let key = EncodingKey::from_ec_pem(DENY_TEST_PRIVATE_KEY_PEM.as_bytes())
+            .expect("valid test EC key");
+        encode(&header, &claims, &key).expect("sign deny-test token")
+    }
+
+    /// Build an AppState with a seeded NIP-FI assertion verifier (`Enforce`
+    /// mode, test issuer) and a populated deny map containing `denied_key`.
+    async fn nip_fi_deny_state(denied_key: &nostr::PublicKey) -> Arc<AppState> {
+        use crate::nip_fi_config::NipFiRelayConfig;
+        use buzz_auth::{
+            FederatedAssertionVerifier, FreshnessClass, HttpJwksFetcher, IssuerCapacity,
+            IssuerRegistry, JwksSourceContract, NipFiDenyMap, NipFiMode, ProductionJwksSource,
+            TokenClass,
+        };
+
+        // Build config in enforce mode.
+        let mut config = crate::config::Config::for_test();
+        config.require_relay_membership = false;
+
+        let jwks_contract =
+            JwksSourceContract::new(format!("{DENY_TEST_ISS}/.well-known/jwks.json"), 300, 86400)
+                .expect("valid JWKS contract");
+        let issuer_policy = buzz_auth::IssuerPolicy::new(
+            DENY_TEST_ISS.to_owned(),
+            vec![DENY_TEST_AUD.to_owned()],
+            TokenClass::DedicatedNipFi,
+            FreshnessClass::OfflineJwt,
+            vec![jsonwebtoken::Algorithm::ES256],
+            30,
+            3600,
+            None,
+            jwks_contract.clone(),
+        )
+        .expect("valid test issuer policy");
+
+        let jwks_config = buzz_auth::IssuerJwksConfig {
+            issuer: DENY_TEST_ISS.to_owned(),
+            contract: jwks_contract,
+        };
+
+        config.nip_fi = NipFiRelayConfig {
+            mode: NipFiMode::Enforce,
+            registry: {
+                let mut r = IssuerRegistry::new();
+                r.insert(issuer_policy);
+                r
+            },
+            jwks_configs: vec![jwks_config],
+            command_configs: vec![],
+            communities: crate::nip_fi_core::test_support::any_host(DENY_TEST_AUD),
+            max_connection_lifetime_secs: 3600,
+        };
+
+        // 100ms acquire timeout: the port-1 stub must fail fast instead of
+        // waiting out sqlx's 30s default, keeping the unit lane quick.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy(&config.database_url)
+            .expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (mut state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+
+        // Wire the NIP-FI assertion verifier with a seeded JWKS snapshot so the
+        // full JWT pipeline runs without any HTTP call. The seeded JWKS contains
+        // the test public key that signs tokens in `mint_deny_test_token`.
+        let jwks = jsonwebtoken::jwk::JwkSet {
+            keys: vec![deny_test_public_jwk()],
+        };
+        let key_source = Arc::new(
+            ProductionJwksSource::new(
+                vec![buzz_auth::IssuerJwksConfig {
+                    issuer: DENY_TEST_ISS.to_owned(),
+                    contract: buzz_auth::JwksSourceContract::new(
+                        format!("{DENY_TEST_ISS}/.well-known/jwks.json"),
+                        300,
+                        86400,
+                    )
+                    .expect("valid contract"),
+                }],
+                HttpJwksFetcher::new(),
+            )
+            .expect("key source"),
+        );
+        key_source.seed_snapshot_for_test(DENY_TEST_ISS, jwks).await;
+        let verifier = Arc::new(FederatedAssertionVerifier::new(
+            state.config.nip_fi.registry.clone(),
+            Arc::clone(&key_source),
+        ));
+        state.nip_fi_verifier = Some(verifier);
+        state.nip_fi_jwks_source = Some(Arc::clone(&key_source));
+
+        // Populate the deny map with a live entry for the denied key.
+        let deny_map = Arc::new(NipFiDenyMap::new(
+            16,
+            vec![IssuerCapacity {
+                issuer: DENY_TEST_ISS.to_owned(),
+                capacity: 16,
+            }],
+        ));
+        let until = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        let merge_result =
+            deny_map.merge_cross_pod_deny(DENY_TEST_ISS, denied_key, until, chrono::Utc::now());
+        assert!(
+            matches!(merge_result, buzz_auth::CrossPodMergeResult::Merged),
+            "deny entry must be inserted for test setup"
+        );
+        state.nip_fi_deny_map = Some(deny_map);
+
+        Arc::new(state)
+    }
+
+    /// Drive a request through the real built router. Returns the full response.
+    async fn nip_fi_gate_response(
+        state: Arc<AppState>,
+        path: &str,
+        extra_header_name: Option<&str>,
+        extra_header_value: Option<&str>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut builder = Request::get(path)
+            .header(axum::http::header::HOST, "relay.example")
+            // WebSocket upgrade headers so axum's WebSocketUpgrade extractor
+            // doesn't reject with 400/426 before the handler body runs.
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let (Some(name), Some(value)) = (extra_header_name, extra_header_value) {
+            builder = builder.header(name, value);
+        }
+        let req = builder.body(Body::empty()).expect("request");
+        build_router(state)
+            .oneshot(req)
+            .await
+            .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn deny_map_admits_key_not_in_map() {
+        // A key NOT in the deny map passes the check and gets exactly the
+        // downstream outcome of the same request with no deny map installed.
+        // What lies past the gate (host binding, extractor) depends on the
+        // local DB, so the no-map baseline is the known outcome; a 403 means
+        // the deny check fired for a non-denied key (inverted condition).
+        let clean_key = nostr::Keys::generate().public_key();
+        // Build state with a DIFFERENT denied key so clean_key is not in the map.
+        let other_key = nostr::Keys::generate().public_key();
+        let state = nip_fi_deny_state(&other_key).await;
+        let mut baseline = (*state).clone();
+        baseline.nip_fi_deny_map = None;
+        let token = mint_deny_test_token(&clean_key.to_hex());
+        let bearer = format!("Bearer {token}");
+
+        let status =
+            nip_fi_gate_status(state, "/", Some("Nostr-Federated-Identity"), Some(&bearer)).await;
+        let expected = nip_fi_gate_status(
+            Arc::new(baseline),
+            "/",
+            Some("Nostr-Federated-Identity"),
+            Some(&bearer),
+        )
+        .await;
+
+        // Unbound host → 404; bound host → NIP-11 fallback → 200. Anything
+        // else means an upstream failure that could mask the comparison.
+        assert!(
+            matches!(
+                expected,
+                axum::http::StatusCode::OK | axum::http::StatusCode::NOT_FOUND
+            ),
+            "no-map baseline must be 200 or 404, got {expected}"
+        );
+        assert_eq!(
+            status, expected,
+            "WS admission for a key NOT in the deny map must reach the no-map downstream outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_map_blocks_ws_admission_for_live_entry() {
+        // A key with a live deny entry is refused 403 `authorization_denied`
+        // at WS admission even when the bearer JWT is otherwise valid.
+        //
+        // Full wire contract assertion: status 403, Content-Type text/plain,
+        // exact body "authorization denied\n", no WWW-Authenticate header.
+        // This distinguishes AuthorizationDenied from EvidenceRejected (also 403)
+        // and from AuthorizationUnavailable (503). [FI-TRACE-DENIAL-ORACLE]
+        //
+        // Mutation evidence (A–C in build comments above):
+        //   A) Delete the deny-map check → 404 not 403 → status assert panics.
+        //   B) Use DenialClass::EvidenceRejected → body is "evidence rejected\n"
+        //      → body assert panics.
+        //   C) Remove nip_fi_deny_map from state → map None → 404 → status panics.
+        let denied_key = nostr::Keys::generate().public_key();
+        let state = nip_fi_deny_state(&denied_key).await;
+        let token = mint_deny_test_token(&denied_key.to_hex());
+        let bearer = format!("Bearer {token}");
+
+        let resp =
+            nip_fi_gate_response(state, "/", Some("Nostr-Federated-Identity"), Some(&bearer)).await;
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "WS admission for a key with a live deny entry must be refused 403 \
+             authorization_denied [FI-TRACE-DENY-SET]"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "authorization_denied response must carry text/plain; charset=utf-8"
+        );
+        assert!(
+            resp.headers().get("WWW-Authenticate").is_none(),
+            "authorization_denied must NOT carry WWW-Authenticate (that is MissingEvidence only)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64)
+            .await
+            .expect("body bytes");
+        assert_eq!(
+            body.as_ref(),
+            b"authorization denied\n",
+            "authorization_denied wire body must be exactly 'authorization denied\\n' \
+             [FI-TRACE-DENIAL-ORACLE]"
+        );
+    }
+
+    // ── Characterization: HTTP guard evaluation contract ─────────────────────
+
+    const GUARD_PROTECTED_PATH: &str = "/workflows/wf/runs";
+
+    async fn guard_state_with(
+        result: Result<Option<nostr::PublicKey>, buzz_auth::VerifierError>,
+    ) -> (Arc<AppState>, Arc<ScriptedVerifier>) {
+        let verifier = Arc::new(ScriptedVerifier::new(result));
+        let mut state = (*nip_fi_enforce_state().await).clone();
+        state.nip_fi_verifier = Some(verifier.clone());
+        (Arc::new(state), verifier)
+    }
+
+    async fn status_and_body(resp: axum::response::Response) -> (axum::http::StatusCode, Vec<u8>) {
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body bytes");
+        (status, body.to_vec())
+    }
+
+    // Pins: the guard maps verifier errors through
+    // `VerifierError::denial_class` — 503 for an unavailable dependency, 403
+    // evidence rejected otherwise — before any handler runs.
+    // Mutation: mapping every verifier error to EvidenceRejected fails the 503
+    // row; deleting the guard's verify call lets the handler answer instead.
+    #[tokio::test]
+    async fn characterize_guard_verifier_error_classes() {
+        use buzz_auth::VerifierError;
+        let rows = [
+            (
+                VerifierError::KeySourceUnavailable,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                &b"authorization unavailable\n"[..],
+            ),
+            (
+                VerifierError::InvalidSignatureOrClaims,
+                axum::http::StatusCode::FORBIDDEN,
+                &b"evidence rejected\n"[..],
+            ),
+        ];
+        for (err, status, body) in rows {
+            let (state, verifier) = guard_state_with(Err(err)).await;
+            let resp = nip_fi_gate_response(
+                state,
+                GUARD_PROTECTED_PATH,
+                Some("Nostr-Federated-Identity"),
+                Some("Bearer a.b.c"),
+            )
+            .await;
+            assert_eq!(
+                status_and_body(resp).await,
+                (status, body.to_vec()),
+                "{err:?}"
+            );
+            assert_eq!(
+                verifier.calls(),
+                1,
+                "guard verifies exactly once and the handler never runs: {err:?}"
+            );
+        }
+    }
+
+    // Pins ruling: in enforce, an unmapped Host is 503 at the router guard
+    // (protected HTTP) and at the upgrade (root and audio WS) — with or
+    // without an assertion, and before any verification.
+    // Mutation: dropping `resolve_community` at either site lets the
+    // verifier run (or a 401 through).
+    #[tokio::test]
+    async fn nip_fi_enforce_unmapped_host_is_503_before_verification() {
+        let audio = format!("/huddle/{}/audio", uuid::Uuid::new_v4());
+        for path in [GUARD_PROTECTED_PATH, "/", audio.as_str()] {
+            for token in [None, Some("Bearer a.b.c")] {
+                let (state, verifier) = guard_state_with(Ok(None)).await;
+                let mut state = (*state).clone();
+                // The gate helpers send Host `relay.example`; map another one.
+                Arc::make_mut(&mut state.config).nip_fi.communities =
+                    crate::nip_fi_config::NipFiCommunities::for_test(
+                        "https://other.example",
+                        &["https://issuer.test"],
+                    );
+                let resp = nip_fi_gate_response(
+                    Arc::new(state),
+                    path,
+                    token.map(|_| "Nostr-Federated-Identity"),
+                    token,
+                )
+                .await;
+                assert_eq!(
+                    status_and_body(resp).await,
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        b"authorization unavailable\n".to_vec()
+                    ),
+                    "{path} token={token:?}"
+                );
+                assert_eq!(verifier.calls(), 0, "{path} token={token:?}");
+            }
+        }
+    }
+
+    // Pins: Off mode never consults the community map. With the production
+    // Off default (no communities) every NIP-FI site answers exactly as
+    // before: the upgrades reach the tenant lookup's exact 404, header or not.
+    // Mutation: resolving the Host before the Off early-return turns these
+    // into 503.
+    #[tokio::test]
+    async fn nip_fi_off_unmapped_host_is_byte_identical_404() {
+        let audio = format!("/huddle/{}/audio", uuid::Uuid::new_v4());
+        for path in ["/", audio.as_str()] {
+            for token in [None, Some("Bearer a.b.c")] {
+                let mut state = (*nip_fi_off_state().await).clone();
+                Arc::make_mut(&mut state.config).nip_fi.communities = Default::default();
+                let resp = nip_fi_gate_response(
+                    Arc::new(state),
+                    path,
+                    token.map(|_| "Nostr-Federated-Identity"),
+                    token,
+                )
+                .await;
+                assert_eq!(
+                    status_and_body(resp).await,
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        b"relay: no community is configured for this host".to_vec()
+                    ),
+                    "{path} token={token:?}"
+                );
+            }
+        }
+    }
+
+    // Pins: transport extraction precedes the verifier-presence check in the
+    // guard (the enforce fixture has no verifier).
+    // Mutation: checking the verifier first turns this 403 into 503.
+    #[tokio::test]
+    async fn characterize_guard_transport_precedes_verifier_presence() {
+        let resp = nip_fi_gate_response(
+            nip_fi_enforce_state().await,
+            GUARD_PROTECTED_PATH,
+            Some("Nostr-Federated-Identity"),
+            Some("junk"),
+        )
+        .await;
+        assert_eq!(
+            status_and_body(resp).await,
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                b"evidence rejected\n".to_vec()
+            )
+        );
+    }
+
+    // Pins: the guard verifies but does not pair keys. A claimless assertion
+    // passes the guard (one verify) and reaches the handler, whose path
+    // extractor rejects the non-UUID workflow id with 400 before any NIP-98
+    // or handler-side assertion work.
+    // Mutation: adding key pairing to the guard turns this into 403
+    // authorization denied.
+    #[tokio::test]
+    async fn characterize_guard_does_not_pair_keys() {
+        let (state, verifier) = guard_state_with(Ok(None)).await;
+        let resp = nip_fi_gate_response(
+            state,
+            GUARD_PROTECTED_PATH,
+            Some("Nostr-Federated-Identity"),
+            Some("Bearer a.b.c"),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(verifier.calls(), 1);
     }
 }

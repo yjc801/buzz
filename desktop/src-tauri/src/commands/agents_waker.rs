@@ -41,8 +41,8 @@ use crate::{
 /// retention hiccup never blocks the disk-authoritative write. The
 /// [`retain_waker_bundle_pending`] half below applies the same best-effort
 /// rule independently.
-pub(crate) fn retain_managed_agent_pending(
-    app: &AppHandle,
+pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     record: &ManagedAgentRecord,
 ) {
@@ -93,8 +93,8 @@ pub(crate) fn retain_managed_agent_pending(
 /// generic flush loop (`persona_events::flush_active_pending_events`) already
 /// drains every 30s for persona, team, and managed-agent writers — this reuses
 /// that retry path rather than adding a second one.
-pub(crate) fn retain_waker_bundle_pending(
-    app: &AppHandle,
+pub(crate) fn retain_waker_bundle_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     record: &ManagedAgentRecord,
 ) -> Result<(), String> {

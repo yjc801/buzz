@@ -82,8 +82,8 @@ pub(crate) const DEFAULT_BUNDLE_LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
 ///
 /// Gated on enrolment because this is the one summary field that costs a file
 /// read; every other agent would pay it for an answer that is always `None`.
-pub(crate) fn bundle_expiry_for(
-    app: &AppHandle,
+pub(crate) fn bundle_expiry_for<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &crate::managed_agents::ManagedAgentRecord,
 ) -> Option<u64> {
     if !record.waker_enabled {
@@ -394,7 +394,9 @@ impl Drop for Fence {
 ///
 /// # Errors
 /// Propagates a failure to resolve or create the managed agents directory.
-pub(crate) fn issuance_ledger(app: &AppHandle) -> Result<IssuanceLedger, String> {
+pub(crate) fn issuance_ledger<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<IssuanceLedger, String> {
     Ok(IssuanceLedger::open(
         managed_agents_base_dir(app)?.join("waker-bundle-versions.json"),
     ))

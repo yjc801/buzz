@@ -694,3 +694,38 @@ test("an agent that never deployed anywhere deletes without forcing", async () =
   assert.equal(calls.length, 1);
   assert.equal(calls[0].forceRemoteDelete, undefined);
 });
+
+// --- respawn bound to the workspace relay -----------------------------------
+
+const { markRelayRemoved } = await import("../managedAgentRelayCleanup.ts");
+
+async function respawnAcrossStop(relayUrl, duringStop) {
+  const started = [];
+  const result = respawnManagedAgentWithRules({
+    agent: agent({ status: "running" }),
+    relayUrl,
+    stopManagedAgent: async () => duringStop(),
+    startManagedAgent: async (pubkey) => {
+      started.push(pubkey);
+    },
+  });
+  return { result, started };
+}
+
+test("a respawn whose own relay is removed and re-added during its stop starts nothing", async () => {
+  const { result, started } = await respawnAcrossStop(
+    "wss://respawn-own.example",
+    () => markRelayRemoved("wss://respawn-own.example"),
+  );
+  await assert.rejects(result, /relay was removed from this device/);
+  assert.deepEqual(started, []);
+});
+
+test("removing an unrelated relay during a respawn's stop still restarts it", async () => {
+  const { result, started } = await respawnAcrossStop(
+    "wss://respawn-kept.example",
+    () => markRelayRemoved("wss://respawn-unrelated.example"),
+  );
+  await result;
+  assert.equal(started.length, 1);
+});

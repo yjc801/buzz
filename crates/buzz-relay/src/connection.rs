@@ -196,6 +196,10 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
+    /// Lifecycle control shared with the community registry; the auth
+    /// handler's post-registration deny check routes its denial through it.
+    /// [FI-TRACE-DENY-SET]
+    pub(crate) community_control: crate::state::CommunityConnectionControl,
 
     /// The NIP-FI assertion presented at upgrade, when enforcement is enabled.
     ///
@@ -471,16 +475,18 @@ pub async fn handle_connection(
         crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone())
     };
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+    let control = CommunityConnectionControl::new(cancel);
+    let drain_reason = control.disconnect_reason();
     let pre_expiry_task = pre_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             Arc::clone(&pre_gate),
+            control.clone(),
             pre_terminal_ctrl_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Root,
         )
     });
 
-    let control = CommunityConnectionControl::new(cancel);
     let community_id = tenant.community();
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
@@ -555,6 +561,16 @@ pub async fn handle_connection(
                         )
                         .await;
                     }
+                }
+                // A published reason (e.g. an expiry denial) closes with its
+                // own frame, exactly as the writer would.
+                let close = drain_reason.borrow().map(|reason| reason.close_message());
+                if let Some(close) = close {
+                    let _ = tokio::time::timeout(
+                        WS_TERMINAL_FLUSH_TIMEOUT,
+                        futures_util::SinkExt::send(&mut ws_send, close),
+                    )
+                    .await;
                 }
                 // Close the socket so the client sees a clean close rather than
                 // an abrupt TCP reset.
@@ -688,6 +704,7 @@ async fn handle_active_connection(
         nip_fi_assertion,
         session_deadline,
         nip_fi_gate: nip_fi_gate.clone(),
+        community_control: control.clone(),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -718,12 +735,14 @@ async fn handle_active_connection(
         conn_id,
         tx.clone(),
         ctrl_tx.clone(),
+        conn.terminal_ctrl_tx.clone(),
         Some(restart_tx),
         cancel.clone(),
         conn.tenant.community(),
         Arc::clone(&backpressure_count),
         subscriptions,
         state.config.slow_client_grace_limit,
+        control.clone(),
     );
 
     let (ws_send, ws_recv) = socket.split();
@@ -779,6 +798,7 @@ async fn handle_active_connection(
             crate::nip_fi_session::spawn_nip_fi_expiry_task(
                 deadline,
                 Arc::clone(&nip_fi_gate),
+                conn.community_control.clone(),
                 conn.terminal_ctrl_tx.clone(),
                 crate::nip_fi_session::NipFiWsRoute::Root,
             )
@@ -1400,16 +1420,32 @@ pub(crate) mod tests {
     use tokio::sync::Notify;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    /// A connection whose outbound frames a test can read back.
+    /// A test connection together with the receiving end of each outbound queue.
+    pub(crate) struct TestConn {
+        /// The connection under test.
+        pub(crate) conn: Arc<ConnectionState>,
+        /// Receives data frames (EVENT, NOTICE, OK, ...).
+        pub(crate) send_rx: mpsc::Receiver<WsMessage>,
+        /// Receives control frames; capacity 8, as in production.
+        pub(crate) ctrl_rx: mpsc::Receiver<WsMessage>,
+        /// Receives the terminal NIP-FI denial frame; capacity 1, as in production.
+        pub(crate) terminal_rx: mpsc::Receiver<WsMessage>,
+    }
+
+    /// Builds a connection in `auth` carrying the NIP-FI assertion presented at
+    /// upgrade, if any. The admission gate is off-mode and no session deadline
+    /// is set.
     ///
     /// Lives here, next to `ConnectionState`, so the crate has one place that
-    /// knows how to build one. Shared with `crate::rejection`'s tests.
-    pub(crate) fn test_conn_with_auth(
+    /// knows how to build one. Shared with `crate::rejection`'s and
+    /// `crate::nip_fi_session`'s tests.
+    pub(crate) fn test_conn(
         auth: AuthState,
-    ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
+        nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
+    ) -> TestConn {
         let (send_tx, send_rx) = mpsc::channel(4);
-        let (ctrl_tx, _ctrl_rx) = mpsc::channel(4);
-        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        let (terminal_ctrl_tx, terminal_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let conn = ConnectionState {
             conn_id: Uuid::new_v4(),
@@ -1426,11 +1462,26 @@ pub(crate) mod tests {
             cancel: cancel.clone(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
-            nip_fi_assertion: None,
+            nip_fi_assertion,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         };
-        (Arc::new(conn), send_rx)
+        TestConn {
+            conn: Arc::new(conn),
+            send_rx,
+            ctrl_rx,
+            terminal_rx,
+        }
+    }
+
+    /// A connection without a NIP-FI assertion whose data frames a test can
+    /// read back.
+    pub(crate) fn test_conn_with_auth(
+        auth: AuthState,
+    ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
+        let TestConn { conn, send_rx, .. } = test_conn(auth, None);
+        (conn, send_rx)
     }
 
     /// An authenticated connection — the only state admission quotas apply to.
@@ -1451,7 +1502,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn pending_state() -> AuthState {
+    /// A connection awaiting its NIP-42 AUTH response.
+    pub(crate) fn pending_state() -> AuthState {
         AuthState::Pending {
             challenge: "test-challenge".to_owned(),
             started_at: Instant::now(),
@@ -2128,6 +2180,30 @@ pub(crate) mod tests {
         rx
     }
 
+    /// Every frame the production root `send_loop_inner` writes for a
+    /// cancelled `conn` whose terminal receiver is `terminal_rx`: the terminal
+    /// drain followed by the close chosen from the connection's disconnect
+    /// reason.  Shared with `handlers::auth`'s wire-equality tests.
+    pub(crate) async fn root_wire_frames(
+        conn: &ConnectionState,
+        terminal_rx: mpsc::Receiver<WsMessage>,
+    ) -> Vec<WsMessage> {
+        assert!(conn.cancel.is_cancelled(), "denial must cancel the socket");
+        let (sink, state) = MockSink::new(None);
+        send_loop_inner(
+            sink,
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            terminal_rx,
+            mpsc::channel(1).1,
+            conn.cancel.clone(),
+            conn.community_control.disconnect_reason(),
+        )
+        .await;
+        let mut recorded = state.lock().expect("mock sink poisoned");
+        std::mem::take(&mut recorded.messages)
+    }
+
     fn deleted_community_disconnect_reason() -> watch::Receiver<Option<CommunityDisconnectReason>> {
         let (tx, rx) = watch::channel(None);
         tx.send_replace(Some(CommunityDisconnectReason::CommunityDeleted));
@@ -2662,6 +2738,7 @@ pub(crate) mod tests {
         let expiry_task = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             gate,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
             terminal_ctrl_tx,
             crate::nip_fi_session::NipFiWsRoute::Root,
         );
@@ -2749,6 +2826,7 @@ pub(crate) mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
 
         let state = crate::state::tests::test_state().await;
@@ -2870,8 +2948,15 @@ pub(crate) mod tests {
         // cancel the token.
         let already_expired = Utc::now() - chrono::Duration::seconds(1);
         let gate = crate::nip_fi_gate::SessionAdmissionGate::new(already_expired, cancel.clone());
-        let expiry_handle =
-            spawn_nip_fi_expiry_task(already_expired, gate, terminal_ctrl_tx, NipFiWsRoute::Root);
+        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+        let disconnect_reason = control.disconnect_reason();
+        let expiry_handle = spawn_nip_fi_expiry_task(
+            already_expired,
+            gate,
+            control,
+            terminal_ctrl_tx,
+            NipFiWsRoute::Root,
+        );
         // Wait for the expiry task to fire before we run the send_loop.
         expiry_handle.await.expect("expiry task must complete");
 
@@ -2883,7 +2968,7 @@ pub(crate) mod tests {
             terminal_ctrl_rx,
             restart_rx,
             cancel,
-            ordinary_disconnect_reason(),
+            disconnect_reason,
         )
         .await;
 
@@ -2903,6 +2988,11 @@ pub(crate) mod tests {
         assert!(
             denial_pos < close_pos,
             "B3: expiry denial frame (pos {denial_pos}) must precede Close frame (pos {close_pos})"
+        );
+        // Expiry is `authorization_denied`: the same 1008 as every other row.
+        assert_eq!(
+            msgs[close_pos],
+            CommunityDisconnectReason::AuthorizationDenied.close_message()
         );
     }
 
@@ -2981,15 +3071,15 @@ pub(crate) mod tests {
                                     deadline,
                                     conn_cancel.clone(),
                                 );
+                                let control =
+                                    crate::state::CommunityConnectionControl::new(conn_cancel);
                                 let pre_expiry = crate::nip_fi_session::spawn_nip_fi_expiry_task(
                                     deadline,
                                     Arc::clone(&pre_gate),
+                                    control.clone(),
                                     pre_tx.clone(),
                                     crate::nip_fi_session::NipFiWsRoute::Root,
                                 );
-
-                                let control =
-                                    crate::state::CommunityConnectionControl::new(conn_cancel);
                                 handle_active_connection(
                                     socket,
                                     state_i,

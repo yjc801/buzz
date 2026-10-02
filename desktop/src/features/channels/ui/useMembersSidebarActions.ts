@@ -1,3 +1,4 @@
+import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
 import {
   agentPresenceStartBlockReason,
   type AgentAvailabilityReader,
@@ -142,6 +143,7 @@ export function useMembersSidebarActions({
 
           successCount += 1;
         } catch (error) {
+          if (isRelayRemovedError(error)) continue;
           failures.push({
             error: error instanceof Error ? error.message : failureMessage,
             name: agent.name,
@@ -224,6 +226,7 @@ export function useMembersSidebarActions({
       });
       setActionNoticeMessage(getLifecycleSuccessMessage(agent));
     } catch (error) {
+      if (isRelayRemovedError(error)) return;
       setActionErrorMessage(
         error instanceof Error ? error.message : "Failed to control agent.",
       );
@@ -253,6 +256,7 @@ export function useMembersSidebarActions({
           assertStartNotBlockedByPresence(agent, isManagedAgentActive(agent));
           return respawnManagedAgentWithRules({
             agent,
+            relayUrl,
             ...EMPTY_AGENT_CONTEXT,
             preferredChannelId: channelId,
             startManagedAgent: startManagedAgentMutation.mutateAsync,

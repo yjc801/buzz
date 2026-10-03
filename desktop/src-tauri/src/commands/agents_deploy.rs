@@ -379,6 +379,13 @@ fn build_launch_block_for_policy(
     }
     policy_env.insert("BUZZ_ACP_RELAY_OBSERVER".into(), "true".into());
     policy_env.insert("BUZZ_ACP_LAZY_POOL".into(), "true".into());
+    // Same idle re-sleep as a local lazy spawn: without it a woken remote
+    // pool keeps every worker subprocess alive until the whole harness idles
+    // out, so a busy agent never releases worker memory.
+    policy_env.insert(
+        "BUZZ_ACP_IDLE_POOL_SLEEP".into(),
+        crate::managed_agents::idle_pool_sleep_env(true).into(),
+    );
     policy_env.insert(
         "BUZZ_ACP_AGENTS".into(),
         crate::managed_agents::acp_agents_value(&descriptor.command, record.parallelism),

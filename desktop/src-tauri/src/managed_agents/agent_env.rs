@@ -19,7 +19,7 @@ const IDLE_POOL_SLEEP_SECS: &str = "900";
 /// lazy harnesses (the harness ignores it otherwise); gate to `lazy` here so
 /// the env reads inert (`"0"` = disabled) for eager harnesses. This is a
 /// desktop-owned lifetime policy (reserved key), not user-tunable.
-pub(super) fn idle_pool_sleep_env(lazy: bool) -> &'static str {
+pub(crate) fn idle_pool_sleep_env(lazy: bool) -> &'static str {
     if lazy {
         IDLE_POOL_SLEEP_SECS
     } else {

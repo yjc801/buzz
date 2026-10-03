@@ -60,6 +60,7 @@ fn launch_block_preserves_descriptor_and_spawn_policy() {
     // the descriptor value that wins in launch.env.
     assert_eq!(launch["policy_env"]["GOOSE_MODE"], "auto");
     assert_eq!(launch["policy_env"]["BUZZ_ACP_LAZY_POOL"], "true");
+    assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_POOL_SLEEP"], "900");
     assert_eq!(launch["policy_env"]["BUZZ_ACP_RELAY_OBSERVER"], "true");
     assert_eq!(
         launch["policy_env"]["BUZZ_ACP_TEAM_INSTRUCTIONS"],

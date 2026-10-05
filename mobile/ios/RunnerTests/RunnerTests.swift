@@ -115,7 +115,7 @@ class RunnerTests: XCTestCase {
     let bar = factory.create(withFrame: .zero, viewIdentifier: 999991,
       arguments: ["title": "Alice, Bob", "subtitle": "3 members", "titleEnabled": true])
     let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
-    let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView)
+    let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
     XCTAssertGreaterThan(title.frame.width, 0)
     XCTAssertGreaterThan(title.intrinsicContentSize.width, 0)
     XCTAssertLessThanOrEqual(title.intrinsicContentSize.width, 240)
@@ -129,7 +129,7 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(title.intrinsicContentSize.width, 180)
     title.frame = CGRect(origin: .zero, size: title.intrinsicContentSize)
     title.layoutIfNeeded()
-    for label in title.subviews.compactMap({ $0 as? UILabel }) {
+    for label in title.contentView.subviews.compactMap({ $0 as? UILabel }) {
       XCTAssertEqual(label.lineBreakMode, .byTruncatingTail)
       XCTAssertTrue(title.bounds.contains(label.frame))
     }
@@ -141,8 +141,8 @@ class RunnerTests: XCTestCase {
     title.setSubtitlePresence(.gray)
     title.frame = CGRect(x: 0, y: 0, width: 180, height: 44)
     title.layoutIfNeeded()
-    let dot = try XCTUnwrap(title.subviews.first { $0.accessibilityIdentifier == "dm-navigation-status-dot" })
-    let label = try XCTUnwrap(title.subviews.compactMap { $0 as? UILabel }.first { $0.text == "Offline" })
+    let dot = try XCTUnwrap(title.contentView.subviews.first { $0.accessibilityIdentifier == "dm-navigation-status-dot" })
+    let label = try XCTUnwrap(title.contentView.subviews.compactMap { $0 as? UILabel }.first { $0.text == "Offline" })
     XCTAssertEqual(label.frame.minX - dot.frame.maxX, 6, accuracy: 0.1)
     XCTAssertEqual(label.frame.midY, dot.frame.midY, accuracy: 0.1)
     XCTAssertEqual((dot.frame.minX + label.frame.maxX) / 2, title.bounds.midX, accuracy: 0.1)
@@ -184,7 +184,7 @@ class RunnerTests: XCTestCase {
       parent.view.layoutIfNeeded()
       try await Task.sleep(nanoseconds: 200_000_000)
       let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
-      let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView)
+      let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
       // UIKit may cap inherited toolbar traits; also exercise an explicit AX
       // override while preserving the real navigation bar's allocated bounds.
       title.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
@@ -192,7 +192,7 @@ class RunnerTests: XCTestCase {
       title.layoutIfNeeded()
       XCTAssertEqual(title.traitCollection.preferredContentSizeCategory, .accessibilityExtraExtraExtraLarge)
       XCTAssertTrue(title.accessibilityLabel?.contains(subtitle) == true)
-      for label in title.subviews.compactMap({ $0 as? UILabel }) where !label.isHidden {
+      for label in title.contentView.subviews.compactMap({ $0 as? UILabel }) where !label.isHidden {
         XCTAssertTrue(title.bounds.contains(label.frame))
         XCTAssertGreaterThanOrEqual(label.bounds.height, label.intrinsicContentSize.height)
         let frame = label.convert(label.bounds, to: navigation.navigationBar)
@@ -226,53 +226,44 @@ class RunnerTests: XCTestCase {
   }
 
   @MainActor
-  func testNativeConversationExpiryDisclosure() async throws {
+  func testNativeConversationRetentionTextAndAccessibility() throws {
     for dm in [false, true] {
       let messenger = NavigationTestMessenger()
       let parent = UIViewController()
-      let window = UIWindow(frame: UIScreen.main.bounds)
-      window.rootViewController = parent
-      window.makeKeyAndVisible()
-      defer { window.isHidden = true }
       let factory = IosNavigationBarFactory(messenger: messenger, parent: parent)
-      let expiry = "Ephemeral channel. Cleans up after 1 hour of inactivity."
-      var args: [String: Any] = ["title": dm ? "Alice" : "general",
-                                "subtitle": dm ? "Online" : "2 members",
-                                "titleEnabled": !dm, "ephemeralLabel": expiry]
-      if dm { args["titleAvatar"] = ["avatarInitial": "A"] }
-      let bar = factory.create(withFrame: CGRect(x: 0, y: 0, width: 390, height: 120),
-                               viewIdentifier: 999995, arguments: args)
-      parent.view.addSubview(bar.view())
+      var args: [String: Any] = ["title": dm ? "Alice" : "general", "titleEnabled": true]
+      let bar = factory.create(withFrame: .zero, viewIdentifier: 999995, arguments: args)
       let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
-      let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView)
-      title.frame.size = title.intrinsicContentSize
-      for direction in [UISemanticContentAttribute.forceLeftToRight, .forceRightToLeft] {
-        title.semanticContentAttribute = direction
-        title.setNeedsLayout()
-        title.layoutIfNeeded()
-        let clock = try XCTUnwrap(title.subviews.first { $0.accessibilityIdentifier == "navigation-ephemeral-status" } as? UIButton)
-        XCTAssertNotNil(clock.image(for: .normal))
-        XCTAssertFalse(clock.isHidden)
-        XCTAssertTrue(title.bounds.contains(clock.frame))
-        for label in title.subviews.compactMap({ $0 as? UILabel }) {
-          XCTAssertFalse(label.frame.intersects(clock.frame))
+      for (subtitle, explanation) in [
+        ("Temporary · 1h TTL · Online", "Ephemeral channel. Cleans up after 1 hour of inactivity."),
+        ("Temporary · Cleanup due · Online", "Ephemeral channel. Cleanup is due now."),
+      ] {
+        args["subtitle"] = subtitle
+        args["ephemeralLabel"] = explanation
+        messenger.configure(args)
+        let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
+        title.frame.size = title.intrinsicContentSize
+        for direction in [UISemanticContentAttribute.forceLeftToRight, .forceRightToLeft] {
+          title.semanticContentAttribute = direction
+          title.layoutIfNeeded()
+          let status = try XCTUnwrap(title.contentView.subviews.compactMap { $0 as? UILabel }.first { $0.text == subtitle })
+          XCTAssertFalse(status.isHidden)
+          XCTAssertGreaterThan(status.bounds.width, 0)
+          XCTAssertTrue(title.bounds.contains(status.frame))
+          XCTAssertTrue(title.isAccessibilityElement)
+          XCTAssertTrue(title.accessibilityLabel?.contains(explanation) == true)
+          XCTAssertFalse(title.contentView.subviews.contains { $0 is UIButton }, "Retention stays text-only")
         }
-        XCTAssertTrue(title.accessibilityLabel?.contains(expiry) == true)
+        XCTAssertTrue(title.accessibilityActivate())
+        XCTAssertEqual(messenger.actions.last, "title")
       }
-      let clock = try XCTUnwrap(title.subviews.first { $0.accessibilityIdentifier == "navigation-ephemeral-status" } as? UIButton)
-      XCTAssertTrue(title.isUserInteractionEnabled)
-      clock.sendActions(for: .touchUpInside)
-      try await Task.sleep(nanoseconds: 400_000_000)
-      let disclosure = try XCTUnwrap(navigation.topViewController?.presentedViewController as? UIAlertController)
-      XCTAssertEqual(disclosure.message, expiry)
-      XCTAssertTrue(messenger.actions.isEmpty, "The clock must not open channel settings")
-      disclosure.dismiss(animated: false)
-      try await Task.sleep(nanoseconds: 100_000_000)
+      args["subtitle"] = "Online"
       args.removeValue(forKey: "ephemeralLabel")
       messenger.configure(args)
-      let permanent = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView)
-      XCTAssertFalse(permanent.subviews.contains { $0.accessibilityIdentifier == "navigation-ephemeral-status" })
+      let permanent = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
       XCTAssertFalse(permanent.accessibilityLabel?.contains("Ephemeral") == true)
+      XCTAssertFalse(permanent.contentView.subviews.compactMap { $0 as? UILabel }.contains { $0.text?.contains("Temporary") == true })
+      _ = bar // Keep the platform view alive throughout reconfiguration.
     }
   }
 
@@ -290,18 +281,18 @@ class RunnerTests: XCTestCase {
     )
     parent.view.addSubview(bar.view())
     let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
-    let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView)
+    let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
     title.frame.size = title.intrinsicContentSize
     title.layoutIfNeeded()
     XCTAssertEqual(title.accessibilityLabel, "Alice, Online")
     XCTAssertEqual(title.accessibilityTraits, .header)
     XCTAssertFalse(title.accessibilityActivate())
-    let avatar = try XCTUnwrap(title.subviews.first { $0.accessibilityIdentifier == "dm-navigation-avatar" } as? UIImageView)
+    let avatar = try XCTUnwrap(title.contentView.subviews.first { $0.accessibilityIdentifier == "dm-navigation-avatar" } as? UIImageView)
     XCTAssertNotNil(avatar.image)
     XCTAssertEqual(avatar.frame.size, CGSize(width: 32, height: 32))
-    let presence = try XCTUnwrap(title.subviews.first { $0.accessibilityIdentifier == "dm-navigation-presence" })
+    let presence = try XCTUnwrap(title.contentView.subviews.first { $0.accessibilityIdentifier == "dm-navigation-presence" })
     XCTAssertEqual(presence.backgroundColor, UIColor.green)
-    let labels = title.subviews.compactMap { $0 as? UILabel }
+    let labels = title.contentView.subviews.compactMap { $0 as? UILabel }
     XCTAssertEqual(labels.map(\.text), ["Alice", "Online"])
     for label in labels {
       XCTAssertTrue(title.bounds.contains(label.frame))
@@ -328,11 +319,11 @@ class RunnerTests: XCTestCase {
     parent.view.layoutIfNeeded()
     try await Task.sleep(nanoseconds: 200_000_000)
     let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
-    let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView)
+    let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
     title.layoutIfNeeded()
-    // A plain title view must not receive the control's capsule presentation.
-    XCTAssertFalse(title is UIControl)
-    let labels = title.subviews.compactMap { $0 as? UILabel }
+    // The title owns one native glass capsule and remains a single action.
+    XCTAssertEqual(title.accessibilityTraits, .button)
+    let labels = title.contentView.subviews.compactMap { $0 as? UILabel }
     XCTAssertEqual(labels.map(\.text), ["general", "36 members"])
     for label in labels {
       XCTAssertTrue(title.bounds.contains(label.frame))
@@ -344,7 +335,115 @@ class RunnerTests: XCTestCase {
   }
 
   @MainActor
-  func testCompactNavigationMaterialFollowsScrollDepth() async throws {
+  func testConversationGlassAndBackdropAreReadyBeforeScrolling() throws {
+    for subtitle in ["36 members", "Online", ""] {
+      let messenger = NavigationTestMessenger()
+      let parent = UIViewController()
+      let factory = IosNavigationBarFactory(messenger: messenger, parent: parent)
+      var args: [String: Any] = ["title": "Conversation", "subtitle": subtitle,
+                                "titleEnabled": true, "alwaysFrosted": true]
+      let bar = factory.create(withFrame: .zero, viewIdentifier: 999994, arguments: args)
+      let material = try XCTUnwrap(bar.view().subviews.first as? UIVisualEffectView)
+      XCTAssertEqual(material.alpha, 1, "The initial configuration must not wait for a scroll")
+      let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
+      let title = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
+      if #available(iOS 26.0, *) {
+        XCTAssertTrue(title.effect is UIGlassEffect)
+      } else {
+        XCTAssertTrue(title.effect is UIBlurEffect)
+      }
+      title.frame.size = title.intrinsicContentSize
+      title.layoutIfNeeded()
+      XCTAssertEqual(title.layer.cornerRadius, title.bounds.height / 2)
+      XCTAssertEqual(title.contentView.subviews.compactMap { $0 as? UILabel }.count, 2)
+      XCTAssertTrue(title.accessibilityActivate())
+      XCTAssertEqual(messenger.actions.last, "title")
+      for offset in [0.0, 6.0, 52.0, 0.0, -20.0] {
+        messenger.scroll(to: offset)
+        XCTAssertEqual(material.alpha, 1)
+        args["dark"] = true
+        args["subtitle"] = "Updated status"
+        messenger.configure(args)
+        XCTAssertEqual(material.alpha, 1, "Live status/theme changes must preserve the backdrop")
+      }
+      messenger.configure(["title": "Home", "largeTitle": true])
+      XCTAssertEqual(material.alpha, 0, "Large-title pages keep their existing scroll treatment")
+    }
+  }
+
+  @MainActor
+  func testConversationUsesNativeSoftEdgeWithoutExpandingHitArea() throws {
+    let parent = UIViewController()
+    let window = UIWindow(frame: UIScreen.main.bounds)
+    window.rootViewController = parent
+    window.makeKeyAndVisible()
+    defer { window.isHidden = true }
+    let messenger = NavigationTestMessenger()
+    let factory = IosNavigationBarFactory(messenger: messenger, parent: parent)
+    let bar = factory.create(
+      withFrame: CGRect(x: 0, y: 0, width: window.bounds.width, height: 120),
+      viewIdentifier: 999993,
+      arguments: ["title": "general", "subtitle": "36 members", "alwaysFrosted": true])
+    parent.view.addSubview(bar.view())
+    let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
+    let material = try XCTUnwrap(bar.view().subviews.first as? UIVisualEffectView)
+    for offset in [0.0, 52.0, 0.0] {
+      messenger.scroll(to: offset)
+      bar.view().setNeedsLayout()
+      bar.view().layoutIfNeeded()
+      if #available(iOS 27.0, *) {
+        let scroll = try XCTUnwrap(navigation.topViewController?.view as? UIScrollView)
+        XCTAssertEqual(scroll.topEdgeEffect.style, .soft)
+        XCTAssertFalse(scroll.topEdgeEffect.isHidden)
+        XCTAssertTrue(scroll.bottomEdgeEffect.isHidden)
+        XCTAssertTrue(material.isHidden, "Do not stack a uniform blur over the native fade")
+        XCTAssertFalse(bar.view().clipsToBounds)
+        XCTAssertEqual(scroll.contentOffset.y, offset, accuracy: 0.5)
+        XCTAssertFalse(bar.view().point(inside: CGPoint(x: 20, y: 121), with: nil))
+      } else if #available(iOS 26.0, *) {
+        let safeTop = navigation.view.safeAreaInsets.top
+        XCTAssertEqual(material.frame.height, safeTop > 0 ? safeTop + 6 : 0, accuracy: 0.5)
+        XCTAssertFalse(material.isHidden)
+      } else {
+        XCTAssertEqual(material.frame.height, bar.view().bounds.height, accuracy: 0.5)
+        XCTAssertFalse(material.isHidden)
+      }
+      XCTAssertEqual(material.alpha, 1)
+      XCTAssertNotNil(navigation.topViewController?.navigationItem.titleView as? NavigationTitleView)
+    }
+  }
+
+  @MainActor
+  func testSubtitlelessThreadKeepsFullFallbackBehindControls() throws {
+    let parent = UIViewController()
+    let window = UIWindow(frame: UIScreen.main.bounds)
+    window.rootViewController = parent
+    window.makeKeyAndVisible()
+    defer { window.isHidden = true }
+    let messenger = NavigationTestMessenger()
+    let bar = IosNavigationBarFactory(messenger: messenger, parent: parent).create(
+      withFrame: CGRect(x: 0, y: 0, width: window.bounds.width, height: 120),
+      viewIdentifier: 999991, arguments: ["title": "Thread", "back": true, "alwaysFrosted": true])
+    parent.view.addSubview(bar.view())
+    let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
+    let material = try XCTUnwrap(bar.view().subviews.first as? UIVisualEffectView)
+    for offset in [0.0, 52.0, 0.0] {
+      messenger.scroll(to: offset)
+      bar.view().setNeedsLayout()
+      bar.view().layoutIfNeeded()
+      XCTAssertNil(navigation.topViewController?.navigationItem.titleView)
+      XCTAssertEqual(material.frame.height, bar.view().bounds.height, accuracy: 0.5)
+      XCTAssertEqual(material.alpha, 1)
+      if #available(iOS 27.0, *) {
+        XCTAssertTrue(material.isHidden)
+      } else {
+        XCTAssertFalse(material.isHidden, "Plain thread titles and legacy buttons need a control-area backdrop")
+      }
+    }
+  }
+
+  @MainActor
+  func testCompactNavigationUsesSoftEdgeWithLegacyMaterialFallback() async throws {
     let messenger = NavigationTestMessenger()
     let parent = UIViewController()
     let window = UIWindow(frame: UIScreen.main.bounds)
@@ -379,14 +478,94 @@ class RunnerTests: XCTestCase {
       XCTAssertEqual(material.alpha, min(1, max(0, offset) / 12), accuracy: 0.001,
                      "Updating a compact title must not restore blur at rest")
       XCTAssertEqual(material.frame, bar.view().bounds)
-      if #available(iOS 26.0, *) {
+      if #available(iOS 27.0, *) {
         let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
         let mirroredScroll = try XCTUnwrap(navigation.topViewController?.view as? UIScrollView)
-        XCTAssertTrue(mirroredScroll.topEdgeEffect.isHidden,
-                      "The layout-only scroll view must not add a second header backdrop")
+        XCTAssertTrue(mirroredScroll.topEdgeEffect.isHidden)
+        let edge = try XCTUnwrap(bar.view().subviews.first {
+          $0.accessibilityIdentifier == "navigation-status-edge"
+        } as? UIScrollView)
+        XCTAssertFalse(edge.isHidden)
+        XCTAssertFalse(edge.topEdgeEffect.isHidden)
+        XCTAssertEqual(edge.topEdgeEffect.style, .soft)
+        XCTAssertEqual(edge.contentOffset, .zero)
+        XCTAssertFalse(edge.isUserInteractionEnabled)
+        XCTAssertTrue(material.isHidden, "Only the native fade should be visible")
         XCTAssertTrue(mirroredScroll.bottomEdgeEffect.isHidden)
       }
     }
+  }
+
+  @MainActor
+  func testLargeTitleTextFadesWithScrollAndCompactTitleCanReverse() async throws {
+    guard !UIAccessibility.isReduceMotionEnabled else {
+      throw XCTSkip("The system has disabled transition animation")
+    }
+    let parent = UIViewController()
+    let window = UIWindow(frame: UIScreen.main.bounds)
+    window.rootViewController = parent
+    window.makeKeyAndVisible()
+    defer { window.isHidden = true }
+    let messenger = NavigationTestMessenger()
+    let bar = IosNavigationBarFactory(messenger: messenger, parent: parent).create(
+      withFrame: CGRect(x: 0, y: 0, width: window.bounds.width, height: 180),
+      viewIdentifier: 999992, arguments: ["title": "Home", "largeTitle": true])
+    parent.view.addSubview(bar.view())
+    parent.view.layoutIfNeeded()
+    try await Task.sleep(nanoseconds: 200_000_000)
+    let navigation = try XCTUnwrap(parent.children.first as? UINavigationController)
+    let metrics = try XCTUnwrap(messenger.metrics)
+    let expanded = try XCTUnwrap(metrics["expandedHeight"] as? Double)
+    let compact = try XCTUnwrap(metrics["compactHeight"] as? Double)
+    let boundary = expanded - compact
+
+    func labels(in view: UIView) -> [UILabel] {
+      let own = (view as? UILabel).map { [$0] } ?? []
+      return own + view.subviews.flatMap { labels(in: $0) }
+    }
+    func visibleOpacity(of view: UIView) -> Float {
+      guard !view.isHidden else { return 0 }
+      let opacity = view.layer.presentation()?.opacity ?? Float(view.alpha)
+      let maskOpacity = view.layer.mask.map { $0.presentation()?.opacity ?? $0.opacity } ?? 1
+      return opacity * maskOpacity * (view.superview.map { visibleOpacity(of: $0) } ?? 1)
+    }
+    let title = try XCTUnwrap(labels(in: navigation.view)
+      .filter { $0.text == "Home" }.max { $0.font.pointSize < $1.font.pointSize })
+    let centeredTitle = try XCTUnwrap(navigation.topViewController?.navigationItem.titleView?.subviews.compactMap { $0 as? UILabel }.first)
+    let initialTitleY = title.convert(title.bounds, to: parent.view).minY
+    XCTAssertEqual(title.textColor.cgColor.alpha, 1, accuracy: 0.01)
+    messenger.scroll(to: boundary * 0.7)
+    XCTAssertGreaterThan(title.textColor.cgColor.alpha, 0.1)
+    XCTAssertLessThan(title.textColor.cgColor.alpha, 0.6, "The actual large text must fade before it collapses")
+    // Flutter also resizes the platform view every scroll frame. Exercise that
+    // layout, which could invalidate a snapshot-only header transition.
+    bar.view().frame.size.height -= boundary * 0.7
+    bar.view().setNeedsLayout()
+    bar.view().layoutIfNeeded()
+    XCTAssertLessThan(title.textColor.cgColor.alpha, 0.6)
+    messenger.scroll(to: boundary)
+    try await Task.sleep(nanoseconds: 60_000_000)
+    XCTAssertFalse(try XCTUnwrap(centeredTitle.layer.mask).bounds.isEmpty)
+    XCTAssertGreaterThan(visibleOpacity(of: centeredTitle), 0.01)
+    XCTAssertLessThan(visibleOpacity(of: centeredTitle), 0.99)
+    XCTAssertEqual(title.textColor.cgColor.alpha, 0, accuracy: 0.01)
+    messenger.scroll(to: boundary * 0.7)
+    try await Task.sleep(nanoseconds: 240_000_000)
+    XCTAssertEqual(visibleOpacity(of: centeredTitle), 0, accuracy: 0.01)
+    XCTAssertGreaterThan(title.textColor.cgColor.alpha, 0.1)
+    messenger.scroll(to: boundary)
+    try await Task.sleep(nanoseconds: 240_000_000)
+    XCTAssertEqual(visibleOpacity(of: centeredTitle), 1, accuracy: 0.01)
+    XCTAssertEqual(navigation.navigationBar.frame.height, compact, accuracy: 0.5)
+    messenger.scroll(to: 0)
+    bar.view().frame.size.height += boundary * 0.7
+    bar.view().setNeedsLayout()
+    bar.view().layoutIfNeeded()
+    try await Task.sleep(nanoseconds: 240_000_000)
+    XCTAssertEqual(title.textColor.cgColor.alpha, 1, accuracy: 0.01)
+    XCTAssertEqual(visibleOpacity(of: centeredTitle), 0, accuracy: 0.01)
+    XCTAssertEqual(navigation.navigationBar.frame.height, expanded, accuracy: 0.5)
+    XCTAssertEqual(title.convert(title.bounds, to: parent.view).minY, initialTitleY, accuracy: 0.5)
   }
 
   @MainActor
@@ -410,6 +589,20 @@ class RunnerTests: XCTestCase {
     let material = try XCTUnwrap(bar.view().subviews.first as? UIVisualEffectView)
     XCTAssertNotNil(material.effect)
     XCTAssertEqual(material.alpha, 0)
+    if #available(iOS 27.0, *) {
+      let scroll = try XCTUnwrap(navigation.topViewController?.view as? UIScrollView)
+      XCTAssertTrue(scroll.topEdgeEffect.isHidden)
+      let edge = try XCTUnwrap(bar.view().subviews.first {
+        $0.accessibilityIdentifier == "navigation-status-edge"
+      } as? UIScrollView)
+      XCTAssertFalse(edge.isHidden)
+      XCTAssertFalse(edge.topEdgeEffect.isHidden)
+      XCTAssertEqual(edge.topEdgeEffect.style, .soft)
+      XCTAssertEqual(edge.contentOffset, .zero)
+      XCTAssertFalse(edge.isUserInteractionEnabled)
+      XCTAssertTrue(material.isHidden)
+      XCTAssertFalse(bar.view().clipsToBounds)
+    }
     let expandedHeight = navigation.navigationBar.frame.height
     let metrics = try XCTUnwrap(messenger.metrics)
     let compactHeight = try XCTUnwrap(metrics["compactHeight"] as? Double)
@@ -430,6 +623,13 @@ class RunnerTests: XCTestCase {
       try await Task.sleep(nanoseconds: 200_000_000)
       XCTAssertEqual(navigation.navigationBar.frame.height, expandedHeight, accuracy: 0.5)
       XCTAssertEqual(material.alpha, 0)
+      if #available(iOS 27.0, *) {
+        let edge = try XCTUnwrap(bar.view().subviews.first {
+          $0.accessibilityIdentifier == "navigation-status-edge"
+        } as? UIScrollView)
+        XCTAssertFalse(edge.isHidden, "Returning to rest must not remove the status fade")
+        XCTAssertEqual(edge.contentOffset, .zero)
+      }
     }
   }
 

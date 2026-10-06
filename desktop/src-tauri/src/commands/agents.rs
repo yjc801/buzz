@@ -53,8 +53,8 @@ pub(super) use waker::{
 /// For one-shot command paths only — the 5s list poll calls
 /// `build_managed_agent_summary` directly with stores loaded once per call,
 /// not once per record.
-pub(super) fn summarize_from_disk(
-    app: &AppHandle,
+pub(super) fn summarize_from_disk<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &crate::managed_agents::ManagedAgentRecord,
     runtimes: &std::collections::HashMap<
         crate::managed_agents::ManagedAgentRuntimeKey,
@@ -405,6 +405,14 @@ pub async fn create_managed_agent(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CreateManagedAgentResponse, String> {
+    create_managed_agent_in(input, app, &state).await
+}
+
+async fn create_managed_agent_in<R: tauri::Runtime>(
+    input: CreateManagedAgentRequest,
+    app: AppHandle<R>,
+    state: &AppState,
+) -> Result<CreateManagedAgentResponse, String> {
     let name = input.name.trim().to_string();
     let requested_persona_id = input
         .persona_id
@@ -668,7 +676,7 @@ pub async fn create_managed_agent(
             input.parallelism,
             linked_persona.as_ref(),
         )?;
-        let record = ManagedAgentRecord {
+        let mut record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: name.clone(),
             description: None,
@@ -765,7 +773,9 @@ pub async fn create_managed_agent(
             },
             effort_level: None,
         };
-
+        if let Some(level) = input.effort_level.clone() {
+            super::agent_config::apply_picker_effort_level(&mut record, Some(level));
+        }
         records.push(record);
 
         save_managed_agents(&app, &records)?;
@@ -777,7 +787,7 @@ pub async fn create_managed_agent(
         // Publish the agent to the relay. Inside the Phase-3 lock, after save,
         // before any .await — owner-authored, every agent (Will's ruling: no
         // is_builtin/persona-membership gate).
-        retain_managed_agent_pending(&app, &state, record);
+        retain_managed_agent_pending(&app, state, record);
         // Effective owner-authored description for the kind:0 `about`.
         let profile_about = crate::managed_agents::record_effective_description(record, &personas);
         (
@@ -790,8 +800,7 @@ pub async fn create_managed_agent(
     // ── Phase 3b: local spawn (async preflight outside store lock) ───────────
     let mut spawn_error = None;
     let agent = if input.spawn_after_create && input.backend == BackendKind::Local {
-        match start_local_agent_with_preflight(&app, &state, &pubkey, true, None, None, None).await
-        {
+        match start_local_agent_with_preflight(&app, state, &pubkey, true, None, None, None).await {
             Ok(agent) => agent,
             Err(error) => {
                 let _store_guard = state
@@ -825,7 +834,7 @@ pub async fn create_managed_agent(
     // Use the avatar persisted on the record so the published profile and any
     // later reconciliation agree on the same value.
     let mut profile_sync_error = profile::publish_agent_profile_with_about(
-        &state,
+        state,
         &resolved_relay_url,
         &agent_keys,
         &name,
@@ -835,7 +844,7 @@ pub async fn create_managed_agent(
     )
     .await;
     profile_sync_error =
-        super::agent_models::flush_managed_agent_policy(&app, &state, profile_sync_error).await;
+        super::agent_models::flush_managed_agent_policy(&app, state, profile_sync_error).await;
 
     let spawn_error = if input.spawn_after_create && input.backend != BackendKind::Local {
         if let BackendKind::Provider { ref id, ref config } = input.backend {
@@ -849,10 +858,10 @@ pub async fn create_managed_agent(
                     .iter()
                     .find(|r| r.pubkey == pubkey)
                     .ok_or_else(|| "agent disappeared".to_string())?;
-                build_deploy_payload(&app, &state, rec, None)?
+                build_deploy_payload(&app, state, rec, None)?
             };
             match deploy_to_provider(
-                &app, &state, &pubkey, id, config, agent_json, None, None, None, None,
+                &app, state, &pubkey, id, config, agent_json, None, None, None, None,
             )
             .await
             {

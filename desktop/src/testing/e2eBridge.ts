@@ -121,6 +121,8 @@ export type MockManagedAgentSeed = {
   personaId?: string | null;
   /** Harness/runtime id pin; `null` = inherit from persona (native default). */
   runtime?: string | null;
+  /** Model pinned on the instance record. */
+  model?: string | null;
   status?: RawManagedAgent["status"];
   channelNames?: string[];
   channelIds?: string[];
@@ -687,6 +689,10 @@ type E2eConfig = {
      * returning a catalog.
      */
     discoverAgentModelsError?: string;
+    /** Delay (ms) before `discover_agent_models` settles. */
+    discoverAgentModelsDelayMs?: number;
+    /** Config surface returned for every agent instead of the per-runtime mocks. */
+    agentConfigSurface?: Record<string, unknown>;
     /** ACP commands returned by the discovery IPC in mock mode. */
     acpCommands?: Array<{ command: string; binaryPath: string }>;
     // Backend provider mocks for the create-agent "Run on" section. See
@@ -2566,7 +2572,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     parallelism: 1,
     system_prompt: null,
     avatar_url: seed.avatarUrl ?? null,
-    model: null,
+    model: seed.model ?? null,
     env_vars: { ...(seed.envVars ?? {}) },
     status,
     pid: status === "running" ? 42000 + mockManagedAgents.length : null,
@@ -14331,6 +14337,10 @@ export function maybeInstallE2eTauriMocks() {
           supportsSwitching: false,
         };
       case "discover_agent_models": {
+        const discoverDelayMs = activeConfig?.mock?.discoverAgentModelsDelayMs;
+        if (discoverDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, discoverDelayMs));
+        }
         const discoverError = activeConfig?.mock?.discoverAgentModelsError;
         if (discoverError) {
           throw new Error(discoverError);
@@ -14436,6 +14446,8 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_agent_config_surface": {
         const configArgs = payload as { pubkey: string };
+        const surfaceOverride = activeConfig?.mock?.agentConfigSurface;
+        if (surfaceOverride) return surfaceOverride;
         return buildMockConfigSurface(configArgs.pubkey);
       }
       case "get_runtime_file_config": {

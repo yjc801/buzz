@@ -11,12 +11,6 @@ on:
       desktop_rust:
         required: true
         type: boolean
-      # JSON array of BUZZ_BUILD_* compile states, read from the Justfile's
-      # `compiled_flag_states` by the caller's `changes` job so the set of
-      # states is written in exactly one place.
-      compiled_flag_states:
-        required: true
-        type: string
     outputs:
       desktop_result:
         value: ${{ jobs.results.outputs.desktop_result }}
@@ -27,11 +21,15 @@ env:
   PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
 
 jobs:
-  desktop-core:
-    name: Desktop Core
+  # Biome, node:test, and the Vite build do not compile Rust, but node:test
+  # also pins desktop constants to relay/DB crate sources (for example
+  # relayReconnectReplay.test.mjs), so Rust changes select this job too.
+  desktop-js:
+    name: Desktop JS
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    # Keep in sync with JS_SELECTED in the Desktop gate (pinned by ci-required-gates.test.mjs).
+    if: github.event_name == 'push' || inputs.desktop || inputs.rust
     permissions:
       contents: read
     steps:
@@ -56,8 +54,6 @@ jobs:
         run: just desktop-test
       - name: Desktop build
         run: just desktop-build
-      # Only this lane saves the pnpm store: the two Tauri lanes restore the
-      # same key, and three concurrent saves of one key just race.
       - name: Save pnpm store cache
         if: github.event_name == 'push'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -65,107 +61,38 @@ jobs:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
 
+  # Tauri Rust lanes run in parallel; the mesh-llm feature pulls its own
+  # dependency graph, so it keeps its own cache.
   desktop-tauri:
-    name: Desktop Tauri
+    name: Desktop Tauri (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 2
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          # Both Tauri lanes build the same crate, so they share one cache
-          # entry instead of each starting cold (rust-cache otherwise keys on
-          # the job id).
-          shared-key: desktop-tauri
-          workspaces: desktop/src-tauri
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Install Tauri dependencies (Linux)
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30
-          sudo apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 \
-            -o DPkg::Lock::Timeout=120 \
-            build-essential \
-            curl \
-            file \
-            libasound2-dev \
-            libayatana-appindicator3-dev \
-            libgtk-3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            patchelf \
-            wget
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - name: Restore pnpm store cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: pnpm-${{ runner.os }}-
-      - name: Install desktop dependencies
-        run: just desktop-install-ci
-      # tauri_build::try_build resolves frontendDist (../dist), so the Rust
-      # steps below need the frontend built first.
-      - name: Desktop build
-        run: just desktop-build
-      - name: Desktop Tauri clippy
-        run: just desktop-tauri-clippy
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      - name: Desktop Tauri check
-        run: just desktop-tauri-check
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      - name: Desktop Tauri tests
-        run: just desktop-tauri-test
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      - name: Desktop Mesh feature tests
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --features mesh-llm --lib
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-
-  # Split out of Desktop Core, then sharded by compile state. Each BUZZ_BUILD_*
-  # permutation is a distinct compile of the Tauri crate (build.rs declares
-  # rerun-if-env-changed for all of them), so running the states sequentially
-  # made this the longest desktop lane. One job per state verifies the same
-  # build shapes concurrently instead. The state list is read from the
-  # Justfile's `compiled_flag_states` by the caller's `changes` job, so it is
-  # not duplicated here and a new state cannot be silently left out of CI.
-  desktop-tauri-compiled-flags:
-    name: Desktop Tauri Compiled Flags (${{ matrix.state }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # Disabled by owner decision on PR #118: the compiled-flag matrix does not
-    # run on PRs. Even sharded, each state is a ~10 minute full rebuild plus
-    # the desktop lib suite, and the owner chose to drop it from the PR path.
-    # Nothing else compiles a BUZZ_BUILD_*-set build; run
-    # `just desktop-tauri-test-compiled-flags` by hand when touching a flag.
-    # To re-enable, restore the original condition:
-    # if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
-    if: false
+    # A lane needs up to ~15m. ci-apt-retry.sh bounds the apt step at ~34m worst
+    # case (update ~8.5m + install ~25m); 55m fits both, so a degraded mirror
+    # fails with the wrapper's error instead of the job timeout.
+    timeout-minutes: 55
+    # Keep in sync with RUST_SELECTED in the Desktop gate (pinned by ci-required-gates.test.mjs).
+    if: github.event_name == 'push' || inputs.desktop_rust || inputs.rust
     strategy:
       fail-fast: false
       matrix:
-        state: ${{ fromJSON(inputs.compiled_flag_states) }}
+        include:
+          - lane: core
+            cache: desktop-core
+            save-cache: true
+            run: just desktop-tauri-clippy && just desktop-tauri-check && just desktop-tauri-test
+          - lane: mesh
+            cache: desktop-mesh
+            save-cache: true
+            run: just desktop-tauri-test-mesh
+          # Fork divergence: upstream's compiled-flags lane is omitted by owner
+          # decision on PR #118 — each BUZZ_BUILD_* state is a full rebuild and
+          # the owner dropped it from the PR path. Nothing else compiles a
+          # flag-set build; run `just desktop-tauri-test-compiled-flags` by
+          # hand when touching a compiled flag. To re-enable, add back:
+          #   - lane: compiled-flags
+          #     cache: desktop-core
+          #     save-cache: false
+          #     run: just desktop-tauri-test-compiled-flags
     permissions:
       contents: read
     steps:
@@ -176,22 +103,15 @@ jobs:
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
-          shared-key: desktop-tauri
           workspaces: desktop/src-tauri
-          save-if: ${{ github.event_name != 'pull_request' }}
+          shared-key: ${{ matrix.cache }}
+          save-if: ${{ matrix.save-cache && github.event_name != 'pull_request' }}
       - name: Install Tauri dependencies (Linux)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30
-          sudo apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 \
-            -o DPkg::Lock::Timeout=120 \
+          CI_APT_ATTEMPT_SECONDS=90 scripts/ci-apt-retry.sh sudo apt-get update
+          scripts/ci-apt-retry.sh sudo apt-get install -y --no-install-recommends \
             build-essential \
             curl \
             file \
@@ -204,37 +124,28 @@ jobs:
             libxdo-dev \
             patchelf \
             wget
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - name: Restore pnpm store cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: pnpm-${{ runner.os }}-
-      - name: Install desktop dependencies
-        run: just desktop-install-ci
-      # Needed for tauri_build::try_build's frontendDist, and the recipe itself
-      # shells out to node for the demo-name boundary check.
-      - name: Desktop build
-        run: just desktop-build
-      - name: Desktop Tauri compiled-flag verification (${{ matrix.state }})
-        run: just desktop-tauri-test-compiled-flags-state '${{ matrix.state }}'
+      - name: Desktop Tauri ${{ matrix.lane }}
+        run: ${{ matrix.run }}
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Disabled. To re-enable, restore the original condition:
-    # if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    # A smoke shard needs ~12m, and Chromium dependency setup is bounded by
+    # ci-apt-retry.sh (~25m worst case). Leave time for the full suite
+    # and its reports to finish.
+    timeout-minutes: 45
+    # Fork divergence: disabled. Keep in sync with SMOKE_SELECTED in the
+    # Desktop gate (pinned by ci-required-gates.test.mjs). To re-enable, set
+    # both back to: github.event_name == 'push' || inputs.desktop
     if: false
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # Playwright shards smoke specs by test count, not duration; ten
+        # shards keep the slowest one near 11 minutes of test time.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     permissions:
       contents: read
     steps:
@@ -264,7 +175,7 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
-        run: cd desktop && pnpm exec playwright install-deps chromium
+        run: cd desktop && ../scripts/ci-apt-retry.sh pnpm exec playwright install-deps chromium
       - name: Save Playwright browser cache
         if: steps.playwright-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && matrix.shard == 1
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -274,7 +185,7 @@ jobs:
       - name: Desktop E2E build
         run: pnpm -C desktop build:e2e
       - name: Desktop smoke e2e
-        run: cd desktop && pnpm exec playwright test --project=smoke --shard=${{ matrix.shard }}/4
+        run: cd desktop && pnpm exec playwright test --project=smoke --shard=${{ matrix.shard }}/${{ strategy.job-total }}
       - name: Summarize flaky tests
         if: ${{ !cancelled() }}
         run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop Smoke E2E (${{ matrix.shard }})"
@@ -295,50 +206,45 @@ jobs:
     name: Desktop
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs:
-      - desktop-core
-      - desktop-tauri
-      - desktop-tauri-compiled-flags
-      - desktop-smoke-e2e
-      - desktop-windows-build
+    needs: [desktop-js, desktop-tauri, desktop-smoke-e2e, desktop-windows-build]
     if: always() && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
     steps:
       - name: Check desktop jobs
+        env:
+          JS_SELECTED: ${{ github.event_name == 'push' || inputs.desktop || inputs.rust }}
+          RUST_SELECTED: ${{ github.event_name == 'push' || inputs.desktop_rust || inputs.rust }}
+          FRONTEND_SELECTED: ${{ github.event_name == 'push' || inputs.desktop }}
+          SMOKE_SELECTED: ${{ false }}
+          JS: ${{ needs.desktop-js.result }}
+          TAURI: ${{ needs.desktop-tauri.result }}
+          SMOKE: ${{ needs.desktop-smoke-e2e.result }}
+          WINDOWS: ${{ needs.desktop-windows-build.result }}
         run: |
-          if [ "${{ needs.desktop-core.result }}" != "success" ]; then
-            echo "Desktop Core finished with: ${{ needs.desktop-core.result }}"
-            exit 1
-          fi
-          if [ "${{ needs.desktop-tauri.result }}" != "success" ]; then
-            echo "Desktop Tauri finished with: ${{ needs.desktop-tauri.result }}"
-            exit 1
-          fi
-          # desktop-tauri-compiled-flags is disabled (if: false above), so
-          # "skipped" is expected. If re-enabled it is a matrix job whose result
-          # is success only when every state shard passed.
-          if [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "success" ] && [ "${{ needs.desktop-tauri-compiled-flags.result }}" != "skipped" ]; then
-            echo "Desktop Tauri Compiled Flags finished with: ${{ needs.desktop-tauri-compiled-flags.result }}"
-            exit 1
-          fi
-          # desktop-smoke-e2e is disabled (if: false above), so "skipped" is
-          # expected; still fail on a real failure if it is re-enabled.
-          if [ "${{ needs.desktop-smoke-e2e.result }}" != "success" ] && [ "${{ needs.desktop-smoke-e2e.result }}" != "skipped" ]; then
-            echo "Desktop Smoke E2E shards finished with: ${{ needs.desktop-smoke-e2e.result }}"
-            exit 1
-          fi
-          if [ "${{ needs.desktop-windows-build.result }}" != "success" ]; then
-            echo "Desktop Windows Build finished with: ${{ needs.desktop-windows-build.result }}"
-            exit 1
-          fi
-          echo "Desktop jobs passed"
+          # A selected job must succeed; an unselected job must be skipped.
+          status=0
+          check() {
+            local name="$1" selected="$2" result="$3" want=skipped
+            [ "$selected" = true ] && want=success
+            if [ "$result" != "$want" ]; then
+              echo "$name finished with: $result (expected $want)"
+              status=1
+            fi
+          }
+          check "Desktop JS" "$JS_SELECTED" "$JS"
+          check "Desktop Tauri lanes" "$RUST_SELECTED" "$TAURI"
+          check "Desktop Smoke E2E shards" "$SMOKE_SELECTED" "$SMOKE"
+          check "Desktop Windows Build" "$FRONTEND_SELECTED" "$WINDOWS"
+          [ "$status" = 0 ] && echo "Desktop jobs passed"
+          exit "$status"
 
   desktop-windows-build:
     name: Desktop Windows Build
     runs-on: windows-latest
     timeout-minutes: 20
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    # Keep in sync with FRONTEND_SELECTED in the Desktop gate (pinned by ci-required-gates.test.mjs).
+    if: github.event_name == 'push' || inputs.desktop
     permissions:
       contents: read
     steps:

@@ -564,7 +564,7 @@ pub enum ProvisionOwnerResult {
 /// Default maximum number of communities a single pubkey can own. Enforced at
 /// the relay layer — the authoritative layer — so that concurrent transfers or
 /// transfer-vs-create races cannot both pass a preflight count.
-pub const MAX_COMMUNITIES_PER_OWNER: i64 = 5;
+pub const MAX_COMMUNITIES_PER_OWNER: i64 = 50;
 
 /// Effective per-owner community limit for this deployment.
 ///
@@ -611,7 +611,7 @@ pub fn owner_count_advisory_lock_key(pubkey_hex: &str) -> i64 {
 /// communities whose tombstones permanently retain their hosts. Bounds
 /// create-then-delete host squatting. Absolute: it does not scale with
 /// `BUZZ_MAX_COMMUNITIES_PER_OWNER`.
-pub const MAX_LIFETIME_COMMUNITIES_PER_OWNER: i64 = 20;
+pub const MAX_LIFETIME_COMMUNITIES_PER_OWNER: i64 = 50;
 
 /// One owner's quota usage, read inside the admitting transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1307,7 +1307,8 @@ mod postgres_tests {
     fn owner_limit_defaults_when_unset_or_invalid() {
         assert_eq!(
             super::effective_owner_limit(None),
-            super::MAX_COMMUNITIES_PER_OWNER
+            50,
+            "stock deployment permits 50 active communities"
         );
         assert_eq!(
             super::effective_owner_limit(Some("not-a-number")),
@@ -1751,34 +1752,66 @@ mod postgres_tests {
         let owner = test_pubkey();
         let transferee = test_pubkey();
 
-        // Fill the configured default ownership limit.
-        for _ in 0..MAX_COMMUNITIES_PER_OWNER {
+        // At 49 ownerships, the fiftieth transfer succeeds; at 50, the
+        // fifty-first is rejected by the same transaction-side admission.
+        for _ in 0..(MAX_COMMUNITIES_PER_OWNER - 1) {
             let c = make_test_community(&pool).await;
             bootstrap_owner(&pool, c, &transferee)
                 .await
                 .expect("bootstrap transferee community");
         }
 
-        // Create a community owned by `owner` and try to transfer to `transferee`.
-        let community = make_test_community(&pool).await;
-        bootstrap_owner(&pool, community, &owner)
+        let fiftieth = make_test_community(&pool).await;
+        bootstrap_owner(&pool, fiftieth, &owner)
             .await
             .expect("bootstrap owner");
-
-        let result = transfer_ownership(&pool, community, &transferee, &owner)
-            .await
-            .expect("transfer to maxed transferee");
-
-        assert_eq!(result, TransferResult::LimitReached);
-
-        // Owner is still owner — transfer did not happen.
+        assert!(matches!(
+            transfer_ownership(&pool, fiftieth, &transferee, &owner)
+                .await
+                .expect("fiftieth transfer"),
+            TransferResult::Transferred { .. }
+        ));
         assert_eq!(
-            get_relay_member(&pool, community, &owner)
+            get_relay_member(&pool, fiftieth, &transferee)
+                .await
+                .expect("get transferee")
+                .expect("exists")
+                .role,
+            "owner"
+        );
+        assert_eq!(
+            get_relay_member(&pool, fiftieth, &owner)
+                .await
+                .expect("get previous owner")
+                .expect("exists")
+                .role,
+            "member"
+        );
+
+        let fifty_first = make_test_community(&pool).await;
+        bootstrap_owner(&pool, fifty_first, &owner)
+            .await
+            .expect("bootstrap owner");
+        assert_eq!(
+            transfer_ownership(&pool, fifty_first, &transferee, &owner)
+                .await
+                .expect("fifty-first transfer"),
+            TransferResult::LimitReached
+        );
+        assert_eq!(
+            get_relay_member(&pool, fifty_first, &owner)
                 .await
                 .expect("get owner")
                 .expect("exists")
                 .role,
             "owner"
+        );
+        assert!(
+            get_relay_member(&pool, fifty_first, &transferee)
+                .await
+                .expect("get transferee")
+                .is_none(),
+            "rejected transfer must not add transferee"
         );
     }
 }

@@ -172,6 +172,7 @@ relay:
       memory: "2Gi"
 
   podAnnotations: {}
+  # tags.datadoghq.com/version is chart-owned; see README "Datadog version label".
   podLabels: {}
   nodeSelector: {}
   tolerations: []
@@ -222,6 +223,7 @@ pairingRelay:
     port: 5000
     annotations: {}
   podAnnotations: {}
+  # tags.datadoghq.com/version is chart-owned; see README "Datadog version label".
   podLabels: {}
   resources:
     requests:
@@ -380,6 +382,9 @@ storageAccounting:
   failedJobsHistoryLimit: 3
   relayMode: external            # external | off; inline is a legacy alias
   serviceAccountName: ""         # defaults to the main Buzz service account
+  # Extra Pod labels, e.g. Datadog unified service tagging. The chart owns
+  # `tags.datadoghq.com/version` on every workload (see README "Datadog version
+  # label"); a value supplied here for that one key is ignored.
   podLabels: {}
   podAnnotations:
     sidecar.istio.io/inject: "false"
@@ -405,6 +410,7 @@ operatorJobs:
     # Empty inherits the relay service account, and with it any cloud IAM
     # binding on that account. Name a dedicated account to narrow the executor.
     serviceAccountName: ""
+    # tags.datadoghq.com/version is chart-owned; see README "Datadog version label".
     podLabels: {}
     podAnnotations:
       sidecar.istio.io/inject: "false"

@@ -117,8 +117,7 @@ class UserProfileSheet extends HookConsumerWidget {
     // never placed on the clipboard.
     final npub = fullNpub(pubkey);
 
-    // The contextual label from the opening surface, so the sheet names the
-    // identity exactly as the row that was tapped.
+    // Keep the opening surface's comparison context and qualified identity.
     final opener = names;
     final displayName =
         (opener != null ? ref.watch(opener) : watchIdentityNames(ref, {pk}))

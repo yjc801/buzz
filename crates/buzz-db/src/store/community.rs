@@ -1452,7 +1452,7 @@ mod postgres_tests {
         let db = setup_db().await;
         let owner = format!("{:064x}", Uuid::new_v4().as_u128());
 
-        // Fill the configured default ownership limit.
+        // The fiftieth create succeeds, then the fifty-first is rejected.
         for i in 0..crate::relay_members::MAX_COMMUNITIES_PER_OWNER {
             let host = format!("limit-test-{}-{}.example", i, Uuid::new_v4().simple());
             assert!(matches!(
@@ -1462,6 +1462,16 @@ mod postgres_tests {
                 CreateCommunityWithOwnerResult::Created(_)
             ));
         }
+
+        let page = db
+            .list_communities_owned_by(&owner)
+            .await
+            .expect("owner quota at fifty");
+        assert_eq!(
+            page.quota_used,
+            crate::relay_members::MAX_COMMUNITIES_PER_OWNER
+        );
+        assert!(!page.can_create);
 
         let host = format!("limit-test-overflow-{}.example", Uuid::new_v4().simple());
         assert_eq!(
@@ -1566,7 +1576,7 @@ mod postgres_tests {
         let recipient = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let source_owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
 
-        for index in 0..3 {
+        for index in 0..(crate::relay_members::MAX_COMMUNITIES_PER_OWNER - 2) {
             let host = format!("quota-live-{index}-{}.example", Uuid::new_v4().simple());
             assert!(matches!(
                 db.create_community_with_owner(&host, &recipient)
@@ -1687,6 +1697,11 @@ mod postgres_tests {
             .await
             .expect("owner list at lifetime cap");
         assert_eq!(page.quota_used, 0, "completed deletions free active slots");
+        assert_eq!(
+            page.quota_limit,
+            crate::relay_members::max_communities_per_owner(),
+            "active limit is shown separately"
+        );
         assert!(!page.can_create, "the lifetime cap still blocks creation");
 
         let host = format!("lifetime-overflow-{}.example", Uuid::new_v4().simple());

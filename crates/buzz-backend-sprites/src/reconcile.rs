@@ -231,7 +231,7 @@ async fn deploy_loop(
         }
 
         if matches!(action, Action::RestoreKeepAwake { .. }) {
-            restore_keep_awake(substrate, &sprite_name).await;
+            restore_keep_awake(substrate, &sprite_name).await?;
         }
 
         match action {
@@ -428,21 +428,33 @@ async fn write_env_file(
     Ok(())
 }
 
-/// Restart the keep-awake loop beside a live harness whose hold is gone.
+/// Re-establish the keep-awake hold beside a live harness whose hold is gone.
 ///
-/// Best effort by design: the agent is running either way, so a failed
-/// restart must not fail the deploy that found it running. Nothing is lost —
-/// the missing hold is its own durable record: the next probe reports it
-/// again, and the next deploy (any wake) retries the restart.
-async fn restore_keep_awake(substrate: &impl Substrate, sprite: &str) {
-    let _ = substrate
+/// The script evicts a loop that stopped renewing and exits 0 only once the
+/// hold is back, so success here is evidence, not hope. A failure is
+/// reported rather than folded into a success: the agent is running but will
+/// be frozen whenever it is idle, and the missing hold — reported again by
+/// the next probe — is what the next deploy retries from.
+async fn restore_keep_awake(substrate: &impl Substrate, sprite: &str) -> Result<(), String> {
+    let unrestored = |why: String| {
+        format!(
+            "the agent is running, but its keep-awake hold could not be restored ({why}); \
+             it will be frozen whenever it is idle until a later deploy restores it"
+        )
+    };
+    match substrate
         .run(
             sprite,
             &launcher::keepawake_restore_argv(),
             None,
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )
-        .await;
+        .await
+    {
+        Ok(result) if result.exit_code == 0 => Ok(()),
+        Ok(result) => Err(unrestored(format!("exit {}", result.exit_code))),
+        Err(SubstrateError(e)) => Err(unrestored(e)),
+    }
 }
 
 async fn probe_once(

@@ -234,8 +234,12 @@ running harness *without* its lease restarts the loop (row 4b) instead of
 reporting a healthy no-op. Without that, a heartbeat that died beside a live
 harness left the sprite to be frozen mid-turn whenever no request was live —
 observed in production as turns stalling for hours and then hitting the
-maximum turn duration. The restart is idempotent (one loop per generation)
-and touches nothing the agent can observe.
+maximum turn duration. The restart (`keepawake.sh --restore`) does not defer
+to a loop that still holds the single-instance lock — a missing lease means
+that loop is not renewing (stopped, hung, or stuck through an outage) — so it
+evicts it, starts a fresh one, and succeeds only once the lease is back; a
+restore that cannot bring it back fails the deploy rather than reporting a
+healthy agent that will freeze. It touches nothing the agent can observe.
 
 **Secrets.** The agent's key travels as WebSocket *data* (exec stdin frames)
 into a `/dev/shm` file — RAM-backed, mode 0600, named for the attempt — which

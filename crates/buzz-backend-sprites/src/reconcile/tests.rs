@@ -48,6 +48,8 @@ struct FakeState {
     /// steps before answering normally. Models a sprite whose CPU is held
     /// by a concurrent deploy's adapter install.
     observe_failures: usize,
+    /// Exit code of the keep-awake restore (0 = the hold came back).
+    keepawake_restore_exit: i32,
 }
 
 /// The read-only steps [`crate::provision::observe_step`] retries. A
@@ -249,6 +251,11 @@ impl Substrate for Fake {
                 })
             }
             "lease-release" => ok(String::new()),
+            "keepawake-restore" => Ok(ExecResult {
+                exit_code: state.keepawake_restore_exit,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
             "spot-check" => Ok(ExecResult {
                 exit_code: i32::from(state.spot_check_fails),
                 stdout: String::new(),
@@ -432,6 +439,26 @@ fn a_live_agent_without_its_keep_awake_hold_gets_the_keeper_restored() {
         fake.mutating_calls().is_empty(),
         "the repair touched the agent: {:?}",
         fake.mutating_calls()
+    );
+}
+
+/// A restore that cannot bring the hold back is reported, never folded into
+/// the success a live agent otherwise gets: the agent would keep freezing.
+#[test]
+fn a_failed_keep_awake_restore_is_reported_not_swallowed() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![
+            r#"{"lock":"held","comm":"buzz-acp","gen":"cafe0001","lease":"missing"}"#.to_string(),
+        ],
+        recorded_intent: Some("anything".into()),
+        keepawake_restore_exit: 4,
+        ..Default::default()
+    });
+    let err = run(&fake).unwrap_err();
+    assert!(
+        err.contains("keep-awake hold could not be restored (exit 4)"),
+        "{err}"
     );
 }
 

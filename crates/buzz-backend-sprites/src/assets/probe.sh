@@ -24,7 +24,7 @@ gen=$(cat "$BUZZ/agent.gen" 2>/dev/null | tr -cd 'a-zA-Z0-9' || true)
 # Whether this generation's keep-awake task is held. `unknown` when the task
 # list cannot be read: only a definite `missing` may trigger a repair.
 lease=unknown
-if [ -n "$gen" ] && tasks=$(curl -sf --unix-socket /.sprite/api.sock http://sprite/v1/tasks 2>/dev/null); then
+if [ -n "$gen" ] && tasks=$(curl -sf --connect-timeout 5 --max-time 10 --unix-socket /.sprite/api.sock http://sprite/v1/tasks 2>/dev/null); then
     case "$tasks" in
         *"\"buzz-agent-${gen}\""*) lease=held ;;
         *) lease=missing ;;

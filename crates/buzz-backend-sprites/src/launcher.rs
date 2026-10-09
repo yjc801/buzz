@@ -58,14 +58,14 @@ pub fn probe_argv() -> Vec<String> {
     vec!["bash".to_string(), PROBE_PATH.to_string()]
 }
 
-/// Restart the keep-awake loop for the running generation, detached so it
-/// outlives this exec. Idempotent: the script exits at once when a keeper for
-/// the generation already runs.
+/// Re-establish the running generation's keep-awake hold: evicts a loop that
+/// stopped renewing, starts a fresh detached one, and exits 0 only once the
+/// hold is back (see `keepawake.sh --restore`).
 pub fn keepawake_restore_argv() -> Vec<String> {
     vec![
         "bash".to_string(),
-        "-c".to_string(),
-        format!("setsid {KEEPAWAKE_PATH} </dev/null >/dev/null 2>&1 &"),
+        KEEPAWAKE_PATH.to_string(),
+        "--restore".to_string(),
     ]
 }
 
@@ -214,20 +214,24 @@ mod tests {
         assert_eq!(KEEPAWAKE_SH.matches("/v1/tasks/").count(), 1);
         assert!(KEEPAWAKE_SH.contains("sleep 60 8>&- || true"));
         assert!(KEEPAWAKE_SH.contains(r#"/dev/shm/buzz-keepawake.${GEN}.lock"#));
-        assert!(KEEPAWAKE_SH.contains("flock -n 8 || exit 0"));
         // Children must not inherit the lock: an orphaned `sleep` holding
         // fd 8 outlived a killed keeper live and made the repair's fresh
         // keeper exit on a taken lock.
-        assert!(KEEPAWAKE_SH.contains(r#""$@" >/dev/null 8>&-"#));
-        assert!(KEEPAWAKE_SH.contains(r#"trap 'alive || hb -X DELETE"#));
+        assert!(KEEPAWAKE_SH.contains(r#""$@" 8>&-"#));
+        // Bounded API calls: a hung curl is a loop that stops renewing.
+        assert!(KEEPAWAKE_SH.contains("--max-time"));
+        // The repair evicts a non-renewing owner rather than deferring to
+        // its lock (behaviour: tests/keepawake.test.sh).
+        assert!(KEEPAWAKE_SH.contains(r#"kill -KILL -- "-$old""#));
+        assert!(KEEPAWAKE_SH.contains(r#"trap 'alive || api -X DELETE"#));
     }
 
     #[test]
-    fn the_restore_command_detaches_the_installed_keeper() {
-        let argv = keepawake_restore_argv();
-        assert_eq!(argv[..2], ["bash", "-c"]);
-        assert!(argv[2].starts_with(&format!("setsid {KEEPAWAKE_PATH} ")));
-        assert!(argv[2].trim_end().ends_with('&'));
+    fn the_restore_command_runs_the_installed_keeper_synchronously() {
+        assert_eq!(
+            keepawake_restore_argv(),
+            ["bash", KEEPAWAKE_PATH, "--restore"]
+        );
     }
 
     /// The helper only pays for itself if the agent can reach it, and the only

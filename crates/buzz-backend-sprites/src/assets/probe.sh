@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # buzz-backend-sprites probe — one JSON line of machine-readable liveness
-# evidence: {"lock":"held|free","comm":"...","gen":"..."}. These tokens are
-# the ONLY in-sprite bytes the provider ever quotes into error output.
+# evidence: {"lock":"held|free","comm":"...","gen":"...","lease":"held|missing|unknown"}.
+# These tokens are the ONLY in-sprite bytes the provider ever quotes into
+# error output.
 #
 # flock -n with instant release: the launcher acquires with -w 5, so a
 # probe's microsecond hold can never assassinate a real contender.
@@ -20,4 +21,14 @@ if [ -n "$pid" ]; then
 fi
 gen=$(cat "$BUZZ/agent.gen" 2>/dev/null | tr -cd 'a-zA-Z0-9' || true)
 
-printf '{"lock":"%s","comm":"%s","gen":"%s"}\n' "$lock" "$comm" "$gen"
+# Whether this generation's keep-awake task is held. `unknown` when the task
+# list cannot be read: only a definite `missing` may trigger a repair.
+lease=unknown
+if [ -n "$gen" ] && tasks=$(curl -sf --unix-socket /.sprite/api.sock http://sprite/v1/tasks 2>/dev/null); then
+    case "$tasks" in
+        *"\"buzz-agent-${gen}\""*) lease=held ;;
+        *) lease=missing ;;
+    esac
+fi
+
+printf '{"lock":"%s","comm":"%s","gen":"%s","lease":"%s"}\n' "$lock" "$comm" "$gen" "$lease"

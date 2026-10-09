@@ -230,6 +230,10 @@ async fn deploy_loop(
             continue;
         }
 
+        if matches!(action, Action::RestoreKeepAwake { .. }) {
+            restore_keep_awake(substrate, &sprite_name).await;
+        }
+
         match action {
             // Every success returns through NoOp, but `attempt_started`
             // alone is NOT the fresh-generation answer: it stays true after
@@ -240,7 +244,7 @@ async fn deploy_loop(
             // started proves the floor-bearing env is in effect. Fail
             // closed — no probe, no started generation, or a mismatch all
             // report false (unproven, never a guess).
-            Action::NoOp { agent_id } => {
+            Action::NoOp { agent_id } | Action::RestoreKeepAwake { agent_id } => {
                 let fresh_generation = attempt_started
                     && match (attempt_generation.as_deref(), probe.as_ref()) {
                         (Some(started), Some(running)) => running.gen == started,
@@ -422,6 +426,23 @@ async fn write_env_file(
         ));
     }
     Ok(())
+}
+
+/// Restart the keep-awake loop beside a live harness whose hold is gone.
+///
+/// Best effort by design: the agent is running either way, so a failed
+/// restart must not fail the deploy that found it running. Nothing is lost —
+/// the missing hold is its own durable record: the next probe reports it
+/// again, and the next deploy (any wake) retries the restart.
+async fn restore_keep_awake(substrate: &impl Substrate, sprite: &str) {
+    let _ = substrate
+        .run(
+            sprite,
+            &launcher::keepawake_restore_argv(),
+            None,
+            Duration::from_secs(30),
+        )
+        .await;
 }
 
 async fn probe_once(

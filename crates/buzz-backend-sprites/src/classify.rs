@@ -49,6 +49,11 @@ pub enum Action {
     Start,
     /// Rows 4/7: the harness is running. The only success edge.
     NoOp { agent_id: String },
+    /// Row 4b: the harness is running but its keep-awake hold is gone, so
+    /// the sprite freezes mid-turn whenever no request is live. Restart the
+    /// keeper, then succeed exactly as `NoOp` — the agent itself (its env,
+    /// process, and turns) is not touched.
+    RestoreKeepAwake { agent_id: String },
     /// Rows 7c/7d: evidence is transient or incomplete — poll again.
     Observe { reason: &'static str },
     /// Row 7b: this call's own attempt died. In-band error, no retry.
@@ -61,12 +66,17 @@ pub fn classify(observation: &Observation<'_>) -> Action {
         return Action::Create;
     };
 
-    // Row 4: live wins, unconditionally and with zero mutation — including
-    // when the recorded intent diverges. Configuration edits reach the agent
-    // on its next fresh generation, never by disturbing a running turn.
-    if observation.probe.is_some_and(ProbeReport::started) {
-        return Action::NoOp {
-            agent_id: sprite.name.clone(),
+    // Row 4: live wins, unconditionally and with zero mutation of the agent
+    // — including when the recorded intent diverges. Configuration edits
+    // reach the agent on its next fresh generation, never by disturbing a
+    // running turn. Row 4b's repair only restarts the keep-awake loop beside
+    // it, which no turn can observe.
+    if let Some(probe) = observation.probe.filter(|p| p.started()) {
+        let agent_id = sprite.name.clone();
+        return if probe.needs_keep_awake() {
+            Action::RestoreKeepAwake { agent_id }
+        } else {
+            Action::NoOp { agent_id }
         };
     }
 
@@ -145,6 +155,7 @@ mod tests {
             lock_held,
             comm: comm.into(),
             gen: "cafe0001".into(),
+            lease_missing: false,
         }
     }
 
@@ -186,6 +197,23 @@ mod tests {
         assert_eq!(
             classify(&observation(Some(&s), Some(&p), &[])),
             Action::NoOp {
+                agent_id: s.name.clone()
+            }
+        );
+    }
+
+    /// Row 4b: live but unheld — restore the keeper rather than report a
+    /// healthy no-op over a sprite that idle detection keeps freezing.
+    #[test]
+    fn row4b_started_without_a_keep_awake_hold_restores_it() {
+        let s = sprite();
+        let p = ProbeReport {
+            lease_missing: true,
+            ..probe(true, "buzz-acp")
+        };
+        assert_eq!(
+            classify(&observation(Some(&s), Some(&p), &[])),
+            Action::RestoreKeepAwake {
                 agent_id: s.name.clone()
             }
         );

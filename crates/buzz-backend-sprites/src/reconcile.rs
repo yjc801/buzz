@@ -230,6 +230,10 @@ async fn deploy_loop(
             continue;
         }
 
+        if matches!(action, Action::RestoreKeepAwake { .. }) {
+            restore_keep_awake(substrate, &sprite_name).await?;
+        }
+
         match action {
             // Every success returns through NoOp, but `attempt_started`
             // alone is NOT the fresh-generation answer: it stays true after
@@ -240,7 +244,7 @@ async fn deploy_loop(
             // started proves the floor-bearing env is in effect. Fail
             // closed — no probe, no started generation, or a mismatch all
             // report false (unproven, never a guess).
-            Action::NoOp { agent_id } => {
+            Action::NoOp { agent_id } | Action::RestoreKeepAwake { agent_id } => {
                 let fresh_generation = attempt_started
                     && match (attempt_generation.as_deref(), probe.as_ref()) {
                         (Some(started), Some(running)) => running.gen == started,
@@ -422,6 +426,35 @@ async fn write_env_file(
         ));
     }
     Ok(())
+}
+
+/// Re-establish the keep-awake hold beside a live harness whose hold is gone.
+///
+/// The script evicts a loop that stopped renewing and exits 0 only once the
+/// hold is back, so success here is evidence, not hope. A failure is
+/// reported rather than folded into a success: the agent is running but will
+/// be frozen whenever it is idle, and the missing hold — reported again by
+/// the next probe — is what the next deploy retries from.
+async fn restore_keep_awake(substrate: &impl Substrate, sprite: &str) -> Result<(), String> {
+    let unrestored = |why: String| {
+        format!(
+            "the agent is running, but its keep-awake hold could not be restored ({why}); \
+             it will be frozen whenever it is idle until a later deploy restores it"
+        )
+    };
+    match substrate
+        .run(
+            sprite,
+            &launcher::keepawake_restore_argv(),
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+    {
+        Ok(result) if result.exit_code == 0 => Ok(()),
+        Ok(result) => Err(unrestored(format!("exit {}", result.exit_code))),
+        Err(SubstrateError(e)) => Err(unrestored(e)),
+    }
 }
 
 async fn probe_once(

@@ -105,15 +105,14 @@ if [ -z "$held" ]; then
     echo "launcher: could not take the keep-awake task lease" >&2
     exit 4
 fi
-(
-    trap 'hb -X DELETE "$TASK_URL" || true' EXIT HUP TERM INT
-    while sleep 60; do
-        # After the exec below, PID $SELF *is* the harness (comm buzz-acp).
-        # Anything else means it exited or was replaced: release the hold.
-        [ "$(cat /proc/$SELF/comm 2>/dev/null)" = "buzz-acp" ] || exit 0
-        hb -X PUT "$TASK_URL" -d '{"expire":"5m"}' || true
-    done
-) &
+# The refresh loop lives in keepawake.sh, started in its own session rather
+# than as a subshell of this one: a subshell shares the harness's session and
+# process group, and a heartbeat that quietly died there left a live harness
+# with no hold, frozen mid-turn by idle detection. Detached and fd 9 closed,
+# it can neither hold the agent lock nor be torn down with this session; if
+# it dies anyway, the probe reports the missing hold and a deploy restarts
+# the keeper.
+setsid "$BUZZ/keepawake.sh" </dev/null >/dev/null 2>&1 9>&- &
 
 # Workspace hygiene: take back what closed pull requests left behind (the
 # `sweep` section of workspace.sh — worktrees, branches, slots, build caches

@@ -1,4 +1,4 @@
-//! The embedded in-sprite assets (launcher, probe, workspace helper), their
+//! The embedded in-sprite assets (launcher, probe, keep-awake, workspace helper), their
 //! content digests, the argv builders that invoke them, and the probe's typed
 //! report.
 
@@ -7,12 +7,14 @@ use sha2::{Digest, Sha256};
 pub const LAUNCHER_SH: &str = include_str!("assets/launcher.sh");
 pub const PROBE_SH: &str = include_str!("assets/probe.sh");
 pub const WORKSPACE_SH: &str = include_str!("assets/workspace.sh");
+pub const KEEPAWAKE_SH: &str = include_str!("assets/keepawake.sh");
 
 /// Where the assets live inside the sprite. Versioned by content (the shas
 /// participate in the provision fingerprint), so the paths themselves stay
 /// stable.
 pub const LAUNCHER_PATH: &str = "/home/sprite/.buzz/launcher.sh";
 pub const PROBE_PATH: &str = "/home/sprite/.buzz/probe.sh";
+pub const KEEPAWAKE_PATH: &str = "/home/sprite/.buzz/keepawake.sh";
 /// The workspace helper sits in `bin/` — unlike the launcher and probe, which
 /// only the provider invokes, this one is for the agent, and the launcher puts
 /// `bin/` on its PATH.
@@ -36,6 +38,10 @@ pub fn workspace_sha256() -> String {
     sha256_hex(WORKSPACE_SH)
 }
 
+pub fn keepawake_sha256() -> String {
+    sha256_hex(KEEPAWAKE_SH)
+}
+
 /// The detachable session's argv. Only public identity travels here — the
 /// session list echoes argv back to anyone with org access, and exec URLs
 /// reach logs.
@@ -52,12 +58,27 @@ pub fn probe_argv() -> Vec<String> {
     vec!["bash".to_string(), PROBE_PATH.to_string()]
 }
 
-/// The probe's three independent liveness signals.
+/// Re-establish the running generation's keep-awake hold: evicts a loop that
+/// stopped renewing, starts a fresh detached one, and exits 0 only once the
+/// hold is back (see `keepawake.sh --restore`).
+pub fn keepawake_restore_argv() -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        KEEPAWAKE_PATH.to_string(),
+        "--restore".to_string(),
+    ]
+}
+
+/// The probe's three independent liveness signals, plus the keep-awake hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeReport {
     pub lock_held: bool,
     pub comm: String,
     pub gen: String,
+    /// The generation's keep-awake task is definitely absent. False when it
+    /// is held, unreadable, or the probe predates the field — only a definite
+    /// absence may trigger a repair.
+    pub lease_missing: bool,
 }
 
 impl ProbeReport {
@@ -72,6 +93,7 @@ impl ProbeReport {
                 lock_held: value.get("lock")?.as_str()? == "held",
                 comm: value.get("comm")?.as_str()?.to_string(),
                 gen: value.get("gen")?.as_str()?.to_string(),
+                lease_missing: value.get("lease").and_then(|v| v.as_str()) == Some("missing"),
             })
         })
     }
@@ -87,6 +109,12 @@ impl ProbeReport {
     /// pre-exec window, teardown lag) and classifies as "keep polling".
     pub fn stopped(&self) -> bool {
         !self.lock_held && self.comm != "buzz-acp"
+    }
+
+    /// A running harness that has lost its keep-awake hold: the sprite will
+    /// be frozen mid-turn whenever no request is live.
+    pub fn needs_keep_awake(&self) -> bool {
+        self.started() && self.lease_missing
     }
 }
 
@@ -110,15 +138,100 @@ mod tests {
 
     #[test]
     fn asset_digests_are_stable_hex() {
-        for sha in [launcher_sha256(), probe_sha256(), workspace_sha256()] {
+        let digests = [
+            launcher_sha256(),
+            probe_sha256(),
+            workspace_sha256(),
+            keepawake_sha256(),
+        ];
+        for sha in &digests {
             assert_eq!(sha.len(), 64);
             assert!(sha
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         }
-        assert_ne!(launcher_sha256(), probe_sha256());
-        assert_ne!(launcher_sha256(), workspace_sha256());
-        assert_ne!(probe_sha256(), workspace_sha256());
+        for (i, a) in digests.iter().enumerate() {
+            for b in &digests[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// Only a definite `missing` marks the hold lost. `unknown` (task list
+    /// unreadable) and a probe that predates the field must never trigger a
+    /// repair, or an API hiccup would read as a lost hold.
+    #[test]
+    fn probe_lease_field_is_missing_only_when_definite() {
+        let parse = |lease: &str| {
+            ProbeReport::parse(&format!(
+                r#"{{"lock":"held","comm":"buzz-acp","gen":"g1"{lease}}}"#
+            ))
+            .unwrap()
+        };
+        let missing = parse(r#","lease":"missing""#);
+        assert!(missing.lease_missing && missing.needs_keep_awake());
+        for other in [r#","lease":"held""#, r#","lease":"unknown""#, ""] {
+            assert!(!parse(other).needs_keep_awake(), "{other:?}");
+        }
+        let stopped =
+            ProbeReport::parse(r#"{"lock":"free","comm":"","gen":"g1","lease":"missing"}"#)
+                .unwrap();
+        assert!(
+            !stopped.needs_keep_awake(),
+            "a stopped harness needs a start, not a keep-awake repair"
+        );
+    }
+
+    /// The refresh loop runs detached from the harness's session — the
+    /// in-session subshell is what died on a live harness and left it to be
+    /// frozen mid-turn — and starts after the mandatory first hold, before
+    /// the exec, without the agent lock's fd 9.
+    #[test]
+    fn the_launcher_starts_the_keeper_detached_after_the_first_hold() {
+        let start = LAUNCHER_SH
+            .find(r#"setsid "$BUZZ/keepawake.sh""#)
+            .expect("the launcher no longer starts the keep-awake loop");
+        let line_end = start + LAUNCHER_SH[start..].find('\n').unwrap();
+        assert!(
+            LAUNCHER_SH[start..line_end].contains("9>&-"),
+            "the keeper must not inherit the agent lock"
+        );
+        let first_hold = LAUNCHER_SH.find("exit 4").unwrap();
+        let exec = LAUNCHER_SH.rfind(r#"exec "$BUZZ/bin/buzz-acp""#).unwrap();
+        assert!(first_hold < start && start < exec);
+        assert!(
+            !LAUNCHER_SH.contains(r#"hb -X PUT "$TASK_URL" -d '{"expire":"5m"}' || true"#),
+            "a second, in-session refresh loop is back in the launcher"
+        );
+    }
+
+    /// The keeper holds the same generation-scoped task the launcher takes,
+    /// survives a failing sleep, is single-instance per generation, and only
+    /// deletes the hold once the harness is gone.
+    #[test]
+    fn the_keeper_is_generation_scoped_and_hard_to_kill_quietly() {
+        assert!(KEEPAWAKE_SH.contains("/v1/tasks/buzz-agent-${GEN}"));
+        assert_eq!(KEEPAWAKE_SH.matches("/v1/tasks/").count(), 1);
+        assert!(KEEPAWAKE_SH.contains("sleep 60 8>&- || true"));
+        assert!(KEEPAWAKE_SH.contains(r#"/dev/shm/buzz-keepawake.${GEN}.lock"#));
+        // Children must not inherit the lock: an orphaned `sleep` holding
+        // fd 8 outlived a killed keeper live and made the repair's fresh
+        // keeper exit on a taken lock.
+        assert!(KEEPAWAKE_SH.contains(r#""$@" 8>&-"#));
+        // Bounded API calls: a hung curl is a loop that stops renewing.
+        assert!(KEEPAWAKE_SH.contains("--max-time"));
+        // The repair evicts a non-renewing owner rather than deferring to
+        // its lock (behaviour: tests/keepawake.test.sh).
+        assert!(KEEPAWAKE_SH.contains(r#"kill -KILL -- "-$old""#));
+        assert!(KEEPAWAKE_SH.contains(r#"trap 'alive || api -X DELETE"#));
+    }
+
+    #[test]
+    fn the_restore_command_runs_the_installed_keeper_synchronously() {
+        assert_eq!(
+            keepawake_restore_argv(),
+            ["bash", KEEPAWAKE_PATH, "--restore"]
+        );
     }
 
     /// The helper only pays for itself if the agent can reach it, and the only

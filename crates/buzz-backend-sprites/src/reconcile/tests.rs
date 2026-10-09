@@ -48,6 +48,8 @@ struct FakeState {
     /// steps before answering normally. Models a sprite whose CPU is held
     /// by a concurrent deploy's adapter install.
     observe_failures: usize,
+    /// Exit code of the keep-awake restore (0 = the hold came back).
+    keepawake_restore_exit: i32,
 }
 
 /// The read-only steps [`crate::provision::observe_step`] retries. A
@@ -96,6 +98,9 @@ fn script_kind(argv: &[String]) -> &'static str {
     // to the probe branch makes provisioning fail in a way no sprite does.
     if argv == crate::launcher::probe_argv() {
         return "probe";
+    }
+    if argv == crate::launcher::keepawake_restore_argv() {
+        return "keepawake-restore";
     }
     let joined = argv.join(" ");
     if joined.contains("# take the deploy lease") {
@@ -246,6 +251,11 @@ impl Substrate for Fake {
                 })
             }
             "lease-release" => ok(String::new()),
+            "keepawake-restore" => Ok(ExecResult {
+                exit_code: state.keepawake_restore_exit,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
             "spot-check" => Ok(ExecResult {
                 exit_code: i32::from(state.spot_check_fails),
                 stdout: String::new(),
@@ -370,6 +380,7 @@ fn desired_intent() -> String {
         launcher_sha256: launcher::launcher_sha256(),
         probe_sha256: launcher::probe_sha256(),
         workspace_sha256: launcher::workspace_sha256(),
+        keepawake_sha256: launcher::keepawake_sha256(),
         preapprove_agent_tools: true,
     };
     template.fingerprint().as_str().to_string()
@@ -407,6 +418,68 @@ fn live_agent_is_a_strict_no_op_with_zero_mutation() {
         "the live row mutated: {:?}",
         fake.mutating_calls()
     );
+}
+
+/// Row 4b: a live harness that lost its keep-awake hold gets the keeper
+/// restarted — and nothing else. Without this the deploy reports a healthy
+/// no-op while idle detection keeps freezing the sprite mid-turn.
+#[test]
+fn a_live_agent_without_its_keep_awake_hold_gets_the_keeper_restored() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![
+            r#"{"lock":"held","comm":"buzz-acp","gen":"cafe0001","lease":"missing"}"#.to_string(),
+        ],
+        recorded_intent: Some("anything".into()),
+        ..Default::default()
+    });
+    assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+    assert!(fake.calls().contains(&"run:keepawake-restore".to_string()));
+    assert!(
+        fake.mutating_calls().is_empty(),
+        "the repair touched the agent: {:?}",
+        fake.mutating_calls()
+    );
+}
+
+/// A restore that cannot bring the hold back is reported, never folded into
+/// the success a live agent otherwise gets: the agent would keep freezing.
+#[test]
+fn a_failed_keep_awake_restore_is_reported_not_swallowed() {
+    let fake = Fake::new(FakeState {
+        sprite: Some(ours()),
+        probe_script: vec![
+            r#"{"lock":"held","comm":"buzz-acp","gen":"cafe0001","lease":"missing"}"#.to_string(),
+        ],
+        recorded_intent: Some("anything".into()),
+        keepawake_restore_exit: 4,
+        ..Default::default()
+    });
+    let err = run(&fake).unwrap_err();
+    assert!(
+        err.contains("keep-awake hold could not be restored (exit 4)"),
+        "{err}"
+    );
+}
+
+/// A held (or unreadable) hold is the plain no-op: no restore exec.
+#[test]
+fn a_live_agent_with_its_hold_is_not_restarted() {
+    for lease in ["held", "unknown"] {
+        let fake = Fake::new(FakeState {
+            sprite: Some(ours()),
+            probe_script: vec![format!(
+                r#"{{"lock":"held","comm":"buzz-acp","gen":"cafe0001","lease":"{lease}"}}"#
+            )],
+            recorded_intent: Some("anything".into()),
+            ..Default::default()
+        });
+        assert_eq!(run(&fake).unwrap(), identity().sprite_name());
+        assert!(
+            !fake.calls().contains(&"run:keepawake-restore".to_string()),
+            "restored the keeper on lease={lease}"
+        );
+    }
 }
 
 /// The strict no-op must also be independent of the release infrastructure:

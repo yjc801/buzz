@@ -177,7 +177,8 @@ nothing.
 **"Started" means the harness is running.** Not "the sprite exists" and not
 "a session is listed" — sessions report client attachment, not process
 liveness. An in-VM probe reports three independent signals (an election lock,
-the locked PID's process name, the recorded generation); started means the
+the locked PID's process name, the recorded generation), plus whether the
+generation's keep-awake lease is held; started means the
 lock is held *and* the process is `buzz-acp`. Permission to start requires all
 the negatives, so a mixed reading (the launcher's pre-exec window, teardown
 lag) polls rather than risking a double start. The deploy response's
@@ -226,6 +227,20 @@ recover, so the launcher retries the initial acquisition briefly and
 otherwise fails the start — the deploy then reports a startup failure
 instead of success for an agent that would hibernate unreachable.
 
+The refresh loop (`keepawake.sh`) runs in its own session, detached from the
+harness, and its loss is detected rather than assumed away: the probe also
+reports whether the generation's lease is held, and a deploy that finds a
+running harness *without* its lease restarts the loop (row 4b) instead of
+reporting a healthy no-op. Without that, a heartbeat that died beside a live
+harness left the sprite to be frozen mid-turn whenever no request was live —
+observed in production as turns stalling for hours and then hitting the
+maximum turn duration. The restart (`keepawake.sh --restore`) does not defer
+to a loop that still holds the single-instance lock — a missing lease means
+that loop is not renewing (stopped, hung, or stuck through an outage) — so it
+evicts it, starts a fresh one, and succeeds only once the lease is back; a
+restore that cannot bring it back fails the deploy rather than reporting a
+healthy agent that will freeze. It touches nothing the agent can observe.
+
 **Secrets.** The agent's key travels as WebSocket *data* (exec stdin frames)
 into a `/dev/shm` file — RAM-backed, mode 0600, named for the attempt — which
 the launcher sources and deletes before exec'ing the harness. It never goes in
@@ -235,7 +250,7 @@ continuously synced to object storage and captured by checkpoints. The exec
 URL builder has no env parameter at all, and a test pins its absence.
 
 **Provisioning and change.** Provisioned artifacts — the digest-verified sprig
-runtime, the pinned ACP adapters, the launcher and probe scripts — are
+runtime, the pinned ACP adapters, the launcher, probe, and keep-awake scripts — are
 fingerprinted, and the fingerprint is recorded *inside* the sprite as the last
 step of a provision. A checkpoint restore therefore rolls the artifacts and
 their record back together, which a control-plane label could not do. A

@@ -11,6 +11,7 @@
 //! presence shows.
 
 use buzz_core_pkg::kind::KIND_WAKER_BUNDLE_ENVELOPE;
+use buzz_waker_pkg::start_request::start_request_envelope_keys;
 use buzz_waker_pkg::{SignedStartRequest, StartRequestBody};
 use nostr::nips::nip44;
 use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -71,9 +72,12 @@ pub(crate) fn ensure_bundle_live(
 }
 
 /// Build the wire form of a start request: a gift wrap `#p`-tagged to the
-/// agent, signed by a throwaway key, carrying the owner-signed request
-/// NIP-44 encrypted to the agent. See `buzz_core::kind::KIND_WAKER_START_REQUEST`
-/// for why the envelope is not owner-signed.
+/// agent, signed by the owner↔agent envelope key, carrying the owner-signed
+/// request NIP-44 encrypted to the agent. See
+/// `buzz_core::kind::KIND_WAKER_START_REQUEST` for why the envelope is signed
+/// by neither the owner nor a throwaway key: the waker's query pins `authors`
+/// to the envelope key, so an envelope signed by any other key never reaches
+/// it.
 pub(crate) fn build_start_request_envelope(
     owner_keys: &Keys,
     agent_pubkey: &str,
@@ -90,9 +94,10 @@ pub(crate) fn build_start_request_envelope(
         .map_err(|e| format!("failed to encode start request: {e}"))?;
     let agent = nostr::PublicKey::from_hex(agent_pubkey)
         .map_err(|e| format!("invalid agent pubkey {agent_pubkey}: {e}"))?;
-    let throwaway = Keys::generate();
+    let envelope_keys = start_request_envelope_keys(owner_keys.secret_key(), &agent)
+        .map_err(|e| format!("failed to derive start request envelope key: {e}"))?;
     let content = nip44::encrypt(
-        throwaway.secret_key(),
+        envelope_keys.secret_key(),
         &agent,
         plaintext,
         nip44::Version::V2,
@@ -100,7 +105,7 @@ pub(crate) fn build_start_request_envelope(
     .map_err(|e| format!("failed to encrypt start request: {e}"))?;
     EventBuilder::new(Kind::Custom(KIND_WAKER_BUNDLE_ENVELOPE as u16), content)
         .tags([Tag::public_key(agent)])
-        .sign_with_keys(&throwaway)
+        .sign_with_keys(&envelope_keys)
         .map_err(|e| format!("failed to sign start request envelope: {e}"))
 }
 
@@ -335,7 +340,10 @@ mod tests {
 
     /// The envelope is exactly what the waker's tap accepts: the owner's
     /// signature inside, verifiable against the pinned owner, and an outer
-    /// signer that is NOT the owner (so it stays out of the bundle query).
+    /// signer that is NOT the owner (so it stays out of the bundle query) but
+    /// IS the envelope key the waker pins its `authors` filter to. That last
+    /// property is what the relay matches on; envelopes signed by a throwaway
+    /// key were never delivered, so Start silently did nothing.
     #[test]
     fn the_envelope_is_one_the_waker_accepts() {
         let (owner, agent) = (Keys::generate(), Keys::generate());
@@ -345,6 +353,11 @@ mod tests {
 
         assert_eq!(event.kind.as_u16() as u32, KIND_WAKER_BUNDLE_ENVELOPE);
         assert_ne!(event.pubkey, owner.public_key());
+        // Derived from the agent's side, as the waker computes its filter.
+        let waker_author = start_request_envelope_keys(agent.secret_key(), &owner.public_key())
+            .unwrap()
+            .public_key();
+        assert_eq!(event.pubkey, waker_author);
         assert!(event
             .tags
             .iter()

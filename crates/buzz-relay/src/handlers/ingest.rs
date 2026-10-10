@@ -459,7 +459,9 @@ pub enum IngestError {
 /// `restricted:` wire text the ephemeral path uses. A lookup outage is a
 /// server fault and fails closed as `error:`/500 — a Postgres blip can
 /// neither admit a write past the fence nor read as a client mistake.
-fn map_serving_fence_state(active: Result<bool, buzz_db::DbError>) -> Result<(), IngestError> {
+pub(crate) fn map_serving_fence_state(
+    active: Result<bool, buzz_db::DbError>,
+) -> Result<(), IngestError> {
     match active {
         Ok(true) => Ok(()),
         Ok(false) => Err(IngestError::Rejected(
@@ -2275,6 +2277,27 @@ pub(crate) async fn enforce_write_restriction(
     write_restriction_denial(kind, &restriction, Utc::now()).map_or(Ok(()), Err)
 }
 
+/// [`enforce_write_restriction`] over a 30-second cached restriction row, for
+/// the WebSocket ephemeral and observer paths. Those run per typing pulse and
+/// observer frame; persistent ingest keeps the uncached read. The verdict is
+/// still taken at `now`, so a cached timeout lifts on time.
+pub(crate) async fn enforce_cached_write_restriction(
+    state: &AppState,
+    tenant: &TenantContext,
+    kind: u32,
+    pubkey: &nostr::PublicKey,
+) -> Result<(), IngestError> {
+    let restriction = state
+        .restriction_state_cached(tenant.community(), pubkey.as_bytes())
+        .await
+        .map_err(|e| {
+            IngestError::Internal(format!(
+                "error: internal error checking restriction state: {e}"
+            ))
+        })?;
+    write_restriction_denial(kind, &restriction, Utc::now()).map_or(Ok(()), Err)
+}
+
 /// Ingest a signed Nostr event through the full validation pipeline.
 ///
 /// Shared by WebSocket and HTTP transports. The caller constructs [`IngestAuth`]
@@ -2402,6 +2425,8 @@ async fn ingest_event_inner(
         ));
     }
 
+    // Typing indicators (kind:20002) never reach this gate: the HTTP bridge
+    // routes them to `publish_http_typing` before ingest.
     if auth.is_http() && buzz_core::kind::requires_websocket_ingest(kind_u32) {
         return Err(IngestError::Rejected(format!(
             "invalid: kind {kind_u32} is only accepted via WebSocket"
@@ -3575,7 +3600,7 @@ mod postgres_tests {
     #[ignore = "requires Postgres"]
     async fn check_channel_write_denies_when_channel_lookup_fails() {
         let state = crate::state::tests::test_state_with_database_url(
-            "postgres://buzz:buzz_dev@127.0.0.1:1/buzz",
+            "postgres://buzz:buzz_dev@127.0.0.1:1/buzz", // sadscan:disable np.postgres.1
         )
         .await;
         let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());

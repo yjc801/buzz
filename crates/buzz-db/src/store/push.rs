@@ -29,14 +29,11 @@ async fn begin_operation_transaction(
     Ok(sqlx::Transaction::begin(connection, None).await?)
 }
 
-/// Namespace for the per-community push-gate advisory lock. Event inserts
-/// take it SHARED in `event_follow_up::enqueue_push_match` (and in the
-/// `enqueue_push_match_job` trigger from migration 0023 until it is retired);
-/// every lease transition that can make match eligibility true takes it
-/// EXCLUSIVE here, forcing a total order so a concurrent event insert either
-/// sees the committed lease or strictly precedes the activation (in which case
-/// no wake was owed). Distinct key domain from the audit lock and the lease
-/// address/author locks.
+/// Namespace for the per-community push-gate advisory lock. The post-commit
+/// enqueue worker takes it SHARED, while lease transitions take it EXCLUSIVE.
+/// The worker checks receipt-time eligibility after obtaining the lock. Legacy
+/// trigger writers still hold the shared lock in their event transaction.
+/// Distinct key domain from the audit and lease address/author locks.
 const PUSH_GATE_LOCK_NAMESPACE: &str = "buzz_push_gate:";
 
 /// The push-gate advisory lock key for `community`. Both sides of the lock
@@ -75,8 +72,6 @@ pub struct LeaseVersion<'a> {
 /// Effective fields for an active APNs lease.
 #[derive(Debug, Clone, Copy)]
 pub struct ActiveLease<'a> {
-    /// Application profile selected from the executor descriptor.
-    pub app_profile: &'a str,
     /// SHA-256 of the platform endpoint.
     pub endpoint_hash: &'a [u8],
     /// Opaque endpoint grant issued by the stateless gateway.
@@ -303,7 +298,7 @@ pub async fn accept_lease_event(
     // uniqueness forever. The author lock makes this cleanup atomic with the
     // subsequent author-wide checks and replacement.
     sqlx::query(
-        "UPDATE push_leases SET active=false, endpoint_enabled=false, app_profile=NULL, \
+        "UPDATE push_leases SET active=false, endpoint_enabled=false, \
          endpoint_hash=NULL, endpoint_grant=NULL, max_class=NULL, subscriptions=NULL, updated_at=now() \
          WHERE community_id=$1 AND author=$2 AND active \
            AND expires_at <= EXTRACT(EPOCH FROM now())::bigint",
@@ -326,12 +321,11 @@ pub async fn accept_lease_event(
             return Ok(AcceptLeaseOutcome::LeaseQuotaExceeded);
         }
         let duplicate: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM push_leases WHERE community_id=$1 AND author=$2              AND installation_id<>$3 AND active AND app_profile=$4 AND endpoint_hash=$5)",
+            "SELECT EXISTS(SELECT 1 FROM push_leases WHERE community_id=$1 AND author=$2              AND installation_id<>$3 AND active AND endpoint_hash=$4)",
         )
         .bind(community.as_uuid())
         .bind(author)
         .bind(installation_id)
-        .bind(active.app_profile)
         .bind(active.endpoint_hash)
         .fetch_one(tx.conn())
         .await?;
@@ -378,11 +372,10 @@ pub async fn accept_lease_event(
     )
     .await?;
 
-    let (is_active, app_profile, endpoint_hash, endpoint_grant, max_class, subscriptions) = active
-        .map_or((false, None, None, None, None, None), |active| {
+    let (is_active, endpoint_hash, endpoint_grant, max_class, subscriptions) = active
+        .map_or((false, None, None, None, None), |active| {
             (
                 true,
-                Some(active.app_profile),
                 Some(active.endpoint_hash),
                 Some(active.endpoint_grant),
                 Some(active.max_class),
@@ -391,18 +384,18 @@ pub async fn accept_lease_event(
         });
     if let Err(error) = sqlx::query(
         r#"INSERT INTO push_leases (community_id,author,installation_id,source_event_id,
-            source_created_at,generation,active,app_profile,endpoint_hash,endpoint_grant,max_class,
-            subscriptions,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            source_created_at,generation,active,endpoint_hash,endpoint_grant,max_class,
+            subscriptions,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         ON CONFLICT (community_id,author,installation_id) DO UPDATE SET
             source_event_id=EXCLUDED.source_event_id, source_created_at=EXCLUDED.source_created_at,
             generation=EXCLUDED.generation, active=EXCLUDED.active, endpoint_enabled=true,
-            app_profile=EXCLUDED.app_profile, endpoint_hash=EXCLUDED.endpoint_hash,
+            endpoint_hash=EXCLUDED.endpoint_hash,
             endpoint_grant=EXCLUDED.endpoint_grant, max_class=EXCLUDED.max_class,
             subscriptions=EXCLUDED.subscriptions, expires_at=EXCLUDED.expires_at, updated_at=now()"#,
     )
     .bind(community.as_uuid()).bind(author).bind(installation_id)
     .bind(version.source_event_id).bind(version.source_created_at).bind(version.generation)
-    .bind(is_active).bind(app_profile).bind(endpoint_hash).bind(endpoint_grant)
+    .bind(is_active).bind(endpoint_hash).bind(endpoint_grant)
     .bind(max_class).bind(subscriptions).bind(version.expires_at)
     .execute(tx.conn()).await
     {
@@ -477,18 +470,16 @@ async fn replace_lease(
     version: LeaseVersion<'_>,
     active: Option<ActiveLease<'_>>,
 ) -> Result<ReplaceLeaseOutcome> {
-    let (is_active, app_profile, endpoint_hash, endpoint_grant, max_class, subscriptions) =
-        match active {
-            Some(active) => (
-                true,
-                Some(active.app_profile),
-                Some(active.endpoint_hash),
-                Some(active.endpoint_grant),
-                Some(active.max_class),
-                Some(active.subscriptions),
-            ),
-            None => (false, None, None, None, None, None),
-        };
+    let (is_active, endpoint_hash, endpoint_grant, max_class, subscriptions) = match active {
+        Some(active) => (
+            true,
+            Some(active.endpoint_hash),
+            Some(active.endpoint_grant),
+            Some(active.max_class),
+            Some(active.subscriptions),
+        ),
+        None => (false, None, None, None, None),
+    };
 
     // T1b: an activating replacement can flip the community from "no eligible
     // lease" to "eligible"; serialize it against the event producer's shared
@@ -508,16 +499,15 @@ async fn replace_lease(
         r#"
         INSERT INTO push_leases (
             community_id, author, installation_id, source_event_id,
-            source_created_at, generation, active, app_profile, endpoint_hash,
+            source_created_at, generation, active, endpoint_hash,
             endpoint_grant, max_class, subscriptions, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (community_id, author, installation_id) DO UPDATE SET
             source_event_id = EXCLUDED.source_event_id,
             source_created_at = EXCLUDED.source_created_at,
             generation = EXCLUDED.generation,
             active = EXCLUDED.active,
             endpoint_enabled = true,
-            app_profile = EXCLUDED.app_profile,
             endpoint_hash = EXCLUDED.endpoint_hash,
             endpoint_grant = EXCLUDED.endpoint_grant,
             max_class = EXCLUDED.max_class,
@@ -542,7 +532,6 @@ async fn replace_lease(
     .bind(version.source_created_at)
     .bind(version.generation)
     .bind(is_active)
-    .bind(app_profile)
     .bind(endpoint_hash)
     .bind(endpoint_grant)
     .bind(max_class)
@@ -1577,7 +1566,6 @@ mod postgres_tests {
                 installation,
                 version(generation as u8, generation * 10, generation),
                 ActiveLease {
-                    app_profile: "ios-production",
                     endpoint_hash: endpoint,
                     endpoint_grant: "opaque-grant",
                     max_class: "default",
@@ -1612,7 +1600,6 @@ mod postgres_tests {
                 expires_at: 200,
             },
             Some(ActiveLease {
-                app_profile: "ios-production",
                 endpoint_hash: &endpoint,
                 endpoint_grant: "opaque-grant",
                 max_class: "not-a-class",
@@ -1666,7 +1653,6 @@ mod postgres_tests {
                     expires_at: 1,
                 },
                 Some(ActiveLease {
-                    app_profile: "ios-production",
                     endpoint_hash: &endpoint,
                     endpoint_grant: "opaque-grant",
                     max_class: "default",
@@ -1692,7 +1678,6 @@ mod postgres_tests {
                 expires_at: i64::MAX / 2,
             },
             Some(ActiveLease {
-                app_profile: "ios-production",
                 endpoint_hash: &[43; 32],
                 endpoint_grant: "replacement-grant",
                 max_class: "default",
@@ -1741,7 +1726,6 @@ mod postgres_tests {
                 expires_at: 200,
             },
             ActiveLease {
-                app_profile: "ios-production",
                 endpoint_hash: &endpoint,
                 endpoint_grant: "opaque-grant",
                 max_class: "default",
@@ -1803,7 +1787,6 @@ mod postgres_tests {
                 "install",
                 version(3, 15, 99),
                 ActiveLease {
-                    app_profile: "ios-production",
                     endpoint_hash: &endpoint,
                     endpoint_grant: "grant",
                     max_class: "default",
@@ -2792,7 +2775,6 @@ mod postgres_tests {
                     "install",
                     version(1, 10, 1),
                     ActiveLease {
-                        app_profile: "ios-production",
                         endpoint_hash: &[92; 32],
                         endpoint_grant: "opaque-grant",
                         max_class: "default",

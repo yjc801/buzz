@@ -15,12 +15,12 @@
 # injects the bucket credential server-side — the sprite never holds a key.
 # Collection is opt-in and fails closed: nothing is sent unless
 # BUZZ_COLLECT_CONNECTION names exactly one such connection AND its access
-# policy confines it to this agent — no allow_all, no name_prefix,
-# sprite_labels carrying this agent's own pubkey label, and every
-# allowed_endpoints entry under /agents/<pubkey>/. The bucket holds other
-# agents' plaintext transcripts, and the gateway accepts any key, so the
-# policy is the only isolation; each pass also probes that a key outside the
-# prefix and a bucket listing are actually refused before it sends anything.
+# policy confines it to this provider's sprites — no allow_all, no
+# name_prefix, and sprite_labels carrying the managed-by label. One
+# connection serves the whole fleet by design: every agent's sprite can
+# reach every agent's prefix, so the label is what keeps the bucket's
+# plaintext transcripts away from the org's other sprites, not from the
+# fleet's own agents.
 #
 # Failure discipline: a file counts as collected only after its PUT
 # succeeded, recorded by appending to an on-disk state file. A failed upload
@@ -72,41 +72,24 @@ fi
 [ -n "${BUZZ_COLLECT_CONNECTION:-}" ] || { say_once "BUZZ_COLLECT_CONNECTION unset; nothing collected"; exit 0; }
 GW=$(curl -sf --max-time 20 https://api.sprites.dev/v1/gateway/list | python3 -c '
 import json, os, sys
-want, pubkey = os.environ["BUZZ_COLLECT_CONNECTION"], sys.argv[1]
+want = os.environ["BUZZ_COLLECT_CONNECTION"]
 cs = [c for c in json.load(sys.stdin).get("connections", [])
       if c.get("provider") == "s3_object_store" and c.get("display_name") == want]
 if len(cs) != 1:
     sys.exit(3 if cs else 2)
 policy = cs[0].get("access_policy") or {}
-labels = policy.get("sprite_labels") or []
 if (policy.get("allow_all") or policy.get("name_prefix")
-        or "buzz.block.xyz/managed-by=buzz-backend-sprites" not in labels
-        or "buzz.block.xyz/agent-pubkey-full=" + pubkey not in labels):
+        or "buzz.block.xyz/managed-by=buzz-backend-sprites" not in (policy.get("sprite_labels") or [])):
     sys.exit(4)
-endpoints = policy.get("allowed_endpoints") or []
-if not endpoints or any(not e.startswith("/agents/%s/" % pubkey) for e in endpoints):
-    sys.exit(5)
 print(cs[0]["gateway_base_url"].rstrip("/"))
-' "$PUBKEY")
+')
 case $? in
     0) ;;
     2) say_once "no s3_object_store connection named $BUZZ_COLLECT_CONNECTION; nothing collected"; exit 1 ;;
     3) say_once "several s3_object_store connections named $BUZZ_COLLECT_CONNECTION; nothing collected"; exit 1 ;;
-    4) say_once "connection $BUZZ_COLLECT_CONNECTION is not confined to sprite_labels [buzz.block.xyz/managed-by=buzz-backend-sprites, buzz.block.xyz/agent-pubkey-full=$PUBKEY]; nothing collected"; exit 1 ;;
-    5) say_once "connection $BUZZ_COLLECT_CONNECTION is not confined to allowed_endpoints under /agents/$PUBKEY/; nothing collected"; exit 1 ;;
+    4) say_once "connection $BUZZ_COLLECT_CONNECTION is not confined to sprite_labels [buzz.block.xyz/managed-by=buzz-backend-sprites]; nothing collected"; exit 1 ;;
     *) say "gateway discovery failed; retrying next pass"; exit 1 ;;
 esac
-# The policy is what the gateway reports, not proof it enforces it: a key
-# outside this agent's prefix and a bucket listing must both be refused.
-other=$(printf '%064d' 0)
-[ "$PUBKEY" = "$other" ] && other=$(printf '%064d' 1)
-for probe in "agents/$other/meta.json" "?list-type=2&max-keys=1"; do
-    code=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' "$GW/$probe")
-    case "$code" in
-        401 | 403) ;;
-        *) say_once "connection $BUZZ_COLLECT_CONNECTION answered $code for $probe outside /agents/$PUBKEY/; nothing collected"; exit 1 ;;
-    esac
-done
 say_once "collecting to the object store"
 
 rm -rf -- "$WORK"
@@ -211,8 +194,9 @@ collect_tree "$HOME/.codex/sessions" codex
 # archive without bound. Only a file this disk sent and has since deleted
 # leaves the archive. If the stored `latest` cannot be read, nothing
 # replaces it. The archive is streamed, never held in memory.
-# Snapshot names live in an index inside the prefix, because the connection
-# cannot list the bucket. The index is written BEFORE a snapshot is uploaded
+# Snapshot names live in an index inside the prefix rather than in a bucket
+# listing, so a connection confined to the prefix — which cannot list —
+# works as well as the shared one. The index is written BEFORE a snapshot is uploaded
 # and pruned only after deletes succeed, so it always names every snapshot
 # that exists — a failure at any step leaves at most an extra name, never an
 # unindexed snapshot nothing would ever prune.

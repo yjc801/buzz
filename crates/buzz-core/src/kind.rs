@@ -584,6 +584,9 @@ pub const KIND_PRESENCE_UPDATE: u32 = 20001;
 pub const KIND_PAIRING: u32 = 24134;
 /// Ephemeral: typing indicator for a channel.
 pub const KIND_TYPING_INDICATOR: u32 = 20002;
+/// Ephemeral: an owner's presence for its agents. Content is the status, each
+/// `p` tag names one agent the signer owns. Never the signer's own presence.
+pub const KIND_AGENT_PRESENCE: u32 = 20003;
 /// Ephemeral: owner-scoped encrypted agent observer telemetry and control frame.
 pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
@@ -820,6 +823,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_THREAD_WINDOW_BOUNDS,
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
+    KIND_AGENT_PRESENCE,
     KIND_HUDDLE_REACTION,
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,
@@ -969,7 +973,10 @@ pub const fn is_command_kind(kind: u32) -> bool {
 /// never delivered.
 #[must_use]
 pub const fn requires_websocket_ingest(kind: u32) -> bool {
-    matches!(kind, KIND_GIFT_WRAP | KIND_PRESENCE_UPDATE)
+    matches!(
+        kind,
+        KIND_GIFT_WRAP | KIND_PRESENCE_UPDATE | KIND_AGENT_PRESENCE
+    )
 }
 
 /// Returns `true` if `kind` may only be authored by the relay.
@@ -1075,6 +1082,7 @@ mod tests {
         );
         assert!(requires_websocket_ingest(KIND_GIFT_WRAP));
         assert!(requires_websocket_ingest(KIND_PRESENCE_UPDATE));
+        assert!(requires_websocket_ingest(KIND_AGENT_PRESENCE));
     }
 
     #[test]

@@ -158,6 +158,41 @@ that branch is not pruned while it is checked out.
 `tests/workspace-sweep.test.sh` (a real origin with pull-request refs, the
 production script, a stub GitHub), run under `cargo test`.
 
+## Data collection
+
+A sprite's disk is mortal, and it holds the only record of what the agent
+actually did — every prompt, tool call, and tool output — plus the memory the
+harness keeps on its own. The collector (`~/.buzz/collect.sh`) copies both to
+the org's S3-compatible object store as raw material for the agent's
+self-evolution:
+
+| key under `agents/<pubkey>/` | source |
+|---|---|
+| `transcripts/claude/<path>.gz` | `~/.claude/projects/**`, except `memory/` |
+| `transcripts/codex/<path>.gz` | `~/.codex/sessions/**` |
+| `memory/latest.tar.gz`, `memory/snapshots/<utc>.tar.gz` (newest 14) | Claude's `memory/` directories, Codex's `memories_*.sqlite` (via `sqlite3 .backup`) |
+| `meta.json` | display name, runtime, model, owner |
+
+It reaches the bucket through the Sprites API gateway's `s3_object_store`
+connection (`/v1/gateway/list`), which injects the credential server-side — no
+key is ever on the sprite. No connection means nothing is collected; several
+need `BUZZ_COLLECT_CONNECTION` set to one display name. The launcher runs a
+pass at start, every ten minutes while the harness lives, and a final pass
+once it is gone. A transcript is sent once it has been quiet for five minutes
+(the final pass takes everything), re-sent when it changes, and recorded as
+collected only after its upload succeeded, so a failed pass is retried by the
+next. Every text file is scrubbed first: the exact values of the agent's
+secret environment variables (raw and JSON-escaped) and well-known credential
+shapes become `[redacted]`. Memory is never uploaded empty or partly staged,
+so a fresh disk cannot replace what an earlier one sent.
+
+The bucket holds plaintext transcripts — channel content and tool output —
+so scope the connection's access policy to the
+`buzz.block.xyz/managed-by=buzz-backend-sprites` label rather than every
+sprite in the org. The log is `~/.buzz/collect.log`; the contract is pinned by
+`tests/collect.test.sh` (the production script, a stub gateway and store),
+run under `cargo test`.
+
 ## [L3] Conformance — how this binding realizes the contract
 
 The spec (`docs/remote-agents.md`, §Conformance item 6) requires every binding
@@ -250,7 +285,7 @@ continuously synced to object storage and captured by checkpoints. The exec
 URL builder has no env parameter at all, and a test pins its absence.
 
 **Provisioning and change.** Provisioned artifacts — the digest-verified sprig
-runtime, the pinned ACP adapters, the launcher, probe, and keep-awake scripts — are
+runtime, the pinned ACP adapters, the launcher, probe, keep-awake, and collector scripts — are
 fingerprinted, and the fingerprint is recorded *inside* the sprite as the last
 step of a provision. A checkpoint restore therefore rolls the artifacts and
 their record back together, which a control-plane label could not do. A

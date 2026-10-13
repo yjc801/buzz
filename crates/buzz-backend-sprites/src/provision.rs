@@ -346,6 +346,7 @@ pub async fn resolve(
             probe_sha256: launcher::probe_sha256(),
             workspace_sha256: launcher::workspace_sha256(),
             keepawake_sha256: launcher::keepawake_sha256(),
+            collect_sha256: launcher::collect_sha256(),
             preapprove_agent_tools: cfg.preapprove_agent_tools,
         },
         arch,
@@ -577,6 +578,11 @@ pub async fn ensure(
             "install keep-awake",
             launcher::KEEPAWAKE_PATH,
             launcher::KEEPAWAKE_SH,
+        ),
+        (
+            "install collector",
+            launcher::COLLECT_PATH,
+            launcher::COLLECT_SH,
         ),
         // Written after sprig, never before: sprig extracts into the same
         // `bin/` directory, and an install that lost a race with the tarball

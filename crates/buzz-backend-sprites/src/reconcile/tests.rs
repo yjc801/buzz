@@ -381,6 +381,7 @@ fn desired_intent() -> String {
         probe_sha256: launcher::probe_sha256(),
         workspace_sha256: launcher::workspace_sha256(),
         keepawake_sha256: launcher::keepawake_sha256(),
+        collect_sha256: launcher::collect_sha256(),
         preapprove_agent_tools: true,
     };
     template.fingerprint().as_str().to_string()

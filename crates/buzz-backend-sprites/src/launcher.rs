@@ -1,4 +1,5 @@
-//! The embedded in-sprite assets (launcher, probe, keep-awake, workspace helper), their
+//! The embedded in-sprite assets (launcher, probe, keep-awake, workspace helper,
+//! collector), their
 //! content digests, the argv builders that invoke them, and the probe's typed
 //! report.
 
@@ -8,6 +9,7 @@ pub const LAUNCHER_SH: &str = include_str!("assets/launcher.sh");
 pub const PROBE_SH: &str = include_str!("assets/probe.sh");
 pub const WORKSPACE_SH: &str = include_str!("assets/workspace.sh");
 pub const KEEPAWAKE_SH: &str = include_str!("assets/keepawake.sh");
+pub const COLLECT_SH: &str = include_str!("assets/collect.sh");
 
 /// Where the assets live inside the sprite. Versioned by content (the shas
 /// participate in the provision fingerprint), so the paths themselves stay
@@ -15,6 +17,7 @@ pub const KEEPAWAKE_SH: &str = include_str!("assets/keepawake.sh");
 pub const LAUNCHER_PATH: &str = "/home/sprite/.buzz/launcher.sh";
 pub const PROBE_PATH: &str = "/home/sprite/.buzz/probe.sh";
 pub const KEEPAWAKE_PATH: &str = "/home/sprite/.buzz/keepawake.sh";
+pub const COLLECT_PATH: &str = "/home/sprite/.buzz/collect.sh";
 /// The workspace helper sits in `bin/` — unlike the launcher and probe, which
 /// only the provider invokes, this one is for the agent, and the launcher puts
 /// `bin/` on its PATH.
@@ -40,6 +43,10 @@ pub fn workspace_sha256() -> String {
 
 pub fn keepawake_sha256() -> String {
     sha256_hex(KEEPAWAKE_SH)
+}
+
+pub fn collect_sha256() -> String {
+    sha256_hex(COLLECT_SH)
 }
 
 /// The detachable session's argv. Only public identity travels here — the
@@ -143,6 +150,7 @@ mod tests {
             probe_sha256(),
             workspace_sha256(),
             keepawake_sha256(),
+            collect_sha256(),
         ];
         for sha in &digests {
             assert_eq!(sha.len(), 64);
@@ -278,6 +286,48 @@ mod tests {
         assert!(
             LAUNCHER_SH[..sweep].contains("exec 9>&-"),
             "the sweep subshell no longer closes the election lock"
+        );
+    }
+
+    /// The collector rides beside the harness the same way the sweep does,
+    /// with one addition that is the point of it: when the harness is gone
+    /// it runs a final pass before exiting, so the tail of the last session
+    /// reaches the object store rather than staying on a disk that may never
+    /// wake again. Off the election lock, lowest priority. Pinned as text.
+    #[test]
+    fn the_launcher_collects_off_the_election_lock_with_a_final_pass() {
+        let first = LAUNCHER_SH
+            .find(r#""$BUZZ/collect.sh" "$PUBKEY" "$GEN""#)
+            .expect("the launcher no longer runs the collector");
+        let subshell = LAUNCHER_SH[..first]
+            .rfind("(\n    exec 9>&-")
+            .expect("the collector subshell no longer closes the election lock first");
+        assert!(
+            !LAUNCHER_SH[subshell..first].contains("exec 9>\""),
+            "something re-opens fd 9 between closing it and the collector"
+        );
+        assert!(
+            LAUNCHER_SH[subshell..first].contains("nice -n 19"),
+            "the collector no longer runs at the lowest priority"
+        );
+        let rest = &LAUNCHER_SH[first..];
+        let gone = rest
+            .find(r#"!= "buzz-acp" ]; then"#)
+            .expect("the collector loop no longer notices the harness is gone");
+        let final_pass = rest
+            .find("collect --final")
+            .expect("the collector no longer runs a final pass");
+        let exit = rest[gone..]
+            .find("exit 0")
+            .map(|i| gone + i)
+            .expect("the collector loop no longer exits after the harness");
+        assert!(
+            gone < final_pass && final_pass < exit,
+            "the final pass must run after the harness is gone and before the loop exits"
+        );
+        assert!(
+            rest.find("collect --final") < rest.find(r#"exec "$BUZZ/bin/buzz-acp""#),
+            "the collector must be started before the launcher execs the harness"
         );
     }
 

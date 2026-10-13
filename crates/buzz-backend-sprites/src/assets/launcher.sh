@@ -11,10 +11,9 @@
 # and every sprite reprovisions on its next deploy.
 set -euo pipefail
 
-# Unused by the script body on purpose: the pubkey rides in argv so the
-# session list identifies which agent a session belongs to (the classifier's
-# argv-match negative). The generation names this attempt's env file.
-# shellcheck disable=SC2034
+# The pubkey rides in argv so the session list identifies which agent a
+# session belongs to (the classifier's argv-match negative); the collector
+# also keys its uploads by it. The generation names this attempt's env file.
 PUBKEY="$1"
 GEN="$2"
 BUZZ="$HOME/.buzz"
@@ -141,6 +140,29 @@ setsid "$BUZZ/keepawake.sh" </dev/null >/dev/null 2>&1 9>&- &
     while sleep 60; do
         [ "$(cat /proc/$SELF/comm 2>/dev/null)" = "buzz-acp" ] || exit 0
         sweep
+    done
+) &
+
+# Data collection: copy transcripts and memory to the org's object store
+# (collect.sh) — once now, every ten minutes while the harness lives, and a
+# final pass once it is gone, so the tail of the last session is not left
+# on a disk that may never wake again. Same shape as the sweep: fd 9 closed
+# first, lowest priority, best effort, its own log. A pass that fails leaves
+# its files unrecorded and the next pass retries them.
+(
+    exec 9>&-
+    collect() {
+        nice -n 19 "$BUZZ/collect.sh" "$PUBKEY" "$GEN" "$@" >>"$BUZZ/collect.log" 2>&1 || true
+    }
+    collect
+    ticks=0
+    while sleep 60; do
+        if [ "$(cat /proc/$SELF/comm 2>/dev/null)" != "buzz-acp" ]; then
+            collect --final
+            exit 0
+        fi
+        ticks=$((ticks + 1))
+        [ $((ticks % 10)) -eq 0 ] && collect
     done
 ) &
 

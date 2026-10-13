@@ -52,12 +52,14 @@ pub struct ProvisionTemplate {
     pub claude_adapter_version: &'static str,
     pub install_codex_adapter: bool,
     pub codex_adapter_version: &'static str,
-    /// Content digests of the embedded launcher/probe/workspace/keep-awake
-    /// assets, so a script change reprovisions every sprite it reaches.
+    /// Content digests of the embedded launcher/probe/workspace/keep-awake/
+    /// collector assets, so a script change reprovisions every sprite it
+    /// reaches.
     pub launcher_sha256: String,
     pub probe_sha256: String,
     pub workspace_sha256: String,
     pub keepawake_sha256: String,
+    pub collect_sha256: String,
     /// Whether provisioning writes the agent's tool pre-approval. Part of
     /// the fingerprint because turning it on or off changes what is
     /// written into the sprite — the change must reprovision, exactly like
@@ -112,6 +114,7 @@ mod tests {
             probe_sha256: "c".repeat(64),
             workspace_sha256: "9".repeat(64),
             keepawake_sha256: "6".repeat(64),
+            collect_sha256: "5".repeat(64),
             preapprove_agent_tools: true,
         }
     }
@@ -184,6 +187,11 @@ mod tests {
                 t.keepawake_sha256 = "7".repeat(64);
                 t
             }),
+            ("collect_sha256", {
+                let mut t = template();
+                t.collect_sha256 = "4".repeat(64);
+                t
+            }),
             ("preapprove_agent_tools", {
                 let mut t = template();
                 t.preapprove_agent_tools = false;
@@ -230,6 +238,7 @@ mod tests {
             "probe_sha256",
             "workspace_sha256",
             "keepawake_sha256",
+            "collect_sha256",
             "preapprove_agent_tools",
         ];
         let mut last = 0;

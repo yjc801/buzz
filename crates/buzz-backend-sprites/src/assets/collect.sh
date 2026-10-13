@@ -13,7 +13,11 @@
 #
 # How: through the Sprites API gateway's `s3_object_store` connection, which
 # injects the bucket credential server-side — the sprite never holds a key.
-# No connection configured means nothing to do, not an error.
+# Collection is opt-in and fails closed: nothing is sent unless
+# BUZZ_COLLECT_CONNECTION names exactly one such connection AND its access
+# policy admits only this provider's sprites (no allow_all, no name_prefix,
+# sprite_labels carrying the managed-by label). The bucket holds plaintext
+# transcripts, so a connection any other org sprite can reach is refused.
 #
 # Failure discipline: a file counts as collected only after its PUT
 # succeeded, recorded by appending to an on-disk state file. A failed upload
@@ -30,6 +34,9 @@ FINAL=""
 [ "${3:-}" = "--final" ] && FINAL=1
 BUZZ="$HOME/.buzz"
 STATE="$BUZZ/collect.state"
+# Memory paths this disk has uploaded (NUL-separated): the only remote
+# memory a pass may drop is a file this disk itself sent and has since lost.
+SEEN="$BUZZ/collect.memseen"
 NOTE="/dev/shm/buzz-collect.${GEN}.note"
 # Staging lives on the durable disk: the sprite's /tmp is a small volume
 # and the first pass of a long-lived agent stages a few hundred megabytes.
@@ -59,20 +66,26 @@ else
     flock -n 8 || exit 0
 fi
 
+[ -n "${BUZZ_COLLECT_CONNECTION:-}" ] || { say_once "BUZZ_COLLECT_CONNECTION unset; nothing collected"; exit 0; }
 GW=$(curl -sf --max-time 20 https://api.sprites.dev/v1/gateway/list | python3 -c '
 import json, os, sys
-want = os.environ.get("BUZZ_COLLECT_CONNECTION", "")
+want = os.environ["BUZZ_COLLECT_CONNECTION"]
+label = "buzz.block.xyz/managed-by=buzz-backend-sprites"
 cs = [c for c in json.load(sys.stdin).get("connections", [])
-      if c.get("provider") == "s3_object_store"
-      and (not want or c.get("display_name") == want)]
+      if c.get("provider") == "s3_object_store" and c.get("display_name") == want]
 if len(cs) != 1:
     sys.exit(3 if cs else 2)
+policy = cs[0].get("access_policy") or {}
+if (policy.get("allow_all") or policy.get("name_prefix")
+        or label not in (policy.get("sprite_labels") or [])):
+    sys.exit(4)
 print(cs[0]["gateway_base_url"].rstrip("/"))
 ')
 case $? in
     0) ;;
-    2) say_once "no s3_object_store connection; nothing collected"; exit 0 ;;
-    3) say_once "several s3_object_store connections; set BUZZ_COLLECT_CONNECTION to one display name"; exit 1 ;;
+    2) say_once "no s3_object_store connection named $BUZZ_COLLECT_CONNECTION; nothing collected"; exit 1 ;;
+    3) say_once "several s3_object_store connections named $BUZZ_COLLECT_CONNECTION; nothing collected"; exit 1 ;;
+    4) say_once "connection $BUZZ_COLLECT_CONNECTION is not scoped to sprite_labels [buzz.block.xyz/managed-by=buzz-backend-sprites] alone; nothing collected"; exit 1 ;;
     *) say "gateway discovery failed; retrying next pass"; exit 1 ;;
 esac
 say_once "collecting to the object store"
@@ -94,9 +107,12 @@ put() { # <local-file> <key> <content-type>
     curl -sf --max-time 600 --retry 2 -o /dev/null -H "Content-Type: $3" -T "$1" "$GW/$2"
 }
 
-# Copy <src> to <dst>, replacing the agent's own secret values (any env var
-# whose name says key/token/secret/password, exact and JSON-escaped) and
-# well-known credential shapes. `--gzip` compresses the result.
+# Copy <src> to <dst>, replacing the agent's own secret values (every
+# non-empty env var whose name says key/token/secret/password, exact and
+# JSON-escaped) and well-known credential shapes. A value under 12 bytes is
+# replaced only where it stands alone (not inside a longer alphanumeric run),
+# so a short password is still caught but a value like `1` does not erase
+# every digit. `--gzip` compresses the result.
 scrub() { # <src> <dst> [--gzip]
     python3 - "$@" <<'PY'
 import gzip, json, os, re, sys
@@ -104,7 +120,7 @@ src, dst = sys.argv[1], sys.argv[2]
 name = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH_TAG", re.I)
 values = set()
 for k, v in os.environ.items():
-    if name.search(k) and len(v) >= 12:
+    if name.search(k) and v:
         values.add(v)
         values.add(json.dumps(v)[1:-1])
 shapes = [re.compile(p, re.S) for p in (
@@ -120,7 +136,10 @@ shapes = [re.compile(p, re.S) for p in (
 with open(src, encoding="utf-8", errors="surrogateescape") as f:
     text = f.read()
 for v in sorted(values, key=len, reverse=True):
-    text = text.replace(v, "[redacted]")
+    if len(v) >= 12:
+        text = text.replace(v, "[redacted]")
+    else:
+        text = re.sub(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])", "[redacted]", text)
 for p in shapes:
     text = p.sub("[redacted]", text)
 data = text.encode("utf-8", errors="surrogateescape")
@@ -164,9 +183,13 @@ collect_tree "$HOME/.claude/projects" claude
 collect_tree "$HOME/.codex/sessions" codex
 
 # Memory: one snapshot of every memory store, uploaded when its content
-# changed. An empty or partly staged set is never uploaded — a fresh disk,
-# or one file that failed to stage, must not replace the memory a previous
-# pass collected.
+# changed. An empty or partly staged set is never uploaded. A disk's view is
+# not the whole memory either — a recreated sprite starts with none of what
+# its predecessor sent — so each upload is merged over the stored `latest`:
+# a stored file this disk never sent is kept, and one this disk replaces
+# without ever having sent it is kept under `superseded/<utc>/`. Only a file
+# this disk sent and has since deleted leaves the archive. If the stored
+# `latest` cannot be read, nothing replaces it.
 mkdir -p "$WORK/mem"
 staged=1
 for d in "$HOME"/.claude/projects/*/memory; do
@@ -188,10 +211,61 @@ if [ -z "$staged" ]; then
 elif [ -n "$(find "$WORK/mem" -type f -print -quit)" ]; then
     hash=$(cd "$WORK/mem" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64)
     if [ "${SENT[memory]:-}" != "$hash" ]; then
-        tar -czf "$WORK/mem.tar.gz" -C "$WORK/mem" .
-        snap="$PREFIX/memory/snapshots/$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-        if put "$WORK/mem.tar.gz" "$snap" application/gzip &&
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)
+        code=$(curl -s --max-time 600 -o "$WORK/prev.tar.gz" -w '%{http_code}' "$GW/$PREFIX/memory/latest.tar.gz")
+        case "$code" in
+            200) prev="$WORK/prev.tar.gz" ;;
+            404) prev="" ;;
+            *) prev="-" ;;
+        esac
+        if [ "$prev" = "-" ]; then
+            say "could not read the stored memory (HTTP $code); snapshot not sent"
+            failed=$((failed + 1))
+        elif ! python3 - "$WORK/mem" "$prev" "$SEEN" "$WORK/mem.tar.gz" "$WORK/memseen" "$stamp" <<'PY'
+import io, os, sys, tarfile
+stage, prev, seen_path, out, seen_out, stamp = sys.argv[1:7]
+enc = lambda b: b.decode("utf-8", "surrogateescape")
+local = {}
+for root, _, files in os.walk(stage):
+    for f in files:
+        full = os.path.join(root, f)
+        local[os.path.relpath(full, stage)] = full
+seen = set()
+if os.path.exists(seen_path):
+    with open(seen_path, "rb") as f:
+        seen = set(enc(f.read()).split("\0")) - {""}
+stored = {}
+if prev:
+    with tarfile.open(prev, "r:gz") as t:
+        for m in t.getmembers():
+            if m.isfile():
+                name = m.name[2:] if m.name.startswith("./") else m.name
+                stored[name] = t.extractfile(m).read()
+with tarfile.open(out, "w:gz") as t:
+    def keep(name, data):
+        info = tarfile.TarInfo("./" + name)
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
+    for name, full in sorted(local.items()):
+        t.add(full, arcname="./" + name, recursive=False)
+    for name, data in sorted(stored.items()):
+        if name in seen:
+            continue
+        if name not in local:
+            keep(name, data)
+        else:
+            with open(local[name], "rb") as f:
+                if f.read() != data:
+                    keep("superseded/%s/%s" % (stamp, name), data)
+with open(seen_out, "wb") as f:
+    f.write("\0".join(sorted(seen | set(local))).encode("utf-8", "surrogateescape"))
+PY
+        then
+            say "could not merge the stored memory; snapshot not sent"
+            failed=$((failed + 1))
+        elif put "$WORK/mem.tar.gz" "$PREFIX/memory/snapshots/$stamp.tar.gz" application/gzip &&
             put "$WORK/mem.tar.gz" "$PREFIX/memory/latest.tar.gz" application/gzip; then
+            mv -f -- "$WORK/memseen" "$SEEN"
             record memory "$hash"
             sent=$((sent + 1))
             # Keep the newest snapshots; a failed delete only leaves an extra.

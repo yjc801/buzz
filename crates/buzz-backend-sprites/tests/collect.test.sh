@@ -13,9 +13,13 @@
 #
 #   * nothing counts as collected until its upload succeeded — a failed PUT
 #     is retried on the next pass, and an unchanged file is not re-sent;
-#   * the agent's own secrets and well-known credential shapes never reach
-#     the bucket;
-#   * an empty memory set never replaces the memory a previous pass sent.
+#   * nothing is sent unless the operator named a connection that only this
+#     provider's sprites can reach;
+#   * the agent's own secrets — short ones too — and well-known credential
+#     shapes never reach the bucket;
+#   * no disk's partial view replaces the memory a previous pass sent: an
+#     empty set is not uploaded, and a recreated disk's first memory is
+#     merged over the stored archive rather than replacing it.
 #
 # The scenario is the real script under a private HOME and a stub `curl`
 # standing in for the Sprites gateway and the object store behind it.
@@ -34,15 +38,17 @@ GW="https://gw.test/v1/gateway/s3_object_store/conn"
 
 # The stub gateway and object store. The discovery call answers from
 # $CS/connections; PUT -T stores the body under $CS/store/<key> and counts
-# it; GET ?list-type=2 lists; DELETE removes. `fail_put` fails every PUT.
+# it; GET ?list-type=2 lists; GET <key> answers 200 or 404 like the gateway;
+# DELETE removes. `fail_put` fails every PUT, `fail_get` every object GET.
 cat >"$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-m=GET url="" up="" out=""
+m=GET url="" up="" out="" w=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -X) m=$2; shift ;;
         -T) up=$2; m=PUT; shift ;;
         -o) out=$2; shift ;;
+        -w) w=1; shift ;;
         -H|--max-time|--retry) shift ;;
         https://*) url=$1 ;;
     esac
@@ -60,6 +66,14 @@ case "$m" in
         echo "$key" >>"$CS/puts"
         ;;
     DELETE) rm -f "$CS/store/$key" ;;
+    GET) case "$url" in *'?'*) ;; *)
+        if [ -e "$CS/fail_get" ]; then code=500
+        elif [ -f "$CS/store/$key" ]; then code=200; cp "$CS/store/$key" "$out"
+        else code=404
+        fi
+        [ -n "$w" ] && printf '%s' "$code"
+        exit 0 ;;
+    esac ;;&
     *)
         prefix=${url#*prefix=}
         printf '<ListBucketResult>'
@@ -72,10 +86,13 @@ EOF
 chmod +x "$T/bin/curl"
 export PATH="$T/bin:$PATH"
 
-conn() { # <display-name>...
-    printf '{"connections":[{"provider":"github","gateway_base_url":"https://gw.test/gh"}'
+SCOPED='{"sprite_labels":["buzz.block.xyz/managed-by=buzz-backend-sprites"]}'
+conn() { # <access-policy-json> <display-name>...
+    local policy=$1
+    shift
+    printf '{"connections":[{"provider":"github","gateway_base_url":"https://gw.test/gh","access_policy":{"allow_all":true}}'
     for n in "$@"; do
-        printf ',{"provider":"s3_object_store","display_name":"%s","gateway_base_url":"%s/"}' "$n" "$GW"
+        printf ',{"provider":"s3_object_store","display_name":"%s","gateway_base_url":"%s/","access_policy":%s}' "$n" "$GW" "$policy"
     done
     printf ']}\n'
 }
@@ -94,32 +111,48 @@ puts() { wc -l <"$CS/puts" | tr -d ' '; }
 
 # The agent's secrets, as the launcher's environment carries them.
 export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-secretsecretsecretsecret"
+export DB_PASSWORD="hunter2"
 export NOSTR_PRIVATE_KEY="5f3a9c0b7e2d4f6a8c1e3b5d7f9a2c4e6b8d0f1a3c5e7b9d2f4a6c8e0b1d3f5a"
 export BUZZ_ACP_DISPLAY_NAME="Chris" BUZZ_ACP_AGENT_COMMAND="claude-agent-acp"
 export BUZZ_COLLECT_QUIET_SECS=300
 
 P="$HOME/.claude/projects/-home-sprite"
-mkdir -p "$P/memory" "$P/s1" "$HOME/.codex/sessions/2026/10/12"
-printf '{"out":"token %s key %s gh ghp_%s"}\n' \
-    "$CLAUDE_CODE_OAUTH_TOKEN" "$NOSTR_PRIVATE_KEY" "abcdefghijklmnopqrstuvwxyz0123456789AB" >"$P/old.jsonl"
+Q="$HOME/.claude/projects/-home-sprite-repo"
+mkdir -p "$P/memory" "$P/s1" "$Q/memory" "$HOME/.codex/sessions/2026/10/12"
+printf '{"out":"token %s key %s gh ghp_%s"}\n{"cmd":"env","out":"DB_PASSWORD=%s\\nNOTE=hunter22"}\n' \
+    "$CLAUDE_CODE_OAUTH_TOKEN" "$NOSTR_PRIVATE_KEY" "abcdefghijklmnopqrstuvwxyz0123456789AB" "$DB_PASSWORD" >"$P/old.jsonl"
 printf 'tool output\n' >"$P/s1/tool-result.txt"
 printf '{"live":true}\n' >"$P/live.jsonl"
 printf '# Memory\n- learned a thing\n' >"$P/memory/MEMORY.md"
+printf 'repo notes\n' >"$Q/memory/notes.md"
 printf '{"codex":1}\n' >"$HOME/.codex/sessions/2026/10/12/rollout.jsonl"
 touch -d '1 hour ago' "$P/old.jsonl" "$P/s1/tool-result.txt" "$HOME/.codex/sessions/2026/10/12/rollout.jsonl"
 
-# 1. No connection: nothing to do, and not an error.
-conn >"$CS/connections"
+# 1. Collection is opt-in: no connection named, nothing sent, not an error.
+conn "$SCOPED" agent-memories >"$CS/connections"
+unset BUZZ_COLLECT_CONNECTION
 run
-check "no connection exits 0" '[ "$rc" -eq 0 ]'
-check "no connection uploads nothing" '[ -z "$(ls -A "$CS/store")" ]'
-check "no connection says why" 'grep -q "no s3_object_store connection" "$T/log"'
+check "unnamed connection exits 0" '[ "$rc" -eq 0 ]'
+check "unnamed connection uploads nothing" '[ -z "$(ls -A "$CS/store")" ]'
+check "unnamed connection says why" 'grep -q "BUZZ_COLLECT_CONNECTION unset" "$T/log"'
 
-# 2. Two connections and no choice: refuse rather than guess.
-conn a b >"$CS/connections"
-run
-check "ambiguous connections fail" '[ "$rc" -ne 0 ] && [ -z "$(ls -A "$CS/store")" ]'
-export BUZZ_COLLECT_CONNECTION=b
+# 2. A named connection that is missing, ambiguous, or reachable by sprites
+#    outside this provider is refused before any PUT.
+export BUZZ_COLLECT_CONNECTION=agent-memories
+refused() { # <label> — the last pass sent nothing and failed
+    check "$1 is refused" '[ "$rc" -ne 0 ] && [ -z "$(ls -A "$CS/store")" ]'
+}
+conn "$SCOPED" other >"$CS/connections"; run; refused "a missing connection"
+conn "$SCOPED" agent-memories agent-memories >"$CS/connections"; run; refused "an ambiguous connection"
+conn '{"allow_all":true}' agent-memories >"$CS/connections"; run; refused "an allow_all connection"
+conn '{"allow_all":true,"sprite_labels":["buzz.block.xyz/managed-by=buzz-backend-sprites"]}' agent-memories >"$CS/connections"
+run; refused "allow_all beside the label"
+conn '{"name_prefix":"buzz-","sprite_labels":["buzz.block.xyz/managed-by=buzz-backend-sprites"]}' agent-memories >"$CS/connections"
+run; refused "a name_prefix grant"
+conn '{"sprite_labels":["github"]}' agent-memories >"$CS/connections"; run; refused "another label"
+conn '{}' agent-memories >"$CS/connections"; run; refused "an empty policy"
+check "an unscoped connection says why" 'grep -q "is not scoped to sprite_labels" "$T/log"'
+conn "$SCOPED" agent-memories other >"$CS/connections"
 
 # 3. A failed upload is not recorded.
 touch "$CS/fail_put"
@@ -140,6 +173,8 @@ check "oauth token scrubbed" '! gunz transcripts/claude/-home-sprite/old.jsonl.g
 check "private key scrubbed" '! gunz transcripts/claude/-home-sprite/old.jsonl.gz | grep -q "$NOSTR_PRIVATE_KEY"'
 check "github token shape scrubbed" '! gunz transcripts/claude/-home-sprite/old.jsonl.gz | grep -q "ghp_"'
 check "scrubbed text keeps its shape" 'gunz transcripts/claude/-home-sprite/old.jsonl.gz | grep -q "token \[redacted\] key \[redacted\]"'
+check "short secret scrubbed" 'gunz transcripts/claude/-home-sprite/old.jsonl.gz | grep -q "DB_PASSWORD=\[redacted\]" && ! gunz transcripts/claude/-home-sprite/old.jsonl.gz | grep -qw "hunter2"'
+check "short secret spares longer words" 'gunz transcripts/claude/-home-sprite/old.jsonl.gz | grep -q "NOTE=hunter22"'
 check "memory latest sent" 'tar -xzOf "$CS/store/agents/$PK/memory/latest.tar.gz" ./claude/-home-sprite/memory/MEMORY.md | grep -q "learned a thing"'
 check "one memory snapshot" '[ "$(ls "$CS/store/agents/$PK/memory/snapshots" | wc -l)" -eq 1 ]'
 check "meta names the agent" 'grep -q "\"display_name\": \"Chris\"" "$CS/store/agents/$PK/meta.json"'
@@ -161,10 +196,51 @@ check "changed memory sends a snapshot and latest" '[ "$(grep -c memory/ "$CS/pu
 check "snapshots are pruned to 14" '[ "$(ls "$CS/store/agents/$PK/memory/snapshots" | wc -l)" -eq 14 ]'
 check "latest is the new memory" 'tar -xzOf "$CS/store/agents/$PK/memory/latest.tar.gz" ./claude/-home-sprite/memory/MEMORY.md | grep -q "another thing"'
 
+check "a disk's own edit supersedes nothing" '! tar -tzf "$CS/store/agents/$PK/memory/latest.tar.gz" | grep -q superseded'
+
+latest() { tar -xzOf "$CS/store/agents/$PK/memory/latest.tar.gz" "$@" 2>/dev/null; }
+latest_has() { tar -tzf "$CS/store/agents/$PK/memory/latest.tar.gz" | grep -q "$1"; }
+
 # 8. An empty memory set never replaces what was sent.
-rm -rf "$P/memory"
+rm -rf "$P/memory" "$Q/memory"
 run
-check "empty memory leaves latest alone" '[ "$rc" -eq 0 ] && ! grep -q memory/ "$CS/puts" && tar -xzOf "$CS/store/agents/$PK/memory/latest.tar.gz" ./claude/-home-sprite/memory/MEMORY.md | grep -q "another thing"'
+check "empty memory leaves latest alone" '[ "$rc" -eq 0 ] && ! grep -q memory/ "$CS/puts" && latest ./claude/-home-sprite/memory/MEMORY.md | grep -q "another thing" && latest ./claude/-home-sprite-repo/memory/notes.md | grep -q "repo notes"'
+
+# 9. A recreated disk: no state, and only one of the stored memories has
+#    reappeared, with different content. Nothing the old disk sent is lost.
+rm -f "$HOME/.buzz/collect.state" "$HOME/.buzz/collect.memseen"
+mkdir -p "$P/memory"
+printf '# Memory\n- fresh body\n' >"$P/memory/MEMORY.md"
+run
+check "fresh disk uploads" '[ "$rc" -eq 0 ] && [ "$(grep -c memory/ "$CS/puts")" -eq 2 ]'
+check "fresh disk keeps memory it never had" 'latest ./claude/-home-sprite-repo/memory/notes.md | grep -q "repo notes"'
+check "fresh disk sends its own memory" 'latest ./claude/-home-sprite/memory/MEMORY.md | grep -q "fresh body"'
+check "fresh disk keeps the memory it replaced" 'latest --wildcards "./superseded/*/claude/-home-sprite/memory/MEMORY.md" | grep -q "another thing"'
+
+# 10. Many sparse changes later, every snapshot still holds the whole set.
+for i in $(seq 1 15); do
+    printf '# Memory\n- fresh body %s\n' "$i" >"$P/memory/MEMORY.md"
+    run
+done
+newest=$(cd "$CS/store/agents/$PK/memory/snapshots" && printf '%s\n' * | sort | tail -1)
+check "sparse changes keep the old memory in latest" 'latest ./claude/-home-sprite-repo/memory/notes.md | grep -q "repo notes" && latest_has "superseded/.*/MEMORY.md"'
+check "sparse changes keep it in the newest snapshot" 'tar -tzf "$CS/store/agents/$PK/memory/snapshots/$newest" | grep -q notes.md'
+check "sparse changes supersede once" '[ "$(tar -tzf "$CS/store/agents/$PK/memory/latest.tar.gz" | grep -c superseded/)" -eq 1 ]'
+
+# 11. A file this disk sent and then deleted leaves the archive.
+rm "$P/memory/MEMORY.md"
+printf 'other\n' >"$P/memory/other.md"
+run
+check "a deletion by this disk is honoured" '[ "$rc" -eq 0 ] && ! latest_has "^\./claude/-home-sprite/memory/MEMORY.md" && latest_has "/other.md" && latest_has "/notes.md"'
+
+# 12. A stored latest that cannot be read is never replaced.
+touch "$CS/fail_get"
+printf 'other changed\n' >"$P/memory/other.md"
+run
+rm -f "$CS/fail_get"
+check "unreadable latest fails the pass and is not replaced" '[ "$rc" -ne 0 ] && ! grep -q memory/ "$CS/puts" && grep -q "could not read the stored memory" "$T/log"'
+run
+check "the next pass sends it" '[ "$rc" -eq 0 ] && latest ./claude/-home-sprite/memory/other.md | grep -q "other changed"'
 
 rm -rf "$T" "/dev/shm/buzz-collect.${GEN}.note"
 echo "$pass passed, $fail failed"

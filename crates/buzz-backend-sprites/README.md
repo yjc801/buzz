@@ -175,21 +175,29 @@ self-evolution:
 
 It reaches the bucket through the Sprites API gateway's `s3_object_store`
 connection (`/v1/gateway/list`), which injects the credential server-side — no
-key is ever on the sprite. No connection means nothing is collected; several
-need `BUZZ_COLLECT_CONNECTION` set to one display name. The launcher runs a
+key is ever on the sprite. Collection is opt-in and fails closed: nothing is
+sent unless the agent's environment sets `BUZZ_COLLECT_CONNECTION` to the
+display name of exactly one such connection, and that connection's access
+policy admits only this provider's sprites — `allow_all` off, no
+`name_prefix`, and `sprite_labels` containing
+`buzz.block.xyz/managed-by=buzz-backend-sprites`. The bucket holds plaintext
+transcripts (channel content and tool output), so a connection other org
+sprites can reach is refused before the first upload. The launcher runs a
 pass at start, every ten minutes while the harness lives, and a final pass
 once it is gone. A transcript is sent once it has been quiet for five minutes
 (the final pass takes everything), re-sent when it changes, and recorded as
 collected only after its upload succeeded, so a failed pass is retried by the
 next. Every text file is scrubbed first: the exact values of the agent's
-secret environment variables (raw and JSON-escaped) and well-known credential
-shapes become `[redacted]`. Memory is never uploaded empty or partly staged,
-so a fresh disk cannot replace what an earlier one sent.
-
-The bucket holds plaintext transcripts — channel content and tool output —
-so scope the connection's access policy to the
-`buzz.block.xyz/managed-by=buzz-backend-sprites` label rather than every
-sprite in the org. The log is `~/.buzz/collect.log`; the contract is pinned by
+secret environment variables (raw and JSON-escaped; a value under 12 bytes
+wherever it stands alone) and well-known credential shapes become
+`[redacted]`. Memory is never uploaded empty or partly staged, and never
+replaces the stored archive outright: each upload is merged over the stored
+`latest`, keeping every file this disk never sent, and keeping a stored file
+this disk replaced without having sent it under `superseded/<utc>/`. Only a
+file this disk sent and then deleted leaves the archive, so a recreated
+sprite's first few memories cannot displace what its predecessor collected.
+If the stored `latest` cannot be read, the pass fails and nothing replaces it.
+The log is `~/.buzz/collect.log`; the contract is pinned by
 `tests/collect.test.sh` (the production script, a stub gateway and store),
 run under `cargo test`.
 

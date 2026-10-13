@@ -15,9 +15,12 @@
 # injects the bucket credential server-side — the sprite never holds a key.
 # Collection is opt-in and fails closed: nothing is sent unless
 # BUZZ_COLLECT_CONNECTION names exactly one such connection AND its access
-# policy admits only this provider's sprites (no allow_all, no name_prefix,
-# sprite_labels carrying the managed-by label). The bucket holds plaintext
-# transcripts, so a connection any other org sprite can reach is refused.
+# policy confines it to this agent — no allow_all, no name_prefix,
+# sprite_labels carrying this agent's own pubkey label, and every
+# allowed_endpoints entry under /agents/<pubkey>/. The bucket holds other
+# agents' plaintext transcripts, and the gateway accepts any key, so the
+# policy is the only isolation; each pass also probes that a key outside the
+# prefix and a bucket listing are actually refused before it sends anything.
 #
 # Failure discipline: a file counts as collected only after its PUT
 # succeeded, recorded by appending to an on-disk state file. A failed upload
@@ -69,25 +72,41 @@ fi
 [ -n "${BUZZ_COLLECT_CONNECTION:-}" ] || { say_once "BUZZ_COLLECT_CONNECTION unset; nothing collected"; exit 0; }
 GW=$(curl -sf --max-time 20 https://api.sprites.dev/v1/gateway/list | python3 -c '
 import json, os, sys
-want = os.environ["BUZZ_COLLECT_CONNECTION"]
-label = "buzz.block.xyz/managed-by=buzz-backend-sprites"
+want, pubkey = os.environ["BUZZ_COLLECT_CONNECTION"], sys.argv[1]
 cs = [c for c in json.load(sys.stdin).get("connections", [])
       if c.get("provider") == "s3_object_store" and c.get("display_name") == want]
 if len(cs) != 1:
     sys.exit(3 if cs else 2)
 policy = cs[0].get("access_policy") or {}
+labels = policy.get("sprite_labels") or []
 if (policy.get("allow_all") or policy.get("name_prefix")
-        or label not in (policy.get("sprite_labels") or [])):
+        or "buzz.block.xyz/managed-by=buzz-backend-sprites" not in labels
+        or "buzz.block.xyz/agent-pubkey-full=" + pubkey not in labels):
     sys.exit(4)
+endpoints = policy.get("allowed_endpoints") or []
+if not endpoints or any(not e.startswith("/agents/%s/" % pubkey) for e in endpoints):
+    sys.exit(5)
 print(cs[0]["gateway_base_url"].rstrip("/"))
-')
+' "$PUBKEY")
 case $? in
     0) ;;
     2) say_once "no s3_object_store connection named $BUZZ_COLLECT_CONNECTION; nothing collected"; exit 1 ;;
     3) say_once "several s3_object_store connections named $BUZZ_COLLECT_CONNECTION; nothing collected"; exit 1 ;;
-    4) say_once "connection $BUZZ_COLLECT_CONNECTION is not scoped to sprite_labels [buzz.block.xyz/managed-by=buzz-backend-sprites] alone; nothing collected"; exit 1 ;;
+    4) say_once "connection $BUZZ_COLLECT_CONNECTION is not confined to sprite_labels [buzz.block.xyz/managed-by=buzz-backend-sprites, buzz.block.xyz/agent-pubkey-full=$PUBKEY]; nothing collected"; exit 1 ;;
+    5) say_once "connection $BUZZ_COLLECT_CONNECTION is not confined to allowed_endpoints under /agents/$PUBKEY/; nothing collected"; exit 1 ;;
     *) say "gateway discovery failed; retrying next pass"; exit 1 ;;
 esac
+# The policy is what the gateway reports, not proof it enforces it: a key
+# outside this agent's prefix and a bucket listing must both be refused.
+other=$(printf '%064d' 0)
+[ "$PUBKEY" = "$other" ] && other=$(printf '%064d' 1)
+for probe in "agents/$other/meta.json" "?list-type=2&max-keys=1"; do
+    code=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' "$GW/$probe")
+    case "$code" in
+        401 | 403) ;;
+        *) say_once "connection $BUZZ_COLLECT_CONNECTION answered $code for $probe outside /agents/$PUBKEY/; nothing collected"; exit 1 ;;
+    esac
+done
 say_once "collecting to the object store"
 
 rm -rf -- "$WORK"
@@ -187,9 +206,39 @@ collect_tree "$HOME/.codex/sessions" codex
 # not the whole memory either — a recreated sprite starts with none of what
 # its predecessor sent — so each upload is merged over the stored `latest`:
 # a stored file this disk never sent is kept, and one this disk replaces
-# without ever having sent it is kept under `superseded/<utc>/`. Only a file
-# this disk sent and has since deleted leaves the archive. If the stored
-# `latest` cannot be read, nothing replaces it.
+# without ever having sent it is kept under `superseded/<utc>/` — the newest
+# such copy of each path only, so repeated recreations cannot grow the
+# archive without bound. Only a file this disk sent and has since deleted
+# leaves the archive. If the stored `latest` cannot be read, nothing
+# replaces it. The archive is streamed, never held in memory.
+# Snapshot names live in an index inside the prefix, because the connection
+# cannot list the bucket. The index is written BEFORE a snapshot is uploaded
+# and pruned only after deletes succeed, so it always names every snapshot
+# that exists — a failure at any step leaves at most an extra name, never an
+# unindexed snapshot nothing would ever prune.
+IDX="$PREFIX/memory/snapshots.idx"
+index_snapshot() { # <stamp>
+    local code
+    code=$(curl -s --max-time 30 -o "$WORK/idx" -w '%{http_code}' "$GW/$IDX")
+    case "$code" in
+        200) ;;
+        404) : >"$WORK/idx" ;;
+        *) return 1 ;;
+    esac
+    { cat "$WORK/idx"; echo "$1"; } | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort -u >"$WORK/idx.all"
+    put "$WORK/idx.all" "$IDX" text/plain
+}
+prune_snapshots() { # keep the newest $KEEP_SNAPSHOTS; a failed delete stays indexed
+    local old
+    tail -n "$KEEP_SNAPSHOTS" "$WORK/idx.all" >"$WORK/idx.new"
+    while IFS= read -r old; do
+        curl -sf --max-time 30 -o /dev/null -X DELETE "$GW/$PREFIX/memory/snapshots/$old.tar.gz" ||
+            echo "$old" >>"$WORK/idx.new"
+    done < <(head -n -"$KEEP_SNAPSHOTS" "$WORK/idx.all")
+    sort -u -o "$WORK/idx.new" "$WORK/idx.new"
+    cmp -s "$WORK/idx.new" "$WORK/idx.all" || put "$WORK/idx.new" "$IDX" text/plain
+}
+
 mkdir -p "$WORK/mem"
 staged=1
 for d in "$HOME"/.claude/projects/*/memory; do
@@ -222,9 +271,16 @@ elif [ -n "$(find "$WORK/mem" -type f -print -quit)" ]; then
             say "could not read the stored memory (HTTP $code); snapshot not sent"
             failed=$((failed + 1))
         elif ! python3 - "$WORK/mem" "$prev" "$SEEN" "$WORK/mem.tar.gz" "$WORK/memseen" "$stamp" <<'PY'
-import io, os, sys, tarfile
+import hashlib, os, sys, tarfile
 stage, prev, seen_path, out, seen_out, stamp = sys.argv[1:7]
+SUP = "superseded/"
 enc = lambda b: b.decode("utf-8", "surrogateescape")
+norm = lambda n: n[2:] if n.startswith("./") else n
+def digest(f):
+    h = hashlib.sha256()
+    for chunk in iter(lambda: f.read(1 << 20), b""):
+        h.update(chunk)
+    return h.digest()
 local = {}
 for root, _, files in os.walk(stage):
     for f in files:
@@ -234,48 +290,52 @@ seen = set()
 if os.path.exists(seen_path):
     with open(seen_path, "rb") as f:
         seen = set(enc(f.read()).split("\0")) - {""}
-stored = {}
-if prev:
-    with tarfile.open(prev, "r:gz") as t:
-        for m in t.getmembers():
-            if m.isfile():
-                name = m.name[2:] if m.name.startswith("./") else m.name
-                stored[name] = t.extractfile(m).read()
-with tarfile.open(out, "w:gz") as t:
-    def keep(name, data):
-        info = tarfile.TarInfo("./" + name)
-        info.size = len(data)
-        t.addfile(info, io.BytesIO(data))
+with tarfile.open(out, "w:gz") as dst:
     for name, full in sorted(local.items()):
-        t.add(full, arcname="./" + name, recursive=False)
-    for name, data in sorted(stored.items()):
-        if name in seen:
-            continue
-        if name not in local:
-            keep(name, data)
-        else:
-            with open(local[name], "rb") as f:
-                if f.read() != data:
-                    keep("superseded/%s/%s" % (stamp, name), data)
+        dst.add(full, arcname="./" + name, recursive=False)
+    if prev:
+        with tarfile.open(prev, "r:gz") as src:
+            members = [m for m in src.getmembers() if m.isfile()]
+            plan, replaced, newest = [], set(), {}
+            for m in members:
+                name = norm(m.name)
+                if name.startswith(SUP) or name in seen:
+                    continue
+                if name not in local:
+                    plan.append((m, name))
+                    continue
+                with open(local[name], "rb") as f:
+                    if digest(src.extractfile(m)) != digest(f):
+                        plan.append((m, SUP + stamp + "/" + name))
+                        replaced.add(name)
+            # One superseded copy per path: this pass's, else the newest stored.
+            for m in members:
+                name = norm(m.name)
+                if not name.startswith(SUP) or "/" not in name[len(SUP):]:
+                    continue
+                when, orig = name[len(SUP):].split("/", 1)
+                if orig not in replaced and when >= newest.get(orig, ("", None))[0]:
+                    newest[orig] = (when, m)
+            plan += [(m, norm(m.name)) for _, m in newest.values()]
+            for m, name in plan:
+                info = tarfile.TarInfo("./" + name)
+                info.size, info.mtime = m.size, m.mtime
+                dst.addfile(info, src.extractfile(m))
 with open(seen_out, "wb") as f:
     f.write("\0".join(sorted(seen | set(local))).encode("utf-8", "surrogateescape"))
 PY
         then
             say "could not merge the stored memory; snapshot not sent"
             failed=$((failed + 1))
+        elif ! index_snapshot "$stamp"; then
+            say "could not record the snapshot in its index; snapshot not sent"
+            failed=$((failed + 1))
         elif put "$WORK/mem.tar.gz" "$PREFIX/memory/snapshots/$stamp.tar.gz" application/gzip &&
             put "$WORK/mem.tar.gz" "$PREFIX/memory/latest.tar.gz" application/gzip; then
             mv -f -- "$WORK/memseen" "$SEEN"
             record memory "$hash"
             sent=$((sent + 1))
-            # Keep the newest snapshots; a failed delete only leaves an extra.
-            curl -sf --max-time 30 "$GW/?list-type=2&prefix=$PREFIX/memory/snapshots/" | python3 -c '
-import re, sys
-keys = sorted(re.findall(r"<Key>([^<]+)</Key>", sys.stdin.read()))
-print("\n".join(keys[:-int(sys.argv[1])]))
-' "$KEEP_SNAPSHOTS" | while IFS= read -r old; do
-                [ -n "$old" ] && curl -sf --max-time 30 -o /dev/null -X DELETE "$GW/$old"
-            done
+            prune_snapshots || say "snapshot pruning incomplete; the index keeps the rest for the next pass"
         else
             say "upload failed: memory snapshot"
             failed=$((failed + 1))

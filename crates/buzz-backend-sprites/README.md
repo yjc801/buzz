@@ -178,11 +178,18 @@ connection (`/v1/gateway/list`), which injects the credential server-side — no
 key is ever on the sprite. Collection is opt-in and fails closed: nothing is
 sent unless the agent's environment sets `BUZZ_COLLECT_CONNECTION` to the
 display name of exactly one such connection, and that connection's access
-policy admits only this provider's sprites — `allow_all` off, no
-`name_prefix`, and `sprite_labels` containing
-`buzz.block.xyz/managed-by=buzz-backend-sprites`. The bucket holds plaintext
-transcripts (channel content and tool output), so a connection other org
-sprites can reach is refused before the first upload. The launcher runs a
+policy confines it to this one agent — `allow_all` off, no `name_prefix`,
+`sprite_labels` containing both
+`buzz.block.xyz/managed-by=buzz-backend-sprites` and the agent's own
+`buzz.block.xyz/agent-pubkey-full=<pubkey>`, and every `allowed_endpoints`
+entry under `/agents/<pubkey>/` (e.g. `/agents/<pubkey>/*`). The bucket holds
+every agent's plaintext transcripts (channel content and tool output) and the
+gateway accepts any key, so that policy is the only thing keeping one agent
+out of another's data; it means one connection per agent. Each pass also
+probes that a key under another pubkey and a bucket listing are refused
+(401/403) before it sends anything, so a policy the gateway reports but does
+not enforce collects nothing. Snapshot names are kept in
+`memory/snapshots.idx`, since the connection cannot list the bucket. The launcher runs a
 pass at start, every ten minutes while the harness lives, and a final pass
 once it is gone. A transcript is sent once it has been quiet for five minutes
 (the final pass takes everything), re-sent when it changes, and recorded as
@@ -193,7 +200,8 @@ wherever it stands alone) and well-known credential shapes become
 `[redacted]`. Memory is never uploaded empty or partly staged, and never
 replaces the stored archive outright: each upload is merged over the stored
 `latest`, keeping every file this disk never sent, and keeping a stored file
-this disk replaced without having sent it under `superseded/<utc>/`. Only a
+this disk replaced without having sent it under `superseded/<utc>/` (only
+the newest such copy of each path, so recreations cannot grow it unbounded). Only a
 file this disk sent and then deleted leaves the archive, so a recreated
 sprite's first few memories cannot displace what its predecessor collected.
 If the stored `latest` cannot be read, the pass fails and nothing replaces it.

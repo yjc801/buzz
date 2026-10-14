@@ -504,6 +504,8 @@ test-unit:
     #!/usr/bin/env bash
     set -euo pipefail
     ./scripts/test-ensure-local-relay-key.sh
+    # Shared Huddle transport, codec, and loopback authentication regressions.
+    cargo test -p buzz-audio-client
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-audit --lib
@@ -553,10 +555,11 @@ test-unit:
         # suites are otherwise absent from the infra-free unit lane.
         cargo nextest run -p buzz-media --lib \
             -E 'test(=bucket_index::tests::bucket_snapshot_json_round_trip_preserves_community_keys)'
-        # buzz-admin: storage-snapshot worker plus the community archive
-        # command parser, validation, and propagation-evidence tests.
+        # buzz-admin: storage-snapshot worker, the community archive command
+        # parser, validation, and propagation-evidence tests, and the partition
+        # audit outcome contract.
         cargo nextest run -p buzz-admin \
-            -E 'test(storage_snapshot) + test(/^communities::tests::/) + test(/^tests::communities_/)'
+            -E 'test(storage_snapshot) + test(/^communities::tests::/) + test(/^tests::communities_/) + test(=tests::partition_audit_outcomes_keep_their_json_names_and_exit_codes)'
         # Multi-tenant conformance gate (buzz-conformance): the independent
         # replay checker + golden fixtures. No infra — pure in-process trace
         # replay — so it belongs in the unit job. Run all targets (lib + the
@@ -654,7 +657,7 @@ test-unit:
         # are infra-free; config parses env into a struct and never connects.
         # `^config::` is anchored so it does not also select nip_fi_config.
         cargo nextest run -p buzz-relay --lib --bin buzz-relay \
-            -E 'test(/^api::admin::/) + test(/^push_runtime::/) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/) + test(/^storage_sweep::tests::/) + test(/^nip_fi_core::tests::/) + test(/^nip_fi_http::tests::/) + test(/^nip_fi_config::tests::/) + test(/^readiness::tests::/) + test(/^router::tests::/) + test(/^api::parse_query_tests::/) + test(/^api::git::transport::off_mode_precedence_tests::/) + test(/^audio::join::tests::/) + test(/^audio::handler::tests::/) + test(/^nip_fi_gate::tests::/) + test(/^nip_fi_session::tests::/) + test(/^nip_fi_shadow::tests::/) + test(/^nip_fi_shadow_session::tests::/) + test(/^startup_steps::tests::/) + test(/^telemetry::tests::/) + test(/^config::tests::/) + test(=state::tests::neither_a_confirmed_inactive_community_nor_a_failed_lookup_admits_the_socket) + test(=state::tests::periodic_revalidation_disconnects_inside_the_fenced_callback) + test(=state::tests::bare_community_disconnect_fails_closed_when_the_fence_is_unavailable) + test(=connection::tests::send_loop_sends_policy_close_when_community_is_archived) + test(=state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason) + test(=state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame) + test(=handlers::req::tests::timed_out_historical_read_deregisters_before_closed) + test(=handlers::req::tests::superseded_timeout_leaves_replacement_intact) + test(=handlers::req::tests::search_claim_retires_live_and_yields_to_replacement) + test(=handlers::req::tests::concurrent_claims_and_stale_teardowns_keep_the_last_owner) + test(=handlers::req::tests::timeout_closed_is_emitted_before_a_replacement_can_claim) + test(=handlers::req::tests::revoke_then_replacement_keeps_replacement_whole) + test(=handlers::req::tests::claims_after_connection_cleanup_are_refused) + test(=handlers::req::tests::dropped_terminal_frame_cancels_connection) + test(=handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection) + (kind(bin) & (test(/^tests::/) + test(/^composition_tests::/) + test(/^env_filter_tests::/)) - test(/^tests::postgres_tests::/))'
+            -E 'test(/^api::admin::/) + test(/^push_runtime::/) + test(/^operator_listener::tests::/) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/) + test(/^storage_sweep::tests::/) + test(/^nip_fi_core::tests::/) + test(/^nip_fi_http::tests::/) + test(/^nip_fi_config::tests::/) + test(/^readiness::tests::/) + test(/^router::tests::/) + test(/^api::parse_query_tests::/) + test(/^api::git::transport::off_mode_precedence_tests::/) + test(/^audio::join::tests::/) + test(/^audio::handler::tests::/) + test(/^nip_fi_gate::tests::/) + test(/^nip_fi_session::tests::/) + test(/^nip_fi_shadow::tests::/) + test(/^nip_fi_shadow_session::tests::/) + test(/^startup_steps::tests::/) + test(/^telemetry::tests::/) + test(/^config::tests::/) + test(=state::tests::neither_a_confirmed_inactive_community_nor_a_failed_lookup_admits_the_socket) + test(=state::tests::periodic_revalidation_disconnects_inside_the_fenced_callback) + test(=state::tests::bare_community_disconnect_fails_closed_when_the_fence_is_unavailable) + test(=connection::tests::send_loop_sends_policy_close_when_community_is_archived) + test(=state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason) + test(=state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame) + test(=handlers::req::tests::timed_out_historical_read_deregisters_before_closed) + test(=handlers::req::tests::superseded_timeout_leaves_replacement_intact) + test(=handlers::req::tests::search_claim_retires_live_and_yields_to_replacement) + test(=handlers::req::tests::concurrent_claims_and_stale_teardowns_keep_the_last_owner) + test(=handlers::req::tests::timeout_closed_is_emitted_before_a_replacement_can_claim) + test(=handlers::req::tests::revoke_then_replacement_keeps_replacement_whole) + test(=handlers::req::tests::claims_after_connection_cleanup_are_refused) + test(=handlers::req::tests::dropped_terminal_frame_cancels_connection) + test(=handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection) + test(=handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions) + (kind(bin) & (test(/^tests::/) + test(/^composition_tests::/) + test(/^env_filter_tests::/)) - test(/^tests::postgres_tests::/))'
         # Note on audio::join::tests scope: the full suite is infra-free (no DB,
         # no Redis). The infra-free audio/FI regression witnesses — bootstrap
         # ordering barrier, CommitConfirmed arm, pending-close invisibility,
@@ -663,7 +666,9 @@ test-unit:
         # DB-backed audio join tests use #[ignore] and run in the postgres lane.
         # NIP-FI (S3/S4) relay witnesses: the wholly-new nip_fi_upgrade and
         # api::nip_fi modules,
-        # the auth metrics contract module, plus the exact NIP-FI tests added,
+        # the auth metrics contract module, the DB-free partition alert series
+        # tests (their Postgres case is #[ignore]d and runs in the PostgreSQL
+        # lane), plus the exact NIP-FI tests added,
         # or whose assertions changed, in mixed modules (audio::room,
         # connection, handlers::*, state). nip_fi_config and router are
         # selected whole by the command above. Mixed modules are listed by exact
@@ -674,6 +679,7 @@ test-unit:
         cargo nextest run -p buzz-relay --lib -E '
                 test(/^nip_fi_upgrade::/)
                 + test(/^metrics::contract_tests::/)
+                + test(/^metrics::partition_alert_tests::/)
                 + test(=audio::room::tests::roster_revisions_are_ordered_and_snapshot_is_authoritative)
                 + test(=connection::tests::auth_lifecycle_reconciles_every_terminal_and_never_leaks_gauge)
                 + test(=audio::room::tests::b1_pending_peer_removed_before_commit_emits_no_delta)

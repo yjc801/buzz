@@ -135,6 +135,9 @@ run_unit_tests() {
   run_test_step "buzz-admin community archive command tests" \
     cargo test -p buzz-admin communities -- --nocapture
 
+  run_test_step "buzz-admin partition audit outcome contract test" \
+    cargo test -p buzz-admin tests::partition_audit_outcomes_keep_their_json_names_and_exit_codes -- --exact --nocapture
+
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
   run_test_step "buzz-conformance tests" \
@@ -189,6 +192,9 @@ run_unit_tests() {
   # scoped admission regression in state::tests, plus the REQ lifecycle tests.
   run_test_step "buzz-relay push runtime tests" \
     cargo test -p buzz-relay --lib push_runtime:: -- --nocapture
+
+  run_test_step "buzz-relay operator listener tests" \
+    cargo test -p buzz-relay --lib operator_listener::tests:: -- --nocapture
 
   run_test_step "buzz-relay channel authorization tests" \
     cargo test -p buzz-relay --lib handlers::channel_authz:: -- --nocapture
@@ -254,7 +260,8 @@ run_unit_tests() {
       handlers::req::tests::revoke_then_replacement_keeps_replacement_whole \
       handlers::req::tests::claims_after_connection_cleanup_are_refused \
       handlers::req::tests::dropped_terminal_frame_cancels_connection \
-      handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection
+      handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection \
+      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions
 
   run_test_step "buzz-relay readiness tests" \
     cargo test -p buzz-relay --lib readiness::tests:: -- --nocapture
@@ -300,6 +307,9 @@ run_unit_tests() {
 
   run_test_step "buzz-relay auth metrics contract tests" \
     cargo test -p buzz-relay --lib metrics::contract_tests:: -- --nocapture
+
+  run_test_step "buzz-relay partition alert series tests" \
+    cargo test -p buzz-relay --lib metrics::partition_alert_tests:: -- --nocapture
 
   local nip_fi_exact_tests=(
     audio::room::tests::roster_revisions_are_ordered_and_snapshot_is_authoritative

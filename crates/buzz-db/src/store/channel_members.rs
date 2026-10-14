@@ -4,7 +4,7 @@
 //! roster snapshots hold that same lock through replacement publication.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::channel::{row_to_channel_record, ChannelRecord};
@@ -301,11 +301,25 @@ pub async fn insert_auto_membership_in_transaction(
 
 // ── End transaction-level helpers ─────────────────────────────────────────────
 
+/// The immutable facts that every relay-signed group-state event
+/// (kinds 39000–39002) publishes about its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelIdentity {
+    /// Channel type string (e.g. `"stream"`, `"forum"`, `"dm"`).
+    pub channel_type: String,
+    /// Public key bytes of the channel creator (the kind:9007 signer).
+    pub created_by: Vec<u8>,
+}
+
 /// An active member roster captured while holding the channel's membership
 /// serialization lock on one writer connection.
 pub struct LockedMemberSnapshot {
     /// Canonical active members captured behind the lock.
     pub members: Vec<MemberRecord>,
+    /// The channel's type and creator, read on the same connection, so the
+    /// roster carries the same identity tags as the channel's other
+    /// group-state events. `None` when no channel row exists.
+    pub identity: Option<ChannelIdentity>,
     channel_id: Uuid,
     relay_pubkey: Vec<u8>,
     tx: AdmittedTx,
@@ -477,8 +491,20 @@ pub async fn lock_member_snapshot(
         .into_iter()
         .map(row_to_member_record)
         .collect::<Result<Vec<_>>>()?;
+    let identity = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT channel_type::text, created_by FROM channels WHERE community_id = $1 AND id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .fetch_optional(tx.conn())
+    .await?
+    .map(|(channel_type, created_by)| ChannelIdentity {
+        channel_type,
+        created_by,
+    });
     Ok(LockedMemberSnapshot {
         members,
+        identity,
         channel_id,
         relay_pubkey: relay_pubkey.to_vec(),
         tx,
@@ -513,18 +539,18 @@ pub async fn add_member(
         )));
     }
 
-    let connection = crate::observability::acquire_writer(
+    let mut tx = crate::begin_community_write_transaction(
         pool,
+        community_id,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
 
     // First statement: serialize the whole role-check / owner-count / upsert
     // sequence against concurrent membership writes on this channel.
-    acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
 
-    let channel = get_channel_tx(&mut tx, community_id, channel_id).await?;
+    let channel = get_channel_tx(tx.conn(), community_id, channel_id).await?;
 
     let effective_role = if channel.visibility == "private" {
         let inviter = invited_by.ok_or_else(|| {
@@ -535,7 +561,7 @@ pub async fn add_member(
         let is_creator_bootstrap = inviter == pubkey && inviter == channel.created_by.as_slice();
 
         if !is_creator_bootstrap {
-            let inviter_role_str = get_active_role_tx(&mut tx, community_id, channel_id, inviter)
+            let inviter_role_str = get_active_role_tx(tx.conn(), community_id, channel_id, inviter)
                 .await?
                 .ok_or_else(|| {
                     DbError::AccessDenied("inviter is not an active member".to_string())
@@ -561,7 +587,7 @@ pub async fn add_member(
         // elevated roles. Self-join always gets Member.
         if role.is_elevated() {
             let granter_role = match invited_by {
-                Some(inv) => get_active_role_tx(&mut tx, community_id, channel_id, inv).await?,
+                Some(inv) => get_active_role_tx(tx.conn(), community_id, channel_id, inv).await?,
                 None => None,
             };
             match granter_role.as_deref() {
@@ -593,10 +619,12 @@ pub async fn add_member(
     // current authority from a removed row would make soft-deleted ownership a
     // resurrection token: an owner removed by another owner could self-rejoin
     // via kind:9021 (`Member, None`) and silently regain ownership.
-    let current_role = get_active_role_tx(&mut tx, community_id, channel_id, pubkey).await?;
+    let current_role = get_active_role_tx(tx.conn(), community_id, channel_id, pubkey).await?;
     if let Some(current_role) = current_role.filter(|r| r != effective_role.as_str()) {
         let actor_role = match invited_by {
-            Some(inviter) => get_active_role_tx(&mut tx, community_id, channel_id, inviter).await?,
+            Some(inviter) => {
+                get_active_role_tx(tx.conn(), community_id, channel_id, inviter).await?
+            }
             None => None,
         };
         let actor_role: Option<MemberRole> = actor_role.and_then(|r| r.parse().ok());
@@ -616,7 +644,7 @@ pub async fn add_member(
             )
             .bind(community_id.as_uuid())
             .bind(channel_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await?;
             let owner_count: i64 = row.try_get("cnt")?;
             if owner_count <= 1 {
@@ -642,7 +670,7 @@ pub async fn add_member(
     .bind(pubkey)
     .bind(effective_role.as_str())
     .bind(invited_by)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     let row = sqlx::query(
@@ -654,7 +682,7 @@ pub async fn add_member(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(pubkey)
-    .fetch_one(&mut *tx)
+    .fetch_one(tx.conn())
     .await?;
 
     let record = row_to_member_record(row)?;
@@ -699,20 +727,20 @@ pub async fn remove_member(
         crate::user::is_agent_owner(pool, community_id, pubkey, actor_pubkey).await?
     };
 
-    let connection = crate::observability::acquire_writer(
+    let mut tx = crate::begin_community_write_transaction(
         pool,
+        community_id,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
 
     // First statement: serialize the actor-role check, the last-owner count and
     // the UPDATE against concurrent membership writes on this channel (same key
     // as `add_member`).
-    acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
 
     if !is_self_remove {
-        let actor_role_str = get_active_role_tx(&mut tx, community_id, channel_id, actor_pubkey)
+        let actor_role_str = get_active_role_tx(tx.conn(), community_id, channel_id, actor_pubkey)
             .await?
             .ok_or_else(|| DbError::AccessDenied("actor is not an active member".to_string()))?;
         let actor_role: MemberRole = actor_role_str.parse().map_err(|_| {
@@ -728,7 +756,7 @@ pub async fn remove_member(
     // Defense-in-depth: prevent removing the last owner regardless of caller.
     // Callers (REST handlers, NIP-29 handlers) also check this, but the DB
     // layer enforces it as the final safety net.
-    let target_role = get_active_role_tx(&mut tx, community_id, channel_id, pubkey).await?;
+    let target_role = get_active_role_tx(tx.conn(), community_id, channel_id, pubkey).await?;
     if target_role.as_deref() == Some("owner") {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM channel_members \
@@ -736,7 +764,7 @@ pub async fn remove_member(
         )
         .bind(community_id.as_uuid())
         .bind(channel_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.conn())
         .await?;
         let owner_count: i64 = row.try_get("cnt")?;
         if owner_count <= 1 {
@@ -757,7 +785,7 @@ pub async fn remove_member(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(pubkey)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if result.rows_affected() == 0 {
@@ -874,7 +902,7 @@ pub struct MembershipRemovalFence {
     pub still_removed: bool,
     // Holds the advisory transaction lock. The caller commits via
     // `commit_disabling_workflows`; on drop without commit the tx rolls back.
-    tx: Transaction<'static, Postgres>,
+    tx: AdmittedTx,
 }
 
 impl MembershipRemovalFence {
@@ -924,19 +952,27 @@ impl MembershipRemovalFence {
 /// lock (the transaction is implicitly rolled back if not committed). To
 /// durably write the workflow-disable and release the lock in one step, call
 /// [`Self::commit_disabling_workflows`].
+///
+/// Write admission is taken up front, before the membership lock, so the
+/// lock order matches [`add_member`]. Taking it lazily in
+/// [`Self::commit_disabling_workflows`] would invert that order. As a result,
+/// a community that leaves `active` between the kick commit and this call
+/// refuses the fence, and the caller skips its live side effects. That is
+/// intended: the membership cache is already invalidated and fan-out
+/// re-checks membership before delivery.
 pub async fn membership_removal_fence(
     pool: &PgPool,
     community_id: CommunityId,
     channel_id: Uuid,
     pubkey: &[u8],
 ) -> Result<MembershipRemovalFence> {
-    let connection = crate::observability::acquire_writer(
+    let mut tx = crate::begin_community_write_transaction(
         pool,
+        community_id,
         crate::observability::WriterOperation::Authorization,
     )
     .await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
-    acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await?;
 
     let row = sqlx::query(
         "SELECT removed_at FROM channel_members \
@@ -945,7 +981,7 @@ pub async fn membership_removal_fence(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(pubkey)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     // Row absent → never joined or hard-deleted; treat as removed (safe to

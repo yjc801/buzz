@@ -150,8 +150,12 @@ pub async fn add_relay_member(
     role: &str,
     added_by: Option<&str>,
 ) -> Result<bool> {
-    let mut connection =
-        observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        observability::WriterOperation::Authorization,
+    )
+    .await?;
     let result = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
          VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, pubkey) DO NOTHING",
@@ -160,8 +164,9 @@ pub async fn add_relay_member(
     .bind(pubkey)
     .bind(role)
     .bind(added_by)
-    .execute(&mut *connection)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -177,9 +182,12 @@ pub async fn claim_relay_membership(
     role: &str,
     policy_version: Option<&str>,
 ) -> Result<bool> {
-    let connection =
-        observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        observability::WriterOperation::Authorization,
+    )
+    .await?;
     let inserted = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
          VALUES ($1, $2, $3, 'invite') \
@@ -188,7 +196,7 @@ pub async fn claim_relay_membership(
     .bind(community.as_uuid())
     .bind(pubkey)
     .bind(role)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?
     .rows_affected()
         > 0;
@@ -201,7 +209,7 @@ pub async fn claim_relay_membership(
         .bind(community.as_uuid())
         .bind(pubkey)
         .bind(version)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
     }
 
@@ -243,39 +251,76 @@ pub enum RemoveResult {
     RoleMismatch,
 }
 
+/// Deletes a membership and its join-policy acceptances inside the caller's
+/// admitted transaction.
+///
+/// With `expected_role`, only a member holding exactly that role is removed;
+/// without it, any non-owner is. The member row is locked under that predicate
+/// first, so a concurrent acceptance insert (which must lock the member row for
+/// its foreign key) either commits before the child delete sees it or fails.
+/// Children go before the parent so no foreign-key action is needed. The
+/// caller commits.
+async fn delete_member_with_acceptances(
+    tx: &mut crate::AdmittedTx,
+    pubkey: &str,
+    expected_role: Option<&str>,
+) -> Result<bool> {
+    let community = tx.community();
+    let locked = sqlx::query(
+        "SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2 \
+         AND CASE WHEN $3::text IS NULL THEN role <> 'owner' ELSE role = $3 END \
+         FOR UPDATE",
+    )
+    .bind(community.as_uuid())
+    .bind(pubkey)
+    .bind(expected_role)
+    .fetch_optional(tx.conn())
+    .await?;
+    if locked.is_none() {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM join_policy_acceptances WHERE community_id = $1 AND pubkey = $2")
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .execute(tx.conn())
+        .await?;
+    sqlx::query("DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2")
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .execute(tx.conn())
+        .await?;
+    Ok(true)
+}
+
 /// Removes a relay member atomically, refusing to delete the owner.
 ///
-/// Uses a single conditional `DELETE … WHERE role <> 'owner'` so the
-/// owner-protection check and the deletion are one atomic operation —
-/// no TOCTOU race between a separate read and delete.
+/// The owner-protection check and the deletion run in one transaction under a
+/// row lock, so there is no TOCTOU race between a separate read and delete.
 pub async fn remove_relay_member(
     pool: &PgPool,
     community: CommunityId,
     pubkey: &str,
 ) -> Result<RemoveResult> {
-    let mut connection =
-        observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
-    let result = sqlx::query(
-        "DELETE FROM relay_members \
-         WHERE community_id = $1 AND pubkey = $2 AND role <> 'owner'",
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        observability::WriterOperation::Authorization,
     )
-    .bind(community.as_uuid())
-    .bind(pubkey)
-    .execute(&mut *connection)
     .await?;
-
-    if result.rows_affected() > 0 {
+    if delete_member_with_acceptances(&mut tx, pubkey, None).await? {
+        tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
 
-    // rows_affected == 0: either not found or is owner.  One cheap read to
+    // Nothing was locked: either not found or is owner. One cheap read to
     // distinguish the two cases so callers can return the right error message.
     let exists = sqlx::query("SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(tx.conn())
         .await?;
 
+    tx.commit().await?;
     if exists.is_some() {
         Ok(RemoveResult::IsOwner)
     } else {
@@ -285,9 +330,8 @@ pub async fn remove_relay_member(
 
 /// Removes a relay member only if their current role matches `expected_role`.
 ///
-/// The delete and the role check are collapsed into a single
-/// `DELETE … WHERE pubkey = $1 AND role = $2`, making the operation atomic —
-/// no TOCTOU race between a prior read and this delete.
+/// The role check and the delete run in one transaction under a row lock, so
+/// there is no TOCTOU race between a prior read and this delete.
 ///
 /// Returns:
 /// - `Removed` — row was deleted.
@@ -302,29 +346,26 @@ pub async fn remove_relay_member_if_role(
     pubkey: &str,
     expected_role: &str,
 ) -> Result<RemoveResult> {
-    let mut connection =
-        observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
-    let result = sqlx::query(
-        "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3",
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        observability::WriterOperation::Authorization,
     )
-    .bind(community.as_uuid())
-    .bind(pubkey)
-    .bind(expected_role)
-    .execute(&mut *connection)
     .await?;
-
-    if result.rows_affected() > 0 {
+    if delete_member_with_acceptances(&mut tx, pubkey, Some(expected_role)).await? {
+        tx.commit().await?;
         return Ok(RemoveResult::Removed);
     }
 
-    // rows_affected == 0: either not found or role changed. One cheap read to
+    // Nothing was locked: either not found or role changed. One cheap read to
     // distinguish the cases so callers can return the right error message.
     let row = sqlx::query("SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(tx.conn())
         .await?;
 
+    tx.commit().await?;
     match row {
         None => Ok(RemoveResult::NotFound),
         Some(r) => {
@@ -349,8 +390,12 @@ pub async fn update_relay_member_role(
     pubkey: &str,
     new_role: &str,
 ) -> Result<bool> {
-    let mut connection =
-        observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        observability::WriterOperation::Authorization,
+    )
+    .await?;
     let result = sqlx::query(
         "UPDATE relay_members SET role = $1, updated_at = now() \
          WHERE community_id = $2 AND pubkey = $3 AND role <> 'owner'",
@@ -358,8 +403,9 @@ pub async fn update_relay_member_role(
     .bind(new_role)
     .bind(community.as_uuid())
     .bind(pubkey)
-    .execute(&mut *connection)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -453,14 +499,7 @@ async fn lock_owner_mutation_admission(
         return Ok(OwnerMutationAdmission::Allowed(existing_owners));
     }
 
-    let deletion_pending: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM community_deletion_requests \
-         WHERE community_id = $1 AND stage <> 'aborted')",
-    )
-    .bind(community.as_uuid())
-    .fetch_one(&mut **tx)
-    .await?;
-    if deletion_pending {
+    if deletion_pending(tx, community).await? {
         return Ok(OwnerMutationAdmission::DeletionPending);
     }
 
@@ -474,6 +513,21 @@ async fn lock_owner_mutation_admission(
     Ok(OwnerMutationAdmission::Allowed(existing_owners))
 }
 
+/// Whether `community` has a non-aborted deletion request.
+///
+/// A quiescing or fenced community always has one, so owner mutations that
+/// admission refuses report `DeletionPending` rather than a generic lifecycle
+/// conflict.
+async fn deletion_pending(conn: &mut sqlx::PgConnection, community: CommunityId) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM community_deletion_requests \
+         WHERE community_id = $1 AND stage <> 'aborted')",
+    )
+    .bind(community.as_uuid())
+    .fetch_one(conn)
+    .await?)
+}
+
 async fn bootstrap_owner_with_operation(
     pool: &PgPool,
     community: CommunityId,
@@ -483,6 +537,16 @@ async fn bootstrap_owner_with_operation(
     let pubkey = owner_pubkey.to_ascii_lowercase();
     let connection = observability::acquire_writer(pool, operation).await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+
+    if let Err(error) = crate::deletion::guard_community_write(&mut tx, community).await {
+        return match error {
+            DbError::AccessDenied(_) if deletion_pending(&mut tx, community).await? => {
+                Ok(ProvisionOwnerResult::DeletionPending)
+            }
+            DbError::AccessDenied(_) => Ok(ProvisionOwnerResult::LifecycleConflict),
+            other => Err(other),
+        };
+    }
 
     match lock_owner_mutation_admission(&mut tx, community, &pubkey, OwnerMutationMode::Converge)
         .await?
@@ -707,6 +771,27 @@ pub async fn transfer_ownership(
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
 
+    if let Err(error) = crate::deletion::guard_community_write(&mut tx, community).await {
+        return match error {
+            DbError::AccessDenied(_) if deletion_pending(&mut tx, community).await? => {
+                Ok(TransferResult::DeletionPending)
+            }
+            DbError::AccessDenied(_) => {
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1)")
+                        .bind(community.as_uuid())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if exists {
+                    Ok(TransferResult::LifecycleConflict)
+                } else {
+                    Ok(TransferResult::NoOwner)
+                }
+            }
+            other => Err(other),
+        };
+    }
+
     // 1. Serialize on the transferee so concurrent transfers to the same
     //    recipient cannot both pass the ownership count check.
     crate::observability::observe_advisory_lock(
@@ -802,40 +887,52 @@ pub async fn transfer_ownership(
 ///
 /// Converts BYTEA pubkeys to lowercase hex text and inserts them as members of
 /// `community`. Returns the number of rows inserted, or 0 if:
-/// - the `pubkey_allowlist` table doesn't exist, or
+/// - the `pubkey_allowlist` table doesn't exist,
+/// - `pubkey_allowlist` has no rows for this community, or
 /// - `relay_members` already has rows for this community (migration ran in a
 ///   prior startup).
 ///
 /// The empty-table guard prevents re-adding members that were intentionally
 /// removed by an admin after the initial backfill.
 pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> Result<u64> {
+    // The common startup case writes nothing: the legacy table is gone, it
+    // has no rows for this community, or the community already has members.
+    // Answer those with plain reads so a startup with nothing to backfill
+    // never needs write admission, and a quiescing deployment community keeps
+    // starting as it did before.
     let mut connection =
         observability::acquire_writer(pool, observability::WriterOperation::Bootstrap).await?;
-    // Check if pubkey_allowlist table exists.
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_name = 'pubkey_allowlist')",
     )
     .fetch_one(&mut *connection)
     .await?;
-
-    if !exists {
+    if !exists || community_has_members(&mut connection, community).await? {
         return Ok(0);
     }
-
-    // Only backfill if this community's relay_members is empty — once it has
-    // rows (from a previous backfill or manual admin commands), we must not
-    // re-add members that were intentionally removed.
-    let has_members: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)")
-            .bind(community.as_uuid())
-            .fetch_one(&mut *connection)
-            .await?;
-
-    if has_members {
+    let has_allowlist_rows: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pubkey_allowlist WHERE community_id = $1)",
+    )
+    .bind(community.as_uuid())
+    .fetch_one(&mut *connection)
+    .await?;
+    if !has_allowlist_rows {
         return Ok(0);
     }
+    drop(connection);
 
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        observability::WriterOperation::Bootstrap,
+    )
+    .await?;
+    // Re-check under admission: another pod may have backfilled meanwhile.
+    if community_has_members(tx.conn(), community).await? {
+        tx.commit().await?;
+        return Ok(0);
+    }
     let result = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by, created_at) \
          SELECT $1, encode(pubkey, 'hex'), 'member', NULL, added_at \
@@ -844,10 +941,25 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
          ON CONFLICT (community_id, pubkey) DO NOTHING",
     )
     .bind(community.as_uuid())
-    .execute(&mut *connection)
+    .execute(tx.conn())
     .await?;
-
+    tx.commit().await?;
     Ok(result.rows_affected())
+}
+
+/// Whether `community` has any `relay_members` row. Once it does (from a
+/// previous backfill or admin commands), the backfill must not re-add members
+/// that were intentionally removed.
+async fn community_has_members(
+    conn: &mut sqlx::PgConnection,
+    community: CommunityId,
+) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)")
+            .bind(community.as_uuid())
+            .fetch_one(conn)
+            .await?,
+    )
 }
 
 impl Db {
@@ -1390,6 +1502,126 @@ mod postgres_tests {
                 .as_deref(),
             Some(role)
         );
+    }
+
+    async fn acceptances(pool: &PgPool, community: CommunityId, pubkey: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM join_policy_acceptances WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .fetch_one(pool)
+        .await
+        .expect("count acceptances")
+    }
+
+    /// Both removal paths delete acceptance evidence themselves: with every
+    /// foreign-key delete action retired, nothing cascades. Owners and a role
+    /// mismatch keep theirs.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn member_removal_deletes_acceptances_without_cascades() {
+        let pool = setup_pool().await;
+        crate::test_support::retire_foreign_key_delete_actions(&pool).await;
+        let (community, owner) = owned_community(&pool).await;
+        let version = "a".repeat(64);
+        sqlx::query(
+            "INSERT INTO join_policy_acceptances (community_id, pubkey, policy_version) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community.as_uuid())
+        .bind(&owner)
+        .bind(&version)
+        .execute(&pool)
+        .await
+        .expect("owner acceptance");
+        let member = test_pubkey();
+        let admin = test_pubkey();
+        for (pubkey, role) in [(&member, "member"), (&admin, "admin")] {
+            claim_relay_membership(&pool, community, pubkey, role, Some(&version))
+                .await
+                .expect("claim membership");
+            assert_eq!(acceptances(&pool, community, pubkey).await, 1);
+        }
+
+        assert_eq!(
+            remove_relay_member(&pool, community, &owner)
+                .await
+                .expect("owner removal"),
+            RemoveResult::IsOwner
+        );
+        assert_eq!(acceptances(&pool, community, &owner).await, 1);
+        assert_eq!(
+            remove_relay_member_if_role(&pool, community, &admin, "member")
+                .await
+                .expect("mismatched removal"),
+            RemoveResult::RoleMismatch
+        );
+        assert_eq!(acceptances(&pool, community, &admin).await, 1);
+
+        assert_eq!(
+            remove_relay_member(&pool, community, &member)
+                .await
+                .expect("member removal"),
+            RemoveResult::Removed
+        );
+        assert_eq!(acceptances(&pool, community, &member).await, 0);
+        assert_eq!(
+            remove_relay_member_if_role(&pool, community, &admin, "admin")
+                .await
+                .expect("role removal"),
+            RemoveResult::Removed
+        );
+        assert_eq!(acceptances(&pool, community, &admin).await, 0);
+    }
+
+    /// An acceptance inserted concurrently with the removal holds the member
+    /// row's key-share lock. Removal must wait for it at its row lock and then
+    /// delete it; with no cascade, a removal that took its child snapshot first
+    /// would fail the foreign-key check on the member.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn member_removal_waits_for_and_removes_concurrent_acceptance() {
+        let pool = setup_pool().await;
+        crate::test_support::retire_foreign_key_delete_actions(&pool).await;
+        let (community, _owner) = owned_community(&pool).await;
+        let member = test_pubkey();
+        claim_relay_membership(&pool, community, &member, "member", Some(&"a".repeat(64)))
+            .await
+            .expect("claim membership");
+
+        let mut inserter = pool.begin().await.expect("begin acceptance insert");
+        sqlx::query(
+            "INSERT INTO join_policy_acceptances (community_id, pubkey, policy_version) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(community.as_uuid())
+        .bind(&member)
+        .bind("b".repeat(64))
+        .execute(&mut *inserter)
+        .await
+        .expect("insert concurrent acceptance");
+
+        let name = format!("member-remove-{}", Uuid::new_v4().simple());
+        let remover = crate::test_support::named_pool(&name).await;
+        let removal = tokio::spawn({
+            let member = member.clone();
+            async move { remove_relay_member(&remover, community, &member).await }
+        });
+        crate::test_support::wait_for_lock_wait(&pool, &name).await;
+        inserter
+            .commit()
+            .await
+            .expect("commit concurrent acceptance");
+
+        assert_eq!(
+            removal
+                .await
+                .expect("join removal")
+                .expect("removal after concurrent acceptance"),
+            RemoveResult::Removed
+        );
+        assert_eq!(acceptances(&pool, community, &member).await, 0);
     }
 
     async fn owned_community(pool: &PgPool) -> (CommunityId, String) {

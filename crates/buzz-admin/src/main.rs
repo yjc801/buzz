@@ -31,7 +31,10 @@ use std::time::Instant;
 use anyhow::Result;
 use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
 use buzz_core::tenant::{relay_url_authority, TenantContext};
-use buzz_db::{partition::PartitionAuditReport, Db, DbConfig};
+use buzz_db::{
+    partition::{PartitionAuditOutcome, PartitionAuditReport},
+    Db, DbConfig,
+};
 use buzz_media::{BucketSnapshot, MediaConfig, MediaStorage, S3AddressingStyle, SweepError};
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Parser, Subcommand};
@@ -358,7 +361,7 @@ struct PartitionAuditOutput {
     source_sha: &'static str,
     build_id: &'static str,
     build_url: &'static str,
-    outcome: &'static str,
+    outcome: PartitionAuditOutcome,
     months_ahead: u32,
     identity: PartitionAuditIdentity,
     report: PartitionAuditReport,
@@ -399,20 +402,8 @@ async fn cmd_partition_audit(months_ahead: u32) -> Result<i32> {
     let report = Db::from_pool(pool)
         .audit_partitions_report(months_ahead)
         .await;
-    let outcome = if !report.errors.is_empty() {
-        "error"
-    } else if !report.serving_safe() {
-        "unsafe"
-    } else if report.tables.iter().any(|table| table.degraded()) {
-        "degraded"
-    } else {
-        "ok"
-    };
-    let code = match outcome {
-        "error" => 5,
-        "unsafe" => 2,
-        _ => 0,
-    };
+    let outcome = report.outcome();
+    let code = partition_audit_exit_code(outcome);
     println!(
         "{}",
         serde_json::to_string_pretty(&PartitionAuditOutput {
@@ -428,6 +419,15 @@ async fn cmd_partition_audit(months_ahead: u32) -> Result<i32> {
         })?
     );
     Ok(code)
+}
+
+/// Exit nonzero only when the audit is incomplete or a table cannot serve.
+fn partition_audit_exit_code(outcome: PartitionAuditOutcome) -> i32 {
+    match outcome {
+        PartitionAuditOutcome::Error => 5,
+        PartitionAuditOutcome::Unsafe => 2,
+        PartitionAuditOutcome::Degraded | PartitionAuditOutcome::Ok => 0,
+    }
 }
 
 async fn cmd_add_member(pubkey_arg: String, role: String) -> Result<i32> {
@@ -739,6 +739,7 @@ async fn reconcile_channels(
     channel_arg: Option<String>,
     relay_key_arg: Option<String>,
 ) -> Result<()> {
+    use buzz_core::channel::{channel_created_at_tag, group_state_identity_tags};
     use buzz_core::kind::KIND_NIP29_GROUP_ADMINS;
     use buzz_db::event::EventQuery;
 
@@ -839,7 +840,11 @@ async fn reconcile_channels(
                     tags.push(Tag::parse(["hidden"])?);
                 }
                 tags.push(Tag::parse(["closed"])?);
-                tags.push(Tag::parse(["t", &channel.channel_type])?);
+                tags.extend(group_state_identity_tags(
+                    &channel.channel_type,
+                    &channel.created_by,
+                )?);
+                tags.push(channel_created_at_tag(channel.created_at.timestamp())?);
 
                 let event = EventBuilder::new(Kind::Custom(39000), "")
                     .tags(tags)
@@ -852,6 +857,10 @@ async fn reconcile_channels(
             // kind:39001 — admins
             {
                 let mut tags: Vec<Tag> = vec![Tag::parse(["d", &channel_id_str])?];
+                tags.extend(group_state_identity_tags(
+                    &channel.channel_type,
+                    &channel.created_by,
+                )?);
                 for m in members
                     .iter()
                     .filter(|m| m.role == "owner" || m.role == "admin")
@@ -871,6 +880,10 @@ async fn reconcile_channels(
         // kind:39002 — members
         {
             let mut tags: Vec<Tag> = vec![Tag::parse(["d", &channel_id_str])?];
+            tags.extend(group_state_identity_tags(
+                &channel.channel_type,
+                &channel.created_by,
+            )?);
             for m in &members {
                 let pk = hex::encode(&m.pubkey);
                 tags.push(Tag::parse(["p", &pk, "", &m.role])?);
@@ -1089,5 +1102,18 @@ mod tests {
         ]);
 
         assert!(command.is_err());
+    }
+
+    #[test]
+    fn partition_audit_outcomes_keep_their_json_names_and_exit_codes() {
+        for (outcome, name, code) in [
+            (PartitionAuditOutcome::Ok, "ok", 0),
+            (PartitionAuditOutcome::Degraded, "degraded", 0),
+            (PartitionAuditOutcome::Unsafe, "unsafe", 2),
+            (PartitionAuditOutcome::Error, "error", 5),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), name);
+            assert_eq!(partition_audit_exit_code(outcome), code, "{name}");
+        }
     }
 }

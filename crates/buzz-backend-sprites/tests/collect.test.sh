@@ -41,15 +41,12 @@ GW="https://gw.test/v1/gateway/s3_object_store/conn"
 # it; GET ?list-type=2 lists; GET <key> answers 200 or 404 like the gateway;
 # DELETE removes. `fail_put` fails every PUT, `fail_idx` the snapshot index
 # PUT, `fail_get` every object GET.
-# `allowed` holds the connection's enforced allowed_endpoints (exact paths or
-# trailing-* prefixes); a request outside them is refused with 403. Without
-# it the gateway enforces nothing.
 cat >"$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-m=GET url="" up="" out="" w="" f=""
+m=GET url="" up="" out="" w=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        -sf) f=1 ;;
+        -sf) ;;
         -X) m=$2; shift ;;
         -T) up=$2; m=PUT; shift ;;
         -o) out=$2; shift ;;
@@ -63,20 +60,6 @@ case "$url" in
     */v1/gateway/list) cat "$CS/connections"; exit 0 ;;
 esac
 key=${url#*/conn/}
-if [ -f "$CS/allowed" ]; then
-    path="/${key%%\?*}" ok=""
-    while IFS= read -r pat; do
-        case "$pat" in
-            *'*') [[ "$path" == "${pat%\*}"* ]] && ok=1 ;;
-            *) [ "$path" = "$pat" ] && ok=1 ;;
-        esac
-    done <"$CS/allowed"
-    if [ -z "$ok" ]; then
-        [ -n "$w" ] && printf 403
-        [ -n "$f" ] && exit 22
-        exit 0
-    fi
-fi
 case "$m" in
     PUT)
         [ -e "$CS/fail_put" ] && exit 22
@@ -107,9 +90,7 @@ chmod +x "$T/bin/curl"
 export PATH="$T/bin:$PATH"
 
 MB="buzz.block.xyz/managed-by=buzz-backend-sprites"
-OWN="buzz.block.xyz/agent-pubkey-full=$PK"
-SCOPED='{"sprite_labels":["'$MB'","'$OWN'"],"allowed_endpoints":["/agents/'$PK'/*"]}'
-echo "/agents/$PK/*" >"$CS/allowed"
+SCOPED='{"sprite_labels":["'$MB'"]}'
 conn() { # <access-policy-json> <display-name>...
     local policy=$1
     shift
@@ -159,10 +140,9 @@ check "unnamed connection exits 0" '[ "$rc" -eq 0 ]'
 check "unnamed connection uploads nothing" '[ -z "$(ls -A "$CS/store")" ]'
 check "unnamed connection says why" 'grep -q "BUZZ_COLLECT_CONNECTION unset" "$T/log"'
 
-# 2. A named connection that is missing, ambiguous, reachable by any sprite
-#    but this agent's, or able to address keys outside this agent's prefix is
-#    refused before any PUT — and so is one whose gateway does not enforce
-#    the policy it reports.
+# 2. A named connection that is missing, ambiguous, or reachable by sprites
+#    outside this provider's fleet is refused before any PUT. One connection
+#    shared by the whole fleet is the intended shape and is accepted.
 export BUZZ_COLLECT_CONNECTION=agent-memories
 refused() { # <label> — the last pass sent nothing and failed
     check "$1 is refused" '[ "$rc" -ne 0 ] && [ -z "$(ls -A "$CS/store")" ]'
@@ -170,28 +150,14 @@ refused() { # <label> — the last pass sent nothing and failed
 conn "$SCOPED" other >"$CS/connections"; run; refused "a missing connection"
 conn "$SCOPED" agent-memories agent-memories >"$CS/connections"; run; refused "an ambiguous connection"
 conn '{"allow_all":true}' agent-memories >"$CS/connections"; run; refused "an allow_all connection"
-EP='"allowed_endpoints":["/agents/'$PK'/*"]'
-conn '{"allow_all":true,"sprite_labels":["'$MB'","'$OWN'"],'"$EP"'}' agent-memories >"$CS/connections"
-run; refused "allow_all beside the labels"
-conn '{"name_prefix":"buzz-","sprite_labels":["'$MB'","'$OWN'"],'"$EP"'}' agent-memories >"$CS/connections"
+conn '{"allow_all":true,"sprite_labels":["'$MB'"]}' agent-memories >"$CS/connections"
+run; refused "allow_all beside the label"
+conn '{"name_prefix":"buzz-","sprite_labels":["'$MB'"]}' agent-memories >"$CS/connections"
 run; refused "a name_prefix grant"
-conn '{"sprite_labels":["'$MB'"],'"$EP"'}' agent-memories >"$CS/connections"; run; refused "the fleet-wide managed-by label alone"
-conn '{"sprite_labels":["'$MB'","buzz.block.xyz/agent-pubkey-full=ffff"],'"$EP"'}' agent-memories >"$CS/connections"
-run; refused "another agent's label"
+conn '{"sprite_labels":["buzz.block.xyz/agent-pubkey-full='$PK'"]}' agent-memories >"$CS/connections"
+run; refused "an agent label without the managed-by label"
 conn '{}' agent-memories >"$CS/connections"; run; refused "an empty policy"
 check "an unconfined connection says why" 'grep -q "is not confined to sprite_labels" "$T/log"'
-conn '{"sprite_labels":["'$MB'","'$OWN'"]}' agent-memories >"$CS/connections"; run; refused "no allowed_endpoints"
-conn '{"sprite_labels":["'$MB'","'$OWN'"],"allowed_endpoints":["/*"]}' agent-memories >"$CS/connections"; run; refused "allowed_endpoints /*"
-conn '{"sprite_labels":["'$MB'","'$OWN'"],"allowed_endpoints":["/agents/*"]}' agent-memories >"$CS/connections"; run; refused "allowed_endpoints /agents/*"
-conn '{"sprite_labels":["'$MB'","'$OWN'"],"allowed_endpoints":["/agents/'$PK'/*","/agents/ffff/*"]}' agent-memories >"$CS/connections"
-run; refused "an endpoint in another agent's prefix"
-check "an endpoint outside the prefix says why" 'grep -q "is not confined to allowed_endpoints" "$T/log"'
-conn "$SCOPED" agent-memories >"$CS/connections"
-mv "$CS/allowed" "$CS/allowed.off"; run; refused "a policy the gateway does not enforce"
-mv "$CS/allowed.off" "$CS/allowed"
-check "an unenforced policy says why" 'grep -q "answered 404 for agents/0*/meta.json" "$T/log"'
-echo '/*' >"$CS/allowed"; run; refused "a gateway that lets a listing through"
-echo "/agents/$PK/*" >"$CS/allowed"
 conn "$SCOPED" agent-memories other >"$CS/connections"
 
 # 3. A failed upload is not recorded.

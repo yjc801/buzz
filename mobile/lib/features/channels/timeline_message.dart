@@ -6,6 +6,8 @@ import '../../shared/relay/relay.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
 import '../../shared/mentions/mention_tags.dart';
 import 'channel_window.dart';
+import 'message_media.dart';
+import 'message_content/bubble_segments.dart';
 
 enum SystemEventType {
   memberJoined,
@@ -111,7 +113,7 @@ class SystemEvent {
           return '$actor joined the channel';
         }
         final target = resolveLabel(targetPubkey);
-        return '$target was added by $actor';
+        return '$actor added $target to the channel';
       }(),
       SystemEventType.memberLeft => '$actor left the channel',
       SystemEventType.memberRemoved => () {
@@ -212,7 +214,11 @@ class TimelineMessage {
   /// Attachment messages stay visually distinct from surrounding messages,
   /// even when several are sent by the same author in quick succession.
   bool get hasAttachments =>
-      tags.any((tag) => tag.isNotEmpty && tag.first == 'imeta');
+      tags.any((tag) => tag.isNotEmpty && tag.first == 'imeta') ||
+      messageBubbleSegments(
+        content,
+        parseImetaTags(tags),
+      ).any((segment) => segment.attachment);
 }
 
 @immutable
@@ -255,13 +261,20 @@ const _membershipGroupWindowSeconds = 5 * 60;
 class _MembershipChange {
   final String? actor;
   final bool isSelfJoin;
+  final SystemEventType type;
 
-  const _MembershipChange({required this.actor, required this.isSelfJoin});
+  const _MembershipChange({
+    required this.actor,
+    required this.isSelfJoin,
+    required this.type,
+  });
 }
 
 _MembershipChange? _membershipChange(MainTimelineEntry entry) {
   final event = entry.message.systemEvent;
-  if (!entry.message.isSystem || event?.type != SystemEventType.memberJoined) {
+  if (!entry.message.isSystem ||
+      (event?.type != SystemEventType.memberJoined &&
+          event?.type != SystemEventType.memberRemoved)) {
     return null;
   }
 
@@ -271,8 +284,10 @@ _MembershipChange? _membershipChange(MainTimelineEntry entry) {
     return null;
   }
 
-  final isSelfJoin = actor == target;
+  final isSelfJoin =
+      event!.type == SystemEventType.memberJoined && actor == target;
   return _MembershipChange(
+    type: event.type,
     actor: isSelfJoin ? null : actor,
     isSelfJoin: isSelfJoin,
   );
@@ -282,7 +297,8 @@ bool _membershipChangesCanGroup(
   _MembershipChange first,
   _MembershipChange second,
 ) {
-  return first.isSelfJoin == second.isSelfJoin &&
+  return first.type == second.type &&
+      first.isSelfJoin == second.isSelfJoin &&
       (first.isSelfJoin || first.actor == second.actor);
 }
 
@@ -294,10 +310,9 @@ bool _isSameLocalDay(int firstTimestamp, int secondTimestamp) {
       first.day == second.day;
 }
 
-/// Groups consecutive membership arrivals using the same display rule as
-/// desktop: matching additions (or self-joins) within a fixed five-minute
-/// window become one render item. Other events and local day boundaries break
-/// the group.
+/// Groups consecutive matching additions, removals, or self-joins within a
+/// five-minute window into one render item. Other events and local day
+/// boundaries break the group.
 ///
 /// Each inner list is one renderable timeline item. Non-grouped entries are
 /// returned as single-item lists.
@@ -462,6 +477,9 @@ List<TimelineMessage> formatTimeline(
 
     if (event.kind == EventKind.systemMessage) {
       final systemEvent = SystemEvent.fromContent(event.content);
+      // Purpose is legacy metadata with no mobile surface. Omit its activity
+      // before grouping so it cannot leave blank rows or split sender groups.
+      if (systemEvent?.type == SystemEventType.purposeChanged) continue;
       if (systemEvent != null) {
         result.add(
           TimelineMessage(

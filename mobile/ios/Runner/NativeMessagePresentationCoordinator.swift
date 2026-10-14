@@ -8,6 +8,7 @@ final class NativeMessagePresentationCoordinator: NSObject, UIAdaptivePresentati
   private weak var presented: UIViewController?
   private var pendingResult: FlutterResult?
   private var requestID: String?
+  private var terminalValue: [String: String]?
 
   init(messenger: FlutterBinaryMessenger, parentViewController: UIViewController?) {
     channel = FlutterMethodChannel(name: "buzz/native_message_presentation", binaryMessenger: messenger)
@@ -74,6 +75,9 @@ final class NativeMessagePresentationCoordinator: NSObject, UIAdaptivePresentati
     } else {
       let sheet = NativeReactionDetailsViewController(data: data)
       sheet.onClose = { [weak self] in self?.dismiss([:]) }
+      sheet.onAddReaction = { [weak self] in
+        self?.dismiss(["action": "addReaction"])
+      }
       sheet.onToggle = { [weak self] emoji in
         self?.channel.invokeMethod("toggleReaction", arguments: [
           "requestId": data["requestId"] as? String ?? "", "emoji": emoji,
@@ -98,8 +102,13 @@ final class NativeMessagePresentationCoordinator: NSObject, UIAdaptivePresentati
   }
 
   private func dismiss(_ value: [String: String]) {
+    guard pendingResult != nil, terminalValue == nil else { return }
+    terminalValue = value
     guard let presented else { complete(value); return }
-    let completion: () -> Void = { [weak self] in self?.complete(value) }
+    let completion: () -> Void = { [weak self] in
+      guard let self, self.presented === presented else { return }
+      self.complete(value)
+    }
     if let menu = presented as? NativeMessageMenuViewController {
       menu.animateOut {
         menu.dismiss(animated: false, completion: completion)
@@ -110,14 +119,17 @@ final class NativeMessagePresentationCoordinator: NSObject, UIAdaptivePresentati
   }
 
   func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+    guard presented === presentationController.presentedViewController else { return }
     complete([:])
   }
 
   private func complete(_ value: [String: String]) {
     let result = pendingResult
+    let terminal = terminalValue ?? value
+    terminalValue = nil
     pendingResult = nil
     presented = nil
     requestID = nil
-    result?(value)
+    result?(terminal)
   }
 }

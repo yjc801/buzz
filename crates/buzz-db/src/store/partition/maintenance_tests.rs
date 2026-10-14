@@ -328,8 +328,8 @@ mod postgres_tests {
 
     use super::*;
     use crate::store::partition::tests::postgres_tests::{
-        catalog_snapshot, create_child, drop_schema, fixed_now, scratch_pool,
-        scratch_pool_with_max_connections, seed_parents,
+        catalog_snapshot, create_child, fixed_now, scratch_pool, scratch_pool_with_max_connections,
+        seed_parents,
     };
 
     /// The repaired incident layout for both managed parents, optionally with
@@ -441,7 +441,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn empty_catch_all_advances_to_canonical_layout_and_is_idempotent() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
 
         let audit = maintain(&pool).await.expect("advance");
@@ -474,13 +474,12 @@ mod postgres_tests {
         let before = catalog_snapshot(&pool).await;
         maintain(&pool).await.expect("idempotent rerun");
         assert_eq!(catalog_snapshot(&pool).await, before);
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn canonical_catch_all_name_is_replaced_in_one_transaction() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_parents(&pool).await;
         for table in PARTITIONED_TABLES {
             create_child(
@@ -506,13 +505,12 @@ mod postgres_tests {
             .children
             .iter()
             .any(|child| child.name == format!("{}_p2026_09", table.table))));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn populated_catch_all_is_refused_before_any_lock() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         sqlx::query("INSERT INTO events (created_at, alternate_at) VALUES ('2027-02-01', now())")
             .execute(&pool)
@@ -544,13 +542,12 @@ mod postgres_tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(events_only(&after), events_only(&before));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn counterpart_contention_fails_fast_and_rolls_back() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
         let before = catalog_snapshot(&pool).await;
         let holder = hold_lock(
@@ -575,13 +572,12 @@ mod postgres_tests {
         assert_eq!(catalog_snapshot(&pool).await, before);
 
         assert_advanced(&maintain(&pool).await.expect("advance after release"));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn counterpart_reader_does_not_block_advancement() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
         let holder = hold_lock(&pool, "SELECT count(*) FROM communities").await;
 
@@ -589,13 +585,12 @@ mod postgres_tests {
         drop(holder);
 
         assert_advanced(&result.expect("advance beside a counterpart reader"));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn writer_checking_a_foreign_key_behind_maintenance_does_not_deadlock() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
         // An in-flight insert: the parent first, then the foreign-key check.
         let mut writer = hold_lock(&pool, "LOCK TABLE ONLY events IN ROW EXCLUSIVE MODE").await;
@@ -615,7 +610,7 @@ mod postgres_tests {
                  WHERE $1 = ANY(pg_blocking_pids(pid)))",
             )
             .bind(writer_pid)
-            .fetch_one(&admin)
+            .fetch_one(&scratch.admin)
             .await
             .expect("check queued maintenance");
             if queued {
@@ -650,7 +645,6 @@ mod postgres_tests {
                 .expect("maintenance task")
                 .expect("advance after the writer commits"),
         );
-        drop_schema(&admin, &schema).await;
     }
 
     async fn wait_until_blocked_by(admin: &PgPool, pid: i32, waiters: i64) {
@@ -673,7 +667,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn foreign_key_committed_while_waiting_on_the_parent_is_locked_nowait() {
-        let (pool, admin, schema) = scratch_pool_with_max_connections(6).await;
+        let (pool, scratch) = scratch_pool_with_max_connections(6).await;
         seed_repaired_layout(&pool, true).await;
         sqlx::query("CREATE TABLE reviewers (id UUID PRIMARY KEY)")
             .execute(&pool)
@@ -708,12 +702,12 @@ mod postgres_tests {
                     .expect("roll back counterpart writer");
             }
         });
-        wait_until_blocked_by(&admin, migration_pid, 1).await;
+        wait_until_blocked_by(&scratch.admin, migration_pid, 1).await;
         let maintenance = tokio::spawn({
             let pool = pool.clone();
             async move { maintain(&pool).await }
         });
-        wait_until_blocked_by(&admin, migration_pid, 2).await;
+        wait_until_blocked_by(&scratch.admin, migration_pid, 2).await;
 
         migration.commit().await.expect("commit migration");
         let result = maintenance.await.expect("maintenance task");
@@ -733,7 +727,6 @@ mod postgres_tests {
         release_writer.send(()).expect("release counterpart writer");
         writer.await.expect("counterpart writer task");
         assert_advanced(&maintain(&pool).await.expect("advance after release"));
-        drop_schema(&admin, &schema).await;
     }
 
     async fn backend_pid(connection: &mut PgConnection) -> i32 {
@@ -753,7 +746,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn foreign_key_referencing_the_parent_committed_while_waiting_is_refused() {
-        let (pool, admin, schema) = scratch_pool_with_max_connections(6).await;
+        let (pool, scratch) = scratch_pool_with_max_connections(6).await;
         seed_repaired_layout(&pool, true).await;
         sqlx::query(
             "CREATE TABLE event_refs \
@@ -775,7 +768,7 @@ mod postgres_tests {
             let pool = pool.clone();
             async move { maintain(&pool).await }
         });
-        wait_until_blocked_by(&admin, migration_pid, 1).await;
+        wait_until_blocked_by(&scratch.admin, migration_pid, 1).await;
         migration.commit().await.expect("commit migration");
 
         let result = maintenance.await.expect("maintenance task");
@@ -783,13 +776,12 @@ mod postgres_tests {
             refused_events_only(&result, "events is referenced by a foreign key"),
             "{result:?}"
         );
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn catch_all_foreign_keys_outside_the_parent_are_refused() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
         sqlx::query("CREATE TABLE reviewers (id UUID PRIMARY KEY)")
             .execute(&pool)
@@ -842,13 +834,12 @@ mod postgres_tests {
         }
         drop(holder);
         assert_advanced(&maintain(&pool).await.expect("advance without the keys"));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn catch_all_foreign_key_committed_while_waiting_on_the_parent_is_refused() {
-        let (pool, admin, schema) = scratch_pool_with_max_connections(6).await;
+        let (pool, scratch) = scratch_pool_with_max_connections(6).await;
         seed_repaired_layout(&pool, true).await;
         sqlx::query("CREATE TABLE reviewers (id UUID PRIMARY KEY)")
             .execute(&pool)
@@ -868,7 +859,7 @@ mod postgres_tests {
             let pool = pool.clone();
             async move { maintain(&pool).await }
         });
-        wait_until_blocked_by(&admin, reader_pid, 1).await;
+        wait_until_blocked_by(&scratch.admin, reader_pid, 1).await;
         migration.commit().await.expect("commit migration");
         reader.commit().await.expect("release parent");
 
@@ -885,13 +876,12 @@ mod postgres_tests {
         .await
         .expect("count catch-all key");
         assert_eq!(kept, 1);
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn deadlock_victim_is_classified_as_a_lock_timeout() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_parents(&pool).await;
         let mut first = hold_lock(&pool, "LOCK TABLE ONLY events IN ACCESS EXCLUSIVE MODE").await;
         let mut second = hold_lock(
@@ -925,13 +915,12 @@ mod postgres_tests {
             PartitionMaintenanceOutcome::LockTimeout
         );
         drop((first, second));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn parent_contention_times_out_without_blocking_the_other_table() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
         let holder = hold_lock(&pool, "LOCK TABLE ONLY events IN ACCESS SHARE MODE").await;
 
@@ -961,13 +950,12 @@ mod postgres_tests {
             audited_at: audit.audited_at,
             tables: delivery_log,
         });
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn held_maintenance_lock_skips_without_ddl() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         let before = catalog_snapshot(&pool).await;
         let holder = hold_lock(
@@ -982,13 +970,12 @@ mod postgres_tests {
             .expect("skipped_locked is not a failure");
         assert_eq!(catalog_snapshot(&pool).await, before);
         drop(holder);
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn concurrent_runners_converge_on_one_layout() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, true).await;
 
         let (first, second) = tokio::join!(maintain(&pool), maintain(&pool));
@@ -1012,13 +999,12 @@ mod postgres_tests {
         }
         // Whatever a fail-fast loser left undone, the next pass converges.
         assert_advanced(&maintain(&pool).await.expect("follow-up pass"));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn client_deadline_rolls_back_and_discards_the_session() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         let before = catalog_snapshot(&pool).await;
         // The parent lock wait (2s) outlasts the 300ms client deadline.
@@ -1050,7 +1036,7 @@ mod postgres_tests {
             "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
         )
         .bind(holder_pid)
-        .fetch_all(&admin)
+        .fetch_all(&scratch.admin)
         .await
         .expect("sessions blocked by the holder");
         let mut gone = blocked.is_empty();
@@ -1063,7 +1049,7 @@ mod postgres_tests {
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = ANY($1))",
             )
             .bind(&blocked)
-            .fetch_one(&admin)
+            .fetch_one(&scratch.admin)
             .await
             .expect("check abandoned backend");
             gone = !alive;
@@ -1086,13 +1072,12 @@ mod postgres_tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(events_only(&after), events_only(&before));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn catch_all_with_child_only_trigger_is_refused() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         sqlx::query(
             "CREATE TRIGGER catch_all_only BEFORE INSERT ON events_p_future_next \
@@ -1120,13 +1105,12 @@ mod postgres_tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(events_only(&after), events_only(&before));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn stale_audit_after_a_concurrent_advance_is_a_noop() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         // A runner audits, then loses the race to a runner that commits first.
         let stale = audit_partition_catalog_at(&pool, PARTITION_MANAGER_MONTHS_AHEAD, fixed_now())
@@ -1167,13 +1151,12 @@ mod postgres_tests {
         .await
         .expect("losing runner");
         assert_advanced(&reported);
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn replan_that_finds_only_disabled_work_is_skipped_disabled() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         sqlx::query("DROP TABLE events_p_future_next")
             .execute(&pool)
@@ -1210,13 +1193,12 @@ mod postgres_tests {
             (PartitionMaintenanceOutcome::SkippedDisabled, None)
         );
         assert_eq!(catalog_snapshot(&pool).await, before);
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn audit_retries_when_a_listed_partition_is_dropped() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         let mut dropper = pool.begin().await.expect("begin dropper");
         let dropper_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -1242,7 +1224,7 @@ mod postgres_tests {
                  WHERE $1 = ANY(pg_blocking_pids(pid)))",
             )
             .bind(dropper_pid)
-            .fetch_one(&admin)
+            .fetch_one(&scratch.admin)
             .await
             .expect("check audit queue");
             if queued {
@@ -1263,13 +1245,12 @@ mod postgres_tests {
             .children
             .iter()
             .all(|child| child.name != "events_p_future_next"));
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn unrelated_catch_all_name_is_an_operator_error() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         sqlx::query("CREATE TABLE events_p_future (unrelated BOOLEAN)")
             .execute(&pool)
@@ -1297,13 +1278,12 @@ mod postgres_tests {
                 .filter(|(name, ..)| name.starts_with("events_"))
                 .count()
         );
-        drop_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn incoming_foreign_key_is_refused_under_lock() {
-        let (pool, admin, schema) = scratch_pool().await;
+        let (pool, _scratch) = scratch_pool().await;
         seed_repaired_layout(&pool, false).await;
         sqlx::query(
             "CREATE TABLE event_refs (created_at TIMESTAMPTZ, alternate_at TIMESTAMPTZ, id BIGINT, \
@@ -1325,6 +1305,5 @@ mod postgres_tests {
             .iter()
             .any(|(name, ..)| name == "events_p_future_next"));
         assert_ne!(after, before, "delivery_log still advances");
-        drop_schema(&admin, &schema).await;
     }
 }

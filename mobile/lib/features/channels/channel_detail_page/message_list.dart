@@ -53,6 +53,9 @@ class _MessageList extends HookConsumerWidget {
     final stickyDayTimestamp = useValueNotifier<int?>(null);
     final timelineViewportHeight = useRef(MediaQuery.sizeOf(context).height);
     final isLoadingOlder = useState(false);
+    final navigatingOldest = useRef(false);
+    final olderFetchPaused = useRef(false);
+    final oldestNavigationGeneration = useRef(0);
     final isAtLatest = useState(true);
     final settledImeBottomInset = useState(
       usesFixedAndroidImeViewport
@@ -346,6 +349,14 @@ class _MessageList extends HookConsumerWidget {
       try {
         final targetIndex =
             reversedIndexOf(latestNavigationTargetId.value) ?? 0;
+        if (latestNavigationTargetId.value != null) {
+          itemScrollController.jumpTo(
+            index: targetIndex,
+            // Index zero already includes the composer padding.
+            alignment: targetIndex == 0 ? 0 : latestAlignment(),
+          );
+          return;
+        }
         await itemScrollController.scrollTo(
           index: targetIndex,
           alignment: latestAlignment(),
@@ -506,7 +517,9 @@ class _MessageList extends HookConsumerWidget {
               .reduce((a, b) => a > b ? a : b);
           if (!hasUserScrolled.value ||
               oldestVisible < displayEntries.length - 3 ||
-              isLoadingOlder.value) {
+              isLoadingOlder.value ||
+              navigatingOldest.value ||
+              olderFetchPaused.value) {
             return;
           }
           final notifier = ref.read(
@@ -514,9 +527,14 @@ class _MessageList extends HookConsumerWidget {
           );
           if (notifier.reachedOldest) return;
           isLoadingOlder.value = true;
-          notifier.fetchOlder().whenComplete(
-            () => isLoadingOlder.value = false,
-          );
+          notifier
+              .fetchOlder()
+              .then((loaded) {
+                olderFetchPaused.value = !loaded && !notifier.reachedOldest;
+              })
+              .whenComplete(() {
+                if (context.mounted) isLoadingOlder.value = false;
+              });
         }
 
         var disposed = false;
@@ -675,6 +693,23 @@ class _MessageList extends HookConsumerWidget {
       return null;
     }, [latestEntryId, localSendAnimations]);
 
+    _useChannelScrollToOldest(
+      context,
+      notifier: notifier,
+      itemScrollController: itemScrollController,
+      displayCount: displayEntries.length,
+      isLoadingOlder: isLoadingOlder,
+      navigatingOldest: navigatingOldest,
+      olderFetchPaused: olderFetchPaused,
+      oldestNavigationGeneration: oldestNavigationGeneration,
+      onStart: () {
+        followsLatest.value = false;
+        hasUserScrolled.value = true;
+        isAtLatest.value = false;
+        if (showUnreadNavigation) detachedWhileUnreadShown.value = true;
+      },
+    );
+
     if (entries.isEmpty) {
       return Center(
         child: Column(
@@ -743,6 +778,9 @@ class _MessageList extends HookConsumerWidget {
             );
             if (notification is UserScrollNotification &&
                 notification.direction != ScrollDirection.idle) {
+              navigatingOldest.value = false;
+              oldestNavigationGeneration.value++;
+              olderFetchPaused.value = false;
               hasUserScrolled.value = true;
               followsLatest.value = false;
               if (showUnreadNavigation) {
@@ -807,6 +845,7 @@ class _MessageList extends HookConsumerWidget {
                 final showAuthor =
                     !message.isSystem &&
                     (message.hasAttachments ||
+                        prevMessage?.hasAttachments == true ||
                         prevMessage == null ||
                         prevMessage.isSystem ||
                         showDayDivider ||
@@ -814,7 +853,22 @@ class _MessageList extends HookConsumerWidget {
                             message.pubkey.toLowerCase() ||
                         (message.createdAt - prevMessage.createdAt) > 300);
 
+                final nextMessage = chronIdx + 1 < displayEntries.length
+                    ? displayEntries[chronIdx + 1].first.message
+                    : null;
+                final showAvatar =
+                    message.hasAttachments ||
+                    nextMessage == null ||
+                    nextMessage.isSystem ||
+                    nextMessage.hasAttachments ||
+                    !isSameDay(message.createdAt, nextMessage.createdAt) ||
+                    nextMessage.pubkey.toLowerCase() !=
+                        message.pubkey.toLowerCase() ||
+                    nextMessage.createdAt - message.createdAt > 300;
+
                 return LocalMessageSendTransition(
+                  messageId: message.id,
+                  channelId: channelId,
                   key: ValueKey('channel-message-send-${message.id}'),
                   animate: isRecentLocalMessageSendAnimation(
                     localSendAnimations,
@@ -853,7 +907,19 @@ class _MessageList extends HookConsumerWidget {
                           _MessageBubble(
                             message: message,
                             showAuthor: showAuthor,
+                            showAvatar: showAvatar,
                             hasReplies: entry.summary != null,
+                            replyFooter: entry.summary == null
+                                ? null
+                                : _ThreadSummaryRow(
+                                    summary: entry.summary!,
+                                    message: message,
+                                    allMessages: allMessages,
+                                    channelId: channelId,
+                                    currentPubkey: currentPubkey,
+                                    isMember: isMember,
+                                    isArchived: isArchived,
+                                  ),
                             channelNames: channelNamesMap,
                             currentChannelId: channelId,
                             currentPubkey: currentPubkey,
@@ -863,16 +929,6 @@ class _MessageList extends HookConsumerWidget {
                             composerFocusNode: composerFocusNode,
                             restoreComposerFocus: restoreComposerFocus,
                           ),
-                          if (entry.summary != null)
-                            _ThreadSummaryRow(
-                              summary: entry.summary!,
-                              message: message,
-                              allMessages: allMessages,
-                              channelId: channelId,
-                              currentPubkey: currentPubkey,
-                              isMember: isMember,
-                              isArchived: isArchived,
-                            ),
                         ],
                       ],
                     ),

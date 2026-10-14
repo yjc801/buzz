@@ -104,6 +104,9 @@ class ReactionRow extends HookWidget {
   /// Channel whose members define the reactor names' comparison context.
   final String channelId;
 
+  /// Groups reaction controls in one capsule attached to a bubble.
+  final bool combined;
+
   final List<TimelineReaction> reactions;
   final void Function(String emoji) onToggle;
 
@@ -122,6 +125,7 @@ class ReactionRow extends HookWidget {
     required this.reactions,
     required this.onToggle,
     this.showAddButton = false,
+    this.combined = false,
     this.onAddReaction,
   });
 
@@ -147,6 +151,78 @@ class ReactionRow extends HookWidget {
     // With the add button on, an empty row still renders — that affordance is
     // the point. Without it, an empty row would be dead space.
     if (reactions.isEmpty && !showAddButton) return const SizedBox.shrink();
+
+    if (combined && reactions.isNotEmpty) {
+      final count = reactions.fold<int>(
+        0,
+        (sum, reaction) => sum + reaction.count,
+      );
+      final ownReaction = reactions.any(
+        (reaction) => reaction.reactedByCurrentUser,
+      );
+      void openDetails() => showReactionDetailSheet(
+        context: context,
+        channelId: channelId,
+        reactions: liveReactions,
+        onToggle: (emoji) {
+          if (context.mounted) latestToggle.value(emoji);
+        },
+        onAddReaction: showAddButton ? onAddReaction : null,
+      );
+      return Padding(
+        padding: const EdgeInsets.only(bottom: Grid.xxs),
+        child: Align(
+          widthFactor: 1,
+          alignment: Alignment.centerLeft,
+          child: Semantics(
+            button: true,
+            label:
+                'View $count ${count == 1 ? 'reaction' : 'reactions'}'
+                '${ownReaction ? ', including yours' : ''}',
+            child: GestureDetector(
+              key: const ValueKey('combined-reaction-tray'),
+              behavior: HitTestBehavior.opaque,
+              onTap: openDetails,
+              onLongPress: openDetails,
+              child: ExcludeSemantics(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: context.colors.secondaryContainer,
+                    borderRadius: BorderRadius.circular(Radii.container),
+                    border: Border.all(color: context.colors.surface, width: 2),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: Grid.xxs + Grid.quarter,
+                      vertical: Grid.half,
+                    ),
+                    child: Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: Grid.quarter,
+                      runSpacing: Grid.quarter,
+                      children: [
+                        for (final reaction in reactions)
+                          Padding(
+                            padding: const EdgeInsets.all(Grid.quarter),
+                            child: _ReactionEmoji(reaction: reaction, size: 20),
+                          ),
+                        Padding(
+                          padding: const EdgeInsets.only(left: Grid.half),
+                          child: Text(
+                            '${reactions.fold<int>(0, (sum, reaction) => sum + reaction.count)}',
+                            style: context.textTheme.labelMedium,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
 
     return Padding(
       padding: const EdgeInsets.only(top: Grid.half),
@@ -354,10 +430,25 @@ class _ReactionEmoji extends StatelessWidget {
   Widget build(BuildContext context) {
     final emojiUrl = reaction.emojiUrl;
     if (emojiUrl == null || emojiUrl.isEmpty) {
-      return NativeEmojiGlyph(emoji: reaction.emoji, size: size);
+      return NativeEmojiGlyph(
+        emoji: reaction.emoji,
+        size: size,
+        opticalBoxSize: size,
+        centerInOpticalBox: true,
+      );
     }
     final shortcode = reaction.emoji.substring(1, reaction.emoji.length - 1);
-    return CustomEmojiImage(shortcode: shortcode, url: emojiUrl, size: size);
+    return SizedBox.square(
+      dimension: size,
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: CustomEmojiImage(
+          shortcode: shortcode,
+          url: emojiUrl,
+          size: size,
+        ),
+      ),
+    );
   }
 }
 
@@ -366,6 +457,7 @@ Future<void> showReactionDetailSheet({
   required String channelId,
   required ValueListenable<List<TimelineReaction>> reactions,
   required ValueChanged<String> onToggle,
+  VoidCallback? onAddReaction,
 }) async {
   if (reactions.value.isEmpty) return;
   if (await _showNativeReactionDetails(
@@ -373,6 +465,7 @@ Future<void> showReactionDetailSheet({
     channelId,
     reactions,
     onToggle,
+    onAddReaction,
   )) {
     return;
   }
@@ -398,6 +491,7 @@ Future<void> showReactionDetailSheet({
           channelId: channelId,
           reactions: value,
           onToggle: onToggle,
+          onAddReaction: onAddReaction,
         );
       },
     ),
@@ -408,11 +502,13 @@ class _ReactionDetailSheet extends HookConsumerWidget {
   final String channelId;
   final List<TimelineReaction> reactions;
   final ValueChanged<String> onToggle;
+  final VoidCallback? onAddReaction;
 
   const _ReactionDetailSheet({
     required this.channelId,
     required this.reactions,
     required this.onToggle,
+    this.onAddReaction,
   });
 
   @override
@@ -446,6 +542,16 @@ class _ReactionDetailSheet extends HookConsumerWidget {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
+                  if (onAddReaction != null)
+                    IconButton(
+                      key: const ValueKey('reaction-sheet-add'),
+                      tooltip: 'Add reaction',
+                      icon: const Icon(BuzzIcons.smilePlus),
+                      onPressed: () {
+                        Navigator.of(context).pop();
+                        onAddReaction!();
+                      },
+                    ),
                   for (final reaction in reactions)
                     Padding(
                       padding: const EdgeInsets.only(right: Grid.half),
@@ -613,9 +719,11 @@ Future<bool> _showNativeReactionDetails(
   String channelId,
   ValueListenable<List<TimelineReaction>> reactions,
   ValueChanged<String> onToggle,
+  VoidCallback? onAddReaction,
 ) async {
   if (!NativeMessagePresentation.isSupportedPlatform) return false;
-  return NativeMessagePresentation.withLease(() async {
+  var addRequested = false;
+  final handled = await NativeMessagePresentation.withLease(() async {
     final container = ProviderScope.containerOf(context, listen: false);
     final requestId = DateTime.now().microsecondsSinceEpoch.toString();
     List<String> pubkeys() =>
@@ -743,11 +851,15 @@ Future<bool> _showNativeReactionDetails(
           context,
         ).colorScheme.onSurface.withValues(alpha: 0.25).toARGB32(),
         'dark': Theme.of(context).brightness == Brightness.dark,
+        'canAddReaction': onAddReaction != null,
+        'addReactionIconCodePoint': BuzzIcons.smilePlus.codePoint,
         'profiles': profiles(),
         'reactions': reactionData(),
       }, onReaction: onToggle);
       container.read(userCacheProvider.notifier).preload(pubkeys());
-      return await pending != null;
+      final result = await pending;
+      addRequested = result?['action'] == 'addReaction';
+      return result != null;
     } finally {
       disposed = true;
       reactions.removeListener(updateReactions);
@@ -756,4 +868,6 @@ Future<bool> _showNativeReactionDetails(
       namesSubscription.close();
     }
   });
+  if (addRequested && context.mounted) onAddReaction?.call();
+  return handled;
 }

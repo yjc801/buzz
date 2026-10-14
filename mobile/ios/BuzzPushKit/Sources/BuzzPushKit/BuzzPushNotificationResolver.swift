@@ -462,7 +462,8 @@ public final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         BuzzPushNavigationTarget(
           eventID: event.id,
           communityID: community.id,
-          channelID: $0
+          channelID: $0,
+          threadRootID: BuzzPushNavigationTarget.threadRootID(in: event.tags)
         )
       },
       senderPubkey: event.pubkey.lowercased(),

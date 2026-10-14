@@ -1,5 +1,13 @@
+import 'package:buzz/features/channels/channel_management_provider.dart';
+import 'package:buzz/shared/custom_emoji/custom_emoji_render.dart';
+import 'package:buzz/shared/emoji/native_emoji_glyph.dart';
+import 'package:buzz/shared/relay/media_image.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:buzz/shared/emoji/emoji_avatar.dart';
 import 'dart:async';
+import 'dart:ui' show SemanticsAction;
+import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:buzz/features/channels/channel_identity_names_provider.dart';
 import 'package:buzz/shared/identity_names/identity_names.dart';
 import 'package:buzz/features/channels/message_long_press_region.dart';
@@ -18,6 +26,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../helpers/widget_helpers.dart';
+
+part 'reaction_row_test/combined_tests.dart';
 
 const _alice =
     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -66,6 +76,7 @@ Future<ProviderContainer> _pumpRow(
   required List<TimelineReaction> reactions,
   void Function(String emoji)? onToggle,
   bool showAddButton = false,
+  bool combined = false,
   VoidCallback? onAddReaction,
   String messageId = _messageId,
   VoidCallback? onMessageLongPress,
@@ -84,6 +95,7 @@ Future<ProviderContainer> _pumpRow(
         onLongPress: (_) => onMessageLongPress?.call(),
         child: ReactionRow(
           messageId: messageId,
+          combined: combined,
           channelId: 'channel',
           reactions: reactions,
           onToggle: onToggle ?? (_) {},
@@ -111,7 +123,22 @@ class _FakeUserCacheNotifier extends UserCacheNotifier {
   Future<bool> preload(List<String> pubkeys) async => true;
 }
 
+class _RecordingReactionActions implements ChannelActions {
+  final removed = <String>[];
+  final added = <String>[];
+  @override
+  Future<void> removeReaction(String eventId, String emoji) async =>
+      removed.add(eventId);
+  @override
+  Future<void> addReaction(String eventId, String emoji) async =>
+      added.add(eventId);
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 void main() {
+  combinedReactionTests();
+
   testWidgets('removing the sole reaction closes the sheet', (tester) async {
     final reactions = ValueNotifier<List<TimelineReaction>>([
       _reaction(reactedByCurrentUser: true),
@@ -169,72 +196,71 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'native toggles use the current callback and stream updated counts',
-    (tester) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
-      addTearDown(() => debugDefaultTargetPlatformOverride = null);
-      final completion = Completer<Map<String, Object?>>();
-      Map<Object?, Object?>? payload;
-      Map<Object?, Object?>? updated;
-      final toggles = <String>[];
-      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+  testWidgets('native combined tray toggles and streams updated counts', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final completion = Completer<Map<String, Object?>>();
+    Map<Object?, Object?>? payload;
+    Map<Object?, Object?>? updated;
+    final toggles = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      NativeMessagePresentation.channel,
+      (call) async {
+        if (call.method == 'reactions') {
+          payload = call.arguments as Map;
+          return completion.future;
+        }
+        if (call.method == 'updateReactions') updated = call.arguments as Map;
+        return <String, Object?>{};
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
         NativeMessagePresentation.channel,
-        (call) async {
-          if (call.method == 'reactions') {
-            payload = call.arguments as Map;
-            return completion.future;
-          }
-          if (call.method == 'updateReactions') updated = call.arguments as Map;
-          return <String, Object?>{};
-        },
-      );
-      addTearDown(
-        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
-          NativeMessagePresentation.channel,
-          null,
-        ),
-      );
-      await _pumpRow(
-        tester,
-        reactions: [_reaction()],
-        onToggle: (emoji) => toggles.add('old:$emoji'),
-      );
-      await tester.longPress(
-        find.byKey(const ValueKey('reaction-pill-$_fire')),
-      );
-      await tester.pumpAndSettle();
-      await _pumpRow(
-        tester,
-        reactions: [_reaction(count: 2, reactedByCurrentUser: true)],
-        onToggle: (emoji) => toggles.add('new:$emoji'),
-      );
-      expect((updated!['reactions'] as List).single, containsPair('count', 2));
-      expect(
-        (updated!['reactions'] as List).single,
-        containsPair('selected', true),
-      );
-      expect(updated!['requestId'], payload!['requestId']);
-      await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
-        NativeMessagePresentation.channel.name,
-        const StandardMethodCodec().encodeMethodCall(
-          MethodCall('toggleReaction', {
-            'requestId': payload!['requestId'],
-            'emoji': _fire,
-          }),
-        ),
-        (_) {},
-      );
-      await tester.pump();
-      expect(toggles, ['new:$_fire']);
-      await tester.pumpWidget(const SizedBox());
-      await tester.pumpAndSettle();
-      expect(updated!['reactions'], isEmpty);
-      completion.complete({});
-      await tester.pumpAndSettle();
-      debugDefaultTargetPlatformOverride = null;
-    },
-  );
+        null,
+      ),
+    );
+    await _pumpRow(
+      tester,
+      combined: true,
+      reactions: [_reaction()],
+      onToggle: (emoji) => toggles.add('old:$emoji'),
+    );
+    await tester.tap(find.byKey(const ValueKey('combined-reaction-tray')));
+    await tester.pumpAndSettle();
+    await _pumpRow(
+      tester,
+      combined: true,
+      reactions: [_reaction(count: 2, reactedByCurrentUser: true)],
+      onToggle: (emoji) => toggles.add('new:$emoji'),
+    );
+    expect((updated!['reactions'] as List).single, containsPair('count', 2));
+    expect(
+      (updated!['reactions'] as List).single,
+      containsPair('selected', true),
+    );
+    expect(updated!['requestId'], payload!['requestId']);
+    await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+      NativeMessagePresentation.channel.name,
+      const StandardMethodCodec().encodeMethodCall(
+        MethodCall('toggleReaction', {
+          'requestId': payload!['requestId'],
+          'emoji': _fire,
+        }),
+      ),
+      (_) {},
+    );
+    await tester.pump();
+    expect(toggles, ['new:$_fire']);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    expect(updated!['reactions'], isEmpty);
+    completion.complete({});
+    await tester.pumpAndSettle();
+    debugDefaultTargetPlatformOverride = null;
+  });
 
   testWidgets(
     'native reactor labels retain channel qualifications and live updates',

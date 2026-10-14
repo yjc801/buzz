@@ -150,6 +150,27 @@ class _ThreadMessageList extends HookWidget {
     const headIndex = 0;
     final tailAnchorIndex = replies.length + 1;
 
+    useIosScrollToTop(context, () {
+      if (!itemScrollController.isAttached) return;
+      onUserScrollStart();
+      if (MediaQuery.disableAnimationsOf(context)) {
+        itemScrollController.jumpTo(index: 0);
+        onUserScrollEnd();
+      } else {
+        unawaited(
+          itemScrollController
+              .scrollTo(
+                index: 0,
+                duration: const Duration(milliseconds: 300),
+                curve: Curves.easeOutCubic,
+              )
+              .whenComplete(() {
+                if (context.mounted) onUserScrollEnd();
+              }),
+        );
+      }
+    });
+
     return LaidOutViewportReporter(
       viewport: viewport,
       child: KeyboardDismissOnDrag(
@@ -221,11 +242,26 @@ class _ThreadMessageList extends HookWidget {
                           reply.createdAt,
                         );
                         final showAuthor =
+                            reply.hasAttachments ||
+                            previousReply?.hasAttachments == true ||
                             previousReply == null ||
                             showDayDivider ||
                             previousReply.pubkey.toLowerCase() !=
                                 reply.pubkey.toLowerCase() ||
                             (reply.createdAt - previousReply.createdAt) > 300;
+
+                        final nextReply =
+                            chronologicalIndex + 1 < replies.length
+                            ? replies[chronologicalIndex + 1]
+                            : null;
+                        final showAvatar =
+                            reply.hasAttachments ||
+                            nextReply?.hasAttachments == true ||
+                            nextReply == null ||
+                            !isSameDay(reply.createdAt, nextReply.createdAt) ||
+                            nextReply.pubkey.toLowerCase() !=
+                                reply.pubkey.toLowerCase() ||
+                            nextReply.createdAt - reply.createdAt > 300;
 
                         // Check if this reply itself has children (nested thread).
                         final nestedChildren = childrenByParent[reply.id];
@@ -236,6 +272,9 @@ class _ThreadMessageList extends HookWidget {
 
                         return trackActiveScrollPosition(
                           LocalMessageSendTransition(
+                            messageId: reply.id,
+                            channelId: channelId,
+                            threadHeadId: head.id,
                             key: ValueKey('thread-message-send-${reply.id}'),
                             animate: isRecentLocalMessageSendAnimation(
                               localSendAnimations,
@@ -265,6 +304,7 @@ class _ThreadMessageList extends HookWidget {
                                     channelId: channelId,
                                     currentPubkey: currentPubkey,
                                     showAuthor: showAuthor,
+                                    showAvatar: showAvatar,
                                     isHighlighted:
                                         reply.id == highlightedMessageId,
                                     allMessages: allMessages,

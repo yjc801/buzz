@@ -452,7 +452,12 @@ class _ProfileAvatar extends HookWidget {
               borderRadius: BorderRadius.circular(
                 constraints.biggest.shortestSide * 0.3,
               ),
-              child: avatar,
+              child: !usesInsetAgentArtwork(avatarUrl)
+                  ? avatar
+                  : Transform.scale(
+                      scale: animatedAvatarArtworkScale,
+                      child: avatar,
+                    ),
             );
           },
         ),

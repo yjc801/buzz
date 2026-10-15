@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:buzz/features/channels/me/me_messages_provider.dart';
 import 'dart:collection';
 import 'dart:convert';
 
@@ -44,6 +45,65 @@ void test(String description, Future<void> Function() body) {
 }
 
 void main() {
+  test(
+    'Solo notification target does not skip the intervening history',
+    () async {
+      final relay = _CursorRelay();
+      final container = _buildContainer(relay);
+      addTearDown(container.dispose);
+      container.read(meMessagesProvider(_channelId));
+      await relay.subscribed;
+      await _pumpEventQueue();
+      final notifier = container.read(meMessagesProvider(_channelId).notifier);
+      await notifier.loadEventsById(['older']);
+      expect(
+        container.read(meMessagesProvider(_channelId)).value!.first.id,
+        'older',
+      );
+      expect(await notifier.fetchOlder(), isTrue);
+      expect(await notifier.fetchOlder(), isTrue);
+      expect(await notifier.fetchOlder(), isFalse);
+      expect(container.read(meMessagesProvider(_channelId)).value!.length, 351);
+    },
+  );
+  test('Solo paginates through more than 100 equal-second events', () async {
+    final relay = _CursorRelay();
+    final container = _buildContainer(relay);
+    addTearDown(container.dispose);
+    container.read(meMessagesProvider(_channelId));
+    await relay.subscribed;
+    await _pumpEventQueue();
+    final notifier = container.read(meMessagesProvider(_channelId).notifier);
+    expect(await notifier.fetchOlder(), isTrue);
+    expect(await notifier.fetchOlder(), isTrue);
+    expect(await notifier.fetchOlder(), isFalse);
+    final events = container.read(meMessagesProvider(_channelId)).value!;
+    expect(events.length, 351);
+    expect(events.first.id, 'older');
+    expect(events.map((e) => e.id).toSet().length, 351);
+  });
+  test(
+    'Me reads channel replies without the top-level window filter',
+    () async {
+      final relay = _RecordingRelaySessionNotifier(
+        historyResults: [
+          [_event(id: 'history', createdAt: 10)],
+        ],
+      );
+      final container = _buildContainer(relay);
+      addTearDown(container.dispose);
+      container.read(meMessagesProvider(_channelId));
+      await relay.subscribed;
+      await _pumpEventQueue();
+      expect(relay.queryFilters, isEmpty);
+      expect(relay.historyFilters.single.extensions['top_level'], isNot(true));
+      expect(
+        container.read(meMessagesProvider(_channelId)).value!.map((e) => e.id),
+        ['history'],
+      );
+    },
+  );
+
   test('live window without deep links does not rescan flattened ids', () async {
     var historyIdReads = 0;
     final history = _IdReadTrackingEvent(
@@ -5707,5 +5767,33 @@ class _RecordingRelaySessionNotifier extends RelaySessionNotifier {
     if (!_history.isCompleted) {
       _history.completeError(error);
     }
+  }
+}
+
+class _CursorRelay extends _RecordingRelaySessionNotifier {
+  final events = [
+    for (var i = 0; i < 350; i++)
+      _event(id: i.toString().padLeft(64, '0'), createdAt: 20),
+    _event(id: 'older', createdAt: 19),
+  ];
+  @override
+  Future<List<NostrEvent>> fetchHistory(
+    NostrFilter filter, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    if (filter.ids != null) {
+      return events.where((e) => filter.ids!.contains(e.id)).toList();
+    }
+    final before = filter.extensions['before_id'] as String?;
+    return events
+        .where(
+          (e) =>
+              filter.until == null ||
+              e.createdAt < filter.until! ||
+              (e.createdAt == filter.until &&
+                  (before == null || e.id.compareTo(before) > 0)),
+        )
+        .take(filter.limit)
+        .toList();
   }
 }

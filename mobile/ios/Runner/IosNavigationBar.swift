@@ -593,15 +593,25 @@ private final class IosNavigationBarView: NSObject, FlutterPlatformView {
     item.accessibilityLabel = data["label"] as? String
     item.isEnabled = data["enabled"] as? Bool == true
     if data["avatarInitial"] is String { item.title = nil }
+    if let encoded = data["iconData"] as? String,
+       let bytes = Data(base64Encoded: encoded), let image = UIImage(data: bytes) {
+      item.image = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 24)).image { _ in
+        image.draw(in: CGRect(x: 0, y: 0, width: 24, height: 24))
+      }.withRenderingMode(.alwaysTemplate)
+      item.title = nil
+    }
+
     if let encoded = data["imageData"] as? String,
        let bytes = Data(base64Encoded: encoded), let image = UIImage(data: bytes) {
-      // Fill the 44-point native button with a 4-point inset. Keep the
-      // original 24-point alignment footprint so UIKit does not widen it.
-      let size = CGSize(width: 36, height: 36)
+      // Character artwork floats on the glass; photos fill its circular face.
+      // Preserve the 24-point alignment footprint so UIKit does not widen it.
+      let diameter: CGFloat = data["avatarIsAgent"] as? Bool == true && data["avatarArtwork"] as? Bool != true ? 44 : 36
+      let inset = (diameter - 24) / 2
+      let size = CGSize(width: diameter, height: diameter)
       item.image = UIGraphicsImageRenderer(size: size).image { _ in
         image.draw(in: CGRect(origin: .zero, size: size))
       }.withRenderingMode(.alwaysOriginal).withAlignmentRectInsets(
-        UIEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
+        UIEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
       )
     }
     if item.image == nil, let initial = data["avatarInitial"] as? String {
@@ -612,7 +622,7 @@ private final class IosNavigationBarView: NSObject, FlutterPlatformView {
       item.image = UIGraphicsImageRenderer(size: size).image { _ in
         Self.color(data["avatarBackground"]).setFill()
         UIBezierPath(roundedRect: CGRect(origin: .zero, size: size),
-                     cornerRadius: size.width * (data["avatarIsAgent"] as? Bool == true ? 0.3 : 0.5)).fill()
+                     cornerRadius: size.width * 0.5).fill()
         let text = initial as NSString
         let attributes: [NSAttributedString.Key: Any] = [
           .font: UIFont.systemFont(ofSize: 16, weight: .medium),

@@ -28,7 +28,7 @@ final class NativeProfileTextEditorCoordinator: NSObject,
     _ call: FlutterMethodCall,
     result: @escaping FlutterResult
   ) {
-    guard call.method == "present" || call.method == "presentChannel" else {
+    guard call.method == "present" || call.method == "presentChannel" || call.method == "presentChat" || call.method == "presentProject" else {
       result(FlutterMethodNotImplemented)
       return
     }
@@ -73,6 +73,8 @@ final class NativeProfileTextEditorCoordinator: NSObject,
         canEditCanvas: arguments["canEditCanvas"] as? Bool ?? false,
         canvasContent: arguments["canvasContent"] as? String ?? "",
         canvasLoaded: arguments["canvasLoaded"] as? Bool ?? false,
+        chatOptions: (call.method == "presentChat" || call.method == "presentProject")
+          ? arguments.merging(["projectOnly": call.method == "presentProject"]) { _, new in new } : nil,
         result: result
       )
     }
@@ -96,6 +98,7 @@ final class NativeProfileTextEditorCoordinator: NSObject,
     canEditCanvas: Bool,
     canvasContent: String,
     canvasLoaded: Bool,
+    chatOptions: [String: Any]?,
     result: @escaping FlutterResult
   ) {
     guard presentedController == nil else {
@@ -139,6 +142,7 @@ final class NativeProfileTextEditorCoordinator: NSObject,
       canEditCanvas: canEditCanvas,
       canvasContent: canvasContent,
       canvasLoaded: canvasLoaded,
+      chatOptions: chatOptions,
       onCancel: { [weak self] in self?.finish(value: nil) },
       onSet: { [weak self] value in self?.finish(value: value) }
     )
@@ -237,6 +241,16 @@ private final class NativeProfileTextEditorViewController:
   private var hasCanvas: Bool {
     canvasLoaded && !canvasContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
+  private let chatOptions: [String: Any]?
+  private var hasFocusedEditor = false
+  private var selectedAssistantAvatar: UIImage?
+  private var selectedAssistant: String?
+  private var isChatEditor: Bool { chatOptions != nil }
+  private var isProjectEditor: Bool { chatOptions?["projectOnly"] as? Bool ?? false }
+  private var assistants: [[String: String]] {
+    chatOptions?["assistants"] as? [[String: String]] ?? []
+  }
+  private var fieldsLocked: Bool { chatOptions?["fieldsLocked"] as? Bool ?? false }
   private var isChannelEditor: Bool { channelDescription != nil }
 
   private lazy var textField: UITextField = {
@@ -248,7 +262,7 @@ private final class NativeProfileTextEditorViewController:
     field.adjustsFontForContentSizeCategory = true
     field.clearButtonMode = .whileEditing
     field.returnKeyType = isChannelEditor ? .next : .done
-    field.isEnabled = canEditDetails
+    field.isEnabled = canEditDetails && !fieldsLocked
     field.accessibilityLabel = placeholder
     field.autocapitalizationType = .sentences
     field.delegate = self
@@ -299,6 +313,7 @@ private final class NativeProfileTextEditorViewController:
     canEditCanvas: Bool,
     canvasContent: String,
     canvasLoaded: Bool,
+    chatOptions: [String: Any]?,
     onCancel: @escaping () -> Void,
     onSet: @escaping (Any) -> Void
   ) {
@@ -316,6 +331,8 @@ private final class NativeProfileTextEditorViewController:
     self.canEditCanvas = canEditCanvas
     self.canvasContent = canvasContent
     self.canvasLoaded = canvasLoaded
+    self.chatOptions = chatOptions
+    self.selectedAssistant = chatOptions?["selectedAssistant"] as? String
     self.onCancel = onCancel
     self.onSet = onSet
     super.init(style: .insetGrouped)
@@ -351,7 +368,7 @@ private final class NativeProfileTextEditorViewController:
       action: #selector(cancelTapped)
     )
     navigationItem.rightBarButtonItem = UIBarButtonItem(
-      title: isChannelEditor ? "Save" : "Set",
+      title: isChatEditor ? (fieldsLocked ? "Retry" : "Create") : (isChannelEditor ? "Save" : "Set"),
       style: .done,
       target: self,
       action: #selector(setTapped)
@@ -361,7 +378,8 @@ private final class NativeProfileTextEditorViewController:
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
-    guard canEditDetails else { return }
+    guard canEditDetails && !hasFocusedEditor else { return }
+    hasFocusedEditor = true
     if multiline {
       textView.becomeFirstResponder()
     } else {
@@ -374,6 +392,10 @@ private final class NativeProfileTextEditorViewController:
   }
 
   private var hasUnsavedChanges: Bool {
+    if isChatEditor {
+      return !currentValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        || selectedAssistant != nil
+    }
     if isChannelEditor {
       return allowUnchangedSubmission
         || currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -402,6 +424,11 @@ private final class NativeProfileTextEditorViewController:
   private func updateNavigation() {
     navigationItem.rightBarButtonItem?.isEnabled = canEditDetails && hasUnsavedChanges
       && (!isChannelEditor || !canonicalChannelName.isEmpty)
+      && (!isChatEditor || (
+        !currentValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          && currentValue.count <= 120
+          && (isProjectEditor || assistants.contains { $0["id"] == selectedAssistant })
+      ))
     navigationController?.isModalInPresentation = hasUnsavedChanges
     placeholderLabel.isHidden = !textView.text.isEmpty
   }
@@ -436,7 +463,17 @@ private final class NativeProfileTextEditorViewController:
 
   @objc private func setTapped() {
     guard canEditDetails && hasUnsavedChanges else { return }
-    if isChannelEditor {
+    if isProjectEditor {
+      let name = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !name.isEmpty, currentValue.count <= 120 else { return }
+      onSet(name)
+    } else if isChatEditor {
+      guard let selectedAssistant,
+            assistants.contains(where: { $0["id"] == selectedAssistant }),
+            !currentValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            currentValue.count <= 120 else { return }
+      onSet(["name": currentValue, "assistant": selectedAssistant])
+    } else if isChannelEditor {
       guard !canonicalChannelName.isEmpty else { return }
       onSet(["action": "save", "name": canonicalChannelName, "description": textView.text ?? ""])
     } else {
@@ -466,6 +503,18 @@ private final class NativeProfileTextEditorViewController:
 
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
     tableView.deselectRow(at: indexPath, animated: true)
+    if isChatEditor && indexPath.section == 1 {
+      guard !fieldsLocked && !assistants.isEmpty else { return }
+      view.endEditing(true)
+      let picker = MeAssistantListController(assistants: assistants, selected: selectedAssistant, pageColor: pageBackgroundColor, rowColor: containerBackgroundColor) { [weak self] id, avatar in
+        self?.selectedAssistantAvatar = avatar
+        self?.selectedAssistant = id
+        self?.tableView.reloadSections(IndexSet(integer: 1), with: .none)
+        self?.updateNavigation()
+      }
+      navigationController?.pushViewController(picker, animated: true)
+      return
+    }
     guard isChannelEditor && canEditCanvas else { return }
     if indexPath.section == 2 { editCanvasTapped() }
     if indexPath.section == 3 { removeCanvasTapped() }
@@ -480,7 +529,15 @@ private final class NativeProfileTextEditorViewController:
     return false
   }
 
-  override func numberOfSections(in tableView: UITableView) -> Int { isChannelEditor ? (hasCanvas && canEditCanvas ? 4 : 3) : 1 }
+  override func numberOfSections(in tableView: UITableView) -> Int { isProjectEditor ? 1 : isChatEditor ? 2 : isChannelEditor ? (hasCanvas && canEditCanvas ? 4 : 3) : 1 }
+
+  override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+    guard isChatEditor && section == 1 else { return nil }
+    if let error = chatOptions?["error"] as? String { return error }
+    return assistants.isEmpty
+      ? "No agents are available for this account. Connect an agent on desktop, then try again."
+      : nil
+  }
 
   override func tableView(
     _ tableView: UITableView,
@@ -491,6 +548,7 @@ private final class NativeProfileTextEditorViewController:
     _ tableView: UITableView,
     heightForRowAt indexPath: IndexPath
   ) -> CGFloat {
+    if isChatEditor && indexPath.section == 1 && selectedAssistant != nil { return 64 }
     if isChannelEditor && indexPath.section >= 2 { return UITableView.automaticDimension }
     return (isChannelEditor ? indexPath.section == 1 : multiline) ? 132 : 52
   }
@@ -505,7 +563,19 @@ private final class NativeProfileTextEditorViewController:
     cell.layer.cornerRadius = containerCornerRadius
     cell.layer.cornerCurve = .continuous
     cell.clipsToBounds = true
-    if isChannelEditor && indexPath.section >= 2 {
+    if isChatEditor && indexPath.section == 1 {
+      var content = cell.defaultContentConfiguration()
+      let selected = assistants.first { $0["id"] == selectedAssistant }
+      content.text = selected?["name"] ?? "Choose an agent"
+      if let selected {
+        content.image = selectedAssistantAvatar ?? MeAssistantListController.avatarImage(selected, photo: nil)
+      }
+      content.textProperties.font = .preferredFont(forTextStyle: .body)
+      cell.contentConfiguration = content
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = fieldsLocked || assistants.isEmpty ? .none : .default
+      cell.accessibilityTraits = fieldsLocked || assistants.isEmpty ? .notEnabled : .button
+    } else if isChannelEditor && indexPath.section >= 2 {
       var content = cell.defaultContentConfiguration()
       content.textProperties.font = .preferredFont(forTextStyle: .body)
       if indexPath.section == 3 {
@@ -561,5 +631,114 @@ private extension UIColor {
       blue: CGFloat(argb & 0xff) / 255,
       alpha: CGFloat((argb >> 24) & 0xff) / 255
     )
+  }
+}
+
+/// A member-style list inside the New chat sheet, rather than an action menu.
+private final class MeAssistantListController: UITableViewController {
+  private let assistants: [[String: String]]
+  private let selected: String?
+  private let onSelect: (String, UIImage) -> Void
+  private let pageColor: UIColor
+  private let rowColor: UIColor
+  private let avatars: MeAvatarLoader
+  private var requests: [IndexPath: UUID] = [:]
+
+  init(assistants: [[String: String]], selected: String?, pageColor: UIColor, rowColor: UIColor, avatars: MeAvatarLoader = MeAvatarLoader(), onSelect: @escaping (String, UIImage) -> Void) {
+    self.assistants = assistants
+    self.selected = selected
+    self.onSelect = onSelect
+    self.pageColor = pageColor
+    self.rowColor = rowColor
+    self.avatars = avatars
+    super.init(style: .insetGrouped)
+    title = "Agent"
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  deinit { avatars.cancelAll() }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    tableView.backgroundColor = pageColor
+    tableView.rowHeight = UITableView.automaticDimension
+    tableView.estimatedRowHeight = 64
+  }
+
+  override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    tableView.reloadData()
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    avatars.cancelAll()
+    requests.removeAll()
+  }
+
+  private func avatarURL(_ assistant: [String: String]) -> URL? {
+    assistant["avatarUrl"].flatMap(URL.init(string:))
+  }
+
+  override func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt indexPath: IndexPath) {
+    let assistant = assistants[indexPath.row]
+    guard let url = avatarURL(assistant) else { return }
+    requests[indexPath] = avatars.load(url) { [weak self, weak cell] image in
+      guard self != nil, let cell, tableView.indexPath(for: cell) == indexPath else { return }
+      var content = cell.defaultContentConfiguration()
+      content.text = assistant["name"] ?? "Agent"
+      content.image = Self.avatarImage(assistant, photo: image)
+      cell.contentConfiguration = content
+    }
+  }
+
+  override func tableView(_ tableView: UITableView, didEndDisplaying cell: UITableViewCell, forRowAt indexPath: IndexPath) {
+    if let request = requests.removeValue(forKey: indexPath) { avatars.cancel(request) }
+  }
+
+  override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    assistants.count
+  }
+
+  override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let assistant = assistants[indexPath.row]
+    let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+    var content = cell.defaultContentConfiguration()
+    let name = assistant["name"] ?? "Agent"
+    content.text = name
+    content.image = Self.avatarImage(assistant, photo: avatars.image(for: avatarURL(assistant)))
+    cell.backgroundColor = rowColor
+    cell.contentConfiguration = content
+    cell.accessoryType = assistant["id"] == selected ? .checkmark : .none
+    cell.accessibilityTraits = assistant["id"] == selected ? [.button, .selected] : .button
+    return cell
+  }
+
+  static func avatarImage(_ assistant: [String: String], photo: UIImage?) -> UIImage {
+    let name = assistant["name"] ?? "Agent"
+    return UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40)).image { _ in
+      let bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+      UIBezierPath(roundedRect: bounds, cornerRadius: 12).addClip()
+      UIColor.secondarySystemFill.setFill()
+      UIRectFill(bounds)
+      if let photo {
+        let artworkScale = CGFloat(Double(assistant["artworkScale"] ?? "1") ?? 1)
+        let scale = max(40 / photo.size.width, 40 / photo.size.height) * artworkScale
+        let size = CGSize(width: photo.size.width * scale, height: photo.size.height * scale)
+        photo.draw(in: CGRect(x: (40 - size.width) / 2, y: (40 - size.height) / 2, width: size.width, height: size.height))
+      } else {
+        let initial = String(name.prefix(1)).uppercased() as NSString
+        let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 18, weight: .medium), .foregroundColor: UIColor.label]
+        let size = initial.size(withAttributes: attributes)
+        initial.draw(at: CGPoint(x: (40 - size.width) / 2, y: (40 - size.height) / 2), withAttributes: attributes)
+      }
+    }.withRenderingMode(.alwaysOriginal)
+  }
+
+  override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    guard let id = assistants[indexPath.row]["id"] else { return }
+    onSelect(id, Self.avatarImage(assistants[indexPath.row], photo: avatars.image(for: avatarURL(assistants[indexPath.row]))))
+    navigationController?.popViewController(animated: true)
   }
 }

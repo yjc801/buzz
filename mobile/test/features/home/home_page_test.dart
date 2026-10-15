@@ -1,6 +1,6 @@
+import 'package:buzz/shared/widgets/frosted_app_bar.dart';
 import 'package:buzz/features/home/home_page.dart';
 import 'package:buzz/features/search/search_page.dart';
-import 'package:buzz/features/channels/channels_page.dart';
 import 'package:buzz/features/profile/profile_avatar.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:flutter/foundation.dart';
@@ -30,6 +30,7 @@ void main() {
           child: child!,
         ),
         home: HomePage(
+          mePageBuilder: (_) => const Center(child: Text('Personal workspace')),
           settingsPageBuilder: _buildSettingsPage,
           hasUnreadInbox: unreadInboxCount > 0,
         ),
@@ -131,71 +132,87 @@ void main() {
       findsOneWidget,
     );
     expect(find.bySemanticsLabel('Activity, unread'), findsNothing);
-    final semantics = tester.ensureSemantics();
+    await tester.tap(find.byTooltip('Solo'));
+    await tester.pumpAndSettle();
+    expect(find.text('Personal workspace'), findsOneWidget);
     expect(find.byType(SearchPage), findsNothing);
-    expect(
-      tester
-          .getSemantics(find.bySemanticsLabel('Search'))
-          .flagsCollection
-          .isSelected
-          .toString(),
-      'Tristate.isFalse',
-    );
-    await tester.tap(find.byTooltip('Search'));
-    await tester.pump(const Duration(milliseconds: 250));
-    await tester.pump();
+    await tester.tap(find.byTooltip('Home'));
+    await tester.pumpAndSettle();
+    tester
+        .widget<FrostedAppBar>(find.byType(FrostedAppBar))
+        .nativeActions!
+        .firstWhere((action) => action.label == 'Search')
+        .onPressed!();
+    await tester.pumpAndSettle();
     expect(find.byType(SearchPage), findsOneWidget);
+    final searchRoute = ModalRoute.of(tester.element(find.byType(SearchPage)))!;
+    expect(searchRoute.allowSnapshotting, isFalse);
+    expect(searchRoute.opaque, isTrue);
+    expect(searchRoute.transitionDuration, const Duration(milliseconds: 500));
     expect(
-      tester
-          .getSemantics(find.bySemanticsLabel('Search'))
-          .flagsCollection
-          .isSelected
-          .toString(),
-      'Tristate.isTrue',
+      searchRoute.reverseTransitionDuration,
+      const Duration(milliseconds: 500),
     );
-    semantics.dispose();
+    Navigator.of(tester.element(find.byType(SearchPage))).pop();
+    await tester.pumpAndSettle();
+    expect(find.byType(SearchPage), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('shows icon-only navigation and an aligned quick action', (
+  for (final reducedMotion in [false, true]) {
+    testWidgets('search slides vertically, reduced motion: $reducedMotion', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        await buildHome(disableAnimations: reducedMotion),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Search'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      final search = find.byType(SearchPage);
+      expect(search, findsOneWidget);
+      expect(tester.getTopLeft(search).dx, 0);
+      expect(tester.getTopLeft(search).dy, reducedMotion ? 0 : greaterThan(0));
+      await tester.pumpAndSettle();
+      expect(tester.getTopLeft(search).dy, 0);
+      expect(ModalRoute.of(tester.element(search))!.opaque, isFalse);
+      Navigator.of(tester.element(search)).pop();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      if (reducedMotion) {
+        expect(search, findsNothing);
+      } else {
+        expect(tester.getTopLeft(search).dy, greaterThan(0));
+      }
+      await tester.pumpAndSettle();
+      expect(search, findsNothing);
+    });
+  }
+
+  testWidgets('keeps creation beside the tabs and search beside the avatar', (
     tester,
   ) async {
     await tester.pumpWidget(await buildHome());
     await tester.pump();
-
-    expect(find.byKey(const ValueKey('home-ios-glass-tabs')), findsNothing);
-    expect(find.text('Home'), findsNothing);
-    expect(find.text('Activity'), findsNothing);
-    expect(find.text('Search'), findsNothing);
-    expect(find.bySemanticsLabel('Home'), findsOneWidget);
-    expect(find.bySemanticsLabel('Activity'), findsOneWidget);
-    expect(find.bySemanticsLabel('Search'), findsOneWidget);
-
-    final quickAction = find.byTooltip('Create or start conversation');
-    expect(quickAction, findsOneWidget);
-    final launcherSize = tester.getSize(
-      find.byType(ChannelQuickActionsLauncher),
-    );
-    expect(launcherSize.width, 800);
-    expect(launcherSize.height, greaterThan(0));
-    final motionRect = tester.getRect(
-      find.byKey(const Key('channel-quick-actions-motion')),
-    );
-    expect(motionRect.width, const Size.square(56).width);
-    expect(motionRect.left, greaterThanOrEqualTo(0));
-    expect(tester.getSize(quickAction), const Size.square(56));
-    final quickActionRect = tester.getRect(quickAction);
-    expect(quickActionRect.left, greaterThanOrEqualTo(0));
-    expect(quickActionRect.top, greaterThanOrEqualTo(0));
-    expect(quickActionRect.right, lessThanOrEqualTo(800));
-    expect(quickActionRect.bottom, lessThanOrEqualTo(600));
-    final homeDestinationRect = tester.getRect(find.bySemanticsLabel('Home'));
+    final plus = find.byTooltip('Create or start conversation');
+    final search = find.byTooltip('Search');
+    final avatar = find.byType(ProfileAvatar);
+    expect(plus, findsOneWidget);
+    expect(search, findsOneWidget);
+    expect(tester.getCenter(search).dy, lessThan(tester.getCenter(plus).dy));
+    expect(tester.getCenter(search).dy, tester.getCenter(avatar).dy);
     expect(
-      quickActionRect.center.dy,
-      closeTo(homeDestinationRect.center.dy, 0.01),
+      tester.getCenter(plus).dy,
+      closeTo(tester.getCenter(find.byTooltip('Home')).dy, 0.01),
     );
+    await tester.tap(plus);
+    await tester.pumpAndSettle();
+    expect(find.text('Create channel'), findsOneWidget);
+    expect(find.text('New direct message'), findsOneWidget);
+    expect(find.text('Browse channels'), findsOneWidget);
   });
 
   testWidgets('keeps the Buzz backdrop behind the scalable Home screen', (
@@ -354,7 +371,7 @@ void main() {
     await tester.pump();
     expect(hapticCalls, hasLength(1));
 
-    await tester.tap(find.byTooltip('Search'));
+    await tester.tap(find.byTooltip('Solo'));
     await tester.pump();
     expect(hapticCalls, hasLength(2));
   });
@@ -518,7 +535,6 @@ void main() {
     expect(bodyOpacity.opacity, closeTo(1, 0.001));
     expect(appBarOpacity.opacity, closeTo(1, 0.001));
   });
-
   testWidgets('scales and fades the quick action as tabs change', (
     tester,
   ) async {

@@ -1,3 +1,6 @@
+import 'channel_unread.dart';
+import '../../shared/widgets/collapsible_section_body.dart';
+import '../../shared/me/me_sync.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max, min, pi;
@@ -55,7 +58,6 @@ import 'channels_provider.dart';
 import '../../shared/read_state/deferred_read_state_update.dart';
 import '../../shared/read_state/read_state_provider.dart';
 import '../../shared/read_state/read_state_time.dart';
-import 'unread_badge/observed_unread_event.dart';
 
 part 'channels_page/body.dart';
 part 'channels_page/browse_channels_sheet.dart';
@@ -69,6 +71,7 @@ part 'channels_page/community_switcher.dart';
 part 'channels_page/community_switcher_action.dart';
 part 'channels_page/quick_actions.dart';
 part 'channels_page/quick_actions_launcher.dart';
+part 'channels_page/header_actions.dart';
 
 enum _QuickAction { createChannel, newDm, browseChannels }
 
@@ -95,69 +98,13 @@ const double _kTopSectionBottomPadding = Grid.xxs;
 
 /// Inset for the community and profile avatar row.
 const double _kTopSectionInset = Grid.twelve;
-const Duration _kSectionExpandDuration = Duration(milliseconds: 220);
-const Duration _kSectionCollapseDuration = Duration(milliseconds: 170);
-const Curve _kSectionExpandCurve = Cubic(0.23, 1, 0.32, 1);
-const Curve _kSectionCollapseCurve = Curves.easeInCubic;
-const double _kSectionCollapsedScaleY = 0.98;
 const double _kHeaderFrostScrollDistance = Grid.xxl;
 const double _kHeaderFrostMaxBlurSigma = 23.12;
-
-class _UnreadChannelState {
-  final Set<String> ids;
-
-  const _UnreadChannelState({required this.ids});
-}
-
-_UnreadChannelState _computeUnreadChannelState({
-  required Iterable<Channel> channels,
-  required ReadStateState readState,
-  required ChannelsNotifier channelsNotifier,
-}) {
-  if (!readState.isReady) {
-    return const _UnreadChannelState(ids: {});
-  }
-
-  final latestObservedByChannel = channelsNotifier.latestObservedByChannel;
-  final observedEventsByChannel =
-      channelsNotifier.observedUnreadEventsByChannel;
-  final ids = <String>{};
-
-  for (final channel in channels) {
-    if (readState.locallyForcedChannelIds.contains(channel.id)) {
-      ids.add(channel.id);
-      continue;
-    }
-
-    final latestObserved = latestObservedByChannel[channel.id];
-    if (latestObserved == null) continue;
-
-    final channelReadAt = readState.effectiveTimestamp(channel.id);
-    if (channelReadAt != null && latestObserved <= channelReadAt) continue;
-
-    final observedEvents = observedEventsByChannel[channel.id];
-    int? readAtForObservedEvent(ObservedUnreadEvent event) =>
-        observedUnreadEventReadAt(
-          event,
-          channel.id,
-          readState.effectiveTimestamp,
-        );
-
-    final unreadCount = countUnreadObservedEvents(
-      observedEvents,
-      readAtForObservedEvent,
-    );
-    if (unreadCount == 0) continue;
-
-    ids.add(channel.id);
-  }
-
-  return _UnreadChannelState(ids: ids);
-}
 
 class ChannelsPage extends HookConsumerWidget {
   const ChannelsPage({
     required this.settingsPageBuilder,
+    this.onSearch,
     this.communityInvitePageBuilder,
     this.communityAppearancePageBuilder,
     required this.onSettingsTransitionProgress,
@@ -166,6 +113,9 @@ class ChannelsPage extends HookConsumerWidget {
   });
 
   final WidgetBuilder settingsPageBuilder;
+
+  /// Opens global search from the header.
+  final VoidCallback? onSearch;
 
   /// Builds the invite destination opened from the community sheet.
   final WidgetBuilder? communityInvitePageBuilder;
@@ -270,12 +220,19 @@ class ChannelsPage extends HookConsumerWidget {
     if (channelsAsync.asData?.value case final data?) {
       cachedChannels.value = data;
     }
-    final channels = cachedChannels.value;
+    final personalIds =
+        ref.watch(meGroupsProvider).asData?.value.channels ?? const <String>[];
+    final channels = cachedChannels.value
+        ?.where((channel) => !personalIds.contains(channel.id))
+        .toList();
     Future<void> openChannel(Channel channel) async {
       if (!context.mounted) return;
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
-          builder: (_) => ChannelDetailPage(channel: channel),
+          builder: (_) => ChannelDetailPage(
+            channel: channel,
+            placement: ChannelRoutePlacement.ordinary,
+          ),
         ),
       );
     }
@@ -490,6 +447,12 @@ class ChannelsPage extends HookConsumerWidget {
           onPressed: openCommunitySwitcher,
         ),
         nativeActions: [
+          if (onSearch != null)
+            IosNavigationAction(
+              label: 'Search',
+              symbol: 'magnifyingglass',
+              onPressed: onSearch,
+            ),
           IosNavigationAction(
             label: 'Settings',
             avatarIdentity: '${activeCommunity?.id}:${activeCommunity?.pubkey}',
@@ -528,23 +491,17 @@ class ChannelsPage extends HookConsumerWidget {
           onTap: openCommunitySwitcher,
         ),
         actions: [
-          SizedBox(
-            width: Grid.xl,
-            height: Grid.xl,
-            child: Center(
-              child: ProfileAvatar(
-                size: _kTopSectionProfileAvatarSize,
-                showPresence: false,
-                onTap: () {
-                  unawaited(HapticFeedback.lightImpact());
-                  final route = _SettingsPageRoute(
-                    builder: settingsPageBuilder,
-                    onTransitionProgress: onSettingsTransitionProgress,
-                  );
-                  Navigator.of(context).push(route);
-                },
-              ),
-            ),
+          _ChannelHeaderActions(
+            onSearch: onSearch,
+            onSettings: () {
+              unawaited(HapticFeedback.lightImpact());
+              Navigator.of(context).push(
+                _SettingsPageRoute(
+                  builder: settingsPageBuilder,
+                  onTransitionProgress: onSettingsTransitionProgress,
+                ),
+              );
+            },
           ),
         ],
         bottomHeight: _kTopSectionBottomPadding,

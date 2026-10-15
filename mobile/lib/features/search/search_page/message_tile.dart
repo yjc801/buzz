@@ -146,12 +146,17 @@ class _MessageTile extends ConsumerWidget {
       ),
       onTap: () {
         onResultSelected();
-        _navigateToHit(context, hit, channel);
+        _navigateToHit(context, ref, hit, channel);
       },
     );
   }
 
-  void _navigateToHit(BuildContext context, SearchHit hit, Channel? channel) {
+  void _navigateToHit(
+    BuildContext context,
+    WidgetRef ref,
+    SearchHit hit,
+    Channel? channel,
+  ) {
     if (channel == null) return;
 
     if (hit.kind == 45001) {
@@ -167,11 +172,7 @@ class _MessageTile extends ConsumerWidget {
         ),
       );
     } else {
-      Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => ChannelDetailPage(channel: channel),
-        ),
-      );
+      _openSearchChannel(context, channel);
     }
   }
 }

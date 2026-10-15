@@ -62,7 +62,7 @@ class _CustomChannelSection extends StatelessWidget {
           sortMode: sortMode,
           onSortModeChange: onSortModeChange,
         ),
-        _AnimatedSectionBody(
+        CollapsibleSectionBody(
           expanded: expanded,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -365,7 +365,7 @@ class _ChannelSection extends StatelessWidget {
           sortMode: sortMode,
           onSortModeChange: onSortModeChange,
         ),
-        _AnimatedSectionBody(
+        CollapsibleSectionBody(
           expanded: expanded,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -581,104 +581,9 @@ class _SectionChevron extends StatelessWidget {
 
     return AnimatedRotation(
       turns: expanded ? 0 : -0.25,
-      duration: reducedMotion ? Duration.zero : _kSectionExpandDuration,
-      curve: _kSectionExpandCurve,
+      duration: reducedMotion ? Duration.zero : sectionExpandDuration,
+      curve: sectionExpandCurve,
       child: Icon(BuzzIcons.chevronDown, size: _kChannelIconSize, color: color),
-    );
-  }
-}
-
-class _AnimatedSectionBody extends HookWidget {
-  final bool expanded;
-  final Widget child;
-
-  const _AnimatedSectionBody({required this.expanded, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    final reducedMotion = MediaQuery.of(context).disableAnimations;
-    final controller = useAnimationController(
-      duration: reducedMotion ? Duration.zero : _kSectionExpandDuration,
-      reverseDuration: reducedMotion
-          ? Duration.zero
-          : _kSectionCollapseDuration,
-      initialValue: expanded ? 1 : 0,
-    );
-    final curvedAnimation = useMemoized(
-      () => CurvedAnimation(
-        parent: controller,
-        curve: _kSectionExpandCurve,
-        reverseCurve: _kSectionCollapseCurve,
-      ),
-      [controller],
-    );
-    final shouldRender = useState(expanded);
-
-    useEffect(() => curvedAnimation.dispose, [curvedAnimation]);
-
-    useEffect(() {
-      void handleStatus(AnimationStatus status) {
-        if (status == AnimationStatus.dismissed && !expanded) {
-          shouldRender.value = false;
-        }
-      }
-
-      controller.addStatusListener(handleStatus);
-      return () => controller.removeStatusListener(handleStatus);
-    }, [controller, expanded]);
-
-    useEffect(() {
-      controller.duration = reducedMotion
-          ? Duration.zero
-          : _kSectionExpandDuration;
-      controller.reverseDuration = reducedMotion
-          ? Duration.zero
-          : _kSectionCollapseDuration;
-
-      if (expanded) {
-        shouldRender.value = true;
-        if (reducedMotion) {
-          controller.value = 1;
-        } else {
-          unawaited(controller.forward());
-        }
-      } else if (reducedMotion) {
-        controller.value = 0;
-        shouldRender.value = false;
-      } else {
-        unawaited(controller.reverse());
-      }
-
-      return null;
-    }, [controller, expanded, reducedMotion]);
-
-    return ClipRect(
-      child: AnimatedBuilder(
-        animation: curvedAnimation,
-        child: shouldRender.value ? child : const SizedBox.shrink(),
-        builder: (context, child) {
-          final value = curvedAnimation.value.clamp(0.0, 1.0);
-          final scaleY =
-              _kSectionCollapsedScaleY +
-              ((1 - _kSectionCollapsedScaleY) * value);
-
-          return Align(
-            alignment: Alignment.topCenter,
-            heightFactor: value,
-            child: Opacity(
-              opacity: value,
-              child: Transform.scale(
-                alignment: Alignment.topCenter,
-                scaleY: scaleY,
-                child: ExcludeSemantics(
-                  excluding: !expanded,
-                  child: IgnorePointer(ignoring: !expanded, child: child),
-                ),
-              ),
-            ),
-          );
-        },
-      ),
     );
   }
 }

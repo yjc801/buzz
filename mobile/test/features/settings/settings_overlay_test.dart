@@ -135,7 +135,9 @@ void main() {
         final appBar = tester
             .widgetList<FrostedAppBar>(find.byType(FrostedAppBar))
             .first;
-        appBar.nativeActions!.single.onPressed!();
+        appBar.nativeActions!
+            .singleWhere((action) => action.label == 'Settings')
+            .onPressed!();
       } else {
         await tester.tap(find.byType(ProfileAvatar));
       }

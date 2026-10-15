@@ -3,6 +3,7 @@ import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -20,12 +21,17 @@ class HomePage extends HookConsumerWidget {
   const HomePage({
     required this.settingsPageBuilder,
     this.communityInvitePageBuilder,
+    this.mePageBuilder,
     this.communityAppearancePageBuilder,
     required this.hasUnreadInbox,
+    this.hasUnreadSolo = false,
     super.key,
   });
 
   final WidgetBuilder settingsPageBuilder;
+
+  /// Personal chat workspace supplied by the app composition root.
+  final WidgetBuilder? mePageBuilder;
 
   /// Builds the invite destination opened from the community sheet.
   final WidgetBuilder? communityInvitePageBuilder;
@@ -33,6 +39,9 @@ class HomePage extends HookConsumerWidget {
   /// Builds the appearance destination opened from the community sheet.
   final WidgetBuilder? communityAppearancePageBuilder;
   final bool hasUnreadInbox;
+
+  /// Whether a visible Solo chat has unread activity.
+  final bool hasUnreadSolo;
 
   static const double _tabBarHeight = mobileTabBarHeight;
   static const double _tabBarRadius = _tabBarHeight / 2;
@@ -65,9 +74,9 @@ class HomePage extends HookConsumerWidget {
       label: 'Activity',
     ),
     _HomeDestination(
-      icon: BuzzIcons.search300,
-      selectedIcon: BuzzIcons.search500,
-      label: 'Search',
+      icon: Icons.chat_bubble_outline,
+      selectedIcon: Icons.chat_bubble,
+      label: 'Solo',
     ),
   ];
 
@@ -85,7 +94,6 @@ class HomePage extends HookConsumerWidget {
     );
     final homeReselection = useValueNotifier(0);
     final activityReselection = useValueNotifier(0);
-    final searchReselection = useValueNotifier(0);
     final settingsTransitionProgress = useValueNotifier(0.0);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
@@ -96,10 +104,48 @@ class HomePage extends HookConsumerWidget {
       MediaQuery.sizeOf(context).width,
       _destinations.length,
     );
-
     final pages = [
       ChannelsPage(
         settingsPageBuilder: settingsPageBuilder,
+        onSearch: () => Navigator.of(context).push(
+          PageRouteBuilder<void>(
+            // Keep Android backdrop filters composited while search is open.
+            // UIKit controls must instead be hidden beneath the iOS route.
+            opaque: defaultTargetPlatform == TargetPlatform.iOS,
+            allowSnapshotting: false,
+            transitionDuration: reducedMotion
+                ? Duration.zero
+                : defaultTargetPlatform == TargetPlatform.iOS
+                ? CupertinoRouteTransitionMixin.kTransitionDuration
+                : const Duration(milliseconds: 260),
+            reverseTransitionDuration: reducedMotion
+                ? Duration.zero
+                : defaultTargetPlatform == TargetPlatform.iOS
+                ? CupertinoRouteTransitionMixin.kTransitionDuration
+                : const Duration(milliseconds: 220),
+            transitionsBuilder: (_, animation, secondaryAnimation, child) =>
+                reducedMotion
+                ? child
+                : defaultTargetPlatform == TargetPlatform.iOS
+                ? CupertinoFullscreenDialogTransition(
+                    primaryRouteAnimation: animation,
+                    secondaryRouteAnimation: secondaryAnimation,
+                    linearTransition: false,
+                    child: child,
+                  )
+                : SlideTransition(
+                    position: animation.drive(
+                      Tween(
+                        begin: const Offset(0, 1),
+                        end: Offset.zero,
+                      ).chain(CurveTween(curve: Curves.easeOutCubic)),
+                    ),
+                    child: child,
+                  ),
+            pageBuilder: (_, animation, secondaryAnimation) =>
+                const SearchPage(),
+          ),
+        ),
         communityInvitePageBuilder: communityInvitePageBuilder,
         communityAppearancePageBuilder: communityAppearancePageBuilder,
         tabReselection: homeReselection,
@@ -114,7 +160,7 @@ class HomePage extends HookConsumerWidget {
       else
         const SizedBox.shrink(),
       if (visitedTabs.value.contains(2))
-        SearchPage(tabReselection: searchReselection)
+        mePageBuilder?.call(context) ?? const SizedBox.shrink()
       else
         const SizedBox.shrink(),
     ];
@@ -202,6 +248,7 @@ class HomePage extends HookConsumerWidget {
             bottomNavigationBar: _FloatingTabBar(
               selectedIndex: tabIndex.value,
               hasUnreadInbox: hasUnreadInbox,
+              hasUnreadSolo: hasUnreadSolo,
               onDestinationSelected: (i) {
                 if (i == tabIndex.value) {
                   switch (i) {
@@ -209,8 +256,6 @@ class HomePage extends HookConsumerWidget {
                       homeReselection.value++;
                     case 1:
                       activityReselection.value++;
-                    case 2:
-                      searchReselection.value++;
                   }
                   return;
                 }
@@ -302,12 +347,14 @@ class _HomeDestination {
 class _FloatingTabBar extends StatelessWidget {
   final int selectedIndex;
   final bool hasUnreadInbox;
+  final bool hasUnreadSolo;
   final ValueChanged<int> onDestinationSelected;
   final List<_HomeDestination> destinations;
 
   const _FloatingTabBar({
     required this.selectedIndex,
     required this.hasUnreadInbox,
+    this.hasUnreadSolo = false,
     required this.onDestinationSelected,
     required this.destinations,
   });
@@ -373,7 +420,9 @@ class _FloatingTabBar extends StatelessWidget {
                     child: _FloatingTabDestination(
                       destination: destinations[i],
                       selected: i == safeSelectedIndex,
-                      showUnreadBadge: i == 1 && hasUnreadInbox,
+                      showUnreadBadge:
+                          (i == 1 && hasUnreadInbox) ||
+                          (i == 2 && hasUnreadSolo),
                       onTap: () => onDestinationSelected(i),
                     ),
                   ),
@@ -522,7 +571,9 @@ class _FloatingTabDestination extends StatelessWidget {
                         top: 0,
                         right: 0,
                         child: AnimatedScale(
-                          key: const ValueKey('activity-tab-unread-dot-scale'),
+                          key: ValueKey(
+                            '${destination.label.toLowerCase()}-tab-unread-dot-scale',
+                          ),
                           scale: selected ? 0 : 1,
                           alignment: const Alignment(-0.5, 0.5),
                           duration: reducedMotion
@@ -530,7 +581,9 @@ class _FloatingTabDestination extends StatelessWidget {
                               : HomePage._tabUnreadBadgeDuration,
                           curve: Curves.easeOutCubic,
                           child: Container(
-                            key: const ValueKey('activity-tab-unread-dot'),
+                            key: ValueKey(
+                              '${destination.label.toLowerCase()}-tab-unread-dot',
+                            ),
                             width: 12,
                             height: 12,
                             padding: const EdgeInsets.all(2),

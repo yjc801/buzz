@@ -1,6 +1,9 @@
+import 'agent_reply_handoff.dart';
+import 'huddle_timeline.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../../shared/widgets/ios_scroll_to_top.dart';
 import 'message_footer_layout.dart';
+import 'reply_summary_link.dart';
 import 'dart:async';
 import 'dart:math' show cos, max, min, pi;
 import 'dart:ui' show ImageFilter, lerpDouble;
@@ -15,6 +18,11 @@ import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../../shared/emoji/emoji_burst.dart';
+import '../../shared/me/me_sync.dart';
+import '../../shared/me/me_search_placement.dart';
+import 'me/me_assistant_picker.dart';
+import 'me/me_chat_assistant.dart';
+import 'me/me_messages_provider.dart';
 import '../../shared/huddle/huddle.dart';
 import '../../shared/identity_names/identity_names.dart';
 import '../../shared/identity_names/identity_names_provider.dart';
@@ -48,6 +56,7 @@ import 'channel_sections/channel_sections_provider.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
 import 'channel_typing_indicator.dart';
+import 'inline_agent_typing.dart';
 import 'channels_provider.dart';
 import 'unread_badge/observed_unread_event.dart';
 import 'compose_bar.dart';
@@ -67,6 +76,8 @@ import 'message_actions.dart';
 import 'message_action_backdrop_state.dart';
 import 'message_long_press_region.dart';
 import 'message_content.dart';
+import '../../shared/widgets/message_attachment_corners.dart';
+import 'message_media_avatar.dart';
 import 'message_skeleton_body.dart';
 import '../../shared/read_state/deferred_read_state_update.dart';
 import '../../shared/read_state/read_state_provider.dart';
@@ -83,6 +94,8 @@ import 'reading_marks.dart';
 import 'timeline_message.dart';
 
 part 'channel_detail_page/message_list.dart';
+part 'channel_detail_page/placement_route.dart';
+part 'channel_detail_page/empty_messages.dart';
 part 'channel_detail_page/oldest_navigation.dart';
 part 'channel_detail_page/system_rows.dart';
 part 'channel_detail_page/activity_members_sheet.dart';
@@ -100,14 +113,11 @@ part 'channel_detail_page/app_bar.dart';
 
 /// Fetch deep-link targets that may be outside the loaded channel window.
 Future<void> _loadDeepLinkEvents(
-  WidgetRef ref,
-  String channelId,
+  ChannelMessagesNotifier notifier,
   Set<String> eventIds,
 ) async {
   try {
-    await ref
-        .read(channelMessagesProvider(channelId).notifier)
-        .loadEventsById(eventIds);
+    await notifier.loadEventsById(eventIds);
   } catch (error) {
     debugPrint('deep-link: failed to load target messages: $error');
   }
@@ -246,17 +256,25 @@ enum InitialThreadRouteBehavior {
   replaceCurrentRoute,
 }
 
-class ChannelDetailPage extends HookConsumerWidget {
+class _ResolvedChannelDetailPage extends HookConsumerWidget {
   final Channel channel;
+
+  /// Uses personal assistant routing for a chat placed in Me.
+  final bool personalChat;
+  final bool placementKnown;
+  final String? initialAssistant;
   final String? initialMessageId;
   final String? initialThreadRootId;
 
   /// How the automatically opened initial thread affects the route stack.
   final InitialThreadRouteBehavior initialThreadRouteBehavior;
 
-  const ChannelDetailPage({
+  const _ResolvedChannelDetailPage({
     super.key,
     required this.channel,
+    required this.personalChat,
+    required this.placementKnown,
+    this.initialAssistant,
     this.initialMessageId,
     this.initialThreadRootId,
     this.initialThreadRouteBehavior = InitialThreadRouteBehavior.push,
@@ -264,6 +282,9 @@ class ChannelDetailPage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final messagesProvider = personalChat
+        ? meMessagesProvider(channel.id)
+        : channelMessagesProvider(channel.id);
     final stickyDateHeaderState = useValueNotifier(
       StickyDateHeaderState.hidden,
       [channel.id],
@@ -271,10 +292,21 @@ class ChannelDetailPage extends HookConsumerWidget {
     final composerDockHeight = useState(0.0);
     final composerFocusNode = useFocusNode();
     final restoreComposerFocus = useRef<VoidCallback?>(null);
-    final sendMessage = ref.read(sendMessageProvider);
+    final sendMessage = ref.read(
+      personalChat ? meSendMessageProvider : sendMessageProvider,
+    );
+    final messagesState = ref.watch(messagesProvider);
+    final assistant = useMeChatAssistant(
+      context,
+      ref,
+      enabled: personalChat,
+      channelId: channel.id,
+      initial: initialAssistant,
+      messages: messagesState.value ?? const [],
+    );
+    final mePlacement = personalChat ? ref.watch(meGroupsProvider) : null;
     final detailsAsync = ref.watch(channelDetailsProvider(channel.id));
     final channelsAsync = ref.watch(channelsProvider);
-    final messagesState = ref.watch(channelMessagesProvider(channel.id));
     final huddleLifecycle =
         ref.watch(huddleLifecycleProvider(channel.id)).value ?? const [];
     final sessionStatus = ref.watch(relaySessionProvider).status;
@@ -291,7 +323,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                     .observedUnreadEventsByChannel[channel.id]
                     ?.values ??
                 const <ObservedUnreadEvent>[])
-          if (event.rootId == null &&
+          if ((personalChat || event.rootId == null) &&
               event.createdAt >
                   (observedUnreadEventReadAt(
                         event,
@@ -321,10 +353,11 @@ class ChannelDetailPage extends HookConsumerWidget {
         initialForcedUnreadMessageIdsRef.value;
     // Ownership comes from the signing identity, not reloadable profile metadata.
     final currentPubkey = ref.watch(currentPubkeyProvider);
-    // Only show channel-level typing (exclude thread-scoped entries and self).
+    // Me flattens replies into this timeline, so include their typing signals.
+    // Ordinary channels keep thread activity inside the thread view.
     final typingEntries = ref
         .watch(channelTypingProvider(channel.id))
-        .where((e) => e.threadHeadId == null)
+        .where((e) => personalChat || e.threadHeadId == null)
         .where(
           (e) =>
               currentPubkey == null ||
@@ -484,9 +517,7 @@ class ChannelDetailPage extends HookConsumerWidget {
         showsComposer &&
         !isAgentIdentityUnresolved &&
         !_isOneToOneAgentDm(resolvedChannel, agentPubkeys);
-    final messagesNotifier = ref.read(
-      channelMessagesProvider(channel.id).notifier,
-    );
+    final messagesNotifier = ref.read(messagesProvider.notifier);
     final isConnectionInProgress =
         sessionStatus == SessionStatus.connecting ||
         sessionStatus == SessionStatus.reconnecting;
@@ -534,8 +565,8 @@ class ChannelDetailPage extends HookConsumerWidget {
           ...initialForcedUnreadMessageIds,
         };
         if (eventIds.isEmpty) return null;
-        final notifier = ref.read(channelMessagesProvider(channel.id).notifier);
-        unawaited(_loadDeepLinkEvents(ref, channel.id, eventIds));
+        final notifier = ref.read(messagesProvider.notifier);
+        unawaited(_loadDeepLinkEvents(notifier, eventIds));
         return () => notifier.releaseDeepLinkEvents(eventIds);
       },
       [
@@ -611,10 +642,14 @@ class ChannelDetailPage extends HookConsumerWidget {
             currentPubkey: currentPubkey,
           );
     final timelineEntries = buildMainTimelineEntries(
-      timelineMessages,
-      relaySummaries: ref
-          .read(channelMessagesProvider(channel.id).notifier)
-          .threadSummaries,
+      // End events still update the original card through allMessages.
+      timelineMessages
+          .where(
+            (message) => !isCollapsedHuddleEnding(message, timelineMessages),
+          )
+          .toList(),
+      flat: personalChat,
+      relaySummaries: ref.read(messagesProvider.notifier).threadSummaries,
     );
 
     return FrostedScaffold(
@@ -674,7 +709,9 @@ class ChannelDetailPage extends HookConsumerWidget {
         },
         onNativeTitlePressed: openChannelDetails,
         nativeActions: [
-          if (resolvedChannel.isDm ? showsHuddleAction : showsComposer)
+          if (personalChat)
+            assistant.nativeAction
+          else if (resolvedChannel.isDm ? showsHuddleAction : showsComposer)
             _huddleNavigationAction(context, ref, resolvedChannel, [
               ...messagesState.value ?? const [],
               ...huddleLifecycle,
@@ -692,7 +729,9 @@ class ChannelDetailPage extends HookConsumerWidget {
           onTap: openChannelDetails,
         ),
         actions: [
-          if (resolvedChannel.isDm ? showsHuddleAction : showsComposer)
+          if (personalChat)
+            assistant.action
+          else if (resolvedChannel.isDm ? showsHuddleAction : showsComposer)
             _HuddleButton(
               channel: resolvedChannel,
               events: [...messagesState.value ?? const [], ...huddleLifecycle],
@@ -772,18 +811,25 @@ class ChannelDetailPage extends HookConsumerWidget {
                             ),
                             child: LoadErrorView(
                               message: 'Failed to load messages',
-                              onRetry: () => ref.invalidate(
-                                channelMessagesProvider(channel.id),
-                              ),
+                              onRetry: () => ref.invalidate(messagesProvider),
                             ),
                           ),
                           data: (events) {
                             return _MessageList(
+                              notifier: ref.watch(messagesProvider.notifier),
+                              inlineTyping: personalChat
+                                  ? typingEntries
+                                  : const [],
                               stickyDateHeaderState: stickyDateHeaderState,
                               entries: timelineEntries,
                               allMessages: timelineMessages,
-                              initialMessageId: initialMessageId,
-                              initialThreadRootId: initialThreadRootId,
+                              initialMessageId: personalChat
+                                  ? initialMessageId ?? initialThreadRootId
+                                  : initialMessageId,
+                              initialThreadRootId:
+                                  personalChat || !placementKnown
+                                  ? null
+                                  : initialThreadRootId,
                               initialThreadRouteBehavior:
                                   initialThreadRouteBehavior,
                               initialOrdinaryUnreadMessageIds:
@@ -829,7 +875,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                       : const Duration(milliseconds: 180),
                   curve: Curves.easeOutCubic,
                   alignment: Alignment.bottomCenter,
-                  child: typingEntries.isEmpty
+                  child: personalChat || typingEntries.isEmpty
                       ? const SizedBox.shrink()
                       : ChannelTypingIndicator(
                           channelId: resolvedChannel.id,
@@ -860,13 +906,14 @@ class ChannelDetailPage extends HookConsumerWidget {
                             : const Duration(milliseconds: 180),
                         curve: Curves.easeOutCubic,
                         alignment: Alignment.bottomCenter,
-                        child: typingEntries.isEmpty
+                        child: personalChat || typingEntries.isEmpty
                             ? const SizedBox.shrink()
                             : ChannelTypingIndicator(
                                 channelId: resolvedChannel.id,
                                 entries: typingEntries,
                               ),
                       ),
+                      ?assistant.pendingNotice,
                       ComposeBar(
                         channelId: channel.id,
                         focusNode: composerFocusNode,
@@ -880,13 +927,37 @@ class ChannelDetailPage extends HookConsumerWidget {
                               content,
                               mentionPubkeys, {
                               mediaTags = const <List<String>>[],
-                            }) => sendMessage.call(
-                              channelId: channel.id,
-                              content: content,
-                              mentionPubkeys: mentionPubkeys,
-                              channel: resolvedChannel,
-                              mediaTags: mediaTags,
-                            ),
+                            }) async {
+                              if (!placementKnown) {
+                                ref.invalidate(meGroupsProvider);
+                                throw StateError(
+                                  'Reconnect to verify this chat before sending.',
+                                );
+                              }
+                              var recipients = mentionPubkeys;
+                              if (personalChat) {
+                                if (mePlacement?.asData?.value.channels
+                                        .contains(channel.id) !=
+                                    true) {
+                                  throw StateError(
+                                    'Refresh Solo before sending to this chat.',
+                                  );
+                                }
+                                recipients = await meRecipients(
+                                  ref,
+                                  channel.id,
+                                  assistant.selected,
+                                  mentionPubkeys,
+                                );
+                              }
+                              await sendMessage.call(
+                                channelId: channel.id,
+                                content: content,
+                                mentionPubkeys: recipients,
+                                channel: resolvedChannel,
+                                mediaTags: mediaTags,
+                              );
+                            },
                       ),
                     ],
                   ),

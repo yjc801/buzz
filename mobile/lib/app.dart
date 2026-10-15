@@ -20,6 +20,8 @@ import 'features/channels/channel_management_provider.dart';
 import 'features/channels/channels_provider.dart';
 import 'features/channels/unread_badge/unread_badge_provider.dart';
 import 'features/home/home_page.dart';
+import 'features/channels/me/me_page.dart';
+import 'features/channels/me/me_unread_provider.dart';
 import 'features/invites/invite_create_page.dart';
 import 'features/invites/invite_join_provider.dart';
 import 'features/pairing/pairing_page.dart';
@@ -324,6 +326,7 @@ class App extends HookConsumerWidget {
     // Eagerly initialize websocket session and lifecycle observer when
     // authenticated. These providers connect and manage the websocket.
     var hasUnreadInbox = false;
+    var hasUnreadSolo = false;
     if (ageSignalState != AgeSignalState.restricted &&
         authState.value?.status == AuthStatus.authenticated) {
       ref.watch(relaySessionProvider);
@@ -336,6 +339,7 @@ class App extends HookConsumerWidget {
         ref.watch(pushSubscriptionSyncProvider);
       }
       hasUnreadInbox = ref.watch(_unreadInboxItemCountProvider) > 0;
+      hasUnreadSolo = ref.watch(meUnreadChannelIdsProvider).isNotEmpty;
     }
 
     // Start listening for buzz:// links immediately (even pre-auth) so a
@@ -412,10 +416,12 @@ class App extends HookConsumerWidget {
         data: (state) => switch (state.status) {
           AuthStatus.authenticated => DeepLinkDispatcher(
             child: HomePage(
+              mePageBuilder: (_) => const MePage(),
               settingsPageBuilder: _buildSettingsPage,
               communityInvitePageBuilder: (_) => const CommunityInvitePage(),
               communityAppearancePageBuilder: (_) => const ThemePickerPage(),
               hasUnreadInbox: hasUnreadInbox,
+              hasUnreadSolo: hasUnreadSolo,
             ),
           ),
           _ => const DeepLinkDispatcher(

@@ -1,5 +1,6 @@
 import '../../shared/widgets/ios_scroll_to_top.dart';
 import 'message_footer_layout.dart';
+import 'reply_summary_link.dart';
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -52,10 +53,10 @@ import 'message_actions.dart';
 import 'message_action_backdrop_state.dart';
 import 'message_long_press_region.dart';
 import 'message_content.dart';
+import 'message_media_avatar.dart';
 import 'reaction_row.dart';
 import '../../shared/read_state/read_state_provider.dart';
 import 'send_message_provider.dart';
-import 'small_avatar.dart';
 import 'sticky_date_header.dart';
 import 'reading_marks.dart';
 import 'timeline_message.dart';

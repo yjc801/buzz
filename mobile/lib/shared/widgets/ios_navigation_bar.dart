@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +9,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../relay/relay.dart';
+import '../animated_avatar.dart';
 import 'avatar_image.dart';
 import 'app_route_observer.dart';
 import 'ios_navigation_metrics.dart';
@@ -18,6 +20,7 @@ class IosNavigationAction {
   const IosNavigationAction({
     required this.label,
     this.symbol,
+    this.icon,
     this.imageUrl,
     this.avatarInitial,
     this.avatarIdentity,
@@ -35,6 +38,9 @@ class IosNavigationAction {
 
   final String label;
   final String? symbol;
+
+  /// Custom font artwork rendered as a native template image.
+  final IconData? icon;
   final String? imageUrl;
   final String? avatarInitial;
   final String? avatarIdentity;
@@ -60,6 +66,7 @@ class IosNavigationAction {
     'symbol': avatarInitial == null ? symbol : null,
     'avatarInitial': avatarInitial,
     'avatarIsAgent': avatarIsAgent,
+    'avatarArtwork': avatarIsAgent && usesInsetAgentArtwork(imageUrl),
     'activityColor': activityColor?.toARGB32(),
     'activityLabel': activityLabel,
     'imageUrl': imageUrl,
@@ -182,7 +189,12 @@ class IosNavigationBar extends HookConsumerWidget {
               url: entry.value.imageUrl,
               initial: entry.value.avatarInitial!,
               isAgent: entry.value.avatarIsAgent,
-              background: colors.primaryContainer,
+              circular: true,
+              background:
+                  entry.value.avatarIsAgent &&
+                      usesInsetAgentArtwork(entry.value.imageUrl)
+                  ? Colors.transparent
+                  : colors.primaryContainer,
               foreground: colors.onPrimaryContainer,
               networkImage: (url) =>
                   MediaImageProvider(url: url, auth: auth, client: client),
@@ -213,11 +225,69 @@ class IosNavigationBar extends HookConsumerWidget {
         colors.onPrimaryContainer,
       ],
     );
+    final iconImages = useState(<String, String>{});
+    final icons = <String, IconData>{
+      if (leading?.icon != null) 'leading': leading!.icon!,
+      for (var i = 0; i < actions.length; i++)
+        if (actions[i].icon != null) '$i': actions[i].icon!,
+    };
+    final iconKey = jsonEncode([
+      for (final entry in icons.entries)
+        [
+          entry.key,
+          entry.value.codePoint,
+          entry.value.fontFamily,
+          entry.value.fontPackage,
+        ],
+    ]);
+    useEffect(() {
+      if (icons.isEmpty) return null;
+      var active = true;
+      unawaited(
+        Future.microtask(() async {
+          final rendered = <String, String>{};
+          for (final entry in icons.entries) {
+            final recorder = ui.PictureRecorder();
+            final painter = TextPainter(
+              text: TextSpan(
+                text: String.fromCharCode(entry.value.codePoint),
+                style: TextStyle(
+                  fontFamily: entry.value.fontFamily,
+                  package: entry.value.fontPackage,
+                  fontSize: 22,
+                  color: const Color(0xff000000),
+                ),
+              ),
+              textDirection: TextDirection.ltr,
+            )..layout();
+            final canvas = Canvas(recorder)..scale(3);
+            painter.paint(
+              canvas,
+              Offset((24 - painter.width) / 2, (24 - painter.height) / 2),
+            );
+            final picture = recorder.endRecording();
+            final image = await picture.toImage(72, 72);
+            final bytes = await image.toByteData(
+              format: ui.ImageByteFormat.png,
+            );
+            if (bytes != null) {
+              rendered[entry.key] = base64Encode(bytes.buffer.asUint8List());
+            }
+            image.dispose();
+            picture.dispose();
+            painter.dispose();
+          }
+          if (active && context.mounted) iconImages.value = rendered;
+        }),
+      );
+      return () => active = false;
+    }, [iconKey]);
     Map<String, Object?> encodeAction(IosNavigationAction action, String id) {
       final key = imageKey(action);
       final retained = avatarImages.value[id];
       return {
         ...action._encode(id),
+        if (iconImages.value[id] != null) 'iconData': iconImages.value[id],
         'avatarBackground': colors.primaryContainer.toARGB32(),
         'avatarForeground': colors.onPrimaryContainer.toARGB32(),
         if (retained?.key == key) 'imageData': retained!.data,

@@ -559,6 +559,23 @@ void main() {
       expect(result[0].systemEvent!.type, SystemEventType.channelCreated);
     });
 
+    test('huddle room IDs normalize canonical uppercase UUIDs', () {
+      final event = NostrEvent(
+        id: 'upper',
+        pubkey: 'alice',
+        createdAt: 1000,
+        kind: EventKind.huddleStarted,
+        tags: const [],
+        content:
+            '{"ephemeral_channel_id":"8D764100-FD8F-44CF-9C98-6D8FBD739B8C"}',
+        sig: '',
+      );
+      expect(
+        SystemEvent.fromHuddleEvent(event)!.ephemeralChannelId,
+        '8d764100-fd8f-44cf-9c98-6d8fbd739b8c',
+      );
+    });
+
     test('huddle start and end events render as system rows', () {
       final result = formatTimeline([
         _huddleEvent(id: 'h1', kind: EventKind.huddleStarted),
@@ -794,6 +811,24 @@ void main() {
   });
 
   group('buildMainTimelineEntries', () {
+    test(
+      'Me keeps agent replies inline without duplicate thread summaries',
+      () {
+        final messages = formatTimeline([
+          _textMsg(id: 'root', createdAt: 1000),
+          _replyMsg(id: 'answer', parentId: 'root', createdAt: 2000),
+          _textMsg(id: 'followup', createdAt: 3000),
+        ]);
+        final entries = buildMainTimelineEntries(messages, flat: true);
+        expect(entries.map((e) => e.message.id), [
+          'root',
+          'answer',
+          'followup',
+        ]);
+        expect(entries.every((e) => e.summary == null), isTrue);
+      },
+    );
+
     test('returns only root messages', () {
       final messages = formatTimeline([
         _textMsg(id: threadIdA, createdAt: 1000),

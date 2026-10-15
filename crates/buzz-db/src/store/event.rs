@@ -82,15 +82,16 @@ pub struct EventQuery {
     /// Restrict results to events with any of these IDs (multi-id `IN` pushdown).
     pub ids: Option<Vec<Vec<u8>>>,
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
-    /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
+    /// Matched positionally, with JSONB containment as the index prefilter.
     pub e_tags: Option<Vec<String>>,
     /// Restrict artifact rows ([`ARTIFACT_KINDS`]) to those with a `d` tag
-    /// matching any of these values, via JSONB containment. Their `d_tag`
+    /// matching any of these values, matched positionally. Their `d_tag`
     /// column is NULL (not NIP-33), so this lets identity lookups match before
     /// SQL `LIMIT`. Rows of other kinds are left to the caller's post-filter.
     pub d_tag_values: Option<Vec<String>>,
-    /// Restrict results to events with an exact custom tag pair.
-    /// Uses JSONB containment against `tags` before SQL `LIMIT`.
+    /// Restrict results to events with an exact custom tag pair: a tag whose
+    /// first element is the name and second the value, checked positionally
+    /// (JSONB containment is only the index prefilter) before SQL `LIMIT`.
     pub custom_tag: Option<(String, String)>,
     /// Restrict results to events that, for every `(name, values)` entry,
     /// have a tag whose name is `name` and whose first value is one of
@@ -117,17 +118,12 @@ pub struct EventQuery {
     /// private events are excluded from the candidate page rather than
     /// discarded after it.
     ///
-    /// The clause is: `AND (kind NOT IN (...) OR pubkey = $reader OR tags @> ?)`,
-    /// where the `IN` list is [`SHARED_GATED_KINDS`] and `?` is the JSONB
-    /// literal `[["shared","true"]]`.  The GIN index on `tags` (migration 0004,
-    /// jsonb_path_ops) makes the containment check fast.
-    ///
-    /// NOTE: `tags @> '[["shared","true"]]'` uses JSONB containment, which
-    /// matches any tag array that is a superset of `[["shared","true"]]` — it
-    /// would match `["shared","true","extra"]` too.  The ingest `parts.len() ==
-    /// 2` exact-shape check ensures such malformed tags are never stored, so the
-    /// SQL pushdown is sound.  Keeping `event_visible_to_reader` as post-filter
-    /// defense-in-depth catches any residual mismatch.
+    /// The clause is: `AND (kind NOT IN (...) OR pubkey = $reader OR <shared>)`,
+    /// where the `IN` list is [`SHARED_GATED_KINDS`] and `<shared>` requires a
+    /// tag whose element 0 is `shared` and element 1 is `true`. Containment on
+    /// the GIN index (migration 0004, jsonb_path_ops) is the fast first pass;
+    /// containment alone would also admit decoys like `["x","shared","true"]`.
+    /// `event_visible_to_reader` remains the post-filter.
     pub shared_gated_reader: Option<Vec<u8>>,
 }
 
@@ -729,14 +725,15 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         }
     }
 
-    // e-tag pushdown via JSONB containment: tags @> '[["e","<hex>"]]'.
-    // Multiple e-tags use OR (any match). Served by idx_events_tags_gin
+    // e-tag pushdown: exact positional match with a JSONB containment
+    // prefilter, tags @> ANY('[["e","<hex>"]]', ...). Served by idx_events_tags_gin
     // (GIN, jsonb_path_ops — migrations/0004): the channel-window aux closure
     // fans this out once per retained row, which made unindexed containment
     // the dominant scroll-back cost (~1.7s/page on staging).
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
-            push_e_tag_filter(&mut qb, col_prefix, e_tags);
+            qb.push(" AND ");
+            push_exact_tag_match(&mut qb, col_prefix, "e", e_tags);
         }
     }
 
@@ -745,9 +742,8 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
     }
 
     if let Some((ref name, ref value)) = q.custom_tag {
-        let containment = serde_json::json!([[name, value]]);
-        qb.push(format!(" AND {col_prefix}tags @> "))
-            .push_bind(containment);
+        qb.push(" AND ");
+        push_exact_tag_match(&mut qb, col_prefix, name, std::slice::from_ref(value));
     }
 
     push_tag_value_filters(&mut qb, col_prefix, &q.tag_values);
@@ -794,16 +790,12 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
     // shared ones off the end of the result set (the catalog query pattern).
     //
     // Clause: AND (kind NOT IN (30175, 30178) OR pubkey = $reader
-    //              OR tags @> '[["shared","true"]]')
+    //              OR <exact ["shared","true",...] tag>)
     //
-    // The JSONB containment check is served by idx_events_tags_gin (migration
-    // 0004, jsonb_path_ops).  `tags @> '[["shared","true"]]'` matches any array
-    // that contains exactly the sub-array — a two-element `["shared","true"]`
-    // tag passes; a tag-absent event does not.  Because ingest requires exactly
-    // two elements for the shared tag (parts.len() == 2), no stored event can
-    // carry a three-element superset.
+    // The shared match is positional, like the other tag pushdowns: plain
+    // containment would admit a private event carrying ["x","shared","true"],
+    // which then wastes a page slot before the post-filter drops it.
     if let Some(ref reader_bytes) = q.shared_gated_reader {
-        let shared_containment = serde_json::json!([["shared", "true"]]);
         qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
         let mut sep = qb.separated(", ");
         for kind in SHARED_GATED_KINDS {
@@ -811,8 +803,8 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         }
         qb.push(format!(") OR {col_prefix}pubkey = "));
         qb.push_bind(reader_bytes.clone());
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(shared_containment);
+        qb.push(" OR ");
+        push_exact_tag_match(&mut qb, col_prefix, "shared", &["true".to_owned()]);
         qb.push(")");
     }
 
@@ -863,17 +855,35 @@ async fn fetch_with_e_tag_deadline(
     Ok(rows)
 }
 
-/// e-tag pushdown as one array-bound containment test instead of an N-way
-/// `OR` chain, so planner cost does not scale with the number of referenced
-/// ids (the thread aux hop sends one id per reply).
-fn push_e_tag_filter(qb: &mut QueryBuilder<sqlx::Postgres>, col_prefix: &str, e_tags: &[String]) {
-    let containments: Vec<serde_json::Value> = e_tags
+/// Match a tag whose first element is `name` and whose second is any of
+/// `values` (NIP-01), as one parenthesized predicate.
+///
+/// JSONB containment alone ignores element position and multiplicity:
+/// `[["t","t"]]` is contained in `["t","other"]`, and `[["e",id]]` in
+/// `["x","e",id]`. Over-matching before `LIMIT` lets a non-matching newer row
+/// take the slot, so containment stays only as the GIN-indexed prefilter
+/// (one array-bound test, so planner cost does not scale with `values`) and
+/// the positional check makes the predicate exact.
+fn push_exact_tag_match(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    name: &str,
+    values: &[String],
+) {
+    let containments: Vec<serde_json::Value> = values
         .iter()
-        .map(|hex_id| serde_json::json!([["e", hex_id]]))
+        .map(|value| serde_json::json!([[name, value]]))
         .collect();
-    qb.push(format!(" AND {col_prefix}tags @> ANY("))
+    qb.push(format!("({col_prefix}tags @> ANY("))
         .push_bind(containments)
-        .push("::jsonb[])");
+        .push(format!(
+            "::jsonb[]) AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS tag \
+             WHERE tag->>0 = "
+        ))
+        .push_bind(name.to_owned())
+        .push(" AND tag->>1 = ANY(")
+        .push_bind(values.to_vec())
+        .push(")))");
 }
 
 /// Whether `q` carries a [`EventQuery::tag_values`] match. Such a query runs
@@ -884,16 +894,8 @@ fn has_tag_values(q: &EventQuery) -> bool {
     q.tag_values.iter().any(|(_, values)| !values.is_empty())
 }
 
-/// Two tests per [`EventQuery::tag_values`] entry, so each entry is an OR
-/// over its values and entries are ANDed:
-///
-/// - `tags @> ANY(...)` lets Postgres use the `tags` GIN index. On its own
-///   it over-matches, because JSONB containment ignores order and repeats:
-///   `[["t", "stream"]]` contains `[["t", "t"]]`, and `[["name", "t"]]`
-///   contains `[["t", "name"]]`. Those false candidates could fill the page
-///   before `LIMIT` and hide a real match.
-/// - The `EXISTS` test then keeps only rows with a tag whose name is
-///   exactly `name` and whose first value is one of `values`.
+/// AND one [`push_exact_tag_match`] per non-empty [`EventQuery::tag_values`]
+/// entry, so entries are ANDed and values within an entry are ORed.
 fn push_tag_value_filters(
     qb: &mut QueryBuilder<sqlx::Postgres>,
     col_prefix: &str,
@@ -903,26 +905,13 @@ fn push_tag_value_filters(
         if values.is_empty() {
             continue;
         }
-        let containments: Vec<serde_json::Value> = values
-            .iter()
-            .map(|value| serde_json::json!([[name, value]]))
-            .collect();
-        qb.push(format!(" AND {col_prefix}tags @> ANY("))
-            .push_bind(containments)
-            .push("::jsonb[])");
-        qb.push(format!(
-            " AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS tag \
-             WHERE tag->>0 = "
-        ))
-        .push_bind(name.clone())
-        .push(" AND tag->>1 = ANY(")
-        .push_bind(values.clone())
-        .push("::text[]))");
+        qb.push(" AND ");
+        push_exact_tag_match(qb, col_prefix, name, values);
     }
 }
 
 /// Match `#d` on artifact rows before `LIMIT` while leaving other kinds to the
-/// caller's post-filter: `(kind NOT IN (artifact kinds) OR tags @> [["d", v]] ...)`.
+/// caller's post-filter: `(kind NOT IN (artifact kinds) OR <exact d match>)`.
 fn push_artifact_d_tag_predicate(
     qb: &mut QueryBuilder<sqlx::Postgres>,
     col_prefix: &str,
@@ -933,12 +922,9 @@ fn push_artifact_d_tag_predicate(
     }
     let [revision, removal] = ARTIFACT_KINDS;
     qb.push(format!(
-        " AND ({col_prefix}kind NOT IN ({revision}, {removal})"
+        " AND ({col_prefix}kind NOT IN ({revision}, {removal}) OR "
     ));
-    for value in values {
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(serde_json::json!([["d", value]]));
-    }
+    push_exact_tag_match(qb, col_prefix, "d", values);
     qb.push(")");
 }
 
@@ -1111,12 +1097,18 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
 
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
-            push_e_tag_filter(&mut qb, col_prefix, e_tags);
+            qb.push(" AND ");
+            push_exact_tag_match(&mut qb, col_prefix, "e", e_tags);
         }
     }
 
     if let Some(ref values) = q.d_tag_values {
         push_artifact_d_tag_predicate(&mut qb, col_prefix, values);
+    }
+
+    if let Some((ref name, ref value)) = q.custom_tag {
+        qb.push(" AND ");
+        push_exact_tag_match(&mut qb, col_prefix, name, std::slice::from_ref(value));
     }
 
     push_tag_value_filters(&mut qb, col_prefix, &q.tag_values);
@@ -2934,6 +2926,145 @@ mod postgres_tests {
             .await
             .expect("show timeout");
         (inside, after)
+    }
+
+    /// Every pushed-down tag filter matches by position: a newer decoy whose
+    /// tag holds the wanted name and value in the wrong slots must not take a
+    /// `limit: 1` page or be counted.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pushed_down_tag_filters_reject_positional_decoys() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let keys = Keys::generate();
+        let now = nostr::Timestamp::now().as_secs();
+        let target = "ab".repeat(32);
+        let insert = |kind: u16, tag: Vec<&str>, at: u64| {
+            let event = EventBuilder::new(Kind::Custom(kind), "")
+                .tags([Tag::parse(tag).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(at))
+                .sign_with_keys(&keys)
+                .unwrap();
+            let pool = pool.clone();
+            async move {
+                insert_event(&pool, community, &event, None).await.unwrap();
+                event.id.as_bytes().to_vec()
+            }
+        };
+        // Removals: revisions also need an `artifact_heads` row to be read.
+        let [_, artifact_kind] = ARTIFACT_KINDS;
+        let artifact_kind = artifact_kind as u16;
+
+        struct Case<'a> {
+            label: &'a str,
+            kind: u16,
+            real: Vec<&'a str>,
+            /// Inserted after `real`, so it wins a `limit: 1` read if matched.
+            decoy: Vec<&'a str>,
+            query: EventQuery,
+        }
+        let cases = [
+            Case {
+                label: "custom tag value in name slot",
+                kind: 1,
+                real: vec!["t", "t"],
+                decoy: vec!["t", "other"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.custom_tag = Some(("t".into(), "t".into()));
+                    q
+                },
+            },
+            Case {
+                label: "custom tag shifted right",
+                kind: 1,
+                real: vec!["t", "v"],
+                decoy: vec!["meta", "t", "v"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.custom_tag = Some(("t".into(), "v".into()));
+                    q
+                },
+            },
+            Case {
+                label: "e tag shifted right",
+                kind: 7,
+                real: vec!["e", &target],
+                decoy: vec!["x", "e", &target],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.e_tags = Some(vec![target.clone()]);
+                    q
+                },
+            },
+            Case {
+                label: "artifact d tag shifted right",
+                kind: artifact_kind,
+                real: vec!["d", "a1"],
+                decoy: vec!["x", "d", "a1"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.d_tag_values = Some(vec!["a1".into()]);
+                    q
+                },
+            },
+        ];
+        for (offset, case) in (0u64..).step_by(10).zip(cases) {
+            let Case {
+                label,
+                kind,
+                real,
+                decoy,
+                query: mut q,
+            } = case;
+            let real_id = insert(kind, real, now - 1000 + offset).await;
+            insert(kind, decoy, now - 995 + offset).await;
+            q.kinds = Some(vec![i32::from(kind)]);
+            q.pubkey = Some(keys.public_key().to_bytes().to_vec());
+            q.since = Some(DateTime::from_timestamp((now - 1000 + offset) as i64, 0).unwrap());
+            q.until = Some(DateTime::from_timestamp((now - 995 + offset) as i64, 0).unwrap());
+            q.limit = Some(1);
+            let rows = query_events(&pool, &q).await.unwrap();
+            assert_eq!(rows.len(), 1, "{label}");
+            assert_eq!(rows[0].event.id.as_bytes().to_vec(), real_id, "{label}");
+            assert_eq!(count_events(&pool, &q).await.unwrap(), 1, "{label} count");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn shared_gate_rejects_positional_decoy() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let (author, reader) = (Keys::generate(), Keys::generate());
+        let kind = SHARED_GATED_KINDS[0];
+        let now = nostr::Timestamp::now().as_secs();
+        let mut ids = Vec::new();
+        // Real shared event, then a newer private one whose shared marker is
+        // shifted right, so it would win a `limit: 1` read if admitted.
+        for (tag, at) in [
+            (["shared", "true"].as_slice(), now - 10),
+            (&["x", "shared", "true"], now),
+        ] {
+            let event = EventBuilder::new(Kind::Custom(kind as u16), "")
+                .tags([
+                    Tag::parse(["d", &Uuid::new_v4().to_string()]).unwrap(),
+                    Tag::parse(tag.iter().copied()).unwrap(),
+                ])
+                .custom_created_at(nostr::Timestamp::from(at))
+                .sign_with_keys(&author)
+                .unwrap();
+            insert_event(&pool, community, &event, None).await.unwrap();
+            ids.push(event.id.as_bytes().to_vec());
+        }
+        let mut q = EventQuery::for_community(community);
+        q.kinds = Some(vec![kind as i32]);
+        q.pubkey = Some(author.public_key().to_bytes().to_vec());
+        q.shared_gated_reader = Some(reader.public_key().to_bytes().to_vec());
+        q.limit = Some(1);
+        let rows = query_events(&pool, &q).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.id.as_bytes().to_vec(), ids[0]);
     }
 
     #[tokio::test]

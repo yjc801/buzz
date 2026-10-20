@@ -1902,8 +1902,10 @@ mod tests {
                         &keys.public_key().to_hex(),
                         "member",
                         None,
+                        &nostr::Keys::generate(),
                     )
                     .await
+                    .map(|write| write.outcome)
                     .expect("seed member");
                 }
             }
@@ -1944,8 +1946,13 @@ mod tests {
             // while AUTH is paused.
             state
                 .db
-                .remove_relay_member(removed_community, &member.public_key().to_hex())
+                .remove_relay_member(
+                    removed_community,
+                    &member.public_key().to_hex(),
+                    &nostr::Keys::generate(),
+                )
                 .await
+                .map(|write| write.outcome)
                 .expect("remove member");
             assert!(
                 state

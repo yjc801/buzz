@@ -528,6 +528,37 @@ void main() {
         },
       );
 
+      test('admission rejection never reports a successful transfer', () async {
+        importAuth.authentication = Completer<void>();
+        importAuth.entered = Completer<void>();
+        final finished = Completer<void>();
+        container.listen(pairingProvider, (_, next) {
+          if (next.status == PairingStatus.error && !finished.isCompleted) {
+            finished.complete();
+          }
+        });
+        await beginImport(protected: false);
+        validation.complete();
+        await importAuth.entered!.future;
+        expect(
+          socket
+              .decryptedPublishedMessages(sourceSecret)
+              .where((message) => message['type'] == 'complete'),
+          isEmpty,
+        );
+        importAuth.authentication!.completeError(
+          StateError('Admission refused'),
+        );
+        await finished.future;
+        final completions = socket
+            .decryptedPublishedMessages(sourceSecret)
+            .where((message) => message['type'] == 'complete')
+            .toList();
+        expect(completions, hasLength(1));
+        expect(completions.single['success'], isFalse);
+        expect(container.read(pairedCommunityLandingProvider), isNull);
+      });
+
       test('unchecked protection persists on a successful import', () async {
         await beginImport(protected: false);
 
@@ -638,6 +669,10 @@ void main() {
         await Future<void>.delayed(Duration.zero);
 
         expect(container.read(pairingProvider).status, PairingStatus.idle);
+        expect(
+          container.read(authProvider).value!.status,
+          AuthStatus.unauthenticated,
+        );
         expect(socket.isConnected, isFalse);
       });
 
@@ -791,52 +826,64 @@ void main() {
         expect(authorizer.lastIdentityBiometricOnly, isFalse);
       });
 
-      test(
-        'matching SAS sends nsec and successful completion finishes',
-        () async {
-          expect(
-            await notifier.authorizeIdentityExport(
-              community: _exportCommunity(SensitiveActionPolicy.disabledByUser),
-            ),
-            isTrue,
-          );
-          await notifier.pair(recoveryCode);
-          notifier.confirmSas();
-          expect(container.read(pairingProvider).userConfirmedSas, isTrue);
+      for (final padded in [false, true]) {
+        test(
+          'matching SAS exports normalized nsec (padded: $padded)',
+          () async {
+            final community =
+                _exportCommunity(SensitiveActionPolicy.disabledByUser).copyWith(
+                  nsec: padded
+                      ? ' \n${_RecoveryRelayConfig.nsec}\t '
+                      : _RecoveryRelayConfig.nsec,
+                );
+            container
+                .read(relayConfigProvider.notifier)
+                .update(baseUrl: community.relayUrl, nsec: community.nsec);
+            expect(
+              await notifier.authorizeIdentityExport(community: community),
+              isTrue,
+            );
+            await notifier.pair(recoveryCode);
+            notifier.confirmSas();
+            expect(container.read(pairingProvider).userConfirmedSas, isTrue);
 
-          socket.sendSourceMessage(
-            sourceSecret: sourceSecret,
-            sessionSecretHex: sessionSecretHex,
-            message: {'type': 'sas-confirm'},
-            includeTranscriptHash: true,
-          );
+            socket.sendSourceMessage(
+              sourceSecret: sourceSecret,
+              sessionSecretHex: sessionSecretHex,
+              message: {'type': 'sas-confirm'},
+              includeTranscriptHash: true,
+            );
 
-          await Future<void>.delayed(Duration.zero);
+            await Future<void>.delayed(Duration.zero);
 
-          expect(
-            container.read(pairingProvider).status,
-            PairingStatus.transferring,
-          );
-          expect(authorizer.calls, 1);
-          final sentMessages = socket.decryptedPublishedMessages(sourceSecret);
-          expect(
-            sentMessages.any(
-              (message) =>
-                  message['type'] == 'payload' &&
-                  message['payload_type'] == 'nsec' &&
-                  message['payload'] == _RecoveryRelayConfig.nsec,
-            ),
-            isTrue,
-          );
+            expect(
+              container.read(pairingProvider).status,
+              PairingStatus.transferring,
+            );
+            expect(container.read(pairingProvider).errorMessage, isNull);
+            expect(authorizer.calls, 1);
+            final sentMessages = socket.decryptedPublishedMessages(
+              sourceSecret,
+            );
+            final payloads = sentMessages.where(
+              (message) => message['type'] == 'payload',
+            );
+            expect(payloads, hasLength(1));
+            expect(payloads.single['payload_type'], 'nsec');
+            expect(payloads.single['payload'], _RecoveryRelayConfig.nsec);
 
-          socket.sendSourceMessage(
-            sourceSecret: sourceSecret,
-            sessionSecretHex: sessionSecretHex,
-            message: {'type': 'complete', 'success': true},
-          );
-          expect(container.read(pairingProvider).status, PairingStatus.success);
-        },
-      );
+            socket.sendSourceMessage(
+              sourceSecret: sourceSecret,
+              sessionSecretHex: sessionSecretHex,
+              message: {'type': 'complete', 'success': true},
+            );
+            expect(
+              container.read(pairingProvider).status,
+              PairingStatus.success,
+            );
+          },
+        );
+      }
 
       test(
         'malformed payload invalidates authorization before another session',
@@ -1063,50 +1110,56 @@ void main() {
         },
       );
 
-      for (final expired in [false, true]) {
-        test(
-          'community switch aborts ${expired ? 'expired' : 'fresh'} export grant',
-          () async {
-            expect(
-              await notifier.authorizeIdentityExport(
-                community: _exportCommunity(
-                  SensitiveActionPolicy.disabledByUser,
+      for (final change in ['community', 'key']) {
+        for (final expired in [false, true]) {
+          test(
+            '$change switch aborts ${expired ? 'expired' : 'fresh'} export grant',
+            () async {
+              expect(
+                await notifier.authorizeIdentityExport(
+                  community: _exportCommunity(
+                    SensitiveActionPolicy.disabledByUser,
+                  ),
                 ),
-              ),
-              isTrue,
-            );
-            await notifier.pair(recoveryCode);
-            if (expired) now = now.add(identityExportAuthorizationTtl);
-            container
-                .read(relayConfigProvider.notifier)
-                .update(
-                  baseUrl: 'https://other-relay.test',
-                  nsec: nostr.Keys(
-                    '2222222222222222222222222222222222222222222222222222222222222222',
-                  ).nsec,
-                );
-            notifier.confirmSas();
-            socket.sendSourceMessage(
-              sourceSecret: sourceSecret,
-              sessionSecretHex: sessionSecretHex,
-              message: {'type': 'sas-confirm'},
-              includeTranscriptHash: true,
-            );
-            await Future<void>.delayed(Duration.zero);
+                isTrue,
+              );
+              await notifier.pair(recoveryCode);
+              if (expired) now = now.add(identityExportAuthorizationTtl);
+              container
+                  .read(relayConfigProvider.notifier)
+                  .update(
+                    baseUrl: change == 'community'
+                        ? 'https://other-relay.test'
+                        : 'https://relay.test',
+                    nsec: change == 'community'
+                        ? _RecoveryRelayConfig.nsec
+                        : nostr.Keys(
+                            '2222222222222222222222222222222222222222222222222222222222222222',
+                          ).nsec,
+                  );
+              notifier.confirmSas();
+              socket.sendSourceMessage(
+                sourceSecret: sourceSecret,
+                sessionSecretHex: sessionSecretHex,
+                message: {'type': 'sas-confirm'},
+                includeTranscriptHash: true,
+              );
+              await Future<void>.delayed(Duration.zero);
 
-            final state = container.read(pairingProvider);
-            expect(state.status, PairingStatus.confirmingSas);
-            expect(state.userConfirmedSas, isFalse);
-            expect(state.errorMessage, contains('active community changed'));
-            expect(authorizer.calls, 1);
-            expect(
-              socket
-                  .decryptedPublishedMessages(sourceSecret)
-                  .any((message) => message['type'] == 'payload'),
-              isFalse,
-            );
-          },
-        );
+              final state = container.read(pairingProvider);
+              expect(state.status, PairingStatus.confirmingSas);
+              expect(state.userConfirmedSas, isFalse);
+              expect(state.errorMessage, contains('active community changed'));
+              expect(authorizer.calls, 1);
+              expect(
+                socket
+                    .decryptedPublishedMessages(sourceSecret)
+                    .any((message) => message['type'] == 'payload'),
+                isFalse,
+              );
+            },
+          );
+        }
       }
 
       test('expired biometric-only authorization preserves its mode', () async {
@@ -1233,6 +1286,7 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
     implements AuthNotifier {
   Community? lastCommunity;
   Completer<void>? authentication;
+  Completer<void>? entered;
   bool signedOut = false;
 
   @override
@@ -1246,9 +1300,16 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
   }
 
   @override
-  Future<void> authenticateWithCommunity(Community community) async {
+  Future<void> authenticateWithCommunity(
+    Community community, {
+    bool Function()? shouldContinue,
+    bool activate = true,
+  }) async {
+    if (shouldContinue != null && !shouldContinue()) return;
     lastCommunity = community;
+    entered?.complete();
     await authentication?.future;
+    if (shouldContinue != null && !shouldContinue()) return;
     state = AsyncData(
       AuthState(status: AuthStatus.authenticated, community: community),
     );

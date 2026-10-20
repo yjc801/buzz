@@ -174,13 +174,13 @@ pub async fn filter_fanout_by_access(
         matches
     };
 
-    // Owner-only kinds (`RESULT_GATED_KINDS`: kind:30622 DM visibility,
-    // kind:44200 agent turn metrics, kind:30180 waker launch bundles) reach
-    // only the pubkey named in their `p` tag. Same predicate as the pull
-    // paths, applied here so local and Redis delivery share it — a kindless
-    // `ids:[…]` subscription can otherwise match these events. Keyed on the
-    // shared list, not a kind literal, so a newly gated kind cannot be
-    // enforced on pull and forgotten on fan-out.
+    // Owner-only kinds (`RESULT_GATED_KINDS`: DM visibility, agent turn
+    // metrics, waker launch bundles, membership notices) reach only the pubkey
+    // named in their `p` tag. Same predicate as the pull paths, applied here
+    // so local and Redis delivery share it — a kindless `ids:[…]` subscription
+    // can otherwise match these events. Keyed on the shared list, not a kind
+    // literal, so a newly gated kind cannot be enforced on pull and forgotten
+    // on fan-out.
     let kind = event_kind_u32(&stored_event.event);
     let matches = if buzz_core::kind::RESULT_GATED_KINDS.contains(&kind) {
         matches

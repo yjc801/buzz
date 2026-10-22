@@ -187,8 +187,13 @@ enum BundleFrame {
     Delivered { ciphertext: String },
     /// An event on this subscription that failed signature verification.
     Rejected { event_id: String, reason: String },
-    /// This subscription was closed by the relay.
+    /// The live bundle subscription was closed by the relay.
     Closed { message: String },
+    /// The bundle re-query subscription was closed. The relay answers every
+    /// client `CLOSE` with a `CLOSED` frame, so after the tap closes a
+    /// finished re-query this is only the acknowledgement; while a re-query
+    /// is still in flight it is a refusal.
+    SyncClosed { message: String },
     /// The bundle re-query has delivered all of its history.
     SyncComplete,
     /// A frame for a subscription this tap did not open, an event whose
@@ -232,7 +237,11 @@ fn bundle_frame(owner_pubkey: &str, message: RelayMessage) -> BundleFrame {
         RelayMessage::Closed {
             subscription_id,
             message,
-        } if is_bundle_subscription(&subscription_id) => BundleFrame::Closed { message },
+        } if subscription_id == BUNDLE_SYNC_SUBSCRIPTION_ID => BundleFrame::SyncClosed { message },
+        RelayMessage::Closed {
+            subscription_id,
+            message,
+        } if subscription_id == BUNDLE_TAP_SUBSCRIPTION_ID => BundleFrame::Closed { message },
         RelayMessage::Eose { subscription_id }
             if subscription_id == BUNDLE_SYNC_SUBSCRIPTION_ID =>
         {
@@ -590,8 +599,23 @@ pub async fn run_bundle_tap(
                     BundleFrame::Closed { message } => {
                         tracing::warn!(
                             agent = %agent_pubkey,
-                            %message,
+                            reason = %message,
                             "bundle tap subscription closed by relay; reconnecting"
+                        );
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        break;
+                    }
+                    // Not in flight: the relay acknowledging the CLOSE this
+                    // tap sent when the re-query completed. Reconnecting on
+                    // it replayed any pending start request, which re-ran
+                    // the re-query, which closed it again — a loop for as
+                    // long as the request stayed inside its age window.
+                    BundleFrame::SyncClosed { .. } if !sync.in_flight => {}
+                    BundleFrame::SyncClosed { message } => {
+                        tracing::warn!(
+                            agent = %agent_pubkey,
+                            reason = %message,
+                            "bundle re-query closed by relay; reconnecting"
                         );
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         break;
@@ -901,13 +925,27 @@ mod tests {
 
     /// A relay double that completes NIP-42, waits for the tap's two REQs,
     /// then delivers `frames` in order and holds the socket open. It answers
-    /// every bundle re-query with `sync_events`, then EOSE.
+    /// every bundle re-query with `sync_events`, then EOSE, and acknowledges
+    /// every CLOSE with an empty-reason CLOSED, as the relay does.
     async fn scripted_relay(frames: Vec<Value>, sync_events: Vec<nostr::Event>) -> String {
+        scripted_relay_watched(frames, sync_events, false).await.0
+    }
+
+    /// [`scripted_relay`], plus a flag set once the tap drops the socket.
+    /// With `refuse_sync`, every bundle re-query is answered with a CLOSED
+    /// refusal instead of its history.
+    async fn scripted_relay_watched(
+        frames: Vec<Value>,
+        sync_events: Vec<nostr::Event>,
+        refuse_sync: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicBool>) {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as WsMessage;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let hung_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hung_up_flag = Arc::clone(&hung_up);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -938,7 +976,18 @@ mod tests {
                     continue;
                 };
                 let frame: Vec<Value> = serde_json::from_str(&text).unwrap();
+                if frame[0] == "CLOSE" {
+                    let closed = json!(["CLOSED", frame[1], ""]).to_string();
+                    ws.send(WsMessage::Text(closed.into())).await.unwrap();
+                    continue;
+                }
                 if frame[0] != "REQ" || frame[1] != BUNDLE_SYNC_SUBSCRIPTION_ID {
+                    continue;
+                }
+                if refuse_sync {
+                    let closed = json!(["CLOSED", BUNDLE_SYNC_SUBSCRIPTION_ID, "error: refused"])
+                        .to_string();
+                    ws.send(WsMessage::Text(closed.into())).await.unwrap();
                     continue;
                 }
                 for event in &sync_events {
@@ -950,8 +999,9 @@ mod tests {
                 let eose = json!(["EOSE", BUNDLE_SYNC_SUBSCRIPTION_ID]).to_string();
                 ws.send(WsMessage::Text(eose.into())).await.unwrap();
             }
+            hung_up_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        format!("ws://{addr}")
+        (format!("ws://{addr}"), hung_up)
     }
 
     /// Owner, agent, and a floor store that has admitted bundle 1, which is
@@ -1119,6 +1169,86 @@ mod tests {
         assert!(
             state.current().is_none(),
             "the attempt for this press would snapshot the revoked bundle"
+        );
+
+        cancel.cancel();
+        tap.await.unwrap();
+    }
+
+    /// The relay acknowledges the tap's own CLOSE of a finished re-query with
+    /// an empty-reason CLOSED. Read as a refusal, it made the tap reconnect,
+    /// which replayed the start request, which re-ran the re-query — a loop
+    /// every few seconds for as long as the request stayed inside its age
+    /// window (seen live on two agents). The tap must hand the request over
+    /// once and keep the connection.
+    #[tokio::test]
+    async fn the_relays_acknowledgement_of_a_closed_re_query_keeps_the_connection() {
+        let (owner, agent, _dir, floor_store, state) = admitted_bundle_fixture();
+        let owner_hex = owner.public_key().to_hex();
+
+        let press = start_envelope(&owner, &agent, &owner, now_secs());
+        let (relay, hung_up) = scripted_relay_watched(
+            vec![json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press])],
+            Vec::new(),
+            false,
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let tap = spawn_tap(relay, agent, owner_hex, floor_store, &state, tx, &cancel);
+
+        let taken = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, press.id.to_hex());
+
+        // Long enough for the CLOSE, its acknowledgement, and a reconnect.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !hung_up.load(std::sync::atomic::Ordering::SeqCst),
+            "the tap dropped the connection on the acknowledgement of its own CLOSE"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the start request was handed over twice"
+        );
+
+        cancel.cancel();
+        tap.await.unwrap();
+    }
+
+    /// A CLOSED for a re-query still in flight is a refusal, not an
+    /// acknowledgement: the request waiting on it can never be released on
+    /// this connection, so the tap must reconnect and re-query.
+    #[tokio::test]
+    async fn a_re_query_refused_in_flight_reconnects() {
+        let (owner, agent, _dir, floor_store, state) = admitted_bundle_fixture();
+        let owner_hex = owner.public_key().to_hex();
+
+        let press = start_envelope(&owner, &agent, &owner, now_secs());
+        let (relay, hung_up) = scripted_relay_watched(
+            vec![json!(["EVENT", START_REQUEST_SUBSCRIPTION_ID, press])],
+            Vec::new(),
+            true,
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let tap = spawn_tap(relay, agent, owner_hex, floor_store, &state, tx, &cancel);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !hung_up.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a refused re-query must make the tap reconnect");
+        assert!(
+            rx.try_recv().is_err(),
+            "a request must not be handed over before its re-query completes"
         );
 
         cancel.cancel();

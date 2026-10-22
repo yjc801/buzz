@@ -143,6 +143,14 @@ setsid "$BUZZ/keepawake.sh" </dev/null >/dev/null 2>&1 9>&- &
     done
 ) &
 
+# Memory restore: a recreated disk starts with no memory, so put back what the
+# collector stored before the harness reads any (`collect.sh --restore`). It
+# runs in the foreground because the harness must start after it, so it is
+# bounded and off the election lock (fd 9 closed); it does real work once per
+# disk, a failure is logged and retried on the next start, and a start never
+# fails because of it.
+timeout 30 "$BUZZ/collect.sh" "$PUBKEY" "$GEN" --restore >>"$BUZZ/collect.log" 2>&1 9>&- || true
+
 # Data collection: copy transcripts and memory to the org's object store
 # (collect.sh) — once now, every ten minutes while the harness lives, and a
 # final pass once it is gone, so the tail of the last session is not left

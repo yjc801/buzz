@@ -202,6 +202,19 @@ the newest such copy of each path, so recreations cannot grow it unbounded). Onl
 file this disk sent and then deleted leaves the archive, so a recreated
 sprite's first few memories cannot displace what its predecessor collected.
 If the stored `latest` cannot be read, the pass fails and nothing replaces it.
+
+The way back is `collect.sh --restore`, which the launcher runs in the
+foreground before it execs the harness (bounded at 30 seconds, off the
+election lock, never failing the start). Until a disk has restored once
+(`~/.buzz/collect.restored`), it puts back every stored memory file the disk
+is missing and never overwrites one it has; afterwards it does nothing, so a
+file the agent deletes stays deleted. Nothing stored counts as restored; a
+failed read does not, and the next start retries. Every agent on the shared
+connection can write any prefix, so the archive is untrusted: only regular
+files under `claude/<slug>/memory/` and `codex/memories_<n>.sqlite` are
+extracted, a path with an empty, `.` or `..` component is skipped, and
+`superseded/` copies are never restored.
+
 The log is `~/.buzz/collect.log`; the contract is pinned by
 `tests/collect.test.sh` (the production script, a stub gateway and store),
 run under `cargo test`.

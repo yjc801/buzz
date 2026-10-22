@@ -2,7 +2,9 @@
 # buzz-backend-sprites collector — copies what an agent's sessions leave on
 # the sprite's disk into the org's S3-compatible object store, as the raw
 # material for the agent's self-evolution. argv: <agent-pubkey-hex>
-# <generation> [--final]. Started by the launcher beside the harness.
+# <generation> [--final | --restore]. Started by the launcher beside the
+# harness; `--restore` runs once before it, to give a recreated disk back its
+# memory.
 #
 # What: session transcripts (Claude Code `~/.claude/projects`, Codex
 # `~/.codex/sessions`), the harness-native memory (Claude's per-project
@@ -33,8 +35,11 @@ set -uo pipefail
 
 PUBKEY="$1"
 GEN="$2"
-FINAL=""
-[ "${3:-}" = "--final" ] && FINAL=1
+FINAL="" RESTORE=""
+case "${3:-}" in
+    --final) FINAL=1 ;;
+    --restore) RESTORE=1 ;;
+esac
 BUZZ="$HOME/.buzz"
 STATE="$BUZZ/collect.state"
 # Memory paths this disk has uploaded (NUL-separated): the only remote
@@ -61,10 +66,13 @@ say_once() {
 }
 
 # One pass at a time per sprite. The periodic pass gives way; the final pass
-# waits for a running one, because nothing comes after it.
+# waits for a running one, because nothing comes after it, and so does a
+# restore, briefly, because the launcher holds the harness until it is done.
 exec 8>"/dev/shm/buzz-collect.lock"
 if [ -n "$FINAL" ]; then
     flock -w 300 8 || { say "final pass could not take the collector lock"; exit 1; }
+elif [ -n "$RESTORE" ]; then
+    flock -w 20 8 || { say "restore could not take the collector lock; retried next start"; exit 1; }
 else
     flock -n 8 || exit 0
 fi
@@ -90,6 +98,61 @@ case $? in
     4) say_once "connection $BUZZ_COLLECT_CONNECTION is not confined to sprite_labels [buzz.block.xyz/managed-by=buzz-backend-sprites]; nothing collected"; exit 1 ;;
     *) say "gateway discovery failed; retrying next pass"; exit 1 ;;
 esac
+
+# Memory restore (--restore, run by the launcher before the harness starts).
+# A recreated disk begins with none of the memory its predecessors collected.
+# Until this disk has restored once, put back every stored memory file it is
+# missing — never overwriting one it has — then mark the disk restored, so a
+# file the agent later deletes stays deleted. Nothing stored is a finished
+# restore; a failed read is not, and the next start tries again. The archive
+# is untrusted input — every agent on the shared connection can write this
+# prefix — so only regular files under a Claude memory directory or a Codex
+# memory database are extracted, and no path may leave its root.
+if [ -n "$RESTORE" ]; then
+    RESTORED="$BUZZ/collect.restored"
+    [ -e "$RESTORED" ] && exit 0
+    R=$(mktemp -d "$BUZZ/.restore.XXXXXX") || exit 1
+    trap 'rm -rf -- "$R"' EXIT
+    code=$(curl -s --max-time 20 -o "$R/latest.tar.gz" -w '%{http_code}' "$GW/$PREFIX/memory/latest.tar.gz")
+    case "$code" in
+        200) ;;
+        404) : >"$RESTORED"; say "no stored memory to restore"; exit 0 ;;
+        *) say "could not read the stored memory (HTTP $code); restore retried next start"; exit 1 ;;
+    esac
+    if ! n=$(python3 - "$R/latest.tar.gz" "$HOME" <<'PY'
+import os, re, shutil, sys, tarfile
+archive, home = sys.argv[1], sys.argv[2]
+claude = re.compile(r"claude/([^/]+)/memory/(.+)")
+codex = re.compile(r"codex/(memories_[0-9]+\.sqlite)")
+restored = 0
+with tarfile.open(archive, "r:gz") as src:
+    for m in src.getmembers():
+        name = m.name[2:] if m.name.startswith("./") else m.name
+        if not m.isfile() or any(p in ("", ".", "..") for p in name.split("/")):
+            continue
+        if c := claude.fullmatch(name):
+            dst = os.path.join(home, ".claude", "projects", c[1], "memory", c[2])
+        elif x := codex.fullmatch(name):
+            dst = os.path.join(home, ".codex", x[1])
+        else:
+            continue  # superseded/ copies and anything unexpected
+        if os.path.lexists(dst):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with src.extractfile(m) as f, open(dst + ".restoring", "wb") as out:
+            shutil.copyfileobj(f, out)
+        os.replace(dst + ".restoring", dst)
+        restored += 1
+print(restored)
+PY
+    ); then
+        say "could not unpack the stored memory; restore retried next start"
+        exit 1
+    fi
+    : >"$RESTORED"
+    say "restored $n memory file(s)"
+    exit 0
+fi
 say_once "collecting to the object store"
 
 rm -rf -- "$WORK"

@@ -281,6 +281,67 @@ check "that copy is the previous body's" 'latest --wildcards "./superseded/*/cla
 check "recreations keep the current body and the never-sent memory" 'latest ./claude/-home-sprite/memory/other.md | grep -qx "body 5" && latest_has "/notes.md"'
 check "recreations do not grow the archive" '[ "$(tar -tzf "$CS/store/agents/$PK/memory/latest.tar.gz" | grep -c superseded/)" -le 2 ]'
 
+# 14. Restore: a recreated disk gets the stored memory back before its
+#     harness starts — missing files only, once, and never by uploading.
+restore() { # <home>
+    mkdir -p "$1/.buzz"
+    : >"$CS/puts"
+    HOME="$1" bash "$COLLECT" "$PK" "$GEN" --restore >>"$T/log" 2>&1
+    rc=$?
+}
+H2="$T/home2"
+mkdir -p "$H2/.claude/projects/-home-sprite/memory"
+printf 'local\n' >"$H2/.claude/projects/-home-sprite/memory/other.md"
+restore "$H2"
+check "restore puts back missing memory" '[ "$rc" -eq 0 ] && grep -q "repo notes" "$H2/.claude/projects/-home-sprite-repo/memory/notes.md"'
+check "restore never overwrites a local file" 'grep -qx local "$H2/.claude/projects/-home-sprite/memory/other.md"'
+check "restore skips superseded copies" '! find "$H2" -path "*superseded*" | grep -q .'
+check "restore uploads nothing" '[ "$(puts)" -eq 0 ]'
+check "restore marks the disk" '[ -e "$H2/.buzz/collect.restored" ] && grep -q "restored 1 memory file" "$T/log"'
+rm "$H2/.claude/projects/-home-sprite-repo/memory/notes.md"
+restore "$H2"
+check "a restored disk is not restored again" '[ "$rc" -eq 0 ] && [ ! -e "$H2/.claude/projects/-home-sprite-repo/memory/notes.md" ]'
+
+H3="$T/home3"
+touch "$CS/fail_get"
+restore "$H3"
+rm -f "$CS/fail_get"
+check "an unreadable archive fails the restore and leaves no mark" '[ "$rc" -ne 0 ] && [ ! -e "$H3/.buzz/collect.restored" ] && [ ! -e "$H3/.claude" ]'
+restore "$H3"
+check "the next start restores it" '[ "$rc" -eq 0 ] && [ -e "$H3/.buzz/collect.restored" ] && grep -q "repo notes" "$H3/.claude/projects/-home-sprite-repo/memory/notes.md"'
+
+mv "$CS/store/agents/$PK/memory/latest.tar.gz" "$T/latest.keep"
+restore "$T/home4"
+mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
+check "nothing stored is a finished restore" '[ "$rc" -eq 0 ] && [ -e "$T/home4/.buzz/collect.restored" ] && grep -q "no stored memory to restore" "$T/log"'
+
+# A hostile archive — any agent on the shared connection can write the prefix:
+# only regular files at a memory path or a Codex memory database come out,
+# and nothing lands outside the agent's own memory roots.
+mv "$CS/store/agents/$PK/memory/latest.tar.gz" "$T/latest.keep"
+python3 - "$CS/store/agents/$PK/memory/latest.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as t:
+    def add(name, data=b"x\n", kind=tarfile.REGTYPE, link=""):
+        i = tarfile.TarInfo(name)
+        i.type, i.linkname, i.size = kind, link, (len(data) if kind == tarfile.REGTYPE else 0)
+        t.addfile(i, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+    add("./claude/ok/memory/good.md", b"good\n")
+    add("./codex/memories_1.sqlite", b"db\n")
+    add("./claude/ok/memory/../../../../escaped.md")
+    add("./claude/../memory/climbed.md")
+    add("/abs/rooted.md")
+    add("./claude/ok/memory/link.md", kind=tarfile.SYMTYPE, link="/etc/passwd")
+    add("./claude/ok/memory/hard.md", kind=tarfile.LNKTYPE, link="./claude/ok/memory/good.md")
+    add("./codex/auth.json")
+    add("./elsewhere/file.md")
+PY
+H5="$T/home5"
+restore "$H5"
+mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
+check "a hostile archive restores only memory files" '[ "$rc" -eq 0 ] && grep -qx good "$H5/.claude/projects/ok/memory/good.md" && grep -qx db "$H5/.codex/memories_1.sqlite"'
+check "a hostile archive writes nothing else" '[ "$(find "$H5" -type f -o -type l | grep -v "/.buzz/" | sort | tr "\n" " ")" = "$H5/.claude/projects/ok/memory/good.md $H5/.codex/memories_1.sqlite " ] && [ ! -e "$T/escaped.md" ] && [ ! -e /abs/rooted.md ]'
+
 rm -rf "$T" "/dev/shm/buzz-collect.${GEN}.note"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

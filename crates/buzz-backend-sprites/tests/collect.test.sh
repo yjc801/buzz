@@ -384,7 +384,29 @@ import io, os, sys, tarfile
 with tarfile.open(sys.argv[1], 'w:gz') as t:
     for name, data in (('./claude/ok/memory/small.md', b'x'), ('./elsewhere/noise', os.urandom(16 << 20))):
         i = tarfile.TarInfo(name); i.size = len(data); t.addfile(i, io.BytesIO(data))"
-check "every refusal is logged" '[ "$(grep -c "stored memory refused" "$T/log")" -ge 4 ] && grep -q "stored memory is over" "$T/log"'
+# tarfile materializes PAX and GNU long-name records while it reads the
+# header after them, so a highly compressible one is a memory bomb that no
+# member or size count sees: each of these is a ~130 KB download.
+oversized "a PAX header bomb" "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz', format=tarfile.PAX_FORMAT) as t:
+    i = tarfile.TarInfo('./claude/ok/memory/small.md'); i.size = 1
+    i.pax_headers = {'comment': 'x' * (129 << 20)}
+    t.addfile(i, io.BytesIO(b'x'))"
+oversized "a GNU long-name bomb" "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz', format=tarfile.GNU_FORMAT) as t:
+    i = tarfile.TarInfo('./claude/ok/memory/' + 'x' * (129 << 20)); i.size = 1
+    t.addfile(i, io.BytesIO(b'x'))"
+# A PAX size record moves where tarfile reads the next header, past the
+# bytes the scan vetted, so one is refused rather than followed.
+oversized "a PAX header that reframes the members" "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz', format=tarfile.PAX_FORMAT) as t:
+    i = tarfile.TarInfo('./claude/ok/memory/small.md'); i.size = 1
+    i.pax_headers = {'size': '0'}
+    t.addfile(i, io.BytesIO(b'x'))"
+check "every refusal is logged" '[ "$(grep -c "stored memory refused" "$T/log")" -ge 7 ] && grep -q "stored memory is over" "$T/log"'
 restore "$T/home-after"
 check "a within-budget archive still restores after the refusals" '[ "$rc" -eq 0 ] && grep -q "repo notes" "$T/home-after/.claude/projects/-home-sprite-repo/memory/notes.md"'
 

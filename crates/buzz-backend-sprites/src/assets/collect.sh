@@ -59,10 +59,12 @@ KEEP_SNAPSHOTS=14
 # connection can replace it — so one that exceeds any of these is refused
 # whole, before a single file is written. A real memory archive is a few
 # hundred kilobytes. SCAN bounds the declared size of every member, which is
-# also what bounds the decompression a gzip bomb can force.
+# also what bounds the decompression a gzip bomb can force. META bounds the
+# PAX and GNU long-name records, which tarfile holds in memory as it reads.
 RESTORE_MAX_DOWNLOAD=$((16 * 1024 * 1024))
 RESTORE_MAX_MEMBERS=2000
 RESTORE_MAX_SCAN=$((128 * 1024 * 1024))
+RESTORE_MAX_META=$((1024 * 1024))
 RESTORE_MAX_FILE=$((4 * 1024 * 1024))
 RESTORE_MAX_TOTAL=$((32 * 1024 * 1024))
 
@@ -120,7 +122,7 @@ esac
 # memory database are extracted, no path may leave its root, and an archive
 # over the RESTORE_MAX_* bounds is refused whole before anything is written.
 # A refusal leaves no mark, so the next start tries again; each try costs at
-# most the bounded download and a header scan.
+# most the bounded download and a bounded expansion.
 if [ -n "$RESTORE" ]; then
     RESTORED="$BUZZ/collect.restored"
     [ -e "$RESTORED" ] && exit 0
@@ -142,21 +144,91 @@ if [ -n "$RESTORE" ]; then
         say "could not download the stored memory (curl exit $got); restore retried next start"
         exit 1
     fi
-    if ! n=$(python3 - "$R/latest.tar.gz" "$HOME" "$RESTORE_MAX_MEMBERS" "$RESTORE_MAX_SCAN" \
-        "$RESTORE_MAX_FILE" "$RESTORE_MAX_TOTAL" <<'PY'
-import os, re, shutil, sys, tarfile
-archive, home = sys.argv[1], sys.argv[2]
-max_members, max_scan, max_file, max_total = map(int, sys.argv[3:7])
+    if ! n=$(python3 - "$R/latest.tar.gz" "$R/latest.tar" "$HOME" "$RESTORE_MAX_MEMBERS" \
+        "$RESTORE_MAX_SCAN" "$RESTORE_MAX_META" "$RESTORE_MAX_FILE" "$RESTORE_MAX_TOTAL" <<'PY'
+import os, re, shutil, sys, tarfile, zlib
+archive, plain, home = sys.argv[1:4]
+max_members, max_scan, max_meta, max_file, max_total = map(int, sys.argv[4:9])
 claude = re.compile(r"claude/([^/]+)/memory/(.+)")
 codex = re.compile(r"codex/(memories_[0-9]+\.sqlite)")
-plan, scanned, total = [], 0, 0
-with tarfile.open(archive, "r:gz") as src:
-    # Headers first, nothing written: the budget is checked as each header is
-    # read, before tarfile decompresses its way past that member's data.
-    for count, m in enumerate(src, 1):
-        scanned += m.size
-        if count > max_members or scanned > max_scan:
-            sys.exit(f"stored memory refused: over {max_members} members or {max_scan} declared bytes")
+pax_record = re.compile(rb"([0-9]+) ([^=\n]+)=")
+
+def refuse(why):
+    sys.exit(f"stored memory refused: {why}")
+
+# Pass 1 expands the gzip itself, header by header, into a plain tar that
+# tarfile then reads. tarfile materializes PAX and GNU long-name records
+# inside the read of the header they precede, before any count of its caller
+# runs, so every byte of the expanded stream is budgeted here first: members,
+# declared data, and extension records (which bound what tarfile can hold in
+# memory). Only the record types a collector writes are admitted, none that
+# reframes the members after it, and nothing past the first end-of-archive
+# block is expanded, so tarfile reads exactly the stream vetted here.
+class Expand:
+    def __init__(self, f):
+        self.f, self.z = f, zlib.decompressobj(31)
+    def read(self, n):  # n bytes, fewer only where the stream ends
+        buf = bytearray()
+        while len(buf) < n and not self.z.eof:
+            data = self.z.unconsumed_tail or self.f.read(1 << 16)
+            if not data:
+                break
+            buf += self.z.decompress(data, n - len(buf))
+        return bytes(buf)
+
+members, scanned, meta, chain = 0, 0, 0, 0
+with open(archive, "rb") as f, open(plain, "wb") as out:
+    src = Expand(f)
+    while True:
+        h = src.read(512)
+        if len(h) < 512:
+            refuse("truncated archive")
+        out.write(h)
+        if h.count(0) == 512:
+            out.write(bytes(512))
+            break
+        if tarfile.nti(h[148:156]) not in tarfile.calc_chksums(h):
+            refuse("bad header checksum")
+        kind, size = h[156:157], tarfile.nti(h[124:136])
+        if size < 0:
+            refuse("negative member size")
+        if kind in (b"x", b"L", b"K"):
+            chain, meta = chain + 1, meta + size
+            if chain > 3 or meta > max_meta:
+                refuse(f"over {max_meta} bytes of header records")
+        elif kind == b"0" or (kind in (b"1", b"2", b"5") and size == 0):
+            chain, members, scanned = 0, members + 1, scanned + (size if kind == b"0" else 0)
+            if members > max_members or scanned > max_scan:
+                refuse(f"over {max_members} members or {max_scan} declared bytes")
+        else:
+            refuse(f"member type {kind!r} of size {size}")
+        left, body = -(-size // 512) * 512, bytearray()
+        while left:
+            chunk = src.read(min(left, 1 << 16))
+            if not chunk:
+                refuse("truncated archive")
+            out.write(chunk)
+            left -= len(chunk)
+            if kind == b"x":
+                body += chunk
+        if kind == b"x":
+            # tarfile parses the padded block, so the padding must be empty,
+            # and a size or sparse record would move the next header.
+            if body[size:].count(0) != len(body) - size:
+                refuse("a PAX header with data in its padding")
+            pos = 0
+            while pos < size:
+                r = pax_record.match(body, pos)
+                end = pos + int(r[1]) if r else 0
+                if not r or end > size or end <= r.end() or body[end - 1] != 0x0A:
+                    refuse("a malformed PAX header")
+                if r[2] == b"size" or r[2].startswith(b"GNU.sparse"):
+                    refuse("a PAX header that reframes the archive")
+                pos = end
+
+plan, total = [], 0
+with tarfile.open(plain, "r:") as src:
+    for m in src:
         name = m.name[2:] if m.name.startswith("./") else m.name
         if not m.isfile() or any(p in ("", ".", "..") for p in name.split("/")):
             continue
@@ -170,7 +242,7 @@ with tarfile.open(archive, "r:gz") as src:
             continue
         total += m.size
         if m.size > max_file or total > max_total:
-            sys.exit(f"stored memory refused: {name} or the set exceeds {max_file}/{max_total} bytes")
+            refuse(f"{name} or the set exceeds {max_file}/{max_total} bytes")
         plan.append((m, dst))
     for m, dst in plan:
         os.makedirs(os.path.dirname(dst), exist_ok=True)

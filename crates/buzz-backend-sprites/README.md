@@ -214,10 +214,12 @@ connection can write any prefix, so the archive is untrusted: only regular
 files under `claude/<slug>/memory/` and `codex/memories_<n>.sqlite` are
 extracted, a path with an empty, `.` or `..` component is skipped, and
 `superseded/` copies are never restored. It is also bounded: an archive over
-16 MiB compressed, 2,000 members or 128 MiB declared in total, or whose
-restored files exceed 4 MiB each or 32 MiB together, is refused whole after
-a header-only scan and before anything is written, so a peer cannot fill the
-disk with a gzip bomb. A refusal is logged and retried at the next start, at
+16 MiB compressed, 2,000 members or 128 MiB declared in total, 1 MiB of PAX
+or GNU long-name records, or whose restored files exceed 4 MiB each or 32 MiB
+together, is refused whole before anything is restored, so a peer cannot
+fill the disk or the memory with a gzip bomb. The script expands the archive
+itself and admits only the record types a collector writes, so `tarfile`
+never parses a byte that was not budgeted first. A refusal is logged and retried at the next start, at
 that bounded cost.
 
 The log is `~/.buzz/collect.log`; the contract is pinned by

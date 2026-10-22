@@ -2863,7 +2863,8 @@ void main() {
     expect(find.byType(PairingPage), findsOneWidget);
     expect(find.byType(FallbackPairingQrScanner), findsNothing);
     expect(find.text('Scan a QR code'), findsOneWidget);
-    expect(find.text('Use pairing code'), findsOneWidget);
+    expect(find.text('Use pairing code'), findsNothing);
+    expect(find.byKey(const Key('developer-pairing-trigger')), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();

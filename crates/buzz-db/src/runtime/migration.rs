@@ -1583,6 +1583,32 @@ mod postgres_tests {
         );
     }
 
+    /// The reconcile script repairs `events_pkey` after every apply, and
+    /// `start-relay-for-tests.sh` runs the same repair before apply so a reused
+    /// database reconciled before the repair existed can still be applied.
+    #[test]
+    fn events_pkey_repair_runs_before_reused_apply_and_matches_reconcile() {
+        let repair = include_str!("../../../../scripts/repair-events-pkey.sql");
+        let block = &repair[repair.find("DO $$").expect("repair script has a DO block")..];
+        assert!(
+            include_str!("../../../../scripts/reconcile-schema-after-pgschema.sql").contains(block),
+            "scripts/reconcile-schema-after-pgschema.sql must carry scripts/repair-events-pkey.sql's \
+             DO block verbatim"
+        );
+
+        let launcher = include_str!("../../../../scripts/start-relay-for-tests.sh");
+        let repair_at = launcher
+            .find("scripts/repair-events-pkey.sql")
+            .expect("start-relay-for-tests.sh runs scripts/repair-events-pkey.sql");
+        let apply_at = launcher
+            .find("./bin/pgschema apply")
+            .expect("start-relay-for-tests.sh runs pgschema apply");
+        assert!(
+            repair_at < apply_at,
+            "start-relay-for-tests.sh must repair events_pkey before pgschema apply"
+        );
+    }
+
     /// `.pgschemaignore` hides dated monthlies from pgschema so a re-apply
     /// cannot drop the ones the relay created at runtime. Each monthly
     /// `schema/partitions/` declares must be exempt, or pgschema would stop
@@ -2717,6 +2743,10 @@ mod postgres_tests {
     /// by name, not ordinal, because migrations append via `ALTER TABLE` while
     /// `schema.sql` declares them inline — positions legitimately differ, shapes
     /// must not. Entity-intake constraints are also compared in the live catalog.
+    /// `events` and its partitions must carry the same primary key on both
+    /// probes, so the reconcile script's `events_pkey` rebuild cannot drift from
+    /// the migrations. Partitions are compared as a set of key definitions
+    /// because the two paths create different months.
     ///
     /// Driving the real binary is load-bearing: `pgschema` 1.7.4 discards
     /// per-key `NULLS FIRST`/`NULLS LAST` when it re-emits an index, so a naive
@@ -2789,6 +2819,23 @@ mod postgres_tests {
             .expect("read constraint definitions")
         }
 
+        // Distinct (is the parent, key definition) pairs across events and its
+        // partitions.
+        async fn events_key_defs(pool: &PgPool) -> Vec<(bool, String)> {
+            sqlx::query_as(
+                "SELECT DISTINCT conrelid = 'events'::regclass, pg_get_constraintdef(oid) \
+                 FROM pg_constraint \
+                 WHERE contype = 'p' AND conrelid IN ( \
+                     SELECT 'events'::regclass \
+                     UNION ALL \
+                     SELECT inhrelid FROM pg_inherits WHERE inhparent = 'events'::regclass) \
+                 ORDER BY 1, 2",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("read events key definitions")
+        }
+
         let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_owned());
@@ -2809,8 +2856,8 @@ mod postgres_tests {
             .await
             .expect("create migrated probe database");
 
-        // Bootstrap the desired-state probe through the real pgschema binary, the
-        // same invocation the test-relay launchers use.
+        // Bootstrap the desired-state probe the way the test-relay launchers do:
+        // the real pgschema binary, then the post-apply reconcile script.
         let apply = pgschema(&conn, &desired_db, &["apply", "--auto-approve"]);
         assert!(
             apply.status.success(),
@@ -2857,6 +2904,13 @@ mod postgres_tests {
                  migration and schema.sql must both use a representable shape."
             );
         }
+        assert_eq!(
+            events_key_defs(&desired).await,
+            events_key_defs(&migrated).await,
+            "events primary-key parity mismatch: the pgschema-bootstrapped, reconciled \
+             desired state has drifted from the migrations; update the events_pkey block in \
+             scripts/reconcile-schema-after-pgschema.sql and scripts/repair-events-pkey.sql"
+        );
 
         assert_eq!(
             constraints(&desired, "entity_deletion_requests").await,
@@ -2876,12 +2930,19 @@ mod postgres_tests {
         }
     }
 
-    /// Re-applying `schema/schema.sql` to a database a relay has used plans
-    /// `DROP TABLE IF EXISTS ... CASCADE` for every monthly the partition
-    /// manager created at runtime, and their rows go with them.
-    /// `.pgschemaignore` keeps those monthlies out of pgschema's view, and
-    /// pgschema does not compare partition bounds, so the advanced catch-all
-    /// is left alone too.
+    /// Re-applying `schema/schema.sql` to a database bootstrapped the way every
+    /// caller does it (pgschema apply, then the reconcile script) and then used
+    /// by a relay plans nothing. pgschema does not compare partition bounds, so
+    /// the advanced catch-alls do not show up in the plan. Two things keep the
+    /// rest of it empty:
+    ///
+    /// - `.pgschemaignore` hides the monthlies the partition manager created
+    ///   at runtime, which pgschema would otherwise drop, rows included, with
+    ///   `DROP TABLE IF EXISTS ... CASCADE`.
+    /// - The reconcile script rebuilds `events_pkey` in its declared order.
+    ///   pgschema creates it with the partition key first, then plans to drop
+    ///   and re-add it and every declared child's key, which fails once the
+    ///   children are attached.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn pgschema_reapply_keeps_runtime_partitions() {
@@ -2902,24 +2963,27 @@ mod postgres_tests {
             .await
             .expect("create probe database");
 
-        let apply = pgschema(&conn, &database, &["apply", "--auto-approve"]);
-        assert!(
-            apply.status.success(),
-            "pgschema apply failed: {}\n{}",
-            String::from_utf8_lossy(&apply.stdout),
-            String::from_utf8_lossy(&apply.stderr),
-        );
-
         let pool = PgPool::connect(&format!("{base_prefix}/{database}"))
             .await
             .expect("connect probe database");
-        // Every pgschema caller attaches the declared children this way.
-        sqlx::raw_sql(include_str!(
-            "../../../../scripts/reconcile-schema-after-pgschema.sql"
-        ))
-        .execute(&pool)
-        .await
-        .expect("reconcile schema after pgschema");
+        // The bootstrap every pgschema caller runs; the reconcile script
+        // attaches the declared children.
+        let bootstrap = |round: &str| {
+            let apply = pgschema(&conn, &database, &["apply", "--auto-approve"]);
+            assert!(
+                apply.status.success(),
+                "{round} pgschema apply failed: {}\n{}",
+                String::from_utf8_lossy(&apply.stdout),
+                String::from_utf8_lossy(&apply.stderr),
+            );
+            sqlx::raw_sql(include_str!(
+                "../../../../scripts/reconcile-schema-after-pgschema.sql"
+            ))
+            .execute(&pool)
+        };
+        bootstrap("first")
+            .await
+            .expect("first post-apply reconciliation");
         async fn catch_all_bounds(pool: &PgPool) -> Vec<(String, Option<String>)> {
             sqlx::query_as(
                 "SELECT relname::text, pg_get_expr(relpartbound, oid) FROM pg_class \
@@ -2949,6 +3013,10 @@ mod postgres_tests {
         .await
         .expect("maintain partitions");
         let advanced_bounds = catch_all_bounds(&pool).await;
+        assert!(
+            advanced_bounds.len() == 2 && advanced_bounds.iter().all(|(_, bound)| bound.is_some()),
+            "maintenance dropped or detached a catch-all: {advanced_bounds:?}"
+        );
         for (declared, advanced) in declared_bounds.iter().zip(&advanced_bounds) {
             assert_ne!(declared, advanced, "catch-all did not advance");
         }
@@ -2961,7 +3029,6 @@ mod postgres_tests {
         .fetch_all(&pool)
         .await
         .expect("list partitions");
-        pool.close().await;
         let declared = declared_monthlies();
         let runtime: Vec<_> = children
             .iter()
@@ -2969,9 +3036,18 @@ mod postgres_tests {
                 child.starts_with(&format!("{parent}_p2")) && !declared.contains(child)
             })
             .collect();
-        for parent in ["events", "delivery_log"] {
-            // The first month the declared catch-all served.
-            let first = format!("{parent}_p2026_07");
+        for (catch_all, bound) in &declared_bounds {
+            // The first month the declared catch-all served, from its
+            // `FOR VALUES FROM ('YYYY-MM-01 ...')` lower bound.
+            let parent = catch_all
+                .strip_suffix("_p_future")
+                .expect("catch-all is named <parent>_p_future");
+            let month = bound
+                .as_deref()
+                .and_then(|bound| bound.split_once("FROM ('"))
+                .and_then(|(_, rest)| rest.get(..7))
+                .expect("declared catch-all has a dated lower bound");
+            let first = format!("{parent}_p{}", month.replace('-', "_"));
             assert!(
                 runtime.iter().any(|(_, child)| *child == first),
                 "maintenance did not advance into {first}: {children:?}"
@@ -2986,15 +3062,14 @@ mod postgres_tests {
             String::from_utf8_lossy(&plan.stderr),
         );
         assert!(
-            !plan_sql.contains("DROP TABLE"),
-            "re-applying schema.sql would drop tables:\n{plan_sql}"
+            plan_sql.trim().is_empty(),
+            "re-applying schema.sql to a reconciled database must plan nothing; \
+             runtime monthlies {runtime:?}:\n{plan_sql}"
         );
-        for (_, child) in &runtime {
-            assert!(
-                !plan_sql.contains(child.as_str()),
-                "re-applying schema.sql would change runtime monthly {child}:\n{plan_sql}"
-            );
-        }
+        bootstrap("second")
+            .await
+            .expect("second post-apply reconciliation");
+        pool.close().await;
 
         sqlx::query(AssertSqlSafe(format!(
             "DROP DATABASE {database} WITH (FORCE)"

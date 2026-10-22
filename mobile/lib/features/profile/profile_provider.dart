@@ -133,6 +133,12 @@ class ProfileNotifier extends AsyncNotifier<UserProfile?> {
 
   /// Updates the current user's display name while preserving the other
   /// metadata fields in their latest kind:0 profile event.
+  Future<void> updateSetup(String displayName, String? avatarUrl) =>
+      _publishProfilePatch({
+        'display_name': displayName.trim(),
+        'picture': ?avatarUrl,
+      });
+
   Future<void> updateDisplayName(String displayName) =>
       _publishProfilePatch({'display_name': displayName.trim()});
 

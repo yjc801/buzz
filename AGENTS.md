@@ -431,8 +431,13 @@ canonical signed Nostr event fields (`id`, `pubkey`, `kind`, `content`,
 `{event_id, accepted, message}`; creates add the entity ID. Exit codes:
 0=ok, 1=input error, 2=network/relay, 3=auth, 4=other, 5=write conflict (NIP-33 LWW).
 
-`--format compact` is a **global** flag — it goes before the subcommand:
+`--format` is a **global** flag — it goes before the subcommand:
 `buzz --format compact channels list`, NOT `buzz channels list --format compact`.
+Without the flag it falls back to `BUZZ_OUTPUT_FORMAT` (unknown values mean
+`json`); buzz-acp sets that to `agent` for agent
+processes, so their event reads drop `sig`, trim the NIP-OA `auth` tag to
+`["auth", <owner>]`, and fold the NIP-10 `root`/`reply` tags into `reply_to`
+(plus `thread_root` on nested replies); other tags remain.
 
 See `crates/buzz-cli/TESTING.md` for the full live-testing runbook.
 
@@ -673,7 +678,7 @@ description. See [PR #803](https://github.com/block/buzz/pull/803).
    `productName`/`identifier` live in the `tauri.<platform>.conf.json`
    overlays, which Tauri merges automatically. See
    [docs/fork-branding.md](docs/fork-branding.md) before changing either.
-8. **`pgschema` omits seed DML and some storage parameters** — `schema/schema.sql` is an ordered `\i` manifest: `schema/tables/public/<table>.sql` holds only that table's `CREATE TABLE` and `CREATE INDEX` statements (one table per file, the shape out-of-band schema tools read), and types, functions, partitions, triggers, and seed rows live in the sibling `schema/` directories. Fresh desired-state bootstraps use `./bin/pgschema apply`, which does not execute `INSERT` statements or preserve every table storage parameter from `schema/schema.sql`. Put each unsupported invariant in `scripts/reconcile-schema-after-pgschema.sql` as an idempotent convergence statement plus a live catalog or data assertion. Every `pgschema apply` caller must run that script. A string assertion against `schema.sql` alone does not prove the pgschema-created database has the intended state.
+8. **`pgschema` omits seed DML and some storage parameters** — `schema/schema.sql` is an ordered `\i` manifest: `schema/tables/public/<table>.sql` holds only that table's `CREATE TABLE` and `CREATE INDEX` statements (one table per file, the shape out-of-band schema tools read), and types, functions, partitions, triggers, and seed rows live in the sibling `schema/` directories. Fresh desired-state bootstraps use `./bin/pgschema apply`, which does not execute `INSERT` statements or preserve every table storage parameter from `schema/schema.sql`. Put each unsupported invariant in `scripts/reconcile-schema-after-pgschema.sql` as an idempotent convergence statement plus a live catalog or data assertion. Every `pgschema apply` caller must run that script, and must run pgschema from the repository root so it reads `.pgschemaignore`; from any other directory a re-apply plans to drop the partitions the relay created at runtime. A string assertion against `schema.sql` alone does not prove the pgschema-created database has the intended state.
 
 ---
 

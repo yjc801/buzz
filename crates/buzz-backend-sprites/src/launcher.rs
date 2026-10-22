@@ -331,6 +331,41 @@ mod tests {
         );
     }
 
+    /// A recreated disk gets its memory back only if the restore finishes
+    /// before the harness reads any, so it runs in the foreground ahead of
+    /// the exec — and because the start waits on it, it is time-bounded and
+    /// cannot hold the election lock. Pinned as text.
+    #[test]
+    fn the_launcher_restores_memory_before_the_harness_starts() {
+        let line_start = LAUNCHER_SH
+            .find(r#""$BUZZ/collect.sh" "$PUBKEY" "$GEN" --restore"#)
+            .map(|i| LAUNCHER_SH[..i].rfind('\n').map_or(0, |n| n + 1))
+            .expect("the launcher no longer restores memory");
+        let line = LAUNCHER_SH[line_start..]
+            .lines()
+            .next()
+            .expect("the restore line is empty");
+        assert!(
+            line.starts_with("timeout "),
+            "the restore is no longer time-bounded: {line}"
+        );
+        assert!(
+            line.contains("9>&-"),
+            "the restore no longer closes the election lock: {line}"
+        );
+        assert!(
+            line.trim_end().ends_with("|| true"),
+            "a failed restore must not fail the start, nor run in the background: {line}"
+        );
+        let exec = LAUNCHER_SH
+            .find(r#"exec "$BUZZ/bin/buzz-acp""#)
+            .expect("the launcher no longer execs the harness");
+        assert!(
+            line_start < exec,
+            "the restore must run before the harness starts"
+        );
+    }
+
     /// The sweep runs beside a live harness — the launcher starts it and
     /// execs the agent straight away — so classification is a snapshot of a
     /// machine somebody else is still using. Two properties make that

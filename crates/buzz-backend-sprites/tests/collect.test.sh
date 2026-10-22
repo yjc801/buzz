@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
         -T) up=$2; m=PUT; shift ;;
         -o) out=$2; shift ;;
         -w) w=1; shift ;;
-        -H|--max-time|--retry) shift ;;
+        -H|--max-time|--retry|--max-filesize) shift ;;
         https://*) url=$1 ;;
     esac
     shift
@@ -280,6 +280,135 @@ check "recreations keep one superseded copy per path" '[ "$rc" -eq 0 ] && [ "$(t
 check "that copy is the previous body's" 'latest --wildcards "./superseded/*/claude/-home-sprite/memory/other.md" | grep -qx "body 4"'
 check "recreations keep the current body and the never-sent memory" 'latest ./claude/-home-sprite/memory/other.md | grep -qx "body 5" && latest_has "/notes.md"'
 check "recreations do not grow the archive" '[ "$(tar -tzf "$CS/store/agents/$PK/memory/latest.tar.gz" | grep -c superseded/)" -le 2 ]'
+
+# 14. Restore: a recreated disk gets the stored memory back before its
+#     harness starts — missing files only, once, and never by uploading.
+restore() { # <home>
+    mkdir -p "$1/.buzz"
+    : >"$CS/puts"
+    HOME="$1" bash "$COLLECT" "$PK" "$GEN" --restore >>"$T/log" 2>&1
+    rc=$?
+}
+H2="$T/home2"
+mkdir -p "$H2/.claude/projects/-home-sprite/memory"
+printf 'local\n' >"$H2/.claude/projects/-home-sprite/memory/other.md"
+restore "$H2"
+check "restore puts back missing memory" '[ "$rc" -eq 0 ] && grep -q "repo notes" "$H2/.claude/projects/-home-sprite-repo/memory/notes.md"'
+check "restore never overwrites a local file" 'grep -qx local "$H2/.claude/projects/-home-sprite/memory/other.md"'
+check "restore skips superseded copies" '! find "$H2" -path "*superseded*" | grep -q .'
+check "restore uploads nothing" '[ "$(puts)" -eq 0 ]'
+check "restore marks the disk" '[ -e "$H2/.buzz/collect.restored" ] && grep -q "restored 1 memory file" "$T/log"'
+rm "$H2/.claude/projects/-home-sprite-repo/memory/notes.md"
+restore "$H2"
+check "a restored disk is not restored again" '[ "$rc" -eq 0 ] && [ ! -e "$H2/.claude/projects/-home-sprite-repo/memory/notes.md" ]'
+
+H3="$T/home3"
+touch "$CS/fail_get"
+restore "$H3"
+rm -f "$CS/fail_get"
+check "an unreadable archive fails the restore and leaves no mark" '[ "$rc" -ne 0 ] && [ ! -e "$H3/.buzz/collect.restored" ] && [ ! -e "$H3/.claude" ]'
+restore "$H3"
+check "the next start restores it" '[ "$rc" -eq 0 ] && [ -e "$H3/.buzz/collect.restored" ] && grep -q "repo notes" "$H3/.claude/projects/-home-sprite-repo/memory/notes.md"'
+
+mv "$CS/store/agents/$PK/memory/latest.tar.gz" "$T/latest.keep"
+restore "$T/home4"
+mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
+check "nothing stored is a finished restore" '[ "$rc" -eq 0 ] && [ -e "$T/home4/.buzz/collect.restored" ] && grep -q "no stored memory to restore" "$T/log"'
+
+# A hostile archive — any agent on the shared connection can write the prefix:
+# only regular files at a memory path or a Codex memory database come out,
+# and nothing lands outside the agent's own memory roots.
+mv "$CS/store/agents/$PK/memory/latest.tar.gz" "$T/latest.keep"
+python3 - "$CS/store/agents/$PK/memory/latest.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as t:
+    def add(name, data=b"x\n", kind=tarfile.REGTYPE, link=""):
+        i = tarfile.TarInfo(name)
+        i.type, i.linkname, i.size = kind, link, (len(data) if kind == tarfile.REGTYPE else 0)
+        t.addfile(i, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+    add("./claude/ok/memory/good.md", b"good\n")
+    add("./codex/memories_1.sqlite", b"db\n")
+    add("./claude/ok/memory/../../../../escaped.md")
+    add("./claude/../memory/climbed.md")
+    add("/abs/rooted.md")
+    add("./claude/ok/memory/link.md", kind=tarfile.SYMTYPE, link="/etc/passwd")
+    add("./claude/ok/memory/hard.md", kind=tarfile.LNKTYPE, link="./claude/ok/memory/good.md")
+    add("./codex/auth.json")
+    add("./elsewhere/file.md")
+PY
+H5="$T/home5"
+restore "$H5"
+mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
+check "a hostile archive restores only memory files" '[ "$rc" -eq 0 ] && grep -qx good "$H5/.claude/projects/ok/memory/good.md" && grep -qx db "$H5/.codex/memories_1.sqlite"'
+check "a hostile archive writes nothing else" '[ "$(find "$H5" -type f -o -type l | grep -v "/.buzz/" | sort | tr "\n" " ")" = "$H5/.claude/projects/ok/memory/good.md $H5/.codex/memories_1.sqlite " ] && [ ! -e "$T/escaped.md" ] && [ ! -e /abs/rooted.md ]'
+
+# An oversized hostile archive is refused whole: nothing is written, no mark
+# is left (the next start retries, at a bounded cost), and the refusal is
+# logged. Zero-filled members compress to almost nothing, so each of these is
+# a small download that would expand far past its share of the disk.
+oversized() { # <label> <python that writes the archive to sys.argv[1]>
+    mv "$CS/store/agents/$PK/memory/latest.tar.gz" "$T/latest.keep"
+    python3 - "$CS/store/agents/$PK/memory/latest.tar.gz" <<<"$2"
+    local h="$T/home-${1// /-}"
+    restore "$h"
+    mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
+    check "an archive with $1 is refused before writing" '[ "$rc" -ne 0 ] && [ ! -e "$h/.buzz/collect.restored" ] && [ -z "$(find "$h" -type f -not -path "*/.buzz/*")" ]'
+}
+ZEROS='
+import io, sys, tarfile
+def zeros(t, name, size):
+    class Z(io.RawIOBase):
+        left = size
+        def readable(self): return True
+        def readinto(self, b):
+            n = min(len(b), self.left); b[:n] = bytes(n); self.left -= n; return n
+    i = tarfile.TarInfo(name); i.size = size; t.addfile(i, Z())
+'
+oversized "an over-size memory file" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    zeros(t, './claude/ok/memory/small.md', 10)
+    zeros(t, './claude/ok/memory/huge.md', 5 << 20)"
+oversized "an over-size memory set" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    for n in range(9): zeros(t, f'./claude/ok/memory/part{n}.md', 4 << 20)"
+oversized "a gzip bomb outside the memory paths" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    zeros(t, './claude/ok/memory/small.md', 10)
+    zeros(t, './elsewhere/bomb', 129 << 20)"
+oversized "too many members" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    for n in range(2001): zeros(t, f'./elsewhere/m{n}', 0)"
+oversized "an over-size download" "
+import io, os, sys, tarfile
+# Valid and within every member budget, so only the download bound refuses it.
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    for name, data in (('./claude/ok/memory/small.md', b'x'), ('./elsewhere/noise', os.urandom(16 << 20))):
+        i = tarfile.TarInfo(name); i.size = len(data); t.addfile(i, io.BytesIO(data))"
+# tarfile materializes PAX and GNU long-name records while it reads the
+# header after them, so a highly compressible one is a memory bomb that no
+# member or size count sees: each of these is a ~130 KB download.
+oversized "a PAX header bomb" "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz', format=tarfile.PAX_FORMAT) as t:
+    i = tarfile.TarInfo('./claude/ok/memory/small.md'); i.size = 1
+    i.pax_headers = {'comment': 'x' * (129 << 20)}
+    t.addfile(i, io.BytesIO(b'x'))"
+oversized "a GNU long-name bomb" "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz', format=tarfile.GNU_FORMAT) as t:
+    i = tarfile.TarInfo('./claude/ok/memory/' + 'x' * (129 << 20)); i.size = 1
+    t.addfile(i, io.BytesIO(b'x'))"
+# A PAX size record moves where tarfile reads the next header, past the
+# bytes the scan vetted, so one is refused rather than followed.
+oversized "a PAX header that reframes the members" "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz', format=tarfile.PAX_FORMAT) as t:
+    i = tarfile.TarInfo('./claude/ok/memory/small.md'); i.size = 1
+    i.pax_headers = {'size': '0'}
+    t.addfile(i, io.BytesIO(b'x'))"
+check "every refusal is logged" '[ "$(grep -c "stored memory refused" "$T/log")" -ge 7 ] && grep -q "stored memory is over" "$T/log"'
+restore "$T/home-after"
+check "a within-budget archive still restores after the refusals" '[ "$rc" -eq 0 ] && grep -q "repo notes" "$T/home-after/.claude/projects/-home-sprite-repo/memory/notes.md"'
 
 rm -rf "$T" "/dev/shm/buzz-collect.${GEN}.note"
 echo "$pass passed, $fail failed"

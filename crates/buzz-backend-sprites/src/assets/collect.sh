@@ -55,6 +55,16 @@ PREFIX="agents/$PUBKEY"
 QUIET="${BUZZ_COLLECT_QUIET_SECS:-300}"
 MAX_BYTES=$((200 * 1024 * 1024))
 KEEP_SNAPSHOTS=14
+# Restore bounds. The stored archive is untrusted — any agent on the shared
+# connection can replace it — so one that exceeds any of these is refused
+# whole, before a single file is written. A real memory archive is a few
+# hundred kilobytes. SCAN bounds the declared size of every member, which is
+# also what bounds the decompression a gzip bomb can force.
+RESTORE_MAX_DOWNLOAD=$((16 * 1024 * 1024))
+RESTORE_MAX_MEMBERS=2000
+RESTORE_MAX_SCAN=$((128 * 1024 * 1024))
+RESTORE_MAX_FILE=$((4 * 1024 * 1024))
+RESTORE_MAX_TOTAL=$((32 * 1024 * 1024))
 
 say() { printf '%s collect[%s]: %s\n' "$(date -u +%FT%TZ)" "$GEN" "$*"; }
 # Say a status line only when it differs from the last one this generation
@@ -107,26 +117,46 @@ esac
 # restore; a failed read is not, and the next start tries again. The archive
 # is untrusted input — every agent on the shared connection can write this
 # prefix — so only regular files under a Claude memory directory or a Codex
-# memory database are extracted, and no path may leave its root.
+# memory database are extracted, no path may leave its root, and an archive
+# over the RESTORE_MAX_* bounds is refused whole before anything is written.
+# A refusal leaves no mark, so the next start tries again; each try costs at
+# most the bounded download and a header scan.
 if [ -n "$RESTORE" ]; then
     RESTORED="$BUZZ/collect.restored"
     [ -e "$RESTORED" ] && exit 0
     R=$(mktemp -d "$BUZZ/.restore.XXXXXX") || exit 1
     trap 'rm -rf -- "$R"' EXIT
-    code=$(curl -s --max-time 20 -o "$R/latest.tar.gz" -w '%{http_code}' "$GW/$PREFIX/memory/latest.tar.gz")
+    code=$(curl -s --max-time 20 --max-filesize "$RESTORE_MAX_DOWNLOAD" -o "$R/latest.tar.gz" \
+        -w '%{http_code}' "$GW/$PREFIX/memory/latest.tar.gz")
+    got=$?
     case "$code" in
         200) ;;
         404) : >"$RESTORED"; say "no stored memory to restore"; exit 0 ;;
         *) say "could not read the stored memory (HTTP $code); restore retried next start"; exit 1 ;;
     esac
-    if ! n=$(python3 - "$R/latest.tar.gz" "$HOME" <<'PY'
+    size=$(stat -c %s "$R/latest.tar.gz" 2>/dev/null || echo 0)
+    if [ "$got" -eq 63 ] || [ "$size" -gt "$RESTORE_MAX_DOWNLOAD" ]; then
+        say "stored memory is over $RESTORE_MAX_DOWNLOAD bytes; not restored, retried next start"
+        exit 1
+    elif [ "$got" -ne 0 ]; then
+        say "could not download the stored memory (curl exit $got); restore retried next start"
+        exit 1
+    fi
+    if ! n=$(python3 - "$R/latest.tar.gz" "$HOME" "$RESTORE_MAX_MEMBERS" "$RESTORE_MAX_SCAN" \
+        "$RESTORE_MAX_FILE" "$RESTORE_MAX_TOTAL" <<'PY'
 import os, re, shutil, sys, tarfile
 archive, home = sys.argv[1], sys.argv[2]
+max_members, max_scan, max_file, max_total = map(int, sys.argv[3:7])
 claude = re.compile(r"claude/([^/]+)/memory/(.+)")
 codex = re.compile(r"codex/(memories_[0-9]+\.sqlite)")
-restored = 0
+plan, scanned, total = [], 0, 0
 with tarfile.open(archive, "r:gz") as src:
-    for m in src.getmembers():
+    # Headers first, nothing written: the budget is checked as each header is
+    # read, before tarfile decompresses its way past that member's data.
+    for count, m in enumerate(src, 1):
+        scanned += m.size
+        if count > max_members or scanned > max_scan:
+            sys.exit(f"stored memory refused: over {max_members} members or {max_scan} declared bytes")
         name = m.name[2:] if m.name.startswith("./") else m.name
         if not m.isfile() or any(p in ("", ".", "..") for p in name.split("/")):
             continue
@@ -138,15 +168,24 @@ with tarfile.open(archive, "r:gz") as src:
             continue  # superseded/ copies and anything unexpected
         if os.path.lexists(dst):
             continue
+        total += m.size
+        if m.size > max_file or total > max_total:
+            sys.exit(f"stored memory refused: {name} or the set exceeds {max_file}/{max_total} bytes")
+        plan.append((m, dst))
+    for m, dst in plan:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with src.extractfile(m) as f, open(dst + ".restoring", "wb") as out:
-            shutil.copyfileobj(f, out)
-        os.replace(dst + ".restoring", dst)
-        restored += 1
-print(restored)
+        part = dst + ".restoring"
+        try:
+            with src.extractfile(m) as f, open(part, "wb") as out:
+                shutil.copyfileobj(f, out)
+            os.replace(part, dst)
+        finally:
+            if os.path.lexists(part):
+                os.unlink(part)
+print(len(plan))
 PY
     ); then
-        say "could not unpack the stored memory; restore retried next start"
+        say "could not restore the stored memory; retried next start"
         exit 1
     fi
     : >"$RESTORED"

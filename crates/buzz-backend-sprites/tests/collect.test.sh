@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
         -T) up=$2; m=PUT; shift ;;
         -o) out=$2; shift ;;
         -w) w=1; shift ;;
-        -H|--max-time|--retry) shift ;;
+        -H|--max-time|--retry|--max-filesize) shift ;;
         https://*) url=$1 ;;
     esac
     shift
@@ -341,6 +341,52 @@ restore "$H5"
 mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
 check "a hostile archive restores only memory files" '[ "$rc" -eq 0 ] && grep -qx good "$H5/.claude/projects/ok/memory/good.md" && grep -qx db "$H5/.codex/memories_1.sqlite"'
 check "a hostile archive writes nothing else" '[ "$(find "$H5" -type f -o -type l | grep -v "/.buzz/" | sort | tr "\n" " ")" = "$H5/.claude/projects/ok/memory/good.md $H5/.codex/memories_1.sqlite " ] && [ ! -e "$T/escaped.md" ] && [ ! -e /abs/rooted.md ]'
+
+# An oversized hostile archive is refused whole: nothing is written, no mark
+# is left (the next start retries, at a bounded cost), and the refusal is
+# logged. Zero-filled members compress to almost nothing, so each of these is
+# a small download that would expand far past its share of the disk.
+oversized() { # <label> <python that writes the archive to sys.argv[1]>
+    mv "$CS/store/agents/$PK/memory/latest.tar.gz" "$T/latest.keep"
+    python3 - "$CS/store/agents/$PK/memory/latest.tar.gz" <<<"$2"
+    local h="$T/home-${1// /-}"
+    restore "$h"
+    mv "$T/latest.keep" "$CS/store/agents/$PK/memory/latest.tar.gz"
+    check "an archive with $1 is refused before writing" '[ "$rc" -ne 0 ] && [ ! -e "$h/.buzz/collect.restored" ] && [ -z "$(find "$h" -type f -not -path "*/.buzz/*")" ]'
+}
+ZEROS='
+import io, sys, tarfile
+def zeros(t, name, size):
+    class Z(io.RawIOBase):
+        left = size
+        def readable(self): return True
+        def readinto(self, b):
+            n = min(len(b), self.left); b[:n] = bytes(n); self.left -= n; return n
+    i = tarfile.TarInfo(name); i.size = size; t.addfile(i, Z())
+'
+oversized "an over-size memory file" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    zeros(t, './claude/ok/memory/small.md', 10)
+    zeros(t, './claude/ok/memory/huge.md', 5 << 20)"
+oversized "an over-size memory set" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    for n in range(9): zeros(t, f'./claude/ok/memory/part{n}.md', 4 << 20)"
+oversized "a gzip bomb outside the memory paths" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    zeros(t, './claude/ok/memory/small.md', 10)
+    zeros(t, './elsewhere/bomb', 129 << 20)"
+oversized "too many members" "$ZEROS
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    for n in range(2001): zeros(t, f'./elsewhere/m{n}', 0)"
+oversized "an over-size download" "
+import io, os, sys, tarfile
+# Valid and within every member budget, so only the download bound refuses it.
+with tarfile.open(sys.argv[1], 'w:gz') as t:
+    for name, data in (('./claude/ok/memory/small.md', b'x'), ('./elsewhere/noise', os.urandom(16 << 20))):
+        i = tarfile.TarInfo(name); i.size = len(data); t.addfile(i, io.BytesIO(data))"
+check "every refusal is logged" '[ "$(grep -c "stored memory refused" "$T/log")" -ge 4 ] && grep -q "stored memory is over" "$T/log"'
+restore "$T/home-after"
+check "a within-budget archive still restores after the refusals" '[ "$rc" -eq 0 ] && grep -q "repo notes" "$T/home-after/.claude/projects/-home-sprite-repo/memory/notes.md"'
 
 rm -rf "$T" "/dev/shm/buzz-collect.${GEN}.note"
 echo "$pass passed, $fail failed"

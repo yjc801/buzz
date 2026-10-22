@@ -213,7 +213,12 @@ failed read does not, and the next start retries. Every agent on the shared
 connection can write any prefix, so the archive is untrusted: only regular
 files under `claude/<slug>/memory/` and `codex/memories_<n>.sqlite` are
 extracted, a path with an empty, `.` or `..` component is skipped, and
-`superseded/` copies are never restored.
+`superseded/` copies are never restored. It is also bounded: an archive over
+16 MiB compressed, 2,000 members or 128 MiB declared in total, or whose
+restored files exceed 4 MiB each or 32 MiB together, is refused whole after
+a header-only scan and before anything is written, so a peer cannot fill the
+disk with a gzip bomb. A refusal is logged and retried at the next start, at
+that bounded cost.
 
 The log is `~/.buzz/collect.log`; the contract is pinned by
 `tests/collect.test.sh` (the production script, a stub gateway and store),

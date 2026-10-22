@@ -3282,17 +3282,21 @@ async fn commit_participant_join(
     #[cfg(test)]
     crate::nip_fi_test_hooks::before_membership_lock(tenant.community()).await;
 
-    buzz_db::channel_members::acquire_channel_membership_lock_in_transaction(&mut tx, channel_id)
-        .await?;
-    if parent_channel_id != channel_id {
-        buzz_db::channel_members::acquire_channel_membership_lock_in_transaction(
-            &mut tx,
-            parent_channel_id,
-        )
-        .await?;
-    }
-    buzz_db::channel_members::lock_channel_ttl_shared_in_transaction(&mut tx, parent_channel_id)
-        .await?;
+    let locked_channels = if parent_channel_id == channel_id {
+        vec![channel_id]
+    } else {
+        vec![channel_id, parent_channel_id]
+    };
+    let mut membership = buzz_db::channel_members::lock_channel_memberships_in_transaction(
+        &mut tx,
+        &locked_channels,
+    )
+    .await?;
+    buzz_db::channel_members::lock_channel_ttl_shared_in_transaction(
+        membership.tx(),
+        parent_channel_id,
+    )
+    .await?;
 
     // Archive re-check (ALL paths): re-read archived_at inside the
     // transaction before any write, taking a row-level write lock
@@ -3306,9 +3310,11 @@ async fn commit_participant_join(
     // is held only for the duration of the join transaction (typically
     // sub-millisecond). See `lock_channel_archived_at_in_transaction` for why
     // the lock is `FOR NO KEY UPDATE` rather than `FOR UPDATE`.
-    let channel_archived =
-        buzz_db::channel_members::lock_channel_archived_at_in_transaction(&mut tx, channel_id)
-            .await?;
+    let channel_archived = buzz_db::channel_members::lock_channel_archived_at_in_transaction(
+        membership.tx(),
+        channel_id,
+    )
+    .await?;
 
     // Test hook: fires after the FOR UPDATE lock is acquired but before the
     // archived check / any write. A test can attempt a concurrent archive here
@@ -3338,9 +3344,12 @@ async fn commit_participant_join(
         // IMPORTANT 4b: Re-read parent membership under the lock. A parent
         // membership revocation in the same window would make the auto-add
         // unjustified; reject rather than grant access from stale authority.
-        let parent_still_member =
-            buzz_db::channel_members::is_member_in_transaction(&mut tx, *parent_id, pubkey_bytes)
-                .await?;
+        let parent_still_member = buzz_db::channel_members::is_member_in_transaction(
+            membership.tx(),
+            *parent_id,
+            pubkey_bytes,
+        )
+        .await?;
 
         if !parent_still_member {
             retire_shadow();
@@ -3355,7 +3364,7 @@ async fn commit_participant_join(
         // but before this transaction acquires the lock; committing a join into
         // an unlinked channel violates the "creator authority" invariant.
         let link_still_exists = buzz_db::event::huddle_started_link_exists_in_transaction(
-            &mut tx,
+            membership.tx(),
             *parent_id,
             channel_id,
             channel_created_by.as_slice(),
@@ -3370,18 +3379,17 @@ async fn commit_participant_join(
 
         // Re-read child membership — a concurrent legitimate add may have
         // already provided access; do not overwrite role/provenance.
-        let still_absent =
-            !buzz_db::channel_members::is_member_in_transaction(&mut tx, channel_id, pubkey_bytes)
-                .await?;
+        let still_absent = !buzz_db::channel_members::is_member_in_transaction(
+            membership.tx(),
+            channel_id,
+            pubkey_bytes,
+        )
+        .await?;
 
         if still_absent {
-            buzz_db::channel_members::insert_auto_membership_in_transaction(
-                &mut tx,
-                channel_id,
-                pubkey_bytes,
-                channel_created_by.as_slice(),
-            )
-            .await?;
+            membership
+                .insert_auto_membership(channel_id, pubkey_bytes, channel_created_by.as_slice())
+                .await?;
         }
         // If not still_absent: concurrent add observed — membership preserved.
     }
@@ -3392,22 +3400,22 @@ async fn commit_participant_join(
     //     an open channel whose `join_role` is `member`. A non-member of a
     //     private scope has lost the membership the pre-join check saw (the
     //     auto-add above already made a private huddle's joiner a member).
-    let scopes = if parent_channel_id == channel_id {
-        vec![channel_id]
-    } else {
-        vec![channel_id, parent_channel_id]
-    };
-    for scope in scopes {
-        let role =
-            buzz_db::channel_members::active_role_in_transaction(&mut tx, scope, pubkey_bytes)
-                .await?;
+    for scope in locked_channels.iter().copied() {
+        let role = buzz_db::channel_members::active_role_in_transaction(
+            membership.tx(),
+            scope,
+            pubkey_bytes,
+        )
+        .await?;
         let refusal = match role.as_deref() {
             Some(role) => (!crate::handlers::ingest::role_may_post(Some(role)))
                 .then_some(JoinCommitError::WriteRoleLost),
             None => {
-                let settings =
-                    buzz_db::channel_members::channel_write_settings_in_transaction(&mut tx, scope)
-                        .await?;
+                let settings = buzz_db::channel_members::channel_write_settings_in_transaction(
+                    membership.tx(),
+                    scope,
+                )
+                .await?;
                 match settings {
                     Some((visibility, _)) if visibility != "open" => {
                         Some(JoinCommitError::MembershipLost)
@@ -9524,7 +9532,7 @@ mod tests {
         // Exercises the concurrent-external-add path in the AutoAddRequired branch
         // of `commit_participant_join`. An external transaction inserts the
         // membership row while our transaction is paused at `before_membership_lock`
-        // — just before `acquire_channel_membership_lock_in_transaction`. When our
+        // — just before `lock_channel_memberships_in_transaction`. When our
         // transaction resumes:
         //   1. It acquires the channel membership lock.
         //   2. Re-reads membership — the external insert is committed and visible.

@@ -147,6 +147,9 @@ run_unit_tests() {
   run_test_step "buzz-admin NIP-FI binding command tests" \
     cargo test -p buzz-admin nip_fi::tests -- --nocapture
 
+  run_test_step "buzz-admin user-deletion intake command tests" \
+    cargo test -p buzz-admin user_deletions::tests -- --nocapture
+
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
   run_test_step "buzz-conformance tests" \

@@ -3043,17 +3043,15 @@ async fn ingest_event_inner(
     }
 
     if channel_id.is_some() {
-        // Allow kind:9002 with archived=false (unarchive operation)
-        let is_unarchive = kind_u32 == KIND_NIP29_EDIT_METADATA
-            && event.tags.iter().any(|t| {
-                let parts = t.as_slice();
-                parts.len() >= 2 && parts[0] == "archived" && parts[1] == "false"
-            });
+        // kind:9002 is not checked here: its atomic write decides the
+        // archive state under the channel row lock, after its duplicate
+        // check, so a resend that races the first commit is a duplicate.
+        let is_edit_metadata = kind_u32 == KIND_NIP29_EDIT_METADATA;
 
         // A member may still leave an archived channel by themselves.
         let is_self_departure = crate::handlers::side_effects::is_self_departure(&event);
 
-        if !is_unarchive && !is_self_departure {
+        if !is_edit_metadata && !is_self_departure {
             if let Some(channel) = &channel_row {
                 if channel.archived_at.is_some() {
                     return Err(match target_denial {
@@ -3535,6 +3533,19 @@ async fn ingest_event_inner(
         crate::handlers::side_effects::persist_workflow_deletion(tenant, &event, state)
             .await
             .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?
+    } else if kind_u32 == KIND_NIP29_EDIT_METADATA {
+        // One commit stores the event and applies its channel changes. A
+        // failure stores nothing, so the client is told and can resend it.
+        // A refusal decided under the lock (for example, restoring a channel
+        // that is not archived) is the client's error; anything else is ours.
+        crate::handlers::side_effects::persist_edit_metadata(tenant, &event, state)
+            .await
+            .map_err(|e| match e.downcast_ref::<buzz_db::DbError>() {
+                Some(buzz_db::DbError::AccessDenied(reason)) => {
+                    IngestError::Rejected(format!("invalid: {reason}"))
+                }
+                _ => IngestError::Internal(format!("error: channel update failed: {e}")),
+            })?
     } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
@@ -3626,7 +3637,10 @@ async fn ingest_event_inner(
         });
     }
 
-    if !workflow_deletion && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    // Workflow deletion and kind:9002 applied their changes in the insert's
+    // own transaction above.
+    let persisted_atomically = workflow_deletion || kind_u32 == KIND_NIP29_EDIT_METADATA;
+    if !persisted_atomically && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await

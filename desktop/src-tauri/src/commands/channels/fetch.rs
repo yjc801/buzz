@@ -49,6 +49,34 @@ async fn query_relay_all(
     }
 }
 
+/// Filters per `/query` request: the relay's advertised NIP-11 `max_filters`.
+const MAX_FILTERS_PER_QUERY: usize = 10;
+
+/// Fetch the kind:39000 metadata for `channel_ids`, one filter per
+/// [`DIRECTORY_PAGE_SIZE`] ids and up to [`MAX_FILTERS_PER_QUERY`] filters per
+/// request.
+///
+/// kind:39000 is addressable — one event per `d` tag — so a slice's answer
+/// can never reach the relay's per-filter row cap (1,000) and needs no
+/// cursor. A single filter for every id was clamped at that cap, dropping the
+/// channels with the oldest metadata (long-standing DMs first) from the
+/// sidebar. Paging that one filter would re-send the whole id list per page;
+/// slicing sends each id once, in one request per 5,000 channels.
+async fn query_channel_metadata(
+    state: &AppState,
+    channel_ids: &[String],
+) -> Result<Vec<nostr::Event>, String> {
+    let filters: Vec<serde_json::Value> = channel_ids
+        .chunks(DIRECTORY_PAGE_SIZE)
+        .map(|ids| serde_json::json!({"kinds": [39000], "#d": ids, "limit": ids.len()}))
+        .collect();
+    let mut events = Vec::with_capacity(channel_ids.len());
+    for batch in filters.chunks(MAX_FILTERS_PER_QUERY) {
+        events.extend(query_relay(state, batch).await?);
+    }
+    Ok(events)
+}
+
 /// Whether an open channel not yet in the real member set should still be
 /// classified `is_member=true` via the pending-owner overlay. Pulled out of
 /// `get_channels`'s open-channel branch so the exact `(d_tag, my_pubkey,
@@ -247,21 +275,7 @@ pub(super) async fn fetch_channels(
             }
 
             // Step 2: fetch channel metadata events (kind:39000) for member channels.
-            // kind:39000 is addressable: exactly one event per `d` tag, so a limit
-            // equal to the number of ids is both necessary and sufficient.
-            let meta_events = if !member_channel_ids.is_empty() {
-                query_relay(
-                    state,
-                    &[serde_json::json!({
-                        "kinds": [39000],
-                        "#d": &member_channel_ids,
-                        "limit": member_channel_ids.len(),
-                    })],
-                )
-                .await?
-            } else {
-                Vec::new()
-            };
+            let meta_events = query_channel_metadata(state, &member_channel_ids).await?;
 
             Ok::<_, String>((meta_events, collect_members_by_channel(&member_events)))
         },

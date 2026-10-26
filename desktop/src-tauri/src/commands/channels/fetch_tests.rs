@@ -433,3 +433,116 @@ async fn discovery_and_activity_failures_still_abort_the_refresh() {
     relay.data.lock().unwrap().fail_messages = true;
     assert!(fetch(&state, DirectoryScope::MemberOnly).await.is_err());
 }
+
+fn at(keys: &Keys, kind: u16, tags: Vec<Vec<&str>>, created_at: u64) -> Event {
+    EventBuilder::new(Kind::from_u16(kind), "")
+        .allow_self_tagging()
+        .tags(tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+fn take_activity_lookups(relay: &Relay) -> Vec<String> {
+    let mut data = relay.data.lock().unwrap();
+    let mut ids: Vec<String> = data
+        .requests
+        .drain(..)
+        .flatten()
+        .filter(|f| f["kinds"][0] == json!(9))
+        .map(|f| f["#h"][0].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn last_message_at(channels: &[ChannelInfo], id: &str) -> Option<String> {
+    let channel = channels.iter().find(|c| c.id == id).expect("listed");
+    channel.last_message_at.clone()
+}
+
+/// An archived channel accepts no messages, so its activity is looked up once
+/// per archiving metadata event. It stays listed with its remembered timestamp,
+/// and a new archiving event, a failed lookup, an unarchive, or a relay switch
+/// each force a fresh lookup. Only the current relay's values are kept.
+#[tokio::test]
+async fn archived_channel_activity_is_looked_up_once_per_archive() {
+    let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
+    let keys = Keys::generate();
+    let me = keys.public_key().to_hex();
+    let archived_at = |ts| {
+        at(
+            &keys,
+            39000,
+            vec![vec!["d", "room"], vec!["archived", "true"]],
+            ts,
+        )
+    };
+    let events = vec![
+        metadata(&keys, "live"),
+        roster(&keys, "live", &[&me]),
+        at(&keys, 9, vec![vec!["h", "live"]], 1_700_000_100),
+        archived_at(1_700_000_000),
+        roster(&keys, "room", &[&me]),
+        at(&keys, 9, vec![vec!["h", "room"]], 1_600_000_000),
+        at(
+            &keys,
+            39000,
+            vec![vec!["d", "quiet"], vec!["archived", "true"]],
+            1_700_000_000,
+        ),
+        roster(&keys, "quiet", &[&me]),
+    ];
+    let relay = Relay::new(events.clone()).await;
+    let state = relay.state(&keys);
+    let lookups = |relay: &Relay| take_activity_lookups(relay);
+    let first_message = Some(nostr_convert::timestamp_to_iso(1_600_000_000));
+
+    let channels = fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live", "quiet", "room"]);
+    assert_eq!(channels.len(), 3, "archived channels stay listed");
+    assert_eq!(last_message_at(&channels, "room"), first_message);
+
+    let channels = fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live"]);
+    assert_eq!(last_message_at(&channels, "room"), first_message);
+    assert_eq!(last_message_at(&channels, "quiet"), None);
+
+    // Unarchived, posted to, and re-archived between two polls: no fetch saw
+    // it unarchived, so only the new archiving event forces the lookup. A
+    // failed lookup remembers nothing, so the next fetch retries.
+    {
+        let mut data = relay.data.lock().unwrap();
+        data.events[3] = archived_at(1_700_000_300);
+        data.events
+            .push(at(&keys, 9, vec![vec!["h", "room"]], 1_700_000_200));
+        data.fail_messages = true;
+    }
+    assert!(fetch(&state, DirectoryScope::MemberOnly).await.is_err());
+    relay.data.lock().unwrap().fail_messages = false;
+    lookups(&relay);
+    let channels = fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live", "room"]);
+    let latest = Some(nostr_convert::timestamp_to_iso(1_700_000_200));
+    assert_eq!(last_message_at(&channels, "room"), latest);
+    let channels = fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live"]);
+    assert_eq!(last_message_at(&channels, "room"), latest);
+
+    // Once seen unarchived, the channel is looked up on every fetch again.
+    relay.data.lock().unwrap().events[3] = metadata(&keys, "room");
+    fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live", "live", "room", "room"]);
+
+    // Another community never reads this relay's remembered values, and the
+    // cache holds one scope: switching back looks everything up again rather
+    // than keeping every community ever visited.
+    let second = Relay::new(events).await;
+    *state.relay_url_override.lock().unwrap() = Some(second.url.clone());
+    fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&second), ["live", "quiet", "room"]);
+    *state.relay_url_override.lock().unwrap() = Some(relay.url.clone());
+    fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live", "quiet", "room"]);
+}

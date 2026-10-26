@@ -215,7 +215,8 @@ pub(super) enum DirectoryScope {
 ///   metadata source (pending-owned ids when member-only, else the all-open
 ///   kind:39000 scan), and the hidden-DM snapshot (kind:30622).
 /// - Phase 2 (parallel): missing member counts (kind:39002 batch) and last-message
-///   timestamps (bounded per-channel human-visible activity batches). Reuse the
+///   timestamps (bounded per-channel human-visible activity batches, skipping
+///   archived channels whose timestamp is remembered). Reuse the
 ///   member-chain rosters; missing-count failures degrade to zero. Timestamp
 ///   failures abort so cached recency is never replaced by a false
 ///   authoritative empty result.
@@ -390,8 +391,18 @@ pub(super) async fn fetch_channels(
     // abort this refresh so the frontend keeps its previous Recent ordering.
     let all_channel_ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
     if !all_channel_ids.is_empty() {
+        // An archived channel accepts no new messages, so its last-message
+        // timestamp is looked up once per archiving metadata event and then
+        // remembered. Archived PR rooms are most of a long-lived membership.
+        let relay_url = crate::relay::relay_ws_url_with_override(state);
+        // Member metadata last, so it wins for a channel in both sets, matching
+        // the event the channel was built from.
+        let archived =
+            archived_metadata_ids(&channels, open_meta_events.iter().chain(&meta_events));
+        let remembered = state.remembered_archived_recency(&relay_url, &my_pubkey, &archived);
         let last_msg_filters: Vec<serde_json::Value> = all_channel_ids
             .iter()
+            .filter(|id| !remembered.contains_key(*id))
             .map(|id| last_message_filter(id))
             .collect();
 
@@ -453,6 +464,17 @@ pub(super) async fn fetch_channels(
                     .or_insert(ts);
             }
         }
+        last_message_by_channel.extend(
+            remembered
+                .into_iter()
+                .filter_map(|(id, ts)| ts.map(|ts| (id, ts))),
+        );
+        state.remember_archived_recency(
+            &relay_url,
+            &my_pubkey,
+            &archived,
+            &last_message_by_channel,
+        );
         for channel in &mut channels {
             if let Some(&ts) = last_message_by_channel.get(&channel.id) {
                 channel.last_message_at = Some(nostr_convert::timestamp_to_iso(ts));
@@ -478,6 +500,31 @@ pub(super) async fn fetch_channels(
     }
 
     Ok(channels)
+}
+
+/// Archived channel id → id of the kind:39000 event that marks it archived.
+/// The event id fences remembered recency: any later metadata change, such as
+/// an unarchive, publishes a new event and forces a fresh lookup.
+fn archived_metadata_ids<'a>(
+    channels: &[ChannelInfo],
+    metadata: impl Iterator<Item = &'a nostr::Event>,
+) -> std::collections::HashMap<String, String> {
+    let archived: std::collections::HashSet<&str> = channels
+        .iter()
+        .filter(|c| c.archived_at.is_some())
+        .map(|c| c.id.as_str())
+        .collect();
+    metadata
+        .filter_map(|ev| {
+            let d = ev.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                (s.len() >= 2 && s[0] == "d").then(|| s[1].as_str())
+            })?;
+            archived
+                .contains(d)
+                .then(|| (d.to_string(), ev.id.to_hex()))
+        })
+        .collect()
 }
 
 pub(super) struct ChannelMembership {

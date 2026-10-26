@@ -196,10 +196,8 @@ async fn member_rosters_are_reused_including_every_discovery_page() {
             assert_eq!(discovery[1]["until"], json!(1_700_000_000));
             assert!(discovery[1]["before_id"].is_string());
         }
-        // Membership pages + member metadata pages + hidden DMs + bounded
-        // activity batches.
-        let pages = count / DIRECTORY_PAGE_SIZE + 1;
-        let expected_reads = 2 * pages + 1 + count.div_ceil(128);
+        // Membership pages + member metadata + hidden DMs + bounded activity batches.
+        let expected_reads = count / DIRECTORY_PAGE_SIZE + 1 + 2 + count.div_ceil(128);
         assert_eq!(data.requests.len(), expected_reads);
         eprintln!(
             "roster-reuse fixture channels={count} reads={} elapsed={:?}",
@@ -246,6 +244,20 @@ async fn member_channels_past_the_relay_row_cap_keep_their_metadata() {
         .find(|c| c.id == "dm")
         .expect("the DM is listed");
     assert_eq!(dm.channel_type, "dm");
+    // One request, each id sent once: re-sending the list per page would
+    // grow with the square of the channel count on every 60s refresh.
+    let data = relay.data.lock().unwrap();
+    let metadata_requests: Vec<_> = data
+        .requests
+        .iter()
+        .filter(|request| request.iter().any(|f| f["kinds"] == json!([39000])))
+        .collect();
+    assert_eq!(metadata_requests.len(), 1);
+    let ids_sent: usize = metadata_requests[0]
+        .iter()
+        .map(|f| f["#d"].as_array().map_or(0, Vec::len))
+        .sum();
+    assert_eq!(ids_sent, count);
 }
 
 #[tokio::test]

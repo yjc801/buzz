@@ -142,6 +142,9 @@ pub struct AppState {
     /// another relay's identity; only verified `Some` values are stored (an
     /// outage or a document without `self` must stay retryable).
     pub relay_self_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
+    /// Last-message timestamps of archived channels, which can never change.
+    /// See `app_state_archived_recency.rs`.
+    pub archived_recency: archived_recency::ArchivedRecencyCache,
     pub archive_db: crate::archive::ArchiveDb,
 }
 
@@ -246,6 +249,7 @@ pub fn build_app_state() -> AppState {
         mesh_coordinator: AsyncMutex::new(None),
         pending_owned_channels: Mutex::new(std::collections::HashSet::new()),
         relay_self_cache: Mutex::new(HashMap::new()),
+        archived_recency: Default::default(),
         archive_db: crate::archive::ArchiveDb::default(),
     }
 }
@@ -307,6 +311,9 @@ pub(crate) use keyring_config::keyring_service;
 
 #[path = "app_state_pending_channels.rs"]
 mod pending_channels;
+
+#[path = "app_state_archived_recency.rs"]
+mod archived_recency;
 
 /// Keyring key name for the human identity nsec.
 const IDENTITY_KEY_NAME: &str = "identity";

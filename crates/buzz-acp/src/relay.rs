@@ -43,6 +43,13 @@ fn event_channel_capacity() -> usize {
 /// Two-generation dedup: each generation holds up to SEEN_ID_LIMIT/2 entries.
 const SEEN_ID_LIMIT: usize = 12_000;
 
+/// Channel ids per kind:39000 filter during discovery — well under the
+/// relay's 1,000-row per-filter cap.
+const DISCOVERY_METADATA_IDS_PER_FILTER: usize = 500;
+
+/// Filters per discovery `/query` request: the relay's NIP-11 `max_filters`.
+const DISCOVERY_MAX_FILTERS_PER_QUERY: usize = 10;
+
 /// Interval between client-initiated WebSocket pings.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// If no pong is received within this duration after a ping, the connection is
@@ -211,15 +218,29 @@ async fn discover_member_channels(
         return Ok(HashMap::new());
     }
 
-    // Step 2: Fetch metadata (kind:39000) for discovered channels.
-    let d_values: Vec<String> = channel_uuids.iter().map(Uuid::to_string).collect();
-    let meta_events = serde_json::Value::Array(
-        rest.query_raw_all(serde_json::json!({
-            "kinds": [buzz_core::kind::KIND_NIP29_GROUP_METADATA],
-            "#d": d_values,
-        }))
-        .await?,
-    );
+    // Step 2: Fetch metadata (kind:39000) for discovered channels. One event
+    // per `d` tag, so a slice of DISCOVERY_METADATA_IDS_PER_FILTER ids can never
+    // reach the relay's per-filter row cap and needs no paging; paging a single
+    // filter would re-send the whole id list on every page.
+    let filters: Vec<Value> = channel_uuids
+        .chunks(DISCOVERY_METADATA_IDS_PER_FILTER)
+        .map(|ids| {
+            serde_json::json!({
+                "kinds": [buzz_core::kind::KIND_NIP29_GROUP_METADATA],
+                "#d": ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+                "limit": ids.len(),
+            })
+        })
+        .collect();
+    let mut meta_events = Vec::with_capacity(channel_uuids.len());
+    for batch in filters.chunks(DISCOVERY_MAX_FILTERS_PER_QUERY) {
+        let page = rest.query_raw(batch).await?;
+        let page = page
+            .as_array()
+            .ok_or_else(|| RelayError::Http("query response is not an array".into()))?;
+        meta_events.extend(page.iter().cloned());
+    }
+    let meta_events = serde_json::Value::Array(meta_events);
 
     // Step 3: Build the final subscribe set, skipping archived channels.
     let map = merge_discovered_channels(channel_uuids, &meta_events);
@@ -4496,30 +4517,44 @@ mod tests {
                 })
             })
             .collect();
+        let metadata_requests =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<Value>>::new()));
+        let server_metadata_requests = metadata_requests.clone();
         let app = Router::new().route(
             "/query",
             post(move |Json(filters): Json<Vec<Value>>| {
                 let memberships = memberships.clone();
+                let metadata_requests = server_metadata_requests.clone();
                 async move {
-                    let filter = &filters[0];
-                    let rows = if filter["kinds"][0] == buzz_core::kind::KIND_NIP29_GROUP_MEMBERS {
-                        memberships
-                    } else {
-                        let ids = filter["#d"].as_array().cloned().unwrap_or_default();
-                        ids.iter()
-                            .filter_map(Value::as_str)
-                            .enumerate()
-                            .map(|(n, id)| {
-                                json!({
-                                    "id": format!("{n:064x}"),
-                                    "kind": buzz_core::kind::KIND_NIP29_GROUP_METADATA,
-                                    "created_at": 1_700_000_000,
-                                    "tags": [["d", id], ["name", format!("ch-{id}")]],
-                                })
-                            })
-                            .collect()
-                    };
-                    Json(Value::Array(relay_page(rows, filter)))
+                    if filters[0]["kinds"][0] == buzz_core::kind::KIND_NIP29_GROUP_METADATA {
+                        metadata_requests
+                            .lock()
+                            .expect("lock")
+                            .push(filters.clone());
+                    }
+                    let mut answer = Vec::new();
+                    for filter in &filters {
+                        let rows =
+                            if filter["kinds"][0] == buzz_core::kind::KIND_NIP29_GROUP_MEMBERS {
+                                memberships.clone()
+                            } else {
+                                let ids = filter["#d"].as_array().cloned().unwrap_or_default();
+                                ids.iter()
+                                    .filter_map(Value::as_str)
+                                    .enumerate()
+                                    .map(|(n, id)| {
+                                        json!({
+                                            "id": format!("{n:064x}"),
+                                            "kind": buzz_core::kind::KIND_NIP29_GROUP_METADATA,
+                                            "created_at": 1_700_000_000,
+                                            "tags": [["d", id], ["name", format!("ch-{id}")]],
+                                        })
+                                    })
+                                    .collect()
+                            };
+                        answer.extend(relay_page(rows, filter));
+                    }
+                    Json(Value::Array(answer))
                 }
             }),
         );
@@ -4549,6 +4584,15 @@ mod tests {
             channels.values().all(|info| info.name.starts_with("ch-")),
             "every channel must carry its metadata, not the unknown fallback"
         );
+        // One request, each id sent once: paging a single filter re-sends
+        // the whole id list per page and grows with the square of the count.
+        let metadata_requests = metadata_requests.lock().expect("lock");
+        assert_eq!(metadata_requests.len(), 1);
+        let ids_sent: usize = metadata_requests[0]
+            .iter()
+            .map(|f| f["#d"].as_array().map_or(0, Vec::len))
+            .sum();
+        assert_eq!(ids_sent, CHANNELS as usize);
     }
 
     #[test]

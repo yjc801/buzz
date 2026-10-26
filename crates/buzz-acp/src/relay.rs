@@ -168,6 +168,66 @@ pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
     }
 }
 
+/// Discover channels the agent is a member of.
+///
+/// Queries kind:39002 (NIP-29 group members) events where `#p` includes
+/// the agent pubkey to find channel memberships, then queries kind:39000
+/// (group metadata) for channel names and types. Both are paged: the
+/// relay caps every answer at its newest 1,000 rows, and an unpaged
+/// membership query silently dropped an agent's oldest channels — its DMs
+/// first.
+async fn discover_member_channels(
+    rest: &RestClient,
+    pk_hex: &str,
+) -> Result<HashMap<Uuid, ChannelInfo>, RelayError> {
+    // Step 1: Find all channels where agent is a member (kind:39002 with #p tag).
+    let member_arr = rest
+        .query_raw_all(serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_NIP29_GROUP_MEMBERS],
+            "#p": [pk_hex],
+        }))
+        .await?;
+
+    // Extract channel UUIDs from #d tags.
+    let mut channel_uuids: Vec<Uuid> = Vec::new();
+    for ev in &member_arr {
+        if let Some(tags) = ev.get("tags").and_then(|t| t.as_array()) {
+            for tag in tags {
+                if let Some(arr) = tag.as_array() {
+                    if arr.first().and_then(|v| v.as_str()) == Some("d") {
+                        if let Some(d_val) = arr.get(1).and_then(|v| v.as_str()) {
+                            if let Ok(uuid) = d_val.parse::<Uuid>() {
+                                channel_uuids.push(uuid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if channel_uuids.is_empty() {
+        debug!("discovered 0 channel(s)");
+        return Ok(HashMap::new());
+    }
+
+    // Step 2: Fetch metadata (kind:39000) for discovered channels.
+    let d_values: Vec<String> = channel_uuids.iter().map(Uuid::to_string).collect();
+    let meta_events = serde_json::Value::Array(
+        rest.query_raw_all(serde_json::json!({
+            "kinds": [buzz_core::kind::KIND_NIP29_GROUP_METADATA],
+            "#d": d_values,
+        }))
+        .await?,
+    );
+
+    // Step 3: Build the final subscribe set, skipping archived channels.
+    let map = merge_discovered_channels(channel_uuids, &meta_events);
+
+    debug!("discovered {} channel(s)", map.len());
+    Ok(map)
+}
+
 /// Build the discovered-channel subscribe set from the membership UUIDs and the
 /// kind:39000 metadata events, **skipping any channel flagged `archived=true`**.
 ///
@@ -822,68 +882,10 @@ impl HarnessRelay {
         })
     }
 
-    /// Discover channels the agent is a member of.
-    ///
-    /// Queries kind:39002 (NIP-29 group members) events where `#p` includes
-    /// the agent pubkey to find channel memberships, then queries kind:39000
-    /// (group metadata) for channel names and types.
+    /// Discover channels the agent is a member of. See
+    /// [`discover_member_channels`].
     pub async fn discover_channels(&self) -> Result<HashMap<Uuid, ChannelInfo>, RelayError> {
-        use nostr::{Alphabet, SingleLetterTag};
-
-        let rest = self.rest_client();
-        let pk_hex = self.keys.public_key().to_hex();
-
-        // Step 1: Find all channels where agent is a member (kind:39002 with #p tag).
-        let p_tag = SingleLetterTag::lowercase(Alphabet::P);
-        let member_filter = nostr::Filter::new()
-            .kind(Kind::Custom(
-                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
-            ))
-            .custom_tags(p_tag, [pk_hex.as_str()]);
-        let member_events = rest.query(&[member_filter]).await?;
-
-        let member_arr = member_events
-            .as_array()
-            .ok_or_else(|| RelayError::Http("expected JSON array from /query (members)".into()))?;
-
-        // Extract channel UUIDs from #d tags.
-        let mut channel_uuids: Vec<Uuid> = Vec::new();
-        for ev in member_arr {
-            if let Some(tags) = ev.get("tags").and_then(|t| t.as_array()) {
-                for tag in tags {
-                    if let Some(arr) = tag.as_array() {
-                        if arr.first().and_then(|v| v.as_str()) == Some("d") {
-                            if let Some(d_val) = arr.get(1).and_then(|v| v.as_str()) {
-                                if let Ok(uuid) = d_val.parse::<Uuid>() {
-                                    channel_uuids.push(uuid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if channel_uuids.is_empty() {
-            debug!("discovered 0 channel(s)");
-            return Ok(HashMap::new());
-        }
-
-        // Step 2: Fetch metadata (kind:39000) for discovered channels.
-        let d_tag = SingleLetterTag::lowercase(Alphabet::D);
-        let d_values: Vec<String> = channel_uuids.iter().map(|u| u.to_string()).collect();
-        let meta_filter = nostr::Filter::new()
-            .kind(Kind::Custom(
-                buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16,
-            ))
-            .custom_tags(d_tag, d_values);
-        let meta_events = rest.query(&[meta_filter]).await?;
-
-        // Step 3: Build the final subscribe set, skipping archived channels.
-        let map = merge_discovered_channels(channel_uuids, &meta_events);
-
-        debug!("discovered {} channel(s)", map.len());
-        Ok(map)
+        discover_member_channels(&self.rest_client(), &self.keys.public_key().to_hex()).await
     }
 
     /// Build a [`RestClient`] that shares this relay's HTTP credentials.
@@ -4446,6 +4448,107 @@ mod tests {
             }
         }
         serde_json::json!({ "tags": tags })
+    }
+
+    /// Answer one `/query` filter over `rows` the way the relay does:
+    /// `created_at DESC, id ASC`, the `(until, before_id)` cursor, and every
+    /// page clamped to the relay's 1,000-row cap.
+    fn relay_page(mut rows: Vec<Value>, filter: &Value) -> Vec<Value> {
+        rows.sort_by(|a, b| {
+            b["created_at"]
+                .as_u64()
+                .cmp(&a["created_at"].as_u64())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+        });
+        let limit = filter["limit"].as_u64().map_or(1_000, |l| l.min(1_000)) as usize;
+        let until = filter["until"].as_u64();
+        let before_id = filter["before_id"].as_str();
+        rows.into_iter()
+            .filter(|row| {
+                let at = row["created_at"].as_u64().unwrap_or_default();
+                let id = row["id"].as_str().unwrap_or_default();
+                match (until, before_id) {
+                    (Some(until), Some(before)) => at < until || (at == until && id > before),
+                    (Some(until), None) => at <= until,
+                    _ => true,
+                }
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// The DM-silence regression: an agent in more channels than the relay's
+    /// row cap must discover every one — the oldest is where a long-standing
+    /// DM sits — and get real metadata for each rather than "unknown".
+    #[tokio::test]
+    async fn discovery_finds_every_channel_past_the_relay_row_cap() {
+        use axum::{routing::post, Json, Router};
+
+        const CHANNELS: u128 = 1_250;
+        let memberships: Vec<Value> = (0..CHANNELS)
+            .map(|n| {
+                json!({
+                    "id": format!("{n:064x}"),
+                    "kind": buzz_core::kind::KIND_NIP29_GROUP_MEMBERS,
+                    // Seven per second, so pages split mid-second.
+                    "created_at": 1_700_000_000 + (n / 7) as u64,
+                    "tags": [["d", Uuid::from_u128(n + 1).to_string()], ["p", "agent"]],
+                })
+            })
+            .collect();
+        let app = Router::new().route(
+            "/query",
+            post(move |Json(filters): Json<Vec<Value>>| {
+                let memberships = memberships.clone();
+                async move {
+                    let filter = &filters[0];
+                    let rows = if filter["kinds"][0] == buzz_core::kind::KIND_NIP29_GROUP_MEMBERS {
+                        memberships
+                    } else {
+                        let ids = filter["#d"].as_array().cloned().unwrap_or_default();
+                        ids.iter()
+                            .filter_map(Value::as_str)
+                            .enumerate()
+                            .map(|(n, id)| {
+                                json!({
+                                    "id": format!("{n:064x}"),
+                                    "kind": buzz_core::kind::KIND_NIP29_GROUP_METADATA,
+                                    "created_at": 1_700_000_000,
+                                    "tags": [["d", id], ["name", format!("ch-{id}")]],
+                                })
+                            })
+                            .collect()
+                    };
+                    Json(Value::Array(relay_page(rows, filter)))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind query test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+
+        let channels = discover_member_channels(&rest, "agent")
+            .await
+            .expect("discovers");
+        server.abort();
+
+        assert_eq!(channels.len(), CHANNELS as usize);
+        let oldest = Uuid::from_u128(1);
+        assert_eq!(channels[&oldest].name, format!("ch-{oldest}"));
+        assert!(
+            channels.values().all(|info| info.name.starts_with("ch-")),
+            "every channel must carry its metadata, not the unknown fallback"
+        );
     }
 
     #[test]

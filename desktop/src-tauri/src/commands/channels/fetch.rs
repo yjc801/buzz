@@ -247,16 +247,17 @@ pub(super) async fn fetch_channels(
             }
 
             // Step 2: fetch channel metadata events (kind:39000) for member channels.
-            // kind:39000 is addressable: exactly one event per `d` tag, so a limit
-            // equal to the number of ids is both necessary and sufficient.
+            // Paged: kind:39000 is one event per `d` tag, but the relay clamps any
+            // single answer to its newest 1,000 rows, so past 1,000 memberships an
+            // unpaged lookup dropped the channels with the oldest metadata — long-
+            // standing DMs first — and they vanished from the sidebar.
             let meta_events = if !member_channel_ids.is_empty() {
-                query_relay(
+                query_relay_all(
                     state,
-                    &[serde_json::json!({
+                    serde_json::json!({
                         "kinds": [39000],
                         "#d": &member_channel_ids,
-                        "limit": member_channel_ids.len(),
-                    })],
+                    }),
                 )
                 .await?
             } else {

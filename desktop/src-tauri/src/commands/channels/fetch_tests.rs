@@ -5,6 +5,9 @@ use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+/// The relay's per-answer row cap (`buzz_db::DEFAULT_MAX_PAGE_LIMIT`).
+const RELAY_ROW_CAP: usize = 1_000;
+
 #[derive(Default)]
 struct Fixture {
     events: Vec<Event>,
@@ -85,7 +88,8 @@ async fn query(
                 .cmp(&a.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        page.truncate(filter["limit"].as_u64().unwrap() as usize);
+        // The relay clamps every answer to its page cap, whatever `limit` asks.
+        page.truncate((filter["limit"].as_u64().unwrap() as usize).min(RELAY_ROW_CAP));
         result.extend(page);
     }
     (StatusCode::OK, Json(json!(result)))
@@ -192,8 +196,10 @@ async fn member_rosters_are_reused_including_every_discovery_page() {
             assert_eq!(discovery[1]["until"], json!(1_700_000_000));
             assert!(discovery[1]["before_id"].is_string());
         }
-        // Membership pages + member metadata + hidden DMs + bounded activity batches.
-        let expected_reads = count / DIRECTORY_PAGE_SIZE + 1 + 2 + count.div_ceil(128);
+        // Membership pages + member metadata pages + hidden DMs + bounded
+        // activity batches.
+        let pages = count / DIRECTORY_PAGE_SIZE + 1;
+        let expected_reads = 2 * pages + 1 + count.div_ceil(128);
         assert_eq!(data.requests.len(), expected_reads);
         eprintln!(
             "roster-reuse fixture channels={count} reads={} elapsed={:?}",
@@ -201,6 +207,45 @@ async fn member_rosters_are_reused_including_every_discovery_page() {
             started.elapsed()
         );
     }
+}
+
+/// The missing-DM regression: past the relay's row cap, every member channel
+/// must still be listed. The DM carries the oldest metadata — archiving
+/// rewrites a PR room's kind:39000, so a long-standing DM sorts last — which
+/// is exactly what a single metadata lookup dropped from the sidebar.
+#[tokio::test]
+async fn member_channels_past_the_relay_row_cap_keep_their_metadata() {
+    let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
+    let keys = Keys::generate();
+    let me = keys.public_key().to_hex();
+    let count = RELAY_ROW_CAP + 1;
+    let mut events = vec![
+        EventBuilder::new(Kind::from_u16(39000), "")
+            .tags([
+                Tag::parse(["d", "dm"]).unwrap(),
+                Tag::parse(["t", "dm"]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(1_600_000_000))
+            .sign_with_keys(&keys)
+            .unwrap(),
+        roster(&keys, "dm", &[&me]),
+    ];
+    for index in 1..count {
+        let id = format!("channel-{index:04}");
+        events.push(metadata(&keys, &id));
+        events.push(roster(&keys, &id, &[&me]));
+    }
+    let relay = Relay::new(events).await;
+    let state = relay.state(&keys);
+
+    let channels = fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+
+    assert_eq!(channels.len(), count);
+    let dm = channels
+        .iter()
+        .find(|c| c.id == "dm")
+        .expect("the DM is listed");
+    assert_eq!(dm.channel_type, "dm");
 }
 
 #[tokio::test]

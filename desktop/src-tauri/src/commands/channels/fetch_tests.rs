@@ -464,7 +464,7 @@ fn last_message_at(channels: &[ChannelInfo], id: &str) -> Option<String> {
 /// An archived channel accepts no messages, so its activity is looked up once
 /// per archiving metadata event. It stays listed with its remembered timestamp,
 /// and a new archiving event, a failed lookup, an unarchive, or a relay switch
-/// each force a fresh lookup.
+/// each force a fresh lookup. Only the current relay's values are kept.
 #[tokio::test]
 async fn archived_channel_activity_is_looked_up_once_per_archive() {
     let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
@@ -535,9 +535,14 @@ async fn archived_channel_activity_is_looked_up_once_per_archive() {
     fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
     assert_eq!(lookups(&relay), ["live", "live", "room", "room"]);
 
-    // Another community never reads this relay's remembered values.
+    // Another community never reads this relay's remembered values, and the
+    // cache holds one scope: switching back looks everything up again rather
+    // than keeping every community ever visited.
     let second = Relay::new(events).await;
     *state.relay_url_override.lock().unwrap() = Some(second.url.clone());
     fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
     assert_eq!(lookups(&second), ["live", "quiet", "room"]);
+    *state.relay_url_override.lock().unwrap() = Some(relay.url.clone());
+    fetch(&state, DirectoryScope::MemberOnly).await.unwrap();
+    assert_eq!(lookups(&relay), ["live", "quiet", "room"]);
 }

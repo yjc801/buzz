@@ -8,9 +8,9 @@
 //! Each entry is bound to the kind:39000 event that declared the channel
 //! archived. Unarchiving, renaming, or re-archiving publishes a new metadata
 //! event, so a remembered value can never outlive the archive it was read
-//! under, however fetches interleave. Entries are scoped by relay URL and
-//! identity, so a community switch or identity swap never reads another
-//! scope's values.
+//! under, however fetches interleave. The cache holds one relay URL and
+//! identity at a time: a community switch or identity swap replaces it, so it
+//! never reads another scope's values and never grows past one archive set.
 
 use std::collections::HashMap;
 
@@ -21,7 +21,8 @@ type ScopeEntries = HashMap<String, (String, Option<u64>)>;
 
 #[derive(Default)]
 pub struct ArchivedRecencyCache {
-    scopes: std::sync::Mutex<HashMap<(String, String), ScopeEntries>>,
+    /// `(relay URL, pubkey)` of the last successful fetch, and its entries.
+    scope: std::sync::Mutex<Option<((String, String), ScopeEntries)>>,
 }
 
 impl AppState {
@@ -35,12 +36,15 @@ impl AppState {
         pubkey: &str,
         archived: &HashMap<String, String>,
     ) -> HashMap<String, Option<u64>> {
-        let Ok(scopes) = self.archived_recency.scopes.lock() else {
+        let Ok(scope) = self.archived_recency.scope.lock() else {
             return HashMap::new();
         };
-        let Some(entries) = scopes.get(&(relay_url.to_string(), pubkey.to_string())) else {
+        let Some(((scope_relay, scope_pubkey), entries)) = scope.as_ref() else {
             return HashMap::new();
         };
+        if scope_relay != relay_url || scope_pubkey != pubkey {
+            return HashMap::new();
+        }
         archived
             .iter()
             .filter_map(|(id, metadata_id)| {
@@ -50,11 +54,12 @@ impl AppState {
             .collect()
     }
 
-    /// Replace this scope's entries with the `archived` channels of a fetch
-    /// whose activity lookups all succeeded. `last_message_by_channel` must
-    /// cover every archived channel, remembered or looked up: a channel absent
-    /// from it is recorded as having no messages. Channels no longer archived
-    /// drop out, which keeps the scope bounded by the current archive set.
+    /// Replace the cache with the `archived` channels of a fetch whose
+    /// activity lookups all succeeded. `last_message_by_channel` must cover
+    /// every archived channel, remembered or looked up: a channel absent from
+    /// it is recorded as having no messages. Channels no longer archived and
+    /// every other relay/identity scope drop out, so the cache is bounded by
+    /// one archive set.
     pub fn remember_archived_recency(
         &self,
         relay_url: &str,
@@ -62,7 +67,7 @@ impl AppState {
         archived: &HashMap<String, String>,
         last_message_by_channel: &HashMap<String, u64>,
     ) {
-        let Ok(mut scopes) = self.archived_recency.scopes.lock() else {
+        let Ok(mut scope) = self.archived_recency.scope.lock() else {
             return;
         };
         let entries = archived
@@ -72,6 +77,6 @@ impl AppState {
                 (id.clone(), (metadata_id.clone(), last_message_at))
             })
             .collect();
-        scopes.insert((relay_url.to_string(), pubkey.to_string()), entries);
+        *scope = Some(((relay_url.to_string(), pubkey.to_string()), entries));
     }
 }

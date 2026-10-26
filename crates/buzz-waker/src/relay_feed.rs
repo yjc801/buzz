@@ -57,6 +57,62 @@ const ARCHIVED_CHANNELS_SUBSCRIPTION_ID: &str = "buzz-waker-archived";
 /// one bounded query answered from the relay's current metadata rows.
 const ARCHIVED_CHANNELS_TIMEOUT_SECS: u64 = 20;
 
+/// Memberships asked for per discovery page.
+///
+/// The relay answers any query with at most its page cap (1,000 rows,
+/// newest first), so a single unpaged discovery silently dropped every
+/// channel past an agent's newest 1,000 memberships — typically its oldest
+/// DMs. Sent explicitly, below that cap, for the reason
+/// [`crate::feed::REPLAY_PAGE_LIMIT`] gives: a page that comes back exactly
+/// this full is the only evidence there is more behind it.
+const DISCOVER_CHANNELS_PAGE_LIMIT: usize = 500;
+
+/// Ceiling on discovery pages per connection — 32,000 memberships — so a
+/// relay that keeps answering full pages cannot hold connection setup forever.
+const MAX_DISCOVER_CHANNELS_PAGES: u32 = 64;
+
+/// The relay's composite page cursor: the last row served, in its
+/// `created_at DESC, id ASC` order. Sent back as `until` + `before_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageCursor {
+    created_at: u64,
+    id: String,
+}
+
+impl PageCursor {
+    fn of(event: &Value) -> Option<Self> {
+        Some(Self {
+            created_at: event.get("created_at")?.as_u64()?,
+            id: event.get("id")?.as_str()?.to_string(),
+        })
+    }
+
+    /// Whichever of the two sorts later in the relay's page order.
+    fn older(self, other: Self) -> Self {
+        if (other.created_at, std::cmp::Reverse(&other.id))
+            < (self.created_at, std::cmp::Reverse(&self.id))
+        {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// The kind:39002 filter for one discovery page, `#p` = this agent.
+fn discover_channels_filter(agent_pubkey: &str, cursor: Option<&PageCursor>) -> Value {
+    let mut filter = json!({
+        "kinds": [buzz_core::kind::KIND_NIP29_GROUP_MEMBERS],
+        "#p": [agent_pubkey],
+        "limit": DISCOVER_CHANNELS_PAGE_LIMIT,
+    });
+    if let Some(cursor) = cursor {
+        filter["until"] = json!(cursor.created_at);
+        filter["before_id"] = json!(cursor.id);
+    }
+    filter
+}
+
 /// A NIP-42-authenticated connection to one relay, **as one agent**,
 /// reconnectable in place.
 ///
@@ -136,38 +192,69 @@ impl FeedTransport for RelayFeed {
         // authenticated identity must be the same value by construction, or
         // this could discover a channel list that does not belong to the
         // connection that will go on to subscribe live to it.
-        let filter = json!({
-            "kinds": [buzz_core::kind::KIND_NIP29_GROUP_MEMBERS],
-            "#p": [self.agent_pubkey],
-        });
-        let req = json!(["REQ", DISCOVER_CHANNELS_SUBSCRIPTION_ID, filter]);
-        self.connection_mut()?.send_raw(&req).await?;
-
         let mut channel_ids = Vec::new();
-        loop {
-            match self.next_frame(DISCOVER_CHANNELS_TIMEOUT_SECS).await? {
-                Some(FeedFrame::Event {
-                    subscription_id,
-                    event,
-                }) if subscription_id == DISCOVER_CHANNELS_SUBSCRIPTION_ID => {
-                    if let Some(channel_id) = extract_d_tag_uuid(&event) {
-                        channel_ids.push(channel_id);
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<PageCursor> = None;
+        for _ in 0..MAX_DISCOVER_CHANNELS_PAGES {
+            let filter = discover_channels_filter(&self.agent_pubkey, cursor.as_ref());
+            let req = json!(["REQ", DISCOVER_CHANNELS_SUBSCRIPTION_ID, filter]);
+            self.connection_mut()?.send_raw(&req).await?;
+
+            let mut rows = 0usize;
+            let mut last: Option<PageCursor> = None;
+            loop {
+                match self.next_frame(DISCOVER_CHANNELS_TIMEOUT_SECS).await? {
+                    Some(FeedFrame::Event {
+                        subscription_id,
+                        event,
+                    }) if subscription_id == DISCOVER_CHANNELS_SUBSCRIPTION_ID => {
+                        rows += 1;
+                        if let Some(row) = PageCursor::of(&event) {
+                            last = Some(match last {
+                                Some(prev) => prev.older(row),
+                                None => row,
+                            });
+                        }
+                        if let Some(channel_id) = extract_d_tag_uuid(&event) {
+                            if seen.insert(channel_id) {
+                                channel_ids.push(channel_id);
+                            }
+                        }
                     }
+                    Some(FeedFrame::Eose { subscription_id })
+                        if subscription_id == DISCOVER_CHANNELS_SUBSCRIPTION_ID =>
+                    {
+                        break;
+                    }
+                    // A frame for anything else cannot arrive here — no other
+                    // subscription is open yet at this point in the connect
+                    // sequence — but ignoring rather than erroring costs
+                    // nothing and keeps this loop from being the one place a
+                    // stray relay message tears down the connection.
+                    Some(_) => {}
+                    None => return Err(WsClientError::Timeout),
                 }
-                Some(FeedFrame::Eose { subscription_id })
-                    if subscription_id == DISCOVER_CHANNELS_SUBSCRIPTION_ID =>
-                {
-                    break;
-                }
-                // A frame for anything else cannot arrive here — no other
-                // subscription is open yet at this point in the connect
-                // sequence — but ignoring rather than erroring costs nothing
-                // and keeps this loop from being the one place a stray relay
-                // message tears down the connection.
-                Some(_) => {}
-                None => return Err(WsClientError::Timeout),
             }
+
+            // A short page is the relay running out of rows: nothing older.
+            if rows < DISCOVER_CHANNELS_PAGE_LIMIT {
+                return Ok(channel_ids);
+            }
+            // A full page that leaves the cursor where it was cannot advance —
+            // a relay that ignores `before_id` serves it again forever.
+            if last.is_none() || last == cursor {
+                break;
+            }
+            cursor = last;
         }
+        // Every channel found so far is still worth watching; what is missing
+        // is the older memberships, so say so rather than fail the connection.
+        tracing::error!(
+            agent = %self.agent_pubkey,
+            discovered = channel_ids.len(),
+            "buzz-waker: channel discovery stopped before the relay ran out of \
+             memberships — mentions in the undiscovered channels will not wake"
+        );
         Ok(channel_ids)
     }
 
@@ -180,35 +267,40 @@ impl FeedTransport for RelayFeed {
             return Ok(archived);
         }
 
-        let req = json!([
-            "REQ",
-            ARCHIVED_CHANNELS_SUBSCRIPTION_ID,
-            channel_metadata_filter(channel_ids)
-        ]);
-        self.connection_mut()?.send_raw(&req).await?;
+        // One query per page-sized slice: every channel has exactly one
+        // metadata event, so a slice can never fill past the relay's row cap
+        // and leave archived channels unreported.
+        for slice in channel_ids.chunks(DISCOVER_CHANNELS_PAGE_LIMIT) {
+            let req = json!([
+                "REQ",
+                ARCHIVED_CHANNELS_SUBSCRIPTION_ID,
+                channel_metadata_filter(slice)
+            ]);
+            self.connection_mut()?.send_raw(&req).await?;
 
-        loop {
-            match self.next_frame(ARCHIVED_CHANNELS_TIMEOUT_SECS).await? {
-                Some(FeedFrame::Event {
-                    subscription_id,
-                    event,
-                }) if subscription_id == ARCHIVED_CHANNELS_SUBSCRIPTION_ID => {
-                    if event_is_archived(&event) {
-                        if let Some(channel_id) = extract_d_tag_uuid(&event) {
-                            archived.insert(channel_id);
+            loop {
+                match self.next_frame(ARCHIVED_CHANNELS_TIMEOUT_SECS).await? {
+                    Some(FeedFrame::Event {
+                        subscription_id,
+                        event,
+                    }) if subscription_id == ARCHIVED_CHANNELS_SUBSCRIPTION_ID => {
+                        if event_is_archived(&event) {
+                            if let Some(channel_id) = extract_d_tag_uuid(&event) {
+                                archived.insert(channel_id);
+                            }
                         }
                     }
+                    Some(FeedFrame::Eose { subscription_id })
+                        if subscription_id == ARCHIVED_CHANNELS_SUBSCRIPTION_ID =>
+                    {
+                        break;
+                    }
+                    // Same reasoning as `discover_channels`: nothing else is
+                    // subscribed yet, and ignoring a stray frame is cheaper
+                    // than tearing down the connection over one.
+                    Some(_) => {}
+                    None => return Err(WsClientError::Timeout),
                 }
-                Some(FeedFrame::Eose { subscription_id })
-                    if subscription_id == ARCHIVED_CHANNELS_SUBSCRIPTION_ID =>
-                {
-                    break;
-                }
-                // Same reasoning as `discover_channels`: nothing else is
-                // subscribed yet, and ignoring a stray frame is cheaper than
-                // tearing down the connection over one.
-                Some(_) => {}
-                None => return Err(WsClientError::Timeout),
             }
         }
         Ok(archived)
@@ -568,6 +660,208 @@ mod tests {
             "membership, every per-channel live subscription, and backfill must \
              all carry the identical replay floor — got {observed:?}"
         );
+    }
+
+    /// The relay's row cap (`buzz_db::DEFAULT_MAX_PAGE_LIMIT`), enforced by
+    /// [`serving_relay_server`] the way the real query path clamps `limit`.
+    const RELAY_ROW_CAP: usize = 1_000;
+
+    /// A relay double that *answers* discovery: it serves `memberships`
+    /// newest first under the relay's own ordering (`created_at DESC, id
+    /// ASC`), honours `until` + `before_id` (unless `honour_before_id` is
+    /// false, as on a relay predating the cursor), clamps every page to
+    /// [`RELAY_ROW_CAP`], and answers anything else with a bare EOSE.
+    async fn serving_relay_server(
+        memberships: Vec<nostr::Event>,
+        honour_before_id: bool,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let mut rows: Vec<Value> = memberships
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("event serializes"))
+            .collect();
+        rows.sort_by(|a, b| {
+            b["created_at"]
+                .as_u64()
+                .cmp(&a["created_at"].as_u64())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+        });
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let challenge = json!(["AUTH", "mock-relay-challenge"]).to_string();
+            if ws.send(WsMessage::Text(challenge.into())).await.is_err() {
+                return;
+            }
+            while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                let Ok(frame) = serde_json::from_str::<Vec<Value>>(&text) else {
+                    continue;
+                };
+                let mut replies = Vec::new();
+                match frame.first().and_then(Value::as_str) {
+                    Some("AUTH") => {
+                        let id = frame[1]["id"].as_str().unwrap_or_default();
+                        replies.push(json!(["OK", id, true, ""]));
+                    }
+                    Some("REQ") => {
+                        let sub = frame[1].clone();
+                        let filter = &frame[2];
+                        if sub == DISCOVER_CHANNELS_SUBSCRIPTION_ID {
+                            let limit = filter["limit"]
+                                .as_u64()
+                                .map_or(RELAY_ROW_CAP, |l| (l as usize).min(RELAY_ROW_CAP));
+                            let until = filter["until"].as_u64();
+                            let before_id =
+                                filter["before_id"].as_str().filter(|_| honour_before_id);
+                            let page = rows.iter().filter(|row| {
+                                let at = row["created_at"].as_u64().unwrap_or_default();
+                                let id = row["id"].as_str().unwrap_or_default();
+                                match (until, before_id) {
+                                    (Some(until), Some(before)) => {
+                                        at < until || (at == until && id > before)
+                                    }
+                                    (Some(until), None) => at <= until,
+                                    _ => true,
+                                }
+                            });
+                            for row in page.take(limit) {
+                                replies.push(json!(["EVENT", sub, row]));
+                            }
+                        } else if sub == ARCHIVED_CHANNELS_SUBSCRIPTION_ID {
+                            // Every asked-for channel is archived, clamped to
+                            // the same row cap as any other query.
+                            let ids = filter["#d"].as_array().cloned().unwrap_or_default();
+                            for id in ids.iter().filter_map(Value::as_str).take(RELAY_ROW_CAP) {
+                                replies.push(json!(["EVENT", sub, archived_metadata(id)]));
+                            }
+                        }
+                        replies.push(json!(["EOSE", sub]));
+                    }
+                    _ => {}
+                }
+                for reply in replies {
+                    if ws
+                        .send(WsMessage::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        format!("ws://{addr}")
+    }
+
+    /// A signed kind:39000 metadata event marking channel `id` archived.
+    fn archived_metadata(id: &str) -> Value {
+        let event = nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16),
+            "",
+        )
+        .tags([
+            Tag::parse(["d", id]).expect("valid d tag"),
+            Tag::parse(["archived", "true"]).expect("valid archived tag"),
+        ])
+        .sign_with_keys(&Keys::generate())
+        .expect("signs");
+        serde_json::to_value(event).expect("event serializes")
+    }
+
+    /// `count` signed kind:39002 membership events naming `agent`, one channel
+    /// each, packed `per_second` to a timestamp so pages split mid-second.
+    fn memberships(agent: &Keys, count: u128, per_second: u128) -> Vec<nostr::Event> {
+        let relay = Keys::generate();
+        let agent = agent.public_key().to_hex();
+        (0..count)
+            .map(|n| {
+                nostr::EventBuilder::new(
+                    nostr::Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16),
+                    "",
+                )
+                .tags([
+                    Tag::parse(["d", &Uuid::from_u128(n + 1).to_string()]).expect("valid d tag"),
+                    Tag::parse(["p", &agent]).expect("valid p tag"),
+                ])
+                .custom_created_at(nostr::Timestamp::from(
+                    1_700_000_000 + u64::try_from(n / per_second).expect("fits"),
+                ))
+                .sign_with_keys(&relay)
+                .expect("signs")
+            })
+            .collect()
+    }
+
+    /// The DM-silence regression: an agent in more channels than the relay's
+    /// row cap must still discover every one, including the oldest — which is
+    /// where a long-standing DM sits. Ties within a second straddle page
+    /// boundaries, so this also pins that the cursor neither skips nor
+    /// repeats a row.
+    #[tokio::test]
+    async fn discovery_finds_every_channel_past_the_relay_row_cap() {
+        let agent = Keys::generate();
+        let all = memberships(&agent, 1_250, 7);
+        let url = serving_relay_server(all, true).await;
+        let mut feed = RelayFeed::new(url, agent, None);
+        feed.connect().await.expect("connects");
+
+        let found = feed.discover_channels().await.expect("discovers");
+
+        assert_eq!(found.len(), 1_250, "every membership must be discovered");
+        let unique: std::collections::HashSet<_> = found.iter().collect();
+        assert_eq!(
+            unique.len(),
+            found.len(),
+            "no channel may be reported twice"
+        );
+        assert!(
+            found.contains(&Uuid::from_u128(1)),
+            "the oldest membership — the long-standing DM — must be found"
+        );
+    }
+
+    /// Once discovery returns more channels than the row cap, the archived
+    /// probe must still hear about every one — a single query would leave the
+    /// rest looking live and spend a subscription on each.
+    #[tokio::test]
+    async fn the_archived_probe_reports_every_channel_past_the_relay_row_cap() {
+        let agent = Keys::generate();
+        let url = serving_relay_server(Vec::new(), true).await;
+        let mut feed = RelayFeed::new(url, agent, None);
+        feed.connect().await.expect("connects");
+        let ids: Vec<Uuid> = (1..=1_250).map(Uuid::from_u128).collect();
+
+        let archived = feed.archived_channels(&ids).await.expect("probes");
+
+        assert_eq!(archived.len(), ids.len());
+    }
+
+    /// A relay that ignores `before_id` re-serves the same full page for a
+    /// second packed with more rows than a page. Discovery must stop with
+    /// what it has rather than loop until the page budget runs out.
+    #[tokio::test]
+    async fn discovery_stops_when_a_full_page_cannot_advance() {
+        let agent = Keys::generate();
+        let all = memberships(&agent, 600, 600);
+        let url = serving_relay_server(all, false).await;
+        let mut feed = RelayFeed::new(url, agent, None);
+        feed.connect().await.expect("connects");
+
+        let found = tokio::time::timeout(Duration::from_secs(10), feed.discover_channels())
+            .await
+            .expect("a stalled cursor must end discovery, not spin")
+            .expect("discovers");
+
+        assert_eq!(found.len(), DISCOVER_CHANNELS_PAGE_LIMIT);
     }
 
     #[test]

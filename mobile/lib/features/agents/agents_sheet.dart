@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../../shared/me/default_agent.dart';
+import '../../shared/me/default_agent_writer.dart';
+import '../../shared/me/me_sync.dart';
 import '../../shared/agents/remote_agents.dart';
 import '../../shared/community/community_provider.dart';
 import '../../shared/hosted/hosted_flow.dart';
@@ -14,6 +17,10 @@ import '../../shared/profile/user_cache_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
+import '../../shared/widgets/frosted_app_bar.dart';
+import '../../shared/widgets/frosted_scaffold.dart';
+import '../../shared/theme/buzz_icons.dart';
+import '../../shared/widgets/buzz_loading_indicator.dart';
 import '../../shared/widgets/buzz_titled_sheet_layout.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../channels/channel.dart';
@@ -21,6 +28,7 @@ import '../channels/channel_detail_page.dart';
 import '../profile/user_profile_sheet.dart';
 import 'create_agent_sheet.dart';
 import 'delete_agent_action.dart';
+import 'community_bot_profiles.dart';
 
 /// Opens the active community's Agents navigation stack inside one modal.
 Future<void> showAgents(BuildContext context) async {
@@ -54,7 +62,11 @@ class _AgentsNavigation extends HookConsumerWidget {
     return SizedBox(
       height: MediaQuery.sizeOf(context).height * .72,
       child: NavigatorPopHandler<Channel>(
-        onPopWithResult: (result) => navigator.currentState!.pop(result),
+        onPopWithResult: (result) {
+          if (navigator.currentState?.canPop() ?? false) {
+            navigator.currentState!.pop(result);
+          }
+        },
         child: Navigator(
           key: navigator,
           onGenerateRoute: (_) => MaterialPageRoute<void>(
@@ -69,7 +81,9 @@ class _AgentsNavigation extends HookConsumerWidget {
                       builder: (detailContext) => Material(
                         key: const ValueKey('agent-detail-surface'),
                         color: context.colors.surface,
-                        child: SizedBox.expand(
+                        child: SafeArea(
+                          top: false,
+                          bottom: false,
                           child: BuzzTitledSheetLayout(
                             title: '',
                             leading: IconButton(
@@ -111,10 +125,12 @@ class AgentsSheet extends HookConsumerWidget {
   const AgentsSheet({
     required this.controller,
     required this.onClose,
+    this.embedded = false,
     required this.onSelect,
     super.key,
   });
-  final VoidCallback onClose;
+  final VoidCallback? onClose;
+  final bool embedded;
   final ValueChanged<String> onSelect;
   final RemoteAgentController controller;
 
@@ -133,20 +149,32 @@ class AgentsSheet extends HookConsumerWidget {
     }, [flow.stage]);
     final community = ref.watch(activeCommunityProvider).asData?.value;
     final directory = ref.watch(agentDirectoryProvider);
+    // Builderlab sign-in gates only remote agents; community bots and other
+    // directory agents stay listed without it.
+    final remoteAgentsEnabled = ref.watch(remoteAgentsEnabledProvider);
+    final registeredKeys = {
+      for (final agent in controller.agents) agent['agent_pubkey'] as String,
+    };
+    // Key on the agents' identities, not the list instance: each refresh
+    // replaces the list, and refetching would blank the shown agents.
+    final registeredKey = (registeredKeys.toList()..sort()).join(',');
+    // Bumped by Retry and pull-to-refresh so a failed lookup runs again.
+    final attempt = useState(0);
     final registryFuture = useMemoized(() async {
       final fetch = ref.read(relaySessionProvider.notifier).fetchHistory;
-      return ownedCommunityAgents(
-        {
-          for (final agent in controller.agents)
-            agent['agent_pubkey'] as String,
-        },
-        controller.owner,
-        fetch,
-      );
-    }, [community?.relayUrl, controller.agents, controller.owner]);
+      return ownedCommunityAgents(registeredKeys, controller.owner, fetch);
+    }, [community?.relayUrl, registeredKey, controller.owner, attempt.value]);
     final registered = useFuture(registryFuture, preserveState: false);
+    // A refresh keeps showing the last owned agents for the same registry.
+    final scope = '${community?.relayUrl}|$registeredKey|${controller.owner}';
+    final lastOwned = useRef<(String, Set<String>)?>(null);
+    if (registered.data case final owned?) lastOwned.value = (scope, owned);
+    final owned =
+        registered.data ??
+        (lastOwned.value?.$1 == scope ? lastOwned.value?.$2 : null);
     final keys = {
-      ...?registered.data,
+      ...?owned,
+      ...?ref.watch(communityBotProfilesProvider).asData?.value,
       for (final entry in directory.asData?.value ?? <AgentDirectoryEntry>[])
         entry.pubkey,
     }.where((key) => !controller.deletedAgents.contains(key)).toList();
@@ -162,7 +190,32 @@ class AgentsSheet extends HookConsumerWidget {
     keys.sort((a, b) => names.labelFor(a).compareTo(names.labelFor(b)));
     final profiles = ref.watch(userCacheProvider);
     final creating = useState(false);
-    final failed = directory.hasError || registered.hasError;
+    final savingDefault = useState(false);
+    final defaultAgent = ref.watch(defaultAgentProvider).value;
+    Future<void> chooseDefault(String key) async {
+      if (savingDefault.value) return;
+      savingDefault.value = true;
+      final sync = ref.read(meSyncProvider);
+      try {
+        await saveDefaultAgent(sync, key);
+        if (!context.mounted || ref.read(meSyncProvider) != sync) return;
+        ref.invalidate(defaultAgentProvider);
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Bestie saved.')));
+      } catch (error) {
+        if (context.mounted && ref.read(meSyncProvider) == sync) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Could not save the Bestie. $error')),
+          );
+        }
+      } finally {
+        if (context.mounted) savingDefault.value = false;
+      }
+    }
+
+    final failed =
+        controller.listingFailed || directory.hasError || registered.hasError;
     final loading =
         !creating.value &&
         (controller.busy ||
@@ -171,9 +224,158 @@ class AgentsSheet extends HookConsumerWidget {
 
     Future<void> refresh() async {
       await controller.run(controller.refresh);
-      if (context.mounted) ref.invalidate(agentDirectoryProvider);
+      if (!context.mounted) return;
+      attempt.value++;
+      ref.invalidate(agentDirectoryProvider);
     }
 
+    final headerTitleStyle = context.textTheme.titleMedium?.copyWith(
+      fontSize: 22,
+      fontWeight: FontWeight.w600,
+      color: navigationPrimaryForeground(context),
+    );
+    final topSectionHeight = embedded
+        ? frostedAppBarHeight(
+            context,
+            nativeLargeTitle: true,
+            titleStyle: headerTitleStyle,
+            bottomHeight: Grid.xxs,
+          )
+        : 0.0;
+    final VoidCallback? addAgent =
+        !remoteAgentsEnabled || controller.busy || creating.value
+        ? null
+        : () async {
+            creating.value = true;
+            try {
+              await showBuzzModalBottomSheet<bool>(
+                context: context,
+                useRootNavigator: true,
+                isScrollControlled: true,
+                showCloseButton: false,
+                builder: (_) => CreateAgentSheet(
+                  controller: controller,
+                  community: community!,
+                  onCreated: () => ref.invalidate(agentDirectoryProvider),
+                ),
+              );
+            } finally {
+              if (context.mounted) creating.value = false;
+            }
+          };
+    final content = Material(
+      color: Colors.transparent,
+      child: RefreshIndicator(
+        onRefresh: refresh,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(
+            Grid.xs,
+            topSectionHeight,
+            Grid.xs,
+            Grid.sm,
+          ),
+          children: [
+            // Refreshes stay silent once agents are listed; only an
+            // empty first load shows a spinner, where the empty state goes.
+            if (loading && keys.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(Grid.sm),
+                child: Center(child: BuzzLoadingIndicator(size: 22)),
+              ),
+            if (supportsRemoteAgents(community) && !remoteAgentsEnabled)
+              ListTile(
+                title: const Text('Sign in to create an agent'),
+                trailing: TextButton(
+                  onPressed: controller.busy || signingIn
+                      ? null
+                      : () => unawaited(flow.reconnectAccount()),
+                  child: const Text('Sign in'),
+                ),
+              ),
+            if (failed)
+              ListTile(
+                title: const Text('Could not load agents'),
+                trailing: TextButton(
+                  onPressed: refresh,
+                  child: const Text('Retry'),
+                ),
+              ),
+            if (!loading && !failed && keys.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(Grid.sm),
+                child: Text(
+                  'No agents in this community yet.',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            for (final key in keys)
+              ListTile(
+                key: ValueKey(key),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: Grid.xxs,
+                  vertical: Grid.xxs,
+                ),
+                leading: AvatarImage(
+                  imageUrl: profiles[key]?.avatarUrl,
+                  radius: Grid.sm,
+                  isAgent: true,
+                  backgroundColor: context.colors.surfaceContainerHighest,
+                  fallback: Center(
+                    child: Text(names.labelFor(key).characters.first),
+                  ),
+                ),
+                title: Text(names.labelFor(key)),
+                trailing: IconButton(
+                  tooltip: defaultAgent == key
+                      ? 'Bestie'
+                      : 'Use ${names.labelFor(key)} as Bestie',
+                  onPressed: savingDefault.value || defaultAgent == key
+                      ? null
+                      : () => chooseDefault(key),
+                  icon: Icon(
+                    defaultAgent == key ? Icons.star : Icons.star_border,
+                  ),
+                ),
+                onTap: () => onSelect(key),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (embedded) {
+      return FrostedScaffold(
+        backgroundColor: context.colors.surface,
+        appBar: FrostedAppBar(
+          nativeTitle: 'Agents',
+          nativeLargeTitle: true,
+          automaticallyImplyLeading: false,
+          nativeActions: [
+            IosNavigationAction(
+              label: 'Add agent',
+              symbol: 'plus',
+              icon: BuzzIcons.plus,
+              onPressed: addAgent,
+            ),
+          ],
+          horizontalInset: Grid.gutter,
+          showBottomDivider: true,
+          bottomDividerOpacity: 0.07,
+          title: Text('Agents', style: headerTitleStyle),
+          titleStyle: headerTitleStyle,
+          actions: [
+            IconButton(
+              tooltip: 'Add agent',
+              onPressed: addAgent,
+              icon: const Icon(BuzzIcons.plus),
+            ),
+          ],
+          bottomHeight: Grid.xxs,
+          bottom: const SizedBox.expand(),
+        ),
+        body: content,
+      );
+    }
     return SizedBox(
       height: MediaQuery.sizeOf(context).height * .72,
       child: BuzzTitledSheetLayout(
@@ -185,91 +387,10 @@ class AgentsSheet extends HookConsumerWidget {
         ),
         trailing: IconButton(
           tooltip: 'Add agent',
-          onPressed: community == null || controller.busy || creating.value
-              ? null
-              : () async {
-                  creating.value = true;
-                  try {
-                    await showBuzzModalBottomSheet<bool>(
-                      context: context,
-                      useRootNavigator: true,
-                      isScrollControlled: true,
-                      showCloseButton: false,
-                      builder: (_) => CreateAgentSheet(
-                        controller: controller,
-                        community: community,
-                        onCreated: () => ref.invalidate(agentDirectoryProvider),
-                      ),
-                    );
-                  } finally {
-                    if (context.mounted) creating.value = false;
-                  }
-                },
+          onPressed: addAgent,
           icon: const Icon(Icons.add),
         ),
-        child: Material(
-          color: Colors.transparent,
-          child: RefreshIndicator(
-            onRefresh: refresh,
-            child: ListView(
-              physics: const AlwaysScrollableScrollPhysics(),
-              padding: const EdgeInsets.fromLTRB(Grid.xs, 0, Grid.xs, Grid.sm),
-              children: [
-                if (loading) const LinearProgressIndicator(),
-                if (controller.account.account == null)
-                  ListTile(
-                    title: const Text('Sign in to create an agent'),
-                    trailing: TextButton(
-                      onPressed: controller.busy || signingIn
-                          ? null
-                          : () => unawaited(flow.reconnectAccount()),
-                      child: const Text('Sign in'),
-                    ),
-                  ),
-                if (!controller.busy &&
-                    controller.account.account != null &&
-                    controller.status.isNotEmpty &&
-                    !creating.value)
-                  ListTile(subtitle: Text(controller.status)),
-                if (failed)
-                  ListTile(
-                    title: const Text('Could not load agents'),
-                    trailing: TextButton(
-                      onPressed: refresh,
-                      child: const Text('Retry'),
-                    ),
-                  ),
-                if (!loading && !failed && keys.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.all(Grid.sm),
-                    child: Text(
-                      'No agents in this community yet.',
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                for (final key in keys)
-                  ListTile(
-                    key: ValueKey(key),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: Grid.xxs,
-                      vertical: Grid.xxs,
-                    ),
-                    leading: AvatarImage(
-                      imageUrl: profiles[key]?.avatarUrl,
-                      radius: Grid.sm,
-                      isAgent: true,
-                      backgroundColor: context.colors.surfaceContainerHighest,
-                      fallback: Center(
-                        child: Text(names.labelFor(key).characters.first),
-                      ),
-                    ),
-                    title: Text(names.labelFor(key)),
-                    onTap: () => onSelect(key),
-                  ),
-              ],
-            ),
-          ),
-        ),
+        child: content,
       ),
     );
   }

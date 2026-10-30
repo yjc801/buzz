@@ -331,6 +331,65 @@ mod tests {
         );
     }
 
+    /// Codex never trims its diagnostics database, and a 1 GB one added a
+    /// minute to every Codex start — past the harness's request timeout. The
+    /// launcher's own `prune_codex_logs`, run here against a scratch home:
+    /// an oversized log database goes with its WAL and shared-memory files,
+    /// a small one stays, and Codex's other databases are never touched. The
+    /// prune must also run before the harness is exec'd.
+    #[test]
+    fn the_launcher_drops_an_oversized_codex_log_database() {
+        let start = LAUNCHER_SH
+            .find("prune_codex_logs() {")
+            .expect("the launcher no longer defines prune_codex_logs");
+        let end = start
+            + LAUNCHER_SH[start..]
+                .find("\n}\n")
+                .expect("prune_codex_logs is unterminated")
+            + 3;
+        let function = &LAUNCHER_SH[start..end];
+        let call = LAUNCHER_SH
+            .find("\nprune_codex_logs\n")
+            .expect("the launcher no longer calls prune_codex_logs");
+        assert!(
+            call < LAUNCHER_SH
+                .find(r#"exec "$BUZZ/bin/buzz-acp""#)
+                .expect("the launcher no longer execs the harness"),
+            "the prune must run before the harness starts"
+        );
+
+        let home = std::env::temp_dir().join(format!("buzz-codex-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let sized = |name: &str, len: u64| {
+            // Sparse: an oversized file without writing hundreds of megabytes.
+            std::fs::File::create(codex.join(name))
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        };
+        sized("logs_2.sqlite", 257 << 20);
+        sized("logs_2.sqlite-wal", 10);
+        sized("logs_2.sqlite-shm", 10);
+        sized("logs_3.sqlite", 1 << 20);
+        sized("state_5.sqlite", 900 << 20);
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{function}prune_codex_logs"))
+            .env("HOME", &home)
+            .status()
+            .expect("bash not available");
+        assert!(status.success(), "prune_codex_logs failed");
+        for gone in ["logs_2.sqlite", "logs_2.sqlite-wal", "logs_2.sqlite-shm"] {
+            assert!(!codex.join(gone).exists(), "{gone} was not dropped");
+        }
+        for kept in ["logs_3.sqlite", "state_5.sqlite"] {
+            assert!(codex.join(kept).exists(), "{kept} was dropped");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// A recreated disk gets its memory back only if the restore finishes
     /// before the harness reads any, so it runs in the foreground ahead of
     /// the exec — and because the start waits on it, it is time-bounded and

@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 /// Bumping this re-fingerprints every sprite — the intended way to roll out
 /// a provision-shape change (directory layout, adapter install mechanics).
-pub const TEMPLATE_VERSION: u32 = 1;
+pub const TEMPLATE_VERSION: u32 = 2;
 
 /// The provider-controlled inputs that shape what provision writes into the
 /// sprite. Field order is the canonical serialization order; adding a field

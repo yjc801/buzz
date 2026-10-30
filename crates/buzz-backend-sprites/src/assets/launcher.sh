@@ -143,6 +143,22 @@ setsid "$BUZZ/keepawake.sh" </dev/null >/dev/null 2>&1 9>&- &
     done
 ) &
 
+# Codex keeps its own diagnostics in ~/.codex/logs_<n>.sqlite and never trims
+# them: one agent's grew past 1 GB in 19 days and added a minute to every
+# Codex start, past the harness's 60s request timeout (2026-10-30). The files
+# hold diagnostics only — no memory, sessions or settings — so an oversized
+# one is dropped before this generation's Codex can open it. Unlinking is
+# safe even if a stray process from an earlier generation still holds it:
+# that process keeps its inode, and Codex starts a fresh database.
+prune_codex_logs() {
+    local db
+    for db in "$HOME"/.codex/logs_*.sqlite; do
+        [ -f "$db" ] && [ "$(wc -c <"$db")" -gt $((256 * 1024 * 1024)) ] || continue
+        rm -f -- "$db" "$db-wal" "$db-shm"
+    done
+}
+prune_codex_logs
+
 # Memory restore: a recreated disk starts with no memory, so put back what the
 # collector stored before the harness reads any (`collect.sh --restore`). It
 # runs in the foreground because the harness must start after it, so it is

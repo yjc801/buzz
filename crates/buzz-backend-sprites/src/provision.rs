@@ -33,6 +33,10 @@ const INTENT_PATH: &str = "/home/sprite/.buzz/provision-intent";
 /// allow rules into it rather than replacing it.
 const CLAUDE_SETTINGS_PATH: &str = "/home/sprite/.claude/settings.json";
 
+/// Codex's user config inside the sprite. Provisioning merges one feature
+/// flag into it (see [`codex_config_script`]) and leaves the rest alone.
+const CODEX_CONFIG_PATH: &str = "/home/sprite/.codex/config.toml";
+
 /// The tools an agent is pre-approved to use when `preapprove_agent_tools`
 /// is on. Chosen to restore what the Sprites image's own default mode
 /// intended: a coding agent needs a shell, files and fetches, and a list
@@ -641,6 +645,19 @@ pub async fn ensure(
     .await
     .and_then(expect_ok)?;
 
+    if t.install_codex_adapter {
+        run_step(
+            substrate,
+            sprite,
+            "configure Codex",
+            &sh(&lease_guard(lease_token, &codex_config_script())),
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+        .and_then(expect_ok)?;
+    }
+
     // The record comes LAST, atomically: a crash anywhere above leaves no
     // intent file (or the previous one), and either reads as divergence.
     run_step(
@@ -676,6 +693,55 @@ pub async fn ensure(
 /// a real file), so the assertions cover the script that actually runs.
 fn tool_permission_script(grant: bool) -> String {
     tool_permission_script_at(CLAUDE_SETTINGS_PATH, grant)
+}
+
+/// The in-sprite script that turns off Codex's remote plugin catalog:
+/// `[features] remote_plugin = false` in its user config. Codex fetches the
+/// catalog before every session and waits on it, and from a sprite that
+/// request never answers, so no Codex turn ever started (2026-10-30, Codex
+/// 0.151.0 and 0.163.0; with the flag off a turn completed in 4–5s).
+///
+/// Merges into the file rather than replacing it, writes through a temp
+/// sibling and an atomic rename, and refuses — failing the provision — to
+/// write anything Python's own TOML parser does not read back with the flag
+/// off, so a config it cannot edit safely is reported, never corrupted.
+fn codex_config_script() -> String {
+    codex_config_script_at(CODEX_CONFIG_PATH)
+}
+
+fn codex_config_script_at(config: &str) -> String {
+    format!(
+        "python3 - <<'PYEOF'\n\
+         import os, pathlib, re, sys, tomllib\n\
+         p = pathlib.Path({config:?})\n\
+         flag = 'remote_plugin = false'\n\
+         out, table, done = [], None, False\n\
+         for line in (p.read_text().splitlines() if p.exists() else []):\n\
+         \x20   head = re.match(r'\\s*\\[([^\\]]+)\\]', line)\n\
+         \x20   if head:\n\
+         \x20       table = head[1].strip()\n\
+         \x20   elif table == 'features' and re.match(r'\\s*remote_plugin\\s*=', line):\n\
+         \x20       continue\n\
+         \x20   out.append(line)\n\
+         \x20   if head and table == 'features' and not done:\n\
+         \x20       out.append(flag); done = True\n\
+         if not done:\n\
+         \x20   out += ['', '[features]', flag]\n\
+         text = '\\n'.join(out).lstrip('\\n') + '\\n'\n\
+         try:\n\
+         \x20   ok = tomllib.loads(text).get('features', {{}}).get('remote_plugin') is False\n\
+         except tomllib.TOMLDecodeError:\n\
+         \x20   ok = False\n\
+         if not ok:\n\
+         \x20   sys.exit(f'cannot set features.remote_plugin = false in {{p}}; edit it by hand')\n\
+         p.parent.mkdir(parents=True, exist_ok=True)\n\
+         tmp = p.with_name(p.name + '.tmp')\n\
+         tmp.write_text(text)\n\
+         if p.exists():\n\
+         \x20   os.chmod(tmp, os.stat(p).st_mode & 0o7777)\n\
+         os.replace(tmp, p)\n\
+         PYEOF\n"
+    )
 }
 
 fn tool_permission_script_at(settings: &str, grant: bool) -> String {
@@ -1120,6 +1186,56 @@ mod tests {
             !dir.join("settings.json.tmp").exists(),
             "temp sibling left behind"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Codex config step, run as written against real files: it creates
+    /// the flag where there is no config, turns an existing `true` off while
+    /// keeping every other key, table and comment, is a byte-identical no-op
+    /// on a second run, and refuses — leaving the file untouched — a config
+    /// it cannot edit without breaking TOML.
+    #[test]
+    fn codex_config_turns_off_the_remote_plugin_catalog_on_a_real_file() {
+        let dir = std::env::temp_dir().join(format!("buzz-sprites-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = dir.join(".codex").join("config.toml");
+        let apply = || {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(codex_config_script_at(
+                    config.to_str().expect("utf-8 temp path"),
+                ))
+                .status()
+                .expect("bash not available")
+                .success()
+        };
+        let read = || std::fs::read_to_string(&config).unwrap();
+
+        assert!(apply(), "no config: the script failed");
+        assert_eq!(read(), "[features]\nremote_plugin = false\n");
+
+        let existing = "model = \"gpt-5\"\n# keep me\n\n[features]\nremote_plugin = true\nplugins = true\n\n[mcp_servers.x]\ncommand = \"y\"\n";
+        std::fs::write(&config, existing).unwrap();
+        assert!(apply(), "existing config: the script failed");
+        let merged = read();
+        assert_eq!(
+            merged,
+            "model = \"gpt-5\"\n# keep me\n\n[features]\nremote_plugin = false\nplugins = true\n\n[mcp_servers.x]\ncommand = \"y\"\n",
+            "the merge changed more than the flag"
+        );
+        assert!(apply(), "second run: the script failed");
+        assert_eq!(read(), merged, "a second run is not a no-op");
+        assert!(
+            !dir.join(".codex/config.toml.tmp").exists(),
+            "temp sibling left behind"
+        );
+
+        // A dotted top-level key already defines the table: adding a
+        // [features] header would make the file invalid, so it must refuse.
+        let unsafe_config = "features.remote_plugin = true\n";
+        std::fs::write(&config, unsafe_config).unwrap();
+        assert!(!apply(), "an uneditable config was not refused");
+        assert_eq!(read(), unsafe_config, "a refused config was modified");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

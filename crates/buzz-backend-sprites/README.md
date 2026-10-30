@@ -66,6 +66,14 @@ provisioning: `buzz-agent` (always installed, via the sprig multicall), or
 else — including Goose, which the sprite base image does not ship — is
 refused at deploy time, before the sprite is touched.
 
+With the Codex adapter installed, provisioning also merges
+`[features] remote_plugin = false` into `~/.codex/config.toml`: Codex waits on
+its remote plugin catalog before every session, and from a sprite that request
+never answers, so no Codex turn could start. Codex also never trims its
+diagnostics database (`~/.codex/logs_<n>.sqlite`); the launcher drops one over
+256 MiB before starting the harness, since a 1 GB one added a minute to every
+Codex start and pushed requests past the harness's 60-second timeout.
+
 ## Workspace hygiene
 
 Agents mint checkouts faster than they retire them: before this existed the

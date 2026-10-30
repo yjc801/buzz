@@ -79,7 +79,7 @@ use buzz_waker::enrolment::{parse_authorized_owners, RosterEntry};
 use buzz_waker::floors::{FloorError, FloorStore};
 use buzz_waker::presence_feed::{run_presence_tap, PresenceState};
 use buzz_waker::roster_feed::{run_roster_tap, Admission, RosterState};
-use buzz_waker::wake_loop::{run_wake_loop, WakeLoopConfig};
+use buzz_waker::wake_loop::{run_wake_loop, WakeLoopConfig, CHANNEL_REFRESH_INTERVAL};
 use buzz_waker::watch_list::WatchList;
 
 /// One watched agent, as read from `WAKER_AGENTS_CONFIG_PATH`.
@@ -670,6 +670,7 @@ fn spawn_agent_watch(
             watch_list: watch_list.clone(),
             bundle_state,
             provider_env: provider_env.clone(),
+            channel_refresh: CHANNEL_REFRESH_INTERVAL,
         };
         let cancel = cancel.clone();
         let generation = cancel.clone();

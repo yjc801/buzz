@@ -90,6 +90,37 @@ pub struct WakeLoopConfig {
     /// one — see `effects::RealWakeEffects`'s own doc for what this is and
     /// why it's `None` for a statically configured agent.
     pub provider_env: Option<Arc<HashMap<String, String>>>,
+    /// How long one mention-feed connection lives before the loop reconnects
+    /// on purpose — [`CHANNEL_REFRESH_INTERVAL`] in production.
+    pub channel_refresh: Duration,
+}
+
+/// How often the mention feed reconnects to re-run channel discovery.
+///
+/// Between reconnects, a channel the agent joins reaches the live watch only
+/// through a member-added notification; when one is missed, every mention in
+/// that channel is silently dropped until something else reconnects the feed
+/// (seen live: a new issue room watched by nobody for days). The reconnect is
+/// the existing, coverage-safe path — it rediscovers every channel and
+/// backfills mentions from [`crate::RECONNECT_OVERLAP_SECS`] before the
+/// checkpoint, across all channels — so a mention missed in an unwatched
+/// channel is recovered at most this long after it was sent. Kept well inside
+/// [`crate::WAKE_DELIVERABLE_AGE_SECS`] so the woken harness can still act on
+/// it.
+pub const CHANNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+
+const _: () = assert!(
+    CHANNEL_REFRESH_INTERVAL.as_secs() < crate::WAKE_DELIVERABLE_AGE_SECS,
+    "a mention recovered by the refresh must still be deliverable"
+);
+
+/// Channels `discovered` holds that `previous` did not: each one is a channel
+/// the live watch was missing until this discovery, sorted so the log is
+/// reproducible.
+fn channels_missed(previous: &HashSet<Uuid>, discovered: &HashSet<Uuid>) -> Vec<Uuid> {
+    let mut missed: Vec<Uuid> = discovered.difference(previous).copied().collect();
+    missed.sort_unstable();
+    missed
 }
 
 fn now_secs() -> u64 {
@@ -281,6 +312,10 @@ pub async fn run_wake_loop(
     // `stranded`: nothing else would re-deliver it (see the claim's `Err` arm).
     let mut unclaimed_start: Option<TriggerEvent> = None;
     let mut consecutive_failures = 0u32;
+    // The channels the previous connection ended up watching: its discovery
+    // plus every membership change it applied. A channel the next discovery
+    // finds beyond these is one the live path never subscribed.
+    let mut watched: Option<HashSet<Uuid>> = None;
 
     'reconnect: while !cancel.is_cancelled() {
         if consecutive_failures > 0 {
@@ -372,6 +407,18 @@ pub async fn run_wake_loop(
                 "buzz-waker: skipped archived channels; they cannot receive a mention"
             );
         }
+        let discovered_set: HashSet<Uuid> = discovered_channels.iter().copied().collect();
+        if let Some(previous) = &watched {
+            for channel_id in channels_missed(previous, &discovered_set) {
+                tracing::warn!(
+                    agent = %agent_pubkey, %channel_id,
+                    "buzz-waker: discovery found a channel the previous connection was not \
+                     watching — its member-added notification was missed or arrived while \
+                     disconnected; subscribing now"
+                );
+            }
+        }
+        watched = Some(discovered_set);
 
         if let Err(error) = transport.subscribe_membership(since).await {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: membership watch subscribe failed");
@@ -394,6 +441,7 @@ pub async fn run_wake_loop(
             continue 'reconnect;
         }
         consecutive_failures = 0;
+        let refresh_at = tokio::time::Instant::now() + config.channel_refresh;
         let mut replay = WakeReplay::new(since);
         // Per-connection: this socket's subscriptions are the only ones these
         // deadlines describe, and the reconnect above already resubscribed
@@ -522,6 +570,17 @@ pub async fn run_wake_loop(
                             "buzz-waker: re-subscribed a channel parked by rate limiting"
                         );
                     }
+                }
+
+                // Lowest priority of the timers, and a plain reconnect: the
+                // reconnect path is what re-runs discovery and backfills from
+                // before the checkpoint — see CHANNEL_REFRESH_INTERVAL.
+                () = tokio::time::sleep_until(refresh_at) => {
+                    tracing::info!(
+                        agent = %agent_pubkey,
+                        "buzz-waker: refreshing the mention feed to rediscover channels"
+                    );
+                    continue 'reconnect;
                 }
 
                 // Only polled while the mention feed is connected, on purpose:
@@ -712,6 +771,14 @@ pub async fn run_wake_loop(
                                             consecutive_failures = consecutive_failures.saturating_add(1);
                                             continue 'reconnect;
                                         }
+                                        tracing::info!(
+                                            agent = %agent_pubkey, %channel_id,
+                                            "buzz-waker: watching a channel after a \
+                                             membership-added notification"
+                                        );
+                                        if let Some(watched) = watched.as_mut() {
+                                            watched.insert(channel_id);
+                                        }
                                     } else if let Err(error) =
                                         transport.unsubscribe_channel_live(channel_id).await
                                     {
@@ -722,6 +789,15 @@ pub async fn run_wake_loop(
                                         );
                                         consecutive_failures = consecutive_failures.saturating_add(1);
                                         continue 'reconnect;
+                                    } else {
+                                        tracing::info!(
+                                            agent = %agent_pubkey, %channel_id,
+                                            "buzz-waker: stopped watching a channel after a \
+                                             membership-removed notification"
+                                        );
+                                        if let Some(watched) = watched.as_mut() {
+                                            watched.remove(&channel_id);
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -1673,6 +1749,160 @@ mod tests {
         assert!(
             held_for.as_millis() as u64 >= crate::attempt::WAKE_ATTEMPT_DEBOUNCE_MS,
             "a re-drive at {held_for:?} lands inside the debounce window"
+        );
+    }
+
+    #[test]
+    fn channels_missed_are_exactly_the_newly_discovered_ones() {
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let previous: HashSet<Uuid> = [a, b].into();
+        let discovered: HashSet<Uuid> = [c, a].into();
+        // b left (handled by its removal notification, not this warning);
+        // c is the one the live watch never had.
+        assert_eq!(channels_missed(&previous, &discovered), vec![c]);
+        assert!(channels_missed(&discovered, &discovered).is_empty());
+    }
+
+    /// A relay double for the whole loop: NIP-42, then for every REQ —
+    /// discovery (kind:39002) answers with the channels `members_on(n)` names
+    /// for the n-th connection; every other REQ gets a bare EOSE. Records each
+    /// connection's channel live subscriptions.
+    async fn refreshing_relay(
+        members_on: fn(usize) -> Vec<Uuid>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Vec<Uuid>>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(std::sync::Mutex::new(Vec::<Vec<Uuid>>::new()));
+        let recorded = Arc::clone(&live);
+        tokio::spawn(async move {
+            let signer = Keys::generate();
+            while let Ok((stream, _)) = listener.accept().await {
+                let connection = {
+                    let mut live = recorded.lock().unwrap();
+                    live.push(Vec::new());
+                    live.len() - 1
+                };
+                let recorded = Arc::clone(&recorded);
+                let signer = signer.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let challenge = serde_json::json!(["AUTH", "c"]).to_string();
+                    let _ = ws.send(WsMessage::Text(challenge.into())).await;
+                    while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                        let Ok(frame) = serde_json::from_str::<Vec<serde_json::Value>>(&text)
+                        else {
+                            continue;
+                        };
+                        let reply = |v: serde_json::Value| WsMessage::Text(v.to_string().into());
+                        match frame[0].as_str() {
+                            Some("AUTH") => {
+                                let ok = serde_json::json!(["OK", frame[1]["id"], true, ""]);
+                                let _ = ws.send(reply(ok)).await;
+                            }
+                            Some("REQ") => {
+                                let sub = frame[1].as_str().unwrap_or_default().to_string();
+                                let discovery = frame[2]["kinds"].as_array().is_some_and(|k| {
+                                    k.contains(&serde_json::json!(
+                                        buzz_core::kind::KIND_NIP29_GROUP_MEMBERS
+                                    ))
+                                });
+                                if discovery {
+                                    for channel in members_on(connection) {
+                                        let event = nostr::EventBuilder::new(
+                                            nostr::Kind::Custom(
+                                                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+                                            ),
+                                            "",
+                                        )
+                                        .tags([
+                                            nostr::Tag::parse(["d", &channel.to_string()]).unwrap()
+                                        ])
+                                        .sign_with_keys(&signer)
+                                        .unwrap();
+                                        let _ = ws
+                                            .send(reply(serde_json::json!(["EVENT", sub, event])))
+                                            .await;
+                                    }
+                                }
+                                for channel in members_on(connection) {
+                                    if sub == crate::feed::wake_live_subscription_id(channel) {
+                                        recorded.lock().unwrap()[connection].push(channel);
+                                    }
+                                }
+                                let _ = ws.send(reply(serde_json::json!(["EOSE", sub]))).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), live)
+    }
+
+    /// The agent joins channel B while the feed is up and its member-added
+    /// notification never arrives — the case that left a new issue room
+    /// unwatched for days. The periodic refresh must reconnect on its own and
+    /// subscribe B.
+    #[tokio::test]
+    async fn the_refresh_subscribes_a_channel_whose_notification_was_missed() {
+        let (a, b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+        fn members_on(connection: usize) -> Vec<Uuid> {
+            let (a, b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+            if connection == 0 {
+                vec![a]
+            } else {
+                vec![a, b]
+            }
+        }
+        let (relay, live) = refreshing_relay(members_on).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = WakeLoopConfig {
+            relay_url: relay,
+            keys: Keys::generate(),
+            auth_tag: None,
+            cursor_path: dir.path().join("cursor.json"),
+            presence_state: Arc::new(crate::presence_feed::PresenceState::new()),
+            watch_list: crate::watch_list::WatchList::new(),
+            bundle_state: Arc::new(crate::bundle_feed::BundleState::new()),
+            provider_env: None,
+            channel_refresh: Duration::from_millis(300),
+        };
+        let (_start_tx, start_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_wake_loop(config, start_rx, cancel.clone()));
+
+        let watched_b = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if live
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(1)
+                    .any(|subs| subs.contains(&b))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        cancel.cancel();
+        let _ = task.await;
+        assert!(
+            watched_b.is_ok(),
+            "the feed never reconnected to subscribe the missed channel"
+        );
+        assert_eq!(
+            live.lock().unwrap()[0],
+            vec![a],
+            "the first connection watched only A"
         );
     }
 }

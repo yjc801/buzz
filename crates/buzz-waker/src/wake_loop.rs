@@ -52,8 +52,8 @@ use crate::cursor::{Admission, CursorStore, Resume, DEFAULT_COMPLETED_RING};
 use crate::decide::{normalize_pubkey, TriggerEvent};
 use crate::effects::RealWakeEffects;
 use crate::feed::{
-    is_rate_limited, parse_rate_limit_retry_secs, rate_limit_park_ms, reconnect_delay_ms, step,
-    FeedStep, FeedTransport, WakeReplay, FEED_IDLE_TIMEOUT_SECS,
+    is_channel_access_denied, is_rate_limited, parse_rate_limit_retry_secs, rate_limit_park_ms,
+    reconnect_delay_ms, step, FeedStep, FeedTransport, WakeReplay, FEED_IDLE_TIMEOUT_SECS,
 };
 use crate::presence_feed::PresenceState;
 use crate::relay_feed::RelayFeed;
@@ -826,6 +826,29 @@ pub async fn run_wake_loop(
                                             delay_ms, strikes = entry.strikes,
                                             "buzz-waker: channel live subscription rate limited; \
                                              parking before re-subscribing"
+                                        );
+                                        continue;
+                                    }
+
+                                    // The relay closed this channel to the
+                                    // agent (archived, or no longer a member).
+                                    // Re-subscribing would hold a dead
+                                    // subscription against the quota, or be
+                                    // refused and bounce; a member-added
+                                    // notification brings it back if access
+                                    // returns — and so does the next
+                                    // refresh's discovery, which must then
+                                    // see it as one this connection was not
+                                    // watching.
+                                    if is_channel_access_denied(&reason) {
+                                        parked.remove(&channel_id);
+                                        if let Some(watched) = watched.as_mut() {
+                                            watched.remove(&channel_id);
+                                        }
+                                        tracing::info!(
+                                            agent = %agent_pubkey, %channel_id, %reason,
+                                            "buzz-waker: stopped watching a channel the relay \
+                                             closed to this agent"
                                         );
                                         continue;
                                     }
@@ -2154,6 +2177,151 @@ mod tests {
             )
             .await,
             "a stalled refresh replay was not abandoned at its deadline"
+        );
+    }
+
+    /// A relay double for the whole loop, on every connection: NIP-42,
+    /// discovery answering with channel A, a bare EOSE for every other REQ,
+    /// and — the first time A is subscribed live on any connection —
+    /// `CLOSED restricted: channel access revoked` on it, as the relay sends
+    /// to every subscriber when a channel is archived. Returns how many times
+    /// A was subscribed live.
+    async fn revoking_relay(channel: Uuid) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live_reqs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&live_reqs);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let counted = Arc::clone(&counted);
+                tokio::spawn(serve_revoking(stream, channel, counted));
+            }
+        });
+        (format!("ws://{addr}"), live_reqs)
+    }
+
+    /// One connection of [`revoking_relay`].
+    async fn serve_revoking(
+        stream: tokio::net::TcpStream,
+        channel: Uuid,
+        counted: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        {
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let signer = Keys::generate();
+            let text = |v: serde_json::Value| WsMessage::Text(v.to_string().into());
+            let _ = ws.send(text(serde_json::json!(["AUTH", "c"]))).await;
+            let live_sub = crate::feed::wake_live_subscription_id(channel);
+            while let Some(Ok(WsMessage::Text(frame))) = ws.next().await {
+                let Ok(frame) = serde_json::from_str::<Vec<serde_json::Value>>(&frame) else {
+                    continue;
+                };
+                match frame[0].as_str() {
+                    Some("AUTH") => {
+                        let ok = serde_json::json!(["OK", frame[1]["id"], true, ""]);
+                        let _ = ws.send(text(ok)).await;
+                    }
+                    Some("REQ") => {
+                        let sub = frame[1].as_str().unwrap_or_default().to_string();
+                        let discovery = frame[2]["kinds"].as_array().is_some_and(|k| {
+                            k.contains(&serde_json::json!(
+                                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS
+                            ))
+                        });
+                        if discovery {
+                            let event = nostr::EventBuilder::new(
+                                nostr::Kind::Custom(
+                                    buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+                                ),
+                                "",
+                            )
+                            .tags([nostr::Tag::parse(["d", &channel.to_string()]).unwrap()])
+                            .sign_with_keys(&signer)
+                            .unwrap();
+                            let _ = ws
+                                .send(text(serde_json::json!(["EVENT", sub, event])))
+                                .await;
+                        }
+                        if sub == live_sub {
+                            let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if n == 0 {
+                                let revoked = serde_json::json!([
+                                    "CLOSED",
+                                    sub,
+                                    "restricted: channel access revoked"
+                                ]);
+                                let _ = ws.send(text(revoked)).await;
+                                continue;
+                            }
+                        }
+                        let _ = ws.send(text(serde_json::json!(["EOSE", sub]))).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The relay archives a channel and closes its live subscription as
+    /// `channel access revoked`. The loop used to re-subscribe at once — and
+    /// the relay accepts that REQ, leaving a subscription nothing can ever
+    /// post to, held against the quota until the next reconnect. It must drop
+    /// the channel and keep the connection.
+    #[tokio::test]
+    async fn a_channel_the_relay_closes_to_the_agent_is_not_resubscribed() {
+        let channel = Uuid::from_u128(0xA);
+        let (relay, live_reqs) = revoking_relay(channel).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = WakeLoopConfig {
+            relay_url: relay,
+            keys: Keys::generate(),
+            auth_tag: None,
+            cursor_path: dir.path().join("cursor.json"),
+            presence_state: Arc::new(crate::presence_feed::PresenceState::new()),
+            watch_list: crate::watch_list::WatchList::new(),
+            bundle_state: Arc::new(crate::bundle_feed::BundleState::new()),
+            provider_env: None,
+            channel_refresh: CHANNEL_REFRESH_INTERVAL,
+            refresh_setup_deadline: REFRESH_SETUP_DEADLINE,
+        };
+        let (_start_tx, start_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_wake_loop(config, start_rx, cancel.clone()));
+
+        let subscribed = tokio::time::timeout(Duration::from_secs(5), async {
+            while live_reqs.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Long enough for the CLOSED to arrive and a re-subscribe to follow.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel.cancel();
+        let _ = task.await;
+
+        assert!(subscribed.is_ok(), "the channel was never subscribed");
+        assert_eq!(
+            live_reqs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the loop re-subscribed a channel the relay closed to this agent"
+        );
+    }
+
+    /// A channel the relay closed to the agent leaves the connection's
+    /// watched set with its subscription — otherwise a refresh that finds it
+    /// again (unarchived, and its member-added notification missed) would
+    /// resubscribe it without saying the live watch had been missing it.
+    #[tokio::test]
+    async fn a_dropped_channel_is_reported_when_discovery_finds_it_again() {
+        let (relay, _) = revoking_relay(Uuid::from_u128(0xA)).await;
+        assert!(
+            loop_logs_within_the_deadline(relay, "previous connection was not watching").await,
+            "a channel the loop dropped was not reported when the refresh found it"
         );
     }
 }

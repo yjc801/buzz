@@ -867,6 +867,31 @@ pub fn is_rate_limited(reason: &str) -> bool {
     reason.starts_with("rate-limited:")
 }
 
+/// Close reasons that deny this agent one channel while the connection stays
+/// fine — the relay's member eviction (`restricted: channel access revoked`,
+/// also sent to every subscriber when a channel is archived) and a REQ for a
+/// channel the agent is not in (`restricted: not a channel member`).
+///
+/// Exact strings, never a `restricted:` prefix: a prefix would also match a
+/// connection-level denial like `restricted: insufficient scope`, which must
+/// still reconnect. `buzz-acp` matches the same two strings for the same
+/// reason (`CHANNEL_ACCESS_DENIED_REASONS`).
+const CHANNEL_ACCESS_DENIED_REASONS: &[&str] = &[
+    "restricted: channel access revoked",
+    "restricted: not a channel member",
+];
+
+/// Whether a relay's close `reason` says this channel is closed to the agent:
+/// archived, or the agent no longer a member. Re-subscribing cannot help — on
+/// an archived channel it holds a subscription nothing can ever post to, and
+/// as a non-member it is refused again — so the channel is dropped instead.
+/// Access coming back is signalled by a member-added notification (the relay
+/// re-emits one on unarchive), which re-subscribes it.
+#[must_use]
+pub fn is_channel_access_denied(reason: &str) -> bool {
+    CHANNEL_ACCESS_DENIED_REASONS.contains(&reason)
+}
+
 /// Parse a relay's `retry in {N}s` hint out of a close reason.
 ///
 /// Accepts any string containing `retry in ` followed by decimal digits.
@@ -2218,6 +2243,22 @@ mod tests {
             !is_rate_limited("error: the relay mentioned rate-limited: late"),
             "the prefix is machine-readable precisely so prose cannot trip it"
         );
+    }
+
+    #[test]
+    fn only_the_exact_per_channel_denials_drop_a_channel() {
+        for (reason, drops) in [
+            ("restricted: channel access revoked", true),
+            ("restricted: not a channel member", true),
+            // Connection-level: must still reconnect, never drop one channel.
+            ("restricted: insufficient scope", false),
+            ("restricted: you were removed from this relay", false),
+            ("rate-limited: quota exceeded; retry in 4s", false),
+            ("restricted: channel access revoked and more", false),
+            ("", false),
+        ] {
+            assert_eq!(is_channel_access_denied(reason), drops, "{reason:?}");
+        }
     }
 
     #[test]

@@ -255,6 +255,72 @@ enum Settlement {
 /// testable.
 const PARK_DRAIN_SPACING: Duration = Duration::from_millis(250);
 
+/// Channel live subscriptions sent at once when a connection subscribes,
+/// before [`SUBSCRIBE_SPACING`] applies.
+///
+/// The relay meters REQ/EVENT frames per *identity* — by default 50 per 5s
+/// fixed window — and the mention feed authenticates as the agent, so its
+/// subscribe burst spends the same budget the agent's own harness needs to
+/// subscribe and post. Sending every channel at once (80+ on the busiest
+/// agents, at every refresh) blew through it: dozens of subscriptions closed
+/// as rate limited, and the agent's own frames refused alongside them.
+const SUBSCRIBE_BURST: usize = 10;
+
+/// Gap between channel live subscriptions after [`SUBSCRIBE_BURST`]: about 17
+/// per 5s window, so a connection's whole setup stays near two thirds of the
+/// identity's budget and leaves the harness the rest.
+const SUBSCRIBE_SPACING: Duration = Duration::from_millis(300);
+
+/// The longest a connection's subscribe pacing may take in total.
+///
+/// Setup does not read the socket, and the relay closes a connection after
+/// three unanswered pings at 30s intervals, so pacing must finish well inside
+/// that — and inside [`REFRESH_SETUP_DEADLINE`]. Past roughly 140 channels the
+/// spacing shrinks to fit; any rate limiting that causes is parked like any
+/// other.
+const MAX_SUBSCRIBE_PACING: Duration = Duration::from_secs(40);
+
+/// How long to wait before sending subscription `index` (0-based) of `total`.
+fn subscribe_delay(index: usize, total: usize) -> Duration {
+    if index < SUBSCRIBE_BURST {
+        return Duration::ZERO;
+    }
+    let paced = u32::try_from(total.saturating_sub(SUBSCRIBE_BURST)).unwrap_or(u32::MAX);
+    if paced == 0 {
+        return Duration::ZERO;
+    }
+    SUBSCRIBE_SPACING.min(MAX_SUBSCRIBE_PACING / paced)
+}
+
+/// This agent's fixed share of [`refresh_jitter`]'s spread: a stable value in
+/// `[0, 1)` taken from its pubkey, so agents started together drift apart and
+/// the same agent always refreshes on the same schedule.
+fn jitter_fraction(agent_pubkey: &str) -> f64 {
+    let seed = agent_pubkey
+        .get(..8)
+        .and_then(|prefix| u32::from_str_radix(prefix, 16).ok())
+        .unwrap_or(0);
+    f64::from(seed % 1000) / 1000.0
+}
+
+/// How much earlier than `interval` this agent refreshes: up to an eighth of
+/// it. Every agent the daemon starts would otherwise refresh in the same
+/// second — a deploy synchronises them — and pile their reconnects onto the
+/// relay at once. Only ever earlier, never later, so the recovery budget
+/// [`CHANNEL_REFRESH_INTERVAL`] is part of still holds.
+fn refresh_jitter(agent_pubkey: &str, interval: Duration) -> Duration {
+    (interval / 8).mul_f64(jitter_fraction(agent_pubkey))
+}
+
+/// When a connection whose setup finished at `now` refreshes.
+fn next_refresh_at(
+    now: tokio::time::Instant,
+    interval: Duration,
+    agent_pubkey: &str,
+) -> tokio::time::Instant {
+    now + interval - refresh_jitter(agent_pubkey, interval)
+}
+
 /// A channel whose live subscription the relay closed as rate limited.
 ///
 /// Lives only as long as one connection — a reconnect re-runs discovery and
@@ -505,7 +571,12 @@ pub async fn run_wake_loop(
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
         }
-        for channel_id in discovered_channels {
+        let total = discovered_channels.len();
+        for (index, channel_id) in discovered_channels.into_iter().enumerate() {
+            let delay = subscribe_delay(index, total);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if let Err(error) = within(
                 setup_deadline,
                 transport.subscribe_channel_live(channel_id, since),
@@ -533,7 +604,11 @@ pub async fn run_wake_loop(
         // A backfill page the relay refused as rate limited: when to ask for
         // it again, and its bounds.
         let mut backfill_retry: Option<(tokio::time::Instant, u64, Option<u64>)> = None;
-        let refresh_at = tokio::time::Instant::now() + config.channel_refresh;
+        let refresh_at = next_refresh_at(
+            tokio::time::Instant::now(),
+            config.channel_refresh,
+            &agent_pubkey,
+        );
         let mut replay = WakeReplay::new(since);
         // Per-connection: this socket's subscriptions are the only ones these
         // deadlines describe, and the reconnect above already resubscribed
@@ -2464,6 +2539,189 @@ mod tests {
         assert!(
             !logs.contains("backlog replay ended truncated"),
             "a rate-limited page was reported as a truncated replay"
+        );
+    }
+
+    #[test]
+    fn subscriptions_are_paced_after_the_burst_and_bounded_in_total() {
+        for index in 0..SUBSCRIBE_BURST {
+            assert_eq!(subscribe_delay(index, 83), Duration::ZERO);
+        }
+        assert_eq!(subscribe_delay(SUBSCRIBE_BURST, 83), SUBSCRIBE_SPACING);
+        // The busiest agents seen live (69–83 channels) pace at full spacing,
+        // inside the relay's first 30s ping.
+        let paced_83: Duration = (0..83).map(|i| subscribe_delay(i, 83)).sum();
+        assert!(paced_83 < Duration::from_secs(30), "{paced_83:?}");
+        // However many channels, pacing never outlasts its bound.
+        for total in [SUBSCRIBE_BURST, 150, 1_000, 10_000] {
+            let paced: Duration = (0..total).map(|i| subscribe_delay(i, total)).sum();
+            assert!(
+                paced <= MAX_SUBSCRIBE_PACING,
+                "{total} channels pace for {paced:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_jitter_is_stable_bounded_and_spreads_agents() {
+        let interval = CHANNEL_REFRESH_INTERVAL;
+        let (a, b) = ("1b60fb4a3ebf", "ac1606bca896");
+        assert_eq!(refresh_jitter(a, interval), refresh_jitter(a, interval));
+        assert_ne!(refresh_jitter(a, interval), refresh_jitter(b, interval));
+        for agent in [a, b, "00000000", "ffffffff", "not-hex"] {
+            assert!(refresh_jitter(agent, interval) < interval / 8, "{agent}");
+        }
+        // The loop's schedule: earlier than the interval by exactly this
+        // agent's jitter, never later.
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            next_refresh_at(now, interval, b),
+            now + interval - refresh_jitter(b, interval)
+        );
+        assert!(next_refresh_at(now, interval, b) < now + interval);
+    }
+
+    /// A relay double that discovers `channels` for the agent and answers
+    /// every REQ with a bare EOSE, recording when each REQ arrived and on
+    /// which subscription.
+    async fn recording_relay(
+        channels: Vec<Uuid>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(tokio::time::Instant, String)>>>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reqs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&reqs);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let signer = Keys::generate();
+            let text = |v: serde_json::Value| WsMessage::Text(v.to_string().into());
+            let _ = ws.send(text(serde_json::json!(["AUTH", "c"]))).await;
+            while let Some(Ok(WsMessage::Text(frame))) = ws.next().await {
+                let Ok(frame) = serde_json::from_str::<Vec<serde_json::Value>>(&frame) else {
+                    continue;
+                };
+                match frame[0].as_str() {
+                    Some("AUTH") => {
+                        let ok = serde_json::json!(["OK", frame[1]["id"], true, ""]);
+                        let _ = ws.send(text(ok)).await;
+                    }
+                    Some("REQ") => {
+                        let sub = frame[1].as_str().unwrap_or_default().to_string();
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((tokio::time::Instant::now(), sub.clone()));
+                        let discovery = frame[2]["kinds"].as_array().is_some_and(|k| {
+                            k.contains(&serde_json::json!(
+                                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS
+                            ))
+                        });
+                        if discovery {
+                            for channel in &channels {
+                                let event = nostr::EventBuilder::new(
+                                    nostr::Kind::Custom(
+                                        buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+                                    ),
+                                    "",
+                                )
+                                .tags([nostr::Tag::parse(["d", &channel.to_string()]).unwrap()])
+                                .sign_with_keys(&signer)
+                                .unwrap();
+                                let _ = ws
+                                    .send(text(serde_json::json!(["EVENT", sub, event])))
+                                    .await;
+                            }
+                        }
+                        let _ = ws.send(text(serde_json::json!(["EOSE", sub]))).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (format!("ws://{addr}"), reqs)
+    }
+
+    /// The real loop subscribing an agent in more channels than one burst:
+    /// the first burst goes at once, the rest are spaced, and every channel
+    /// is still subscribed before the backfill, as the connect order needs.
+    #[tokio::test]
+    async fn channel_subscriptions_are_paced_and_still_precede_the_backfill() {
+        let channels: Vec<Uuid> = (1..=SUBSCRIBE_BURST as u128 + 6)
+            .map(Uuid::from_u128)
+            .collect();
+        let total = channels.len();
+        let live_subs: HashSet<String> = channels
+            .iter()
+            .map(|channel| crate::feed::wake_live_subscription_id(*channel))
+            .collect();
+        let (relay, reqs) = recording_relay(channels).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = WakeLoopConfig {
+            relay_url: relay,
+            keys: Keys::generate(),
+            auth_tag: None,
+            cursor_path: dir.path().join("cursor.json"),
+            presence_state: Arc::new(crate::presence_feed::PresenceState::new()),
+            watch_list: crate::watch_list::WatchList::new(),
+            bundle_state: Arc::new(crate::bundle_feed::BundleState::new()),
+            provider_env: None,
+            channel_refresh: CHANNEL_REFRESH_INTERVAL,
+            refresh_setup_deadline: REFRESH_SETUP_DEADLINE,
+        };
+        let (_start_tx, start_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_wake_loop(config, start_rx, cancel.clone()));
+        let backfilled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if reqs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, sub)| sub == crate::feed::WAKE_BACKFILL_SUBSCRIPTION_ID)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        cancel.cancel();
+        let _ = task.await;
+        assert!(backfilled.is_ok(), "the backfill was never requested");
+
+        let reqs = reqs.lock().unwrap().clone();
+        let live: Vec<tokio::time::Instant> = reqs
+            .iter()
+            .filter(|(_, sub)| live_subs.contains(sub))
+            .map(|(at, _)| *at)
+            .collect();
+        assert_eq!(live.len(), total, "every channel is subscribed");
+        let burst_ends = live[SUBSCRIBE_BURST - 1];
+        let paced_span = live[total - 1].saturating_duration_since(burst_ends);
+        assert!(
+            paced_span >= SUBSCRIBE_SPACING * 5,
+            "the channels after the burst went out in {paced_span:?}, unpaced"
+        );
+        let backfill_at = reqs
+            .iter()
+            .find(|(_, sub)| sub == crate::feed::WAKE_BACKFILL_SUBSCRIPTION_ID)
+            .map(|(at, _)| *at)
+            .unwrap();
+        assert!(
+            backfill_at >= live[total - 1],
+            "the backfill went out before a live subscription"
         );
     }
 }

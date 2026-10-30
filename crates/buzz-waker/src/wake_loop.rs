@@ -530,6 +530,9 @@ pub async fn run_wake_loop(
         // Until the backlog replay completes, a refresh is still inside its
         // setup deadline (see REFRESH_SETUP_DEADLINE).
         let mut replay_done = false;
+        // A backfill page the relay refused as rate limited: when to ask for
+        // it again, and its bounds.
+        let mut backfill_retry: Option<(tokio::time::Instant, u64, Option<u64>)> = None;
         let refresh_at = tokio::time::Instant::now() + config.channel_refresh;
         let mut replay = WakeReplay::new(since);
         // Per-connection: this socket's subscriptions are the only ones these
@@ -673,6 +676,23 @@ pub async fn run_wake_loop(
                     continue 'reconnect;
                 }
 
+                () = sleep_until_some(backfill_retry.map(|(at, _, _)| at)) => {
+                    if let Some((_, since, until)) = backfill_retry.take() {
+                        if let Err(error) = transport.subscribe_backfill(since, until).await {
+                            tracing::warn!(
+                                agent = %agent_pubkey, %error,
+                                "buzz-waker: re-issuing a rate-limited backlog page failed"
+                            );
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            continue 'reconnect;
+                        }
+                        tracing::info!(
+                            agent = %agent_pubkey,
+                            "buzz-waker: re-issued a backlog replay page after rate limiting"
+                        );
+                    }
+                }
+
                 // A refresh whose backlog replay has not completed by its
                 // deadline has not recovered anything in time; fail it.
                 () = sleep_until_some(setup_deadline), if !replay_done => {
@@ -772,11 +792,15 @@ pub async fn run_wake_loop(
                                         continue 'reconnect;
                                     }
                                 }
-                                Ok(FeedStep::ReplayComplete { truncated }) => {
+                                Ok(FeedStep::ReplayComplete { truncated, reason }) => {
                                     replay_done = true;
+                                    backfill_retry = None;
                                     if truncated {
                                         tracing::error!(
                                             agent = %agent_pubkey,
+                                            reason = reason.as_deref().unwrap_or(
+                                                "page budget spent or stalled on a tied second"
+                                            ),
                                             "buzz-waker: backlog replay ended truncated — some \
                                              historical mentions were not recovered and never \
                                              will be; this is an operational incident, not a \
@@ -789,6 +813,33 @@ pub async fn run_wake_loop(
                                             "buzz-waker: closing the backfill subscription failed"
                                         );
                                     }
+                                }
+                                Ok(FeedStep::BackfillRateLimited {
+                                    since,
+                                    until,
+                                    reason,
+                                    strikes,
+                                }) => {
+                                    // Correlated with the subscription burst
+                                    // that precedes it (see
+                                    // MAX_BACKFILL_RATE_LIMIT_RETRIES): park
+                                    // the page past the relay's hint, as the
+                                    // channel subscriptions are parked.
+                                    let delay_ms = rate_limit_park_ms(
+                                        parse_rate_limit_retry_secs(&reason),
+                                        strikes,
+                                    );
+                                    backfill_retry = Some((
+                                        tokio::time::Instant::now()
+                                            + Duration::from_millis(delay_ms),
+                                        since,
+                                        until,
+                                    ));
+                                    tracing::warn!(
+                                        agent = %agent_pubkey, %reason, delay_ms, strikes,
+                                        "buzz-waker: backlog replay page rate limited; \
+                                         re-issuing it after the relay's hint"
+                                    );
                                 }
                                 Ok(FeedStep::Closed(reason)) => {
                                     tracing::warn!(
@@ -2101,6 +2152,18 @@ mod tests {
     /// Runs the real loop against `relay` with a short refresh and setup
     /// deadline, capturing its logs, until `needle` is logged or 5s pass.
     async fn loop_logs_within_the_deadline(relay: String, needle: &str) -> bool {
+        run_loop_until_logged(relay, needle, Duration::from_millis(300))
+            .await
+            .0
+    }
+
+    /// [`loop_logs_within_the_deadline`] with the refresh interval given,
+    /// also returning everything the loop logged.
+    async fn run_loop_until_logged(
+        relay: String,
+        needle: &str,
+        channel_refresh: Duration,
+    ) -> (bool, String) {
         #[derive(Clone, Default)]
         struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Capture {
@@ -2130,7 +2193,7 @@ mod tests {
             watch_list: crate::watch_list::WatchList::new(),
             bundle_state: Arc::new(crate::bundle_feed::BundleState::new()),
             provider_env: None,
-            channel_refresh: Duration::from_millis(300),
+            channel_refresh,
             refresh_setup_deadline: Duration::from_millis(200),
         };
         let (_start_tx, start_rx) = mpsc::channel(1);
@@ -2148,7 +2211,8 @@ mod tests {
         .is_ok();
         cancel.cancel();
         let _ = task.await;
-        logged
+        let text = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+        (logged, text)
     }
 
     /// PR #199 review, round 2. The refresh timer only starts recovery; the
@@ -2322,6 +2386,84 @@ mod tests {
         assert!(
             loop_logs_within_the_deadline(relay, "previous connection was not watching").await,
             "a channel the loop dropped was not reported when the refresh found it"
+        );
+    }
+
+    /// A relay double whose first backfill REQ is refused as rate limited
+    /// (with the shortest retry hint the waker honours) and every later one answered, as on a
+    /// refresh whose subscription burst tripped the relay's quota.
+    async fn rate_limiting_relay() -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            while let Ok((stream, _)) = listener.accept().await {
+                let refused = Arc::clone(&refused);
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let text = |v: serde_json::Value| WsMessage::Text(v.to_string().into());
+                    let _ = ws.send(text(serde_json::json!(["AUTH", "c"]))).await;
+                    while let Some(Ok(WsMessage::Text(frame))) = ws.next().await {
+                        let Ok(frame) = serde_json::from_str::<Vec<serde_json::Value>>(&frame)
+                        else {
+                            continue;
+                        };
+                        match frame[0].as_str() {
+                            Some("AUTH") => {
+                                let ok = serde_json::json!(["OK", frame[1]["id"], true, ""]);
+                                let _ = ws.send(text(ok)).await;
+                            }
+                            Some("REQ") => {
+                                let sub = frame[1].as_str().unwrap_or_default().to_string();
+                                let first_backfill = sub
+                                    == crate::feed::WAKE_BACKFILL_SUBSCRIPTION_ID
+                                    && !refused.swap(true, std::sync::atomic::Ordering::SeqCst);
+                                let reply = if first_backfill {
+                                    serde_json::json!([
+                                        "CLOSED",
+                                        sub,
+                                        "rate-limited: quota exceeded; retry in 2s"
+                                    ])
+                                } else {
+                                    serde_json::json!(["EOSE", sub])
+                                };
+                                let _ = ws.send(text(reply)).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// The real loop, against a relay that rate-limits the first backfill
+    /// page: the page is re-issued and the replay completes whole. Before,
+    /// the refusal ended the replay truncated and raised an operational
+    /// incident on every refresh of every agent in many channels.
+    #[tokio::test]
+    async fn a_rate_limited_backfill_is_re_issued_not_reported_truncated() {
+        // No refresh inside the test: a refresh opens a new connection, whose
+        // own backfill supersedes the parked page.
+        let (reissued, logs) = run_loop_until_logged(
+            rate_limiting_relay().await,
+            "re-issued a backlog replay page after rate limiting",
+            CHANNEL_REFRESH_INTERVAL,
+        )
+        .await;
+        assert!(
+            reissued,
+            "the rate-limited backfill page was never re-issued"
+        );
+        assert!(
+            !logs.contains("backlog replay ended truncated"),
+            "a rate-limited page was reported as a truncated replay"
         );
     }
 }

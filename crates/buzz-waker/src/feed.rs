@@ -485,6 +485,17 @@ pub const REPLAY_PAGE_LIMIT: u32 = 500;
 /// nobody, which is worse than a truncated backfill it reports.
 pub const MAX_REPLAY_PAGES: u32 = 64;
 
+/// How many times one replay re-issues a backfill page the relay refused as
+/// rate limited, before reporting the walk truncated after all.
+///
+/// A refresh resubscribes every channel at once, and on an agent in dozens of
+/// channels that burst trips the relay's subscription quota just as the
+/// backfill REQ follows it — seen live on every refresh for three agents. The
+/// refusal is about the moment, not the walk, so the page is retried after
+/// the relay's own hint ([`rate_limit_park_ms`]). Bounded so a relay that
+/// keeps refusing still ends in a reported truncation rather than a loop.
+pub const MAX_BACKFILL_RATE_LIMIT_RETRIES: u32 = 5;
+
 /// What one page of replay contained.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct PageTally {
@@ -559,6 +570,8 @@ pub struct WakeReplay {
     phase: ReplayPhase,
     page: PageTally,
     pages_issued: u32,
+    /// Rate-limited refusals of a backfill page this replay has retried.
+    rate_limit_retries: u32,
 }
 
 /// Which page is draining, and so what the next EOSE means.
@@ -593,6 +606,7 @@ impl WakeReplay {
             page: PageTally::default(),
             // The caller's first backfill subscribe is page one.
             pages_issued: 1,
+            rate_limit_retries: 0,
         }
     }
 
@@ -687,6 +701,27 @@ impl WakeReplay {
             // which nothing parsed and so left no bound to page on.
             _ => Some(self.finish(true)),
         }
+    }
+
+    /// The relay refused the standing backfill page as rate limited.
+    ///
+    /// Returns how many such refusals this replay had already retried — the
+    /// strike count for [`rate_limit_park_ms`] — when the page should be
+    /// re-issued, or `None` when no walk is in progress or the retries are
+    /// spent, in which case the caller ends the walk through
+    /// [`WakeReplay::on_backfill_closed`]. The page tally restarts, so rows
+    /// the refused page had already served are not counted twice when it is
+    /// asked for again.
+    pub fn on_backfill_rate_limited(&mut self) -> Option<u32> {
+        if matches!(self.phase, ReplayPhase::Done)
+            || self.rate_limit_retries >= MAX_BACKFILL_RATE_LIMIT_RETRIES
+        {
+            return None;
+        }
+        self.page = PageTally::default();
+        let strikes = self.rate_limit_retries;
+        self.rate_limit_retries += 1;
+        Some(strikes)
     }
 
     /// The backfill subscription went away before the walk finished.
@@ -1140,6 +1175,23 @@ pub enum FeedStep {
         /// [`ReplayStep::Complete`]. The events behind the cut are gone for
         /// good, so this is an operational alert, not a debug detail.
         truncated: bool,
+        /// The relay's reason, when the walk ended because it closed the
+        /// backfill subscription — so an alert says why.
+        reason: Option<String>,
+    },
+    /// The relay refused the standing backfill page as rate limited. Not a
+    /// truncation: call [`FeedTransport::subscribe_backfill`] with these
+    /// bounds again once [`rate_limit_park_ms`] for `strikes` has elapsed.
+    /// The replay stays open (and the cursor's replay pin held) meanwhile.
+    BackfillRateLimited {
+        /// The unchanged replay floor.
+        since: u64,
+        /// The standing page's bound, `None` for the first page.
+        until: Option<u64>,
+        /// The relay's stated reason, carrying its retry hint.
+        reason: String,
+        /// Earlier rate-limited refusals this replay retried.
+        strikes: u32,
     },
     /// The membership-change watch closed. This is the feed's connection
     /// health signal now — see the module docs — so the caller should
@@ -1239,7 +1291,10 @@ pub fn step(
             // `truncated` as an operational incident.)
             Some(ReplayStep::Complete { truncated }) => {
                 cursor.end_replay(now)?;
-                Ok(FeedStep::ReplayComplete { truncated })
+                Ok(FeedStep::ReplayComplete {
+                    truncated,
+                    reason: None,
+                })
             }
             // An EOSE that does not move the replay: any live subscription's
             // EOSE (never gates replay — see the module docs), the
@@ -1260,14 +1315,29 @@ pub fn step(
         } => Ok(FeedStep::Closed(reason)),
         FeedSignal::Closed {
             sub: WakeSubscription::Backfill,
-            ..
-        } => match replay.on_backfill_closed() {
-            Some(ReplayStep::Complete { truncated }) => {
-                cursor.end_replay(now)?;
-                Ok(FeedStep::ReplayComplete { truncated })
+            reason,
+        } => {
+            if is_rate_limited(&reason) {
+                if let Some(strikes) = replay.on_backfill_rate_limited() {
+                    return Ok(FeedStep::BackfillRateLimited {
+                        since: replay.since(),
+                        until: replay.backfill_until(),
+                        reason,
+                        strikes,
+                    });
+                }
             }
-            _ => Ok(FeedStep::Nothing),
-        },
+            match replay.on_backfill_closed() {
+                Some(ReplayStep::Complete { truncated }) => {
+                    cursor.end_replay(now)?;
+                    Ok(FeedStep::ReplayComplete {
+                        truncated,
+                        reason: Some(reason),
+                    })
+                }
+                _ => Ok(FeedStep::Nothing),
+            }
+        }
         FeedSignal::Closed {
             sub: WakeSubscription::Live(channel_id),
             reason,
@@ -1688,7 +1758,10 @@ mod tests {
         .expect("folds");
         assert!(matches!(
             step_result,
-            FeedStep::ReplayComplete { truncated: false }
+            FeedStep::ReplayComplete {
+                truncated: false,
+                ..
+            }
         ));
     }
 
@@ -1719,7 +1792,10 @@ mod tests {
 
         assert!(matches!(
             step_result,
-            FeedStep::ReplayComplete { truncated: false }
+            FeedStep::ReplayComplete {
+                truncated: false,
+                ..
+            }
         ));
         assert!(
             cursor.state().covered_through_secs > before,
@@ -1788,7 +1864,9 @@ mod tests {
         )
         .expect("folds")
         {
-            FeedStep::ReplayComplete { truncated: false } => {}
+            FeedStep::ReplayComplete {
+                truncated: false, ..
+            } => {}
             other => panic!("a short backfill page ends the walk, got {other:?}"),
         }
         assert!(
@@ -1877,7 +1955,9 @@ mod tests {
         )
         .expect("folds")
         {
-            FeedStep::ReplayComplete { truncated: false } => {}
+            FeedStep::ReplayComplete {
+                truncated: false, ..
+            } => {}
             other => panic!("the walk drained cleanly, got {other:?}"),
         }
     }
@@ -2008,8 +2088,106 @@ mod tests {
             message: "error: too many subscriptions".to_string(),
         };
         match step(&mut cursor, &mut replay, &closed, now + 5).expect("folds") {
-            FeedStep::ReplayComplete { truncated: true } => {}
+            FeedStep::ReplayComplete {
+                truncated: true,
+                reason,
+            } => assert_eq!(reason.as_deref(), Some("error: too many subscriptions")),
             other => panic!("a lost walk is a truncated replay, got {other:?}"),
+        }
+    }
+
+    fn rate_limited_backfill() -> FeedFrame {
+        FeedFrame::Closed {
+            subscription_id: WAKE_BACKFILL_SUBSCRIPTION_ID.to_string(),
+            message: "rate-limited: quota exceeded; retry in 4s".to_string(),
+        }
+    }
+
+    /// A refresh's subscription burst trips the relay's quota just as the
+    /// backfill REQ follows it — seen live on every refresh for the agents in
+    /// the most channels. That refusal is about the moment: the page is
+    /// re-issued with its bounds and the walk stays open; only once the
+    /// retries are spent is the walk cut, with the relay's reason.
+    #[test]
+    fn a_rate_limited_backfill_page_is_retried_before_the_walk_is_cut() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 2_000_000_000;
+        let since = now - 10_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(since);
+        let _ = cursor.resume(now);
+
+        for expected in 0..MAX_BACKFILL_RATE_LIMIT_RETRIES {
+            match step(&mut cursor, &mut replay, &rate_limited_backfill(), now).expect("folds") {
+                FeedStep::BackfillRateLimited {
+                    since: page_since,
+                    until,
+                    reason,
+                    strikes,
+                } => {
+                    assert_eq!((page_since, until, strikes), (since, None, expected));
+                    assert!(is_rate_limited(&reason));
+                }
+                other => panic!("a rate-limited page must be retried, got {other:?}"),
+            }
+            assert!(
+                !replay.is_complete(),
+                "the walk stays open while a page is retried"
+            );
+        }
+        match step(&mut cursor, &mut replay, &rate_limited_backfill(), now).expect("folds") {
+            FeedStep::ReplayComplete {
+                truncated: true,
+                reason,
+            } => assert!(reason.is_some_and(|r| is_rate_limited(&r))),
+            other => panic!("spent retries end the walk truncated, got {other:?}"),
+        }
+    }
+
+    /// The rows a refused page had already served are served again when it
+    /// is re-issued. Counted twice, a short page would read as a clamped one
+    /// and the walk would page on past a backlog that was already drained.
+    #[test]
+    fn a_retried_page_is_tallied_afresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 2_000_000_000;
+        let mut cursor = cursor_at(&dir, now);
+        let mut replay = WakeReplay::new(now - 10_000);
+        let _ = cursor.resume(now);
+        let short = REPLAY_PAGE_LIMIT - 1;
+
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_BACKFILL_SUBSCRIPTION_ID,
+            short,
+            |row| now - u64::from(row),
+            0,
+        );
+        assert!(matches!(
+            step(&mut cursor, &mut replay, &rate_limited_backfill(), now).expect("folds"),
+            FeedStep::BackfillRateLimited { .. }
+        ));
+        deliver_page(
+            &mut cursor,
+            &mut replay,
+            WAKE_BACKFILL_SUBSCRIPTION_ID,
+            short,
+            |row| now - u64::from(row),
+            0,
+        );
+        match step(
+            &mut cursor,
+            &mut replay,
+            &eose(WAKE_BACKFILL_SUBSCRIPTION_ID),
+            now,
+        )
+        .expect("folds")
+        {
+            FeedStep::ReplayComplete {
+                truncated: false, ..
+            } => {}
+            other => panic!("a short re-issued page drains the walk, got {other:?}"),
         }
     }
 
@@ -2126,7 +2304,9 @@ mod tests {
         )
         .expect("folds")
         {
-            FeedStep::ReplayComplete { truncated: true } => {}
+            FeedStep::ReplayComplete {
+                truncated: true, ..
+            } => {}
             other => panic!("a stalled walk must report the cut, got {other:?}"),
         }
     }

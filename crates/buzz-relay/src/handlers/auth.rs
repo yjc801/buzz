@@ -3758,7 +3758,7 @@ mod tests {
                     assert!(ok_true, "{case:?}: agent must receive OK(true)");
                     assert!(matches!(
                         harness.conn.auth_state_snapshot(),
-                        AuthState::Authenticated(_)
+                        AuthState::Authenticated { .. }
                     ));
                     assert!(state
                         .db
@@ -4112,7 +4112,7 @@ mod tests {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-        let state = crate::state::tests::test_state_with_database_url(
+        let state = crate::state::tests::test_state_with_unreachable_database_url(
             "postgres://buzz:buzz_dev@127.0.0.1:1/buzz",
         )
         .await;

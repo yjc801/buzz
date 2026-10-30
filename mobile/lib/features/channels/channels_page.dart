@@ -20,6 +20,9 @@ import 'package:buzz/shared/theme/buzz_icons.dart';
 import '../../shared/auth/auth.dart';
 import '../../shared/community/community_icon_provider.dart';
 import '../../shared/community/community_avatar.dart';
+import '../../shared/community/community_grid.dart';
+import '../../shared/community/community_grid_option.dart';
+import '../../shared/community/community_grid_add.dart';
 import '../../shared/community/paired_community_landing.dart';
 import '../../shared/community/community_membership_provider.dart';
 import '../../shared/widgets/app_list_card_item.dart';
@@ -682,7 +685,11 @@ class ChannelsPage extends HookConsumerWidget {
         topSectionHeight: topSectionHeight,
         usesPinnedGradient: usesPinnedGradient,
         scrollController: channelsScrollController,
-        onRefresh: () => ref.read(channelsProvider.notifier).refresh(),
+        onRefresh: () {
+          // Solo has no banner, so pulling must also restart its reader.
+          if (soloSliver != null) ref.invalidate(meGroupsProvider);
+          return ref.read(channelsProvider.notifier).refresh();
+        },
         onSelectChannel: openChannel,
       ),
     );

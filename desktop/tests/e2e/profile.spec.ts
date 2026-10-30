@@ -1592,8 +1592,16 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
             activeTab: string | undefined;
             x: number[];
           }> = [];
-          const startedAt = performance.now();
+          // Time the window from the tab switch, not from before the click:
+          // a slow click or frame would otherwise spend it before the motion.
+          let startedAt: number | null = null;
           const sample = () => {
+            if (
+              startedAt === null &&
+              container.dataset.activeTab === "runtime"
+            ) {
+              startedAt = performance.now();
+            }
             samples.push({
               activeTab: container.dataset.activeTab,
               x: Array.from(container.children).map((child) => {
@@ -1603,7 +1611,7 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
                   : new DOMMatrixReadOnly(transform).m41;
               }),
             });
-            if (performance.now() - startedAt < 320) {
+            if (startedAt === null || performance.now() - startedAt < 320) {
               requestAnimationFrame(sample);
             } else {
               resolve(samples);

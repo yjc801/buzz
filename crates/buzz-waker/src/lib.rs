@@ -102,16 +102,19 @@ pub use start_request::{SignedStartRequest, StartRequestBody, StartRequestError}
 /// Seconds of overlap to subtract from the persisted cursor when re-issuing a
 /// REQ after a reconnect — **G4**.
 ///
-/// Twice the relay's accepted clock drift, and it has to be: `since` compares
-/// `created_at` directly, so a future-dated event can advance a timestamp
-/// cursor by the full drift, and an event the relay then legitimately accepts
-/// can be backdated by the full drift again. Anything less can step over that
-/// second event and lose the mention.
+/// Twice the relay's accepted clock drift plus the recovery delay budget, and
+/// it has to be: `since` compares `created_at` directly, so a future-dated
+/// event can advance a timestamp cursor by the full drift, and an event the
+/// relay then legitimately accepts can be backdated by the full drift again.
+/// On top of that, a mention in a channel the live watch was missing is first
+/// seen by the periodic refresh's reconnect — up to
+/// [`buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS`] after it arrived.
+/// Anything less can step over that mention and lose it.
 ///
-/// Derived from [`buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS`] rather than
-/// written as its own number, so it cannot drift away from the bound it is
-/// defined against.
-pub const RECONNECT_OVERLAP_SECS: u64 = 2 * buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+/// Derived from the `buzz-core` bounds rather than written as its own
+/// number, so it cannot drift away from the bounds it is defined against.
+pub const RECONNECT_OVERLAP_SECS: u64 = 2 * buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS
+    + buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS;
 
 /// Age at which a recovered event can no longer be *guaranteed* to reach the
 /// agent a wake starts — **G4**.
@@ -127,11 +130,13 @@ pub const RECONNECT_OVERLAP_SECS: u64 = 2 * buzz_core::relay::MAX_TIMESTAMP_DRIF
 /// number in its own right — and because the subtraction refuses to compile if
 /// the budget ever grows past the bound it is taken out of.
 ///
-/// It comes out at the relay's accepted past skew — which is the point. That
-/// is the design's construction (`PLANS/BUZZ_WAKER_DESIGN.md` §5): a *live*
-/// trigger is at most that old when it arrives, so live wakes are covered by
-/// definition and only recovery can exceed this. Every second of waker downtime
-/// spends the margin directly.
+/// It comes out at the relay's accepted past skew plus the recovery delay
+/// budget — which is the point. That is the design's construction
+/// (`PLANS/BUZZ_WAKER_DESIGN.md` §5), extended for the periodic refresh: a
+/// *live* trigger is at most the skew old when it arrives, and one in a
+/// channel the live watch was missing is seen at most a recovery delay later,
+/// so both are covered by definition and only longer recovery can exceed
+/// this. Every second of waker downtime past that spends the margin directly.
 pub const WAKE_DELIVERABLE_AGE_SECS: u64 = buzz_core::relay::REPLAY_FLOOR_MAX_AGE_SECS
     - buzz_core::relay::WAKE_PIPELINE_LATENCY_BUDGET_SECS;
 
@@ -141,24 +146,27 @@ mod overlap_tests {
     /// relay's drift bound moves this in lockstep instead of silently
     /// invalidating the reconnect window.
     #[test]
-    fn the_overlap_is_twice_the_relay_drift_bound() {
+    fn the_overlap_is_twice_the_relay_drift_bound_plus_the_recovery_delay() {
         assert_eq!(
             super::RECONNECT_OVERLAP_SECS,
             2 * buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS
+                + buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS
         );
     }
 
     /// The deliverable age is what the floor bound has left after the wake
     /// pipeline is paid for, and the design says that must land on the relay's
-    /// past skew. If a future change to either bound breaks that equality, the
-    /// claim "a live trigger is always deliverable" has stopped holding and
-    /// this must be re-derived rather than patched.
+    /// past skew plus the recovery delay. If a future change to any bound
+    /// breaks that equality, the claim "a live or refresh-recovered trigger is
+    /// always deliverable" has stopped holding and this must be re-derived
+    /// rather than patched.
     #[test]
-    fn a_live_trigger_is_always_deliverable() {
+    fn a_live_or_refresh_recovered_trigger_is_always_deliverable() {
         assert_eq!(
             super::WAKE_DELIVERABLE_AGE_SECS,
-            buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS,
-            "the floor bound must leave exactly the relay's past skew"
+            buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS
+                + buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS,
+            "the floor bound must leave exactly the past skew plus the recovery delay"
         );
     }
 }

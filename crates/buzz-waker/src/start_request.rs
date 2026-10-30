@@ -59,10 +59,20 @@ pub const START_REQUEST_SUBSCRIPTION_ID: &str = "buzz-waker-start";
 
 /// How old a request may be and still start the agent.
 ///
-/// The same bound a mention is held to ([`crate::WAKE_DELIVERABLE_AGE_SECS`]):
-/// past it, the harness a wake starts could not replay back to the request
-/// anyway, and the owner's desktop has long since stopped waiting for it.
-pub const START_REQUEST_MAX_AGE_SECS: u64 = crate::WAKE_DELIVERABLE_AGE_SECS;
+/// The relay's accepted past skew — the bound a *live* trigger is held to.
+/// Deliberately not [`crate::WAKE_DELIVERABLE_AGE_SECS`]: that age also
+/// carries the recovery allowance for a mention in a channel the live watch
+/// was missing, and a start request never waits on a channel subscription —
+/// it reaches the waker on the bundle tap. Past this the owner's desktop has
+/// long since stopped waiting for it, so a replayed press must not spend a
+/// deploy. It sits inside the deliverable age, so the harness a request
+/// starts can always replay back to it.
+pub const START_REQUEST_MAX_AGE_SECS: u64 = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+
+const _: () = assert!(
+    START_REQUEST_MAX_AGE_SECS <= crate::WAKE_DELIVERABLE_AGE_SECS,
+    "a start request the waker accepts must be one the woken harness can replay"
+);
 
 /// How far in the future a request may be dated — clock skew between the
 /// owner's machine and this daemon, not a scheduling feature.
@@ -487,6 +497,15 @@ mod tests {
             admit(&agent, &owner, &event),
             Err(StartRequestError::WrongAgent { .. })
         ));
+    }
+
+    /// PR #199 review, round 2. The owner-start protocol's freshness window
+    /// is its own contract — the 15 minutes the desktop waits — not the
+    /// mention-recovery allowance the deliverable age now also carries. Pinned
+    /// as a value so widening that allowance cannot silently widen this.
+    #[test]
+    fn a_start_request_is_fresh_for_the_original_fifteen_minutes() {
+        assert_eq!(START_REQUEST_MAX_AGE_SECS, 15 * 60);
     }
 
     #[test]

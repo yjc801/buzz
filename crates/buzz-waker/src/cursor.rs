@@ -607,6 +607,52 @@ mod tests {
             .expect("reopen")
     }
 
+    /// PR #199 review, round 1. A channel's member-added notification is
+    /// missed, and a mention in it is published at the relay's full accepted
+    /// past skew just after a refresh — so the next refresh, a whole interval
+    /// later, is the first time the waker can see it. Meanwhile a
+    /// future-dated mention, also accepted, has pushed the high water a full
+    /// skew ahead. At that refresh the reconnect's backfill must still reach
+    /// back to the missed mention, and admitting it must still call it
+    /// deliverable — or the woken agent's replay floor excludes it.
+    #[test]
+    fn a_missed_mention_at_the_skew_limit_survives_one_refresh() {
+        let drift = buzz_core::relay::MAX_TIMESTAMP_DRIFT_SECS;
+        let refresh = buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = store(&dir);
+        // The latest a successful refresh can admit the missed mention: its
+        // timer plus its enforced setup deadline, which together are the
+        // whole recovery budget (`wake_loop::CHANNEL_REFRESH_INTERVAL`).
+        let refreshed_at = NOW + refresh;
+
+        // The future-dated mention, accepted and finished before the refresh.
+        let ahead = refreshed_at + drift;
+        assert!(s
+            .admit("ahead", ahead, refreshed_at)
+            .expect("admit")
+            .is_fresh());
+        s.complete("ahead").expect("complete");
+
+        // Arrived just after the previous refresh (at NOW), already a full
+        // skew old.
+        let missed = NOW - drift;
+        let Resume::Since(since) = s.resume(refreshed_at) else {
+            panic!("a feed that was connected is not behind its coverage window");
+        };
+        assert!(
+            since <= missed,
+            "the refresh's backfill starts at {since}, after the missed mention at {missed}"
+        );
+        assert!(
+            matches!(
+                s.admit("missed", missed, refreshed_at).expect("admit"),
+                Admission::Fresh
+            ),
+            "a mention recovered by the refresh must still be deliverable"
+        );
+    }
+
     #[test]
     fn a_missing_cursor_starts_at_now() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -38,6 +38,19 @@ pub const MAX_TIMESTAMP_DRIFT_SECS: u64 = 900;
 ///   watermark capture.
 pub const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 135 + 10 + 10 + 600 + 300;
 
+/// Longest a valid mention can sit unseen by `buzz-waker` before the waker
+/// recovers it: the waker's periodic mention-feed refresh interval
+/// (`buzz-waker`'s `CHANNEL_REFRESH_INTERVAL`, which is defined from this).
+///
+/// Between refreshes a channel the agent joined reaches the waker's live
+/// watch only through a member-added notification. When one is missed, a
+/// mention in that channel is first seen by the next refresh's backfill — up
+/// to this long after it arrived, and by then it may already be the relay's
+/// full past skew old. Both the replay floor and the waker's reconnect
+/// overlap budget for it, or a recovered mention would wake an agent that
+/// can no longer be shown it.
+pub const WAKE_RECOVERY_DELAY_BUDGET_SECS: u64 = 600;
+
 /// Max age of an externally supplied replay floor, relative to the woken
 /// harness's startup watermark.
 ///
@@ -46,11 +59,12 @@ pub const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 135 + 10 + 10 + 600 + 300;
 /// bound rather than ignored, so a slow deploy still replays as much of the
 /// missed window as the bound allows.
 ///
-/// Sized as the relay's accepted past skew PLUS the wake pipeline latency
-/// budget: a trigger accepted at the relay's maximum age has aged further by
-/// every second of fence/evidence/deploy/boot latency, and a cap equal to the
-/// skew alone would advance the watermark past the very trigger that caused
-/// the start.
+/// Sized as the relay's accepted past skew PLUS the waker's recovery delay
+/// budget PLUS the wake pipeline latency budget: a trigger accepted at the
+/// relay's maximum age can wait a full recovery delay before the waker sees
+/// it, then ages further by every second of fence/evidence/deploy/boot
+/// latency, and a cap short of the sum would advance the watermark past the
+/// very trigger that caused the start.
 ///
 /// Defined here rather than in `buzz-acp` because it is the contract between
 /// two crates, not one crate's internal: the harness *enforces* it, and
@@ -59,7 +73,7 @@ pub const WAKE_PIPELINE_LATENCY_BUDGET_SECS: u64 = 135 + 10 + 10 + 600 + 300;
 /// agent would answer nobody, so the waker raises an operational failure
 /// instead of pretending the mention was delivered.
 pub const REPLAY_FLOOR_MAX_AGE_SECS: u64 =
-    MAX_TIMESTAMP_DRIFT_SECS + WAKE_PIPELINE_LATENCY_BUDGET_SECS;
+    MAX_TIMESTAMP_DRIFT_SECS + WAKE_RECOVERY_DELAY_BUDGET_SECS + WAKE_PIPELINE_LATENCY_BUDGET_SECS;
 
 /// Tag a client puts in its signed NIP-42 AUTH event to request a restricted
 /// connection class.

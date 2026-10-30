@@ -104,15 +104,15 @@ pub struct WakeLoopConfig {
 /// the existing, coverage-safe path — it rediscovers every channel and
 /// backfills mentions from [`crate::RECONNECT_OVERLAP_SECS`] before the
 /// checkpoint, across all channels — so a mention missed in an unwatched
-/// channel is recovered at most this long after it was sent. Kept well inside
-/// [`crate::WAKE_DELIVERABLE_AGE_SECS`] so the woken harness can still act on
-/// it.
-pub const CHANNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
-
-const _: () = assert!(
-    CHANNEL_REFRESH_INTERVAL.as_secs() < crate::WAKE_DELIVERABLE_AGE_SECS,
-    "a mention recovered by the refresh must still be deliverable"
-);
+/// channel is recovered at most this long after it arrived.
+///
+/// Defined from [`buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS`], the
+/// term the replay floor, the deliverable age and the reconnect overlap all
+/// budget for it — so a mention at the relay's full past skew that waits a
+/// whole interval is still reached by the backfill and still shown to the
+/// woken agent.
+pub const CHANNEL_REFRESH_INTERVAL: Duration =
+    Duration::from_secs(buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS);
 
 /// Channels `discovered` holds that `previous` did not: each one is a channel
 /// the live watch was missing until this discovery, sorted so the log is

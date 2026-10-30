@@ -93,6 +93,9 @@ pub struct WakeLoopConfig {
     /// How long one mention-feed connection lives before the loop reconnects
     /// on purpose — [`CHANNEL_REFRESH_INTERVAL`] in production.
     pub channel_refresh: Duration,
+    /// How long a refresh's reconnect may take, from connect until its
+    /// backlog replay completes — [`REFRESH_SETUP_DEADLINE`] in production.
+    pub refresh_setup_deadline: Duration,
 }
 
 /// How often the mention feed reconnects to re-run channel discovery.
@@ -103,16 +106,74 @@ pub struct WakeLoopConfig {
 /// (seen live: a new issue room watched by nobody for days). The reconnect is
 /// the existing, coverage-safe path — it rediscovers every channel and
 /// backfills mentions from [`crate::RECONNECT_OVERLAP_SECS`] before the
-/// checkpoint, across all channels — so a mention missed in an unwatched
-/// channel is recovered at most this long after it arrived.
+/// checkpoint, across all channels.
 ///
-/// Defined from [`buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS`], the
-/// term the replay floor, the deliverable age and the reconnect overlap all
-/// budget for it — so a mention at the relay's full past skew that waits a
-/// whole interval is still reached by the backfill and still shown to the
-/// woken agent.
-pub const CHANNEL_REFRESH_INTERVAL: Duration =
-    Duration::from_secs(buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS);
+/// The timer only *starts* recovery: connecting, discovery, the archive probe,
+/// the subscriptions and the backlog replay all follow it, and the missed
+/// mention is admitted only during that replay. So the interval is what is
+/// left of [`buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS`] once the
+/// enforced [`REFRESH_SETUP_DEADLINE`] is paid for: a successful refresh admits
+/// a missed mention at most the whole budget after it arrived — the term the
+/// replay floor, the deliverable age and the reconnect overlap all carry.
+pub const CHANNEL_REFRESH_INTERVAL: Duration = Duration::from_secs(
+    buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS - REFRESH_SETUP_DEADLINE.as_secs(),
+);
+
+/// How long a refresh's reconnect may take, from connect until its backlog
+/// replay completes. Enforced: a refresh that overruns it is a failed
+/// connection and goes through the ordinary reconnect ladder, so this is a
+/// real bound on the recovery path rather than an estimate of it.
+///
+/// Refresh reconnects only. A reconnect after a failure, or at startup, may
+/// be replaying a long outage — that is outside the recovery budget by
+/// definition (and reported as such by [`Resume::GapTooOld`]), and holding it
+/// to this deadline could keep it from ever finishing.
+pub const REFRESH_SETUP_DEADLINE: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    CHANNEL_REFRESH_INTERVAL.as_secs() + REFRESH_SETUP_DEADLINE.as_secs()
+        == buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS,
+    "a refresh's timer and setup deadline together must be exactly the recovery budget"
+);
+
+/// Why a setup step bounded by a refresh's deadline did not complete.
+enum SetupError<E> {
+    /// The step itself failed.
+    Step(E),
+    /// The refresh's setup deadline passed first.
+    Overran,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SetupError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Step(error) => error.fmt(f),
+            Self::Overran => f.write_str("the refresh's setup deadline passed"),
+        }
+    }
+}
+
+/// Await one setup step, bounded by `deadline` when the reconnect has one.
+async fn within<T, E>(
+    deadline: Option<tokio::time::Instant>,
+    step: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, SetupError<E>> {
+    match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, step).await {
+            Ok(result) => result.map_err(SetupError::Step),
+            Err(_) => Err(SetupError::Overran),
+        },
+        None => step.await.map_err(SetupError::Step),
+    }
+}
+
+/// Sleep until `deadline`, or forever when there is none.
+async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Channels `discovered` holds that `previous` did not: each one is a channel
 /// the live watch was missing until this discovery, sorted so the log is
@@ -316,6 +377,9 @@ pub async fn run_wake_loop(
     // plus every membership change it applied. A channel the next discovery
     // finds beyond these is one the live path never subscribed.
     let mut watched: Option<HashSet<Uuid>> = None;
+    // Set by the refresh timer: the next reconnect is a refresh, held to
+    // REFRESH_SETUP_DEADLINE.
+    let mut refreshing = false;
 
     'reconnect: while !cancel.is_cancelled() {
         if consecutive_failures > 0 {
@@ -337,7 +401,9 @@ pub async fn run_wake_loop(
             config.keys.clone(),
             config.auth_tag.clone(),
         );
-        if let Err(error) = transport.connect().await {
+        let setup_deadline = std::mem::take(&mut refreshing)
+            .then(|| tokio::time::Instant::now() + config.refresh_setup_deadline);
+        if let Err(error) = within(setup_deadline, transport.connect()).await {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: mention feed connect failed");
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
@@ -368,7 +434,8 @@ pub async fn run_wake_loop(
         // discovered channel — all before the first subscribe_backfill call,
         // or a mention published in the gap is lost for good. Every one of
         // these calls carries the same `since`, never connect time.
-        let discovered_channels = match transport.discover_channels().await {
+        let discovered_channels = match within(setup_deadline, transport.discover_channels()).await
+        {
             Ok(channels) => channels,
             Err(error) => {
                 tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: channel discovery failed");
@@ -383,9 +450,22 @@ pub async fn run_wake_loop(
         // open: a probe failure means subscribe to everything, because a
         // wasted subscription is cheap and a wrongly skipped live channel
         // loses every wake in it.
-        let archived = match transport.archived_channels(&discovered_channels).await {
+        let archived = match within(
+            setup_deadline,
+            transport.archived_channels(&discovered_channels),
+        )
+        .await
+        {
             Ok(archived) => archived,
-            Err(error) => {
+            Err(SetupError::Overran) => {
+                tracing::warn!(
+                    agent = %agent_pubkey,
+                    "buzz-waker: the refresh's setup deadline passed during the archive probe"
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                continue 'reconnect;
+            }
+            Err(SetupError::Step(error)) => {
                 tracing::warn!(
                     agent = %agent_pubkey, %error,
                     "buzz-waker: could not read channel metadata; subscribing to every \
@@ -420,13 +500,18 @@ pub async fn run_wake_loop(
         }
         watched = Some(discovered_set);
 
-        if let Err(error) = transport.subscribe_membership(since).await {
+        if let Err(error) = within(setup_deadline, transport.subscribe_membership(since)).await {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: membership watch subscribe failed");
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
         }
         for channel_id in discovered_channels {
-            if let Err(error) = transport.subscribe_channel_live(channel_id, since).await {
+            if let Err(error) = within(
+                setup_deadline,
+                transport.subscribe_channel_live(channel_id, since),
+            )
+            .await
+            {
                 tracing::warn!(
                     agent = %agent_pubkey, %channel_id, %error,
                     "buzz-waker: channel live subscribe failed"
@@ -435,12 +520,16 @@ pub async fn run_wake_loop(
                 continue 'reconnect;
             }
         }
-        if let Err(error) = transport.subscribe_backfill(since, None).await {
+        if let Err(error) = within(setup_deadline, transport.subscribe_backfill(since, None)).await
+        {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: backfill subscribe failed");
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
         }
         consecutive_failures = 0;
+        // Until the backlog replay completes, a refresh is still inside its
+        // setup deadline (see REFRESH_SETUP_DEADLINE).
+        let mut replay_done = false;
         let refresh_at = tokio::time::Instant::now() + config.channel_refresh;
         let mut replay = WakeReplay::new(since);
         // Per-connection: this socket's subscriptions are the only ones these
@@ -580,6 +669,19 @@ pub async fn run_wake_loop(
                         agent = %agent_pubkey,
                         "buzz-waker: refreshing the mention feed to rediscover channels"
                     );
+                    refreshing = true;
+                    continue 'reconnect;
+                }
+
+                // A refresh whose backlog replay has not completed by its
+                // deadline has not recovered anything in time; fail it.
+                () = sleep_until_some(setup_deadline), if !replay_done => {
+                    tracing::warn!(
+                        agent = %agent_pubkey,
+                        "buzz-waker: the refresh's backlog replay did not complete within its \
+                         setup deadline; reconnecting"
+                    );
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     continue 'reconnect;
                 }
 
@@ -671,6 +773,7 @@ pub async fn run_wake_loop(
                                     }
                                 }
                                 Ok(FeedStep::ReplayComplete { truncated }) => {
+                                    replay_done = true;
                                     if truncated {
                                         tracing::error!(
                                             agent = %agent_pubkey,
@@ -1873,6 +1976,7 @@ mod tests {
             bundle_state: Arc::new(crate::bundle_feed::BundleState::new()),
             provider_env: None,
             channel_refresh: Duration::from_millis(300),
+            refresh_setup_deadline: REFRESH_SETUP_DEADLINE,
         };
         let (_start_tx, start_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
@@ -1903,6 +2007,153 @@ mod tests {
             live.lock().unwrap()[0],
             vec![a],
             "the first connection watched only A"
+        );
+    }
+
+    /// Which reply a [`stalling_relay`] withholds on every connection after
+    /// the first — that is, on every refresh.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        Discovery,
+        BackfillReplay,
+    }
+
+    /// A relay double that answers every REQ with a bare EOSE — except, from
+    /// the second connection on, the one `stall` names, which it never
+    /// answers.
+    async fn stalling_relay(stall: Stall) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut connection = 0usize;
+            while let Ok((stream, _)) = listener.accept().await {
+                let refresh = connection > 0;
+                connection += 1;
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let text = |v: serde_json::Value| WsMessage::Text(v.to_string().into());
+                    let _ = ws.send(text(serde_json::json!(["AUTH", "c"]))).await;
+                    while let Some(Ok(WsMessage::Text(frame))) = ws.next().await {
+                        let Ok(frame) = serde_json::from_str::<Vec<serde_json::Value>>(&frame)
+                        else {
+                            continue;
+                        };
+                        match frame[0].as_str() {
+                            Some("AUTH") => {
+                                let ok = serde_json::json!(["OK", frame[1]["id"], true, ""]);
+                                let _ = ws.send(text(ok)).await;
+                            }
+                            Some("REQ") => {
+                                let sub = frame[1].as_str().unwrap_or_default().to_string();
+                                let discovery = frame[2]["kinds"].as_array().is_some_and(|k| {
+                                    k.contains(&serde_json::json!(
+                                        buzz_core::kind::KIND_NIP29_GROUP_MEMBERS
+                                    ))
+                                });
+                                let withheld = refresh
+                                    && match stall {
+                                        Stall::Discovery => discovery,
+                                        Stall::BackfillReplay => {
+                                            sub == crate::feed::WAKE_BACKFILL_SUBSCRIPTION_ID
+                                        }
+                                    };
+                                if !withheld {
+                                    let _ = ws.send(text(serde_json::json!(["EOSE", sub]))).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Runs the real loop against `relay` with a short refresh and setup
+    /// deadline, capturing its logs, until `needle` is logged or 5s pass.
+    async fn loop_logs_within_the_deadline(relay: String, needle: &str) -> bool {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = WakeLoopConfig {
+            relay_url: relay,
+            keys: Keys::generate(),
+            auth_tag: None,
+            cursor_path: dir.path().join("cursor.json"),
+            presence_state: Arc::new(crate::presence_feed::PresenceState::new()),
+            watch_list: crate::watch_list::WatchList::new(),
+            bundle_state: Arc::new(crate::bundle_feed::BundleState::new()),
+            provider_env: None,
+            channel_refresh: Duration::from_millis(300),
+            refresh_setup_deadline: Duration::from_millis(200),
+        };
+        let (_start_tx, start_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_wake_loop(config, start_rx, cancel.clone()));
+        let logged = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if String::from_utf8_lossy(&capture.0.lock().unwrap()).contains(needle) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        cancel.cancel();
+        let _ = task.await;
+        logged
+    }
+
+    /// PR #199 review, round 2. The refresh timer only starts recovery; the
+    /// setup after it must be bounded too. A refresh whose discovery never
+    /// answers must give up at its setup deadline — without it the loop sat
+    /// out the 20s discovery timeout, well past the recovery budget.
+    #[tokio::test]
+    async fn a_refresh_whose_setup_stalls_gives_up_at_its_deadline() {
+        let relay = stalling_relay(Stall::Discovery).await;
+        assert!(
+            loop_logs_within_the_deadline(relay, "the refresh's setup deadline passed").await,
+            "a stalled refresh setup was not abandoned at its deadline"
+        );
+    }
+
+    /// The missed mention is only admitted during the refresh's backlog
+    /// replay, so the deadline runs until that replay completes — not just
+    /// until the backfill REQ is sent.
+    #[tokio::test]
+    async fn a_refresh_whose_backlog_replay_stalls_gives_up_at_its_deadline() {
+        let relay = stalling_relay(Stall::BackfillReplay).await;
+        assert!(
+            loop_logs_within_the_deadline(
+                relay,
+                "backlog replay did not complete within its setup deadline"
+            )
+            .await,
+            "a stalled refresh replay was not abandoned at its deadline"
         );
     }
 }

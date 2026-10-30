@@ -621,7 +621,9 @@ mod tests {
         let refresh = buzz_core::relay::WAKE_RECOVERY_DELAY_BUDGET_SECS;
         let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store(&dir);
-        // The refresh that first sees the missed mention.
+        // The latest a successful refresh can admit the missed mention: its
+        // timer plus its enforced setup deadline, which together are the
+        // whole recovery budget (`wake_loop::CHANNEL_REFRESH_INTERVAL`).
         let refreshed_at = NOW + refresh;
 
         // The future-dated mention, accepted and finished before the refresh.

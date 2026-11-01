@@ -1,3 +1,4 @@
+import 'package:buzz/shared/widgets/feedback_snackbar.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -13,6 +14,8 @@ import '../../../shared/widgets/concentric_sheet_surface.dart';
 import '../../../shared/widgets/bee_refresh_indicator.dart';
 import 'me_assistant_list.dart';
 import 'me_section.dart';
+import 'me_working_provider.dart';
+import 'solo_working_dots.dart';
 import 'me_unread_provider.dart';
 import '../../../shared/widgets/avatar_image.dart';
 import '../../../shared/me/me_groups.dart';
@@ -96,10 +99,11 @@ class MePage extends HookConsumerWidget {
           await _offerMeRecovery(context, ref.read(meSyncProvider));
         }
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
+          ScaffoldMessenger.of(context).showFeedbackSnackBar(
             SnackBar(
               content: Text(error.toString().replaceFirst('Bad state: ', '')),
             ),
+            kind: ToastKind.error,
           );
         }
       } finally {
@@ -175,6 +179,7 @@ class MePage extends HookConsumerWidget {
                   ),
                 );
           Widget row(Channel channel) => _MeChatRow(
+            channelId: channel.id,
             name: channel.name,
             isUnread: unreadIds.contains(channel.id),
             onTap: () => Navigator.of(context).push(
@@ -219,11 +224,6 @@ class MePage extends HookConsumerWidget {
                     MeSection(
                       key: ValueKey(group['id']),
                       label: group['name'] as String,
-                      hasUnread: visible.any(
-                        (c) =>
-                            organization.assignments[c.id] == group['id'] &&
-                            unreadIds.contains(c.id),
-                      ),
                       children: [
                         for (final channel in visible.where(
                           (c) => organization.assignments[c.id] == group['id'],
@@ -244,11 +244,6 @@ class MePage extends HookConsumerWidget {
                     MeSection(
                       key: const ValueKey('me-ungrouped-chats'),
                       label: 'Chats',
-                      hasUnread: visible.any(
-                        (c) =>
-                            !organization.assignments.containsKey(c.id) &&
-                            unreadIds.contains(c.id),
-                      ),
                       children: [
                         for (final channel in visible.where(
                           (c) => !organization.assignments.containsKey(c.id),
@@ -277,8 +272,18 @@ class MePage extends HookConsumerWidget {
             if (sliver && visible.isEmpty && organization.groups.isEmpty)
               SliverToBoxAdapter(
                 child: Padding(
-                  padding: const EdgeInsets.all(Grid.gutter),
-                  child: _MeEmptyState(onNewChat: newChat),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: Grid.gutter,
+                    vertical: Grid.half,
+                  ),
+                  child: Text(
+                    'No chats yet',
+                    style: contentListBodyTextStyle.copyWith(
+                      color: context.colors.onSurfaceVariant.withValues(
+                        alpha: 0.65,
+                      ),
+                    ),
+                  ),
                 ),
               ),
           ];

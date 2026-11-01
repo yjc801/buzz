@@ -34,7 +34,8 @@ import 'channel_identity_names_provider.dart';
 import 'channel_link_navigation.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
-import 'channel_typing_indicator.dart';
+import 'inline_agent_typing.dart';
+import '../../shared/me/me_assistants.dart';
 import 'thread_replies_provider.dart';
 import 'channel_ids_by_name_provider.dart';
 import 'channels_provider.dart';
@@ -852,6 +853,33 @@ class ThreadDetailPage extends HookConsumerWidget {
       return null;
     }, [viewportHeight]);
 
+    // Typing now occupies the timeline, so follow its changing height only
+    // when the reader was already following the tail.
+    useEffect(() {
+      final shouldFollow =
+          isMember &&
+          !isArchived &&
+          initialTailSettle.isComplete &&
+          !tailIntent.isDragging &&
+          !userOptedOutOfTailFollow.value &&
+          (followsThreadTail.value || threadTailIsVisible());
+      if (shouldFollow) followsThreadTail.value = true;
+      // Positioned-list item positions still describe the old row height in
+      // this frame. Correct after layout rather than accepting that stale
+      // tail position as proof the new typing group is visible.
+      tailIntent.schedule(
+        allowed: shouldFollow,
+        revalidate: () =>
+            context.mounted &&
+            itemScrollController.isAttached &&
+            !tailIntent.isDragging &&
+            !userOptedOutOfTailFollow.value &&
+            followsThreadTail.value,
+        action: correctThreadTailInstantly,
+      );
+      return null;
+    }, [threadTyping.isNotEmpty]);
+
     void updateComposerDockHeight(double height) {
       listViewport.reportAfterLayout();
       final previousHeight = composerDockHeight.value;
@@ -966,6 +994,12 @@ class ThreadDetailPage extends HookConsumerWidget {
                   itemPositionsListener: itemPositionsListener,
                   bottomInset: timelineBottomInset,
                   replies: replies,
+                  knownAgents: threadTyping.isEmpty
+                      ? const {}
+                      : ref.watch(meAgentInventoryProvider).value ?? const {},
+                  inlineTyping: isMember && !isArchived
+                      ? threadTyping
+                      : const [],
                   relayReplyState: relayReplyState,
                   onRetryReplies: () =>
                       ref.invalidate(threadRepliesProvider(repliesArgs)),
@@ -987,12 +1021,6 @@ class ThreadDetailPage extends HookConsumerWidget {
                   childrenByParent: childrenByParent,
                 ),
               ),
-              if (!isMember || isArchived)
-                _ThreadTypingIndicator(
-                  channelId: channelId,
-                  entries: threadTyping,
-                  animated: false,
-                ),
             ],
           ),
           if (isMember && !isArchived)
@@ -1005,10 +1033,6 @@ class ThreadDetailPage extends HookConsumerWidget {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      _ThreadTypingIndicator(
-                        channelId: channelId,
-                        entries: threadTyping,
-                      ),
                       ComposeBar(
                         channelId: channelId,
                         focusNode: composerFocusNode,

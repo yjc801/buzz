@@ -1,3 +1,4 @@
+import 'package:buzz/shared/widgets/feedback_snackbar.dart';
 import 'message_swipe_reply.dart';
 import 'agent_reply_handoff.dart';
 import 'huddle_timeline.dart';
@@ -19,6 +20,7 @@ import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../../shared/emoji/emoji_burst.dart';
+import '../../shared/me/me_assistants.dart';
 import '../../shared/me/me_sync.dart';
 import '../../shared/me/me_search_placement.dart';
 import 'me/me_assistant_picker.dart';
@@ -30,6 +32,7 @@ import '../../shared/identity_names/identity_names_provider.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
+import '../../shared/widgets/avatar_shape.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
 import '../../shared/widgets/bouncing_dots_indicator.dart';
@@ -100,6 +103,7 @@ part 'channel_detail_page/placement_route.dart';
 part 'channel_detail_page/empty_messages.dart';
 part 'channel_detail_page/oldest_navigation.dart';
 part 'channel_detail_page/system_rows.dart';
+part 'channel_detail_page/thread_working.dart';
 part 'channel_detail_page/activity_members_sheet.dart';
 part 'channel_detail_page/huddle_sheet.dart';
 part 'channel_detail_page/huddle_call_avatar.dart';
@@ -442,8 +446,24 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
       channelBotPubkeys:
           channelBotPubkeysState.asData?.value ?? const <String>{},
     );
+    // Keep the working-agent reply link on channel and DM roots. Solo
+    // conversations already flatten their replies into the timeline.
+    final threadWorking = _threadWorkingAgents(
+      ref,
+      personalChat
+          ? ''
+          : ref.watch(
+              channelTypingProvider(
+                channel.id,
+              ).select((all) => _threadTypingKey(all, currentPubkey)),
+            ),
+    );
+    final ownedThreadTypers = {
+      for (final agents in threadWorking.values) ...agents,
+    };
     // Agent work is visible in every DM, even when its response is threaded.
-    // Ordinary channels keep thread activity inside the thread view.
+    // Ordinary channels keep other thread activity inside the thread view,
+    // but, as on desktop, show the user's own agents working in any thread.
     final typingEntries = ref
         .watch(
           visibleTypingProvider(
@@ -452,6 +472,7 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
             include: (e) =>
                 personalChat ||
                 e.threadHeadId == null ||
+                ownedThreadTypers.contains(e.pubkey.toLowerCase()) ||
                 (resolvedChannel.isDm &&
                     agentPubkeys.contains(e.pubkey.toLowerCase())),
           ),
@@ -821,7 +842,12 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
                           data: (events) {
                             return _MessageList(
                               notifier: ref.watch(messagesProvider.notifier),
-                              inlineTyping: typingEntries,
+                              inlineTyping:
+                                  resolvedChannel.isMember &&
+                                      !resolvedChannel.isArchived
+                                  ? typingEntries
+                                  : const [],
+                              threadWorking: threadWorking,
                               stickyDateHeaderState: stickyDateHeaderState,
                               entries: timelineEntries,
                               allMessages: timelineMessages,

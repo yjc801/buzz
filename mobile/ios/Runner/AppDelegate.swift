@@ -67,6 +67,8 @@ import os.log
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    engineBridge.pluginRegistry.registrar(forPlugin: "BuzzToastLayer")?.register(
+      ToastLayerFactory(), withId: "buzz/toast_layer")
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BuzzIosMediaCarousel") {
       registrar.register(IosMediaCarouselFactory(messenger: registrar.messenger()), withId: "buzz/ios_media_carousel")
     }
@@ -90,6 +92,10 @@ import os.log
     browserAuthBridge = BuzzBrowserAuthBridge(messenger: messenger)
     hostedHpkeChannel = FlutterMethodChannel(name: "buzz/hosted_hpke", binaryMessenger: messenger)
     hostedHpkeChannel?.setMethodCallHandler { call, result in
+      if call.method == "isSupported" {
+        if #available(iOS 17.0, *) { result(true) } else { result(false) }
+        return
+      }
       guard call.method == "seal" else { result(FlutterMethodNotImplemented); return }
       guard #available(iOS 17.0, *) else {
         result(FlutterError(code: "unsupported", message: "Backup requires iOS 17 or later", details: nil)); return

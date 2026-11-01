@@ -401,7 +401,7 @@ async fn scoped_token_gets_only_the_removal_for_a_move_outside_it() {
 
     let (conn, mut rx) = connect(&f, &owner);
     match &mut *conn.auth_state.lock().unwrap() {
-        crate::connection::AuthState::Authenticated(ctx) => {
+        crate::connection::AuthState::Authenticated { ctx, .. } => {
             ctx.channel_ids = Some(vec![source]);
         }
         _ => unreachable!("test connections are authenticated"),

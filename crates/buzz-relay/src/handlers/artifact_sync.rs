@@ -369,7 +369,7 @@ pub async fn handle_sync(
         }
     };
     let (reader, bound) = match conn.auth_state_snapshot() {
-        AuthState::Authenticated(ctx) => {
+        AuthState::Authenticated { ctx, .. } => {
             if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
                 refuse(&sub_id, "restricted: insufficient scope", &conn, &state).await;
                 return;

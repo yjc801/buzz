@@ -2360,7 +2360,10 @@ pub(crate) mod tests {
                 "auth-required: not authenticated",
             ),
             (
-                AuthState::Authenticated(scoped),
+                AuthState::Authenticated {
+                    ctx: scoped,
+                    class: ConnectionClass::default(),
+                },
                 serde_json::json!({"kinds": [1]}),
                 "restricted: insufficient scope",
             ),

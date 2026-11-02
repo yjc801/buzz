@@ -1,8 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+
 import '../../shared/widgets/profile_action_chip.dart';
 import '../../shared/widgets/app_list_card.dart';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -20,6 +22,8 @@ import '../../shared/widgets/avatar_shape.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/agent_artwork_panel.dart';
 import '../../shared/widgets/buzz_sheet_header.dart';
+import '../../shared/widgets/verified_mark.dart';
+import '../../shared/widgets/verified_profile_details.dart';
 import '../../shared/widgets/buzz_action_tile.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../../shared/widgets/progressive_animated_avatar.dart';
@@ -259,21 +263,29 @@ class UserProfileSheet extends HookConsumerWidget {
 
                     // Display name — centered, large
                     Center(
-                      child: Text(
-                        displayName,
-                        style: agentPresentation
-                            ? context.textTheme.bodyLarge?.copyWith(
-                                fontSize: 20,
-                                height: 1.4,
-                                letterSpacing: -0.2,
-                              )
-                            : context.textTheme.headlineSmall?.copyWith(
-                                fontWeight: FontWeight.w700,
-                              ),
-                        textAlign: TextAlign.center,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              displayName,
+                              style: agentPresentation
+                                  ? context.textTheme.bodyLarge?.copyWith(
+                                      fontSize: 20,
+                                      height: 1.4,
+                                      letterSpacing: -0.2,
+                                    )
+                                  : context.textTheme.headlineSmall?.copyWith(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ),
+                          VerifiedMark(pubkey: pk, size: 20),
+                        ],
                       ),
                     ),
-
+                    VerifiedProfileDetails(pubkey: pk),
                     if (!agentPresentation && agentSubtitle != null) ...[
                       const SizedBox(height: Grid.xxs),
                       Center(
@@ -602,6 +614,7 @@ class _ProfileAvatar extends HookWidget {
                   )
                 : AvatarImageContent(
                     imageUrl: animatedAvatar?.posterUrl ?? avatarUrl,
+                    preferThumbnail: true,
                     fallback: _AvatarFallback(initial: initial),
                   );
             return AvatarClip(

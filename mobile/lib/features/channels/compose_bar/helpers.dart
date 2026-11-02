@@ -160,6 +160,8 @@ Widget _composerSuggestionPanel({
   required List<MentionCandidate> mentionSuggestions,
   required Set<String> unavailableMentions,
   required bool mentionSearchFailed,
+  required bool reserveMentionHeight,
+  required bool mentionSearching,
   required VoidCallback onMentionSearchRetry,
   required Map<String, UserProfile> userCache,
   required String? currentPubkey,
@@ -181,6 +183,8 @@ Widget _composerSuggestionPanel({
           suggestions: mentionSuggestions,
           unavailable: unavailableMentions,
           searchFailed: mentionSearchFailed,
+          reserveHeight: reserveMentionHeight,
+          searching: mentionSearching,
           onRetry: onMentionSearchRetry,
           userCache: userCache,
           currentPubkey: currentPubkey,
@@ -203,6 +207,7 @@ Widget _composerAttachmentPanel({
   required Future<List<XFile>> Function() onPickAllPhotos,
   required Future<void> Function(List<XFile> photos) onChoosePhotos,
   required Future<void> Function(List<XFile> photos) onChooseAllPhotos,
+  required Future<void> Function(Future<void> Function()) preparePhotos,
 }) => _AttachmentSurfacePanel(
   key: ValueKey(
     surface == _AttachmentSurface.closed
@@ -221,6 +226,7 @@ Widget _composerAttachmentPanel({
   onPickAllPhotos: onPickAllPhotos,
   onChoosePhotos: onChoosePhotos,
   onChooseAllPhotos: onChooseAllPhotos,
+  preparePhotos: preparePhotos,
 );
 
 const _pastedImageMimeTypes = <String>[
@@ -306,14 +312,6 @@ void _insertTriggerAtCursor(
     selection: TextSelection.collapsed(offset: cursor + insert.length),
   );
   focusNode.requestFocus();
-}
-
-bool hasMention(String text, String name) {
-  final pattern = RegExp(
-    '(?:^|\\s|[*_]{1,3}|\\|\\|)@${RegExp.escape(name)}(?=\\|\\||[\\s,;.!?:)\\]}*_]|\$)',
-    caseSensitive: false,
-  );
-  return pattern.hasMatch(text);
 }
 
 /// Outcome of the non-member mention prompt. `null` (dialog dismissed)

@@ -26,7 +26,6 @@ class HomePage extends HookConsumerWidget {
     required this.defaultAgentBuilder,
     this.communityInvitePageBuilder,
     this.mePageBuilder,
-    this.profilePageBuilder,
     this.communityAppearancePageBuilder,
     super.key,
   });
@@ -34,7 +33,6 @@ class HomePage extends HookConsumerWidget {
   final WidgetBuilder settingsPageBuilder;
   final ValueChanged<BuildContext> onAgents;
   final WidgetBuilder defaultAgentBuilder;
-  final WidgetBuilder? profilePageBuilder;
 
   /// Builds a sliver inventory and publishes its two creation actions.
   final Widget Function(
@@ -201,7 +199,7 @@ class HomePage extends HookConsumerWidget {
                       ),
                       (
                         label: 'New workspace',
-                        symbol: 'folder.badge.plus',
+                        symbol: 'workspace',
                         onPressed: newWorkspace.value,
                       ),
                       (

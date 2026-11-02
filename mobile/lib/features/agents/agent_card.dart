@@ -45,6 +45,9 @@ class AgentCard extends StatelessWidget {
         style: context.textTheme.headlineMedium,
       ),
     );
+    final portraitFit = usesInsetAgentArtwork(imageUrl)
+        ? BoxFit.contain
+        : BoxFit.cover;
     final portrait =
         animation != null &&
             !MediaQuery.disableAnimationsOf(context) &&
@@ -52,12 +55,13 @@ class AgentCard extends StatelessWidget {
         ? ProgressiveAnimatedAvatar(
             descriptor: animation,
             fallback: fallback,
-            fit: BoxFit.contain,
+            fit: portraitFit,
           )
         : AvatarImageContent(
             imageUrl: poster,
+            preferThumbnail: true,
             fallback: fallback,
-            fit: BoxFit.contain,
+            fit: portraitFit,
           );
     return ClipRRect(
       borderRadius: BorderRadius.circular(Radii.card),
@@ -86,6 +90,7 @@ class AgentCard extends StatelessWidget {
                             scale: 1.8,
                             child: AvatarImageContent(
                               imageUrl: poster,
+                              preferThumbnail: true,
                               fallback: const SizedBox.shrink(),
                             ),
                           ),

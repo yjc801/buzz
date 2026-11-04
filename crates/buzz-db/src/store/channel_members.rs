@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::channel::{row_to_channel_record, ChannelRecord};
 use crate::error::{DbError, Result};
-use crate::{AdmittedTx, Db};
+use crate::{AdmittedTx, Db, ReadAt};
 use buzz_core::CommunityId;
 use buzz_datastore_tracing::datastore_span;
 
@@ -500,7 +500,9 @@ impl LockedMemberSnapshot {
         }
         let tags = serde_json::to_value(&event.tags)?;
         validate_channel_roster_snapshot(&mut self.tx, channel_id, &tags).await?;
-        sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND channel_id = $4 AND deleted_at IS NULL")
+        sqlx::query(superseded_with_mentions_sql!(
+            "UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND channel_id = $4 AND deleted_at IS NULL"
+        ))
             .bind(community_id.as_uuid()).bind(kind).bind(pubkey.as_slice()).bind(channel_id)
             .execute(self.tx.conn()).await?;
         let received_at = Utc::now();
@@ -1548,11 +1550,22 @@ pub async fn get_listed_open_channel_ids(
     pool: &PgPool,
     community_id: CommunityId,
 ) -> Result<Vec<Uuid>> {
+    Ok(get_listed_open_channel_ids_read_at(pool, community_id)
+        .await?
+        .value)
+}
+
+/// [`get_listed_open_channel_ids`], with when its connection was checked out.
+pub async fn get_listed_open_channel_ids_read_at(
+    pool: &PgPool,
+    community_id: CommunityId,
+) -> Result<ReadAt<Vec<Uuid>>> {
     let mut connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::Authorization,
     )
     .await?;
+    let read_at = std::time::Instant::now();
     let sql = format!(
         r#"
         SELECT id
@@ -1563,11 +1576,11 @@ pub async fn get_listed_open_channel_ids(
         open_types = crate::store::channel::legacy_channel_type_sql("channel_type"),
     );
     // Built only from the constant type list.
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+    let value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(community_id.as_uuid())
         .fetch_all(&mut *connection)
-        .await
-        .map_err(Into::into)
+        .await?;
+    Ok(ReadAt { value, read_at })
 }
 
 /// Appends the channels of `more` that `ids` lacks.
@@ -2397,12 +2410,24 @@ impl Db {
     }
 
     /// A community's listed open channel IDs. See [`get_listed_open_channel_ids`].
-    #[datastore_span(name = "get_listed_open_channel_ids", system = "postgresql")]
     pub async fn get_listed_open_channel_ids(
         &self,
         community_id: CommunityId,
     ) -> Result<Vec<Uuid>> {
-        get_listed_open_channel_ids(&self.pool, community_id).await
+        Ok(self
+            .get_listed_open_channel_ids_read_at(community_id)
+            .await?
+            .value)
+    }
+
+    /// [`Self::get_listed_open_channel_ids`], with when its connection was
+    /// checked out, for caches that bound staleness from the read.
+    #[datastore_span(name = "get_listed_open_channel_ids", system = "postgresql")]
+    pub async fn get_listed_open_channel_ids_read_at(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<ReadAt<Vec<Uuid>>> {
+        get_listed_open_channel_ids_read_at(&self.pool, community_id).await
     }
 
     /// The channels of non-legacy types a pubkey can read (member, or open

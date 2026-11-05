@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, Keys, Tag};
@@ -48,7 +48,9 @@ pub const PUBLISH_OK_TIMEOUT_SECS: u64 = 30;
 /// A NIP-42-capable WebSocket connection to a Nostr relay.
 pub struct NostrWsConnection {
     ws: WsStream,
-    buffer: VecDeque<RelayMessage>,
+    /// Messages read while waiting for something else, each with when it
+    /// was read.
+    buffer: VecDeque<(Instant, RelayMessage)>,
     pending_challenge: Option<String>,
     relay_url: String,
 }
@@ -216,10 +218,23 @@ impl NostrWsConnection {
         &mut self,
         timeout_dur: Duration,
     ) -> Result<RelayMessage, WsClientError> {
-        if let Some(msg) = self.buffer.pop_front() {
-            return Ok(msg);
+        Ok(self.next_event_received(timeout_dur).await?.1)
+    }
+
+    /// [`Self::next_event`], with when the message was read off the socket.
+    ///
+    /// A message that arrived while another call, such as
+    /// [`Self::send_event`], waited for something else is returned later,
+    /// with the instant it arrived rather than the instant it is returned.
+    pub async fn next_event_received(
+        &mut self,
+        timeout_dur: Duration,
+    ) -> Result<(Instant, RelayMessage), WsClientError> {
+        if let Some(entry) = self.buffer.pop_front() {
+            return Ok(entry);
         }
-        self.recv_one(timeout_dur).await
+        let msg = self.recv_one(timeout_dur).await?;
+        Ok((Instant::now(), msg))
     }
 
     /// Closes the WebSocket connection gracefully.
@@ -237,10 +252,6 @@ impl NostrWsConnection {
     }
 
     async fn recv_one(&mut self, timeout_dur: Duration) -> Result<RelayMessage, WsClientError> {
-        if let Some(msg) = self.buffer.pop_front() {
-            return Ok(msg);
-        }
-
         // One deadline for the whole call, not one per WebSocket frame.
         //
         // This loop skips control frames, and answering a Ping is not the
@@ -295,9 +306,9 @@ impl NostrWsConnection {
         if let Some(idx) = self
             .buffer
             .iter()
-            .position(|m| matches!(m, RelayMessage::Auth { .. }))
+            .position(|(_, m)| matches!(m, RelayMessage::Auth { .. }))
         {
-            match self.buffer.remove(idx).unwrap() {
+            match self.buffer.remove(idx).unwrap().1 {
                 RelayMessage::Auth { challenge } => return Ok(challenge),
                 _ => unreachable!(),
             }
@@ -332,7 +343,7 @@ impl NostrWsConnection {
                             }
                             return Ok(challenge);
                         }
-                        other => self.buffer.push_back(other),
+                        other => self.buffer.push_back((Instant::now(), other)),
                     }
                 }
                 Message::Ping(data) => {
@@ -354,9 +365,9 @@ impl NostrWsConnection {
         if let Some(idx) = self
             .buffer
             .iter()
-            .position(|m| matches!(m, RelayMessage::Ok(ok) if ok.event_id == event_id))
+            .position(|(_, m)| matches!(m, RelayMessage::Ok(ok) if ok.event_id == event_id))
         {
-            match self.buffer.remove(idx).unwrap() {
+            match self.buffer.remove(idx).unwrap().1 {
                 RelayMessage::Ok(ok) => return Ok(ok),
                 _ => unreachable!(),
             }
@@ -384,9 +395,9 @@ impl NostrWsConnection {
                         RelayMessage::Ok(ok) if ok.event_id == event_id => return Ok(ok),
                         RelayMessage::Auth { ref challenge } => {
                             self.pending_challenge = Some(challenge.clone());
-                            self.buffer.push_back(msg);
+                            self.buffer.push_back((Instant::now(), msg));
                         }
-                        other => self.buffer.push_back(other),
+                        other => self.buffer.push_back((Instant::now(), other)),
                     }
                 }
                 Message::Ping(data) => {

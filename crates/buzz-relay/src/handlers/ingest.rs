@@ -605,7 +605,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
         KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
-        // Waker launch bundles (30180) are owner-authored agent configuration,
+        // Waker launch bundles (31180) are owner-authored agent configuration,
         // addressed by (owner_pubkey, kind, agent_pubkey) and NIP-44-encrypted
         // to the agent. `UsersWrite` for the same reason the sibling
         // managed-agent records above take it: the writer is the owner

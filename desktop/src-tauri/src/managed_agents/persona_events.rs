@@ -442,6 +442,7 @@ pub(crate) async fn flush_pending_events_at(
                 event.clone(),
                 owner_keys,
                 None,
+                Default::default(),
                 WS_PUBLISH_TIMEOUT_SECS,
             )
             .await

@@ -153,7 +153,13 @@ pub const KIND_EMOJI_ENTRY: u32 = 30180;
 /// Member of [`P_GATED_KINDS`]: readable only by the connection authenticated
 /// as the `d_tag` agent. See `PLANS/BUZZ_WAKER_DESIGN.md` §11 (design review
 /// closed, Alex, 2026-08-11).
-pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 30180;
+///
+/// Fork-only number, deliberately outside upstream's 3017x/3018x run: this
+/// was 30180 until upstream assigned 30180 to [`KIND_EMOJI_ENTRY`] (#8783).
+/// Nothing ever reaches a relay under it (see [`KIND_WAKER_BUNDLE_ENVELOPE`]),
+/// so the move needed no data migration. [`KIND_WAKER_START_REQUEST`] moved
+/// with it to 31181.
+pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 31180;
 
 /// The wire envelope a launch bundle is actually published in.
 ///
@@ -161,7 +167,7 @@ pub const KIND_WAKER_LAUNCH_BUNDLE: u32 = 30180;
 /// reaches a relay. They differ because the transport has to work against
 /// relays this project does not operate, and an unrecognised kind is refused
 /// at ingest (`required_scope_for_kind` answers `restricted: unknown event
-/// kind` for anything it does not enumerate). 30180 is not upstream, so a
+/// kind` for anything it does not enumerate). 31180 is not upstream, so a
 /// bundle published under it is rejected by every relay that has not adopted
 /// it — which is what made remote wake silently impossible: the desktop
 /// retried forever and the daemon's tap had nothing to receive.
@@ -236,7 +242,7 @@ pub const KIND_WAKER_BUNDLE_ENVELOPE: u32 = KIND_GIFT_WRAP;
 /// the relay takes a deletion only from the signer it authenticated, which is
 /// the owner, not this key. They are small, carry nothing once stale, and
 /// are refused past their freshness window.
-pub const KIND_WAKER_START_REQUEST: u32 = 30181;
+pub const KIND_WAKER_START_REQUEST: u32 = 31181;
 
 /// Kinds whose stored events are readable only by their author.
 ///

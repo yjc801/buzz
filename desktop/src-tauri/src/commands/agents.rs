@@ -548,7 +548,7 @@ async fn create_managed_agent_in<R: tauri::Runtime>(
         let community_relay_url = crate::managed_agents::mint_scope_and_check_name(
             &records,
             &name,
-            &crate::relay::relay_ws_url_with_override(&state),
+            &crate::relay::relay_ws_url_with_override(state),
         )?;
         // Provider config was already validated in Pre-Phase 2; cache the discovered binary path for deploy_to_provider.
         let provider_binary_path = if let BackendKind::Provider { ref id, .. } = input.backend {

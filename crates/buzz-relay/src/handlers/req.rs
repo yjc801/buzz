@@ -3650,13 +3650,13 @@ mod tests {
         let event_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let bundle_kind = nostr::Kind::Custom(buzz_core::kind::KIND_WAKER_LAUNCH_BUNDLE as u16);
 
-        // Case 1: {kinds:[30180], ids:[...]} — explicit kind, requires #p agent.
+        // Case 1: {kinds:[31180], ids:[...]} — explicit kind, requires #p agent.
         let explicit_kind_ids_only = Filter::new()
             .kind(bundle_kind)
             .id(nostr::EventId::from_hex(event_id).unwrap());
         assert!(
             !p_gated_filters_authorized(&[explicit_kind_ids_only], authed),
-            "kind:30180 + ids without matching #p must be denied"
+            "kind:31180 + ids without matching #p must be denied"
         );
 
         let explicit_kind_wrong_p = Filter::new()
@@ -3665,7 +3665,7 @@ mod tests {
             .custom_tags(p_tag, [other]);
         assert!(
             !p_gated_filters_authorized(&[explicit_kind_wrong_p], authed),
-            "kind:30180 + ids + wrong #p must be denied"
+            "kind:31180 + ids + wrong #p must be denied"
         );
 
         // Case 2: kindless {ids:[...]} — passes this filter-level gate, same as
@@ -3681,7 +3681,7 @@ mod tests {
         let agent_by_p = Filter::new().kind(bundle_kind).custom_tags(p_tag, [authed]);
         assert!(
             p_gated_filters_authorized(&[agent_by_p], authed),
-            "kind:30180 with matching #p must be allowed"
+            "kind:31180 with matching #p must be allowed"
         );
 
         let agent_p_and_ids = Filter::new()
@@ -3690,7 +3690,7 @@ mod tests {
             .custom_tags(p_tag, [authed]);
         assert!(
             p_gated_filters_authorized(&[agent_p_and_ids], authed),
-            "kind:30180 with matching #p and ids must be allowed"
+            "kind:31180 with matching #p and ids must be allowed"
         );
     }
 

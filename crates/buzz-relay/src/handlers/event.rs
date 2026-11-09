@@ -3623,7 +3623,7 @@ mod tests {
 
         /// Live-fan-out regression for Alex's P1 finding on PR #24: a
         /// kindless `ids:[bundle_id]` subscription must not receive a
-        /// kind:30180 waker launch bundle unless the subscribing connection
+        /// kind:31180 waker launch bundle unless the subscribing connection
         /// IS the bundle's target agent (`reader_authorized_for_event`'s #p
         /// gate). Before the fix, `dispatch_persistent_event_inner`'s
         /// owner-only fence hardcoded only kind:30622/44200, so a non-agent

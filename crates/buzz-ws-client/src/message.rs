@@ -1,4 +1,4 @@
-use nostr::{Event, EventBuilder, Keys, RelayUrl, Tag};
+use nostr::{Event, EventBuilder, NostrSigner, RelayUrl, Tag};
 use serde_json::Value;
 
 use crate::error::WsClientError;
@@ -166,19 +166,19 @@ pub fn parse_relay_message(text: &str) -> Result<RelayMessage, WsClientError> {
     }
 }
 
-/// Builds a NIP-42 AUTH event, optionally injecting a NIP-OA auth tag.
+/// Builds a NIP-42 AUTH event signed by `signer`, optionally injecting a NIP-OA auth tag.
 ///
 /// The `auth_tag` parameter allows callers to attach a workspace-scoped
 /// authorization tag (e.g. `["auth", "<token>"]`) alongside the standard
 /// relay and challenge tags required by NIP-42.
-pub fn build_auth_event(
+pub async fn build_auth_event<S: NostrSigner>(
     challenge: &str,
     relay_url: &str,
-    keys: &Keys,
+    signer: &S,
     auth_tag: Option<&Tag>,
 ) -> Result<Event, WsClientError> {
     let extra: Vec<Tag> = auth_tag.into_iter().cloned().collect();
-    build_auth_event_with_tags(challenge, relay_url, keys, &extra)
+    build_auth_event_with_tags(challenge, relay_url, signer, &extra).await
 }
 
 /// Build a signed NIP-42 AUTH event carrying arbitrary extra tags.
@@ -187,15 +187,16 @@ pub fn build_auth_event(
 /// intent that the relay will trust, because the Schnorr signature covers the
 /// tags. Two things ride there today: the NIP-OA `auth` attestation, and the
 /// `class` tag that requests a restricted connection class.
-pub fn build_auth_event_with_tags(
+pub async fn build_auth_event_with_tags<S: NostrSigner>(
     challenge: &str,
     relay_url: &str,
-    keys: &Keys,
+    signer: &S,
     extra_tags: &[Tag],
 ) -> Result<Event, WsClientError> {
     let url = RelayUrl::parse(relay_url).map_err(|e| WsClientError::Url(e.to_string()))?;
     EventBuilder::auth(challenge, url)
         .tags(extra_tags.to_vec())
-        .sign_with_keys(keys)
+        .sign(signer)
+        .await
         .map_err(|e| WsClientError::EventBuilder(e.to_string()))
 }

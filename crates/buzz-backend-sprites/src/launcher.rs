@@ -576,8 +576,8 @@ mod tests {
             "the pre-start pass is unbounded: {line}"
         );
         assert!(
-            line.contains("9>&-") && line.ends_with("|| true"),
-            "the pre-start pass can hold the election lock or fail the start: {line}"
+            line.contains(" 7<&9 9>&- ") && line.ends_with("|| true"),
+            "the pre-start pass is not handed the election lock on fd 7, or can fail the start: {line}"
         );
         let exec = LAUNCHER_SH
             .find(r#"exec "$BUZZ/bin/buzz-acp""#)
@@ -591,10 +591,23 @@ mod tests {
                 .contains(r#"[ "$SWEEP_SHARED" = 1 ] || return 0"#),
             "the shared caches are listed by a sweep that runs beside the harness"
         );
+        // The flag alone must not be what permits the purge: any caller can
+        // pass it. The one assignment is behind the lifecycle evidence.
         assert_eq!(
             WORKSPACE_SH.matches("SWEEP_SHARED=1").count(),
             1,
-            "something other than --before-start makes the shared caches purgeable"
+            "something other than the launcher's own call makes the shared caches purgeable"
+        );
+        assert!(
+            WORKSPACE_SH.contains("if sweep_before_harness; then SWEEP_SHARED=1; fi"),
+            "the shared caches are purgeable without proof that no harness is alive"
+        );
+        let proof = sweep_fn_body("sweep_before_harness");
+        assert!(
+            proof.contains(r#"[ /dev/fd/7 -ef "$lock" ]"#)
+                && proof.contains("flock -n 7")
+                && proof.contains(r#"[ "$comm" != buzz-acp ]"#),
+            "the pre-start proof no longer needs both the agent lock and no live harness"
         );
     }
 

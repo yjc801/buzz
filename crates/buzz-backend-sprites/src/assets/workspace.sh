@@ -112,9 +112,10 @@ default 8, for the disk the slots are on) it also purges idle rebuildable
 caches on that disk -- target/ and node_modules/, unclaimed slots first. The
 launcher runs it at every start and daily while the agent lives, and within a
 minute of a disk falling under its floor (then at most every ten). The shared
-pnpm store and cargo cache are purged only by `sweep --before-start`, which
-the launcher runs before the agent exists: any build may be reading them, and
-no build takes a lock of ours. Every destructive step
+pnpm store and cargo cache are purged only by the `sweep --before-start` the
+launcher runs before the agent exists: any build may be reading them, and no
+build takes a lock of ours. Passing the flag is not enough -- the call must
+hold the launcher's agent lock while no harness is alive. Every destructive step
 is serialized against a hand-out by the reclaim fence, and a directory is
 always moved aside with one rename before it is deleted, so nothing is ever
 pulled out from under a live turn. --dry-run reports without acting, --if-due exits at once
@@ -685,9 +686,11 @@ SWEEP_MIN_FREE_GB="${BUZZ_WORKSPACE_MIN_FREE_GB:-10}"
 SWEEP_LOCAL_MIN_FREE_GB="${BUZZ_WORKSPACE_LOCAL_MIN_FREE_GB:-8}"
 SWEEP_PRESSURE_INTERVAL="${BUZZ_WORKSPACE_PRESSURE_INTERVAL:-600}"
 SWEEP_PRESSURE_ONLY=0
-# Set only by `sweep --before-start`: the one pass in which the caches every
-# checkout shares may be purged. See sweep_list_shared_caches.
+# Set only for the launcher's own `sweep --before-start` (sweep_before_harness
+# decides): the one pass in which the caches every checkout shares may be
+# purged. See sweep_list_shared_caches.
 SWEEP_SHARED=0
+SWEEP_SHARED_WHY=""
 SWEEP_API_BUDGET="${BUZZ_WORKSPACE_SWEEP_API_BUDGET:-40}"
 SWEEP_ROOTS="${BUZZ_WORKSPACE_SWEEP_ROOTS:-$HOME}"
 SWEEP_DEPTH="${BUZZ_WORKSPACE_SWEEP_DEPTH:-6}"
@@ -1756,8 +1759,8 @@ sweep_list_caches() {
 # before the rename is not a fence either -- a build can start between the
 # read and the rename, and then loses its store mid-command. What does hold
 # is that with no harness there is no agent to start one. So a sweep that
-# runs beside the harness never lists them, whatever it reads, and between
-# starts they are simply not bounded.
+# runs beside the harness never lists them, whatever it reads or is told (see
+# sweep_before_harness), and between starts they are simply not bounded.
 #
 # They are listed only as what pnpm and this script made: a versioned store
 # under the configured directory, never that directory.
@@ -1778,6 +1781,45 @@ sweep_list_shared_caches() {
         d=$(sweep_realpath "$d") || continue
         printf '%s %s - - %s %s\n' "$prio" "$(mtime_of "$d")" "$d" "$d" >>"$SWEEP_TMP/builddirs"
     done
+}
+
+# Is this the launcher's call, made before it execs the harness? rc 1 with the
+# reason in SWEEP_SHARED_WHY when that cannot be shown.
+#
+# `--before-start` alone shows nothing: any caller can pass it, and an agent
+# passing it from a live turn would reopen exactly the race the flag exists to
+# close. Two facts together are what a live harness cannot supply:
+#   1. This process holds the agent lock, through the descriptor the launcher
+#      handed it on fd 7. The launcher takes that lock before anything else
+#      and keeps it across its exec, so while it is held here nothing can
+#      become the harness except the launcher that is waiting on this call.
+#      This is the fence; the descriptor stays open for the whole pass.
+#   2. No harness is alive. A process started under a live harness may have
+#      inherited the lock's descriptor, but it cannot make its own harness not
+#      exist. `buzz-acp` in /proc/<pid>/comm is what the launcher and the
+#      provider's probe already go by, and the caches are shared by the whole
+#      machine, so a harness anywhere on it counts.
+# Where there is no flock or no /proc neither can be shown, and the shared
+# caches are kept.
+sweep_before_harness() {
+    local lock="$BUZZ/agent.lock" p comm
+    if ! command -v flock >/dev/null 2>&1 || [ ! -d /proc ]; then
+        SWEEP_SHARED_WHY="this host has no flock or no /proc to show there is no harness"
+        return 1
+    fi
+    if ! [ /dev/fd/7 -ef "$lock" ] || ! flock -n 7 2>/dev/null; then
+        SWEEP_SHARED_WHY="not called by the launcher (fd 7 does not hold $lock)"
+        return 1
+    fi
+    for p in /proc/[0-9]*; do
+        comm=""
+        { read -r comm <"$p/comm"; } 2>/dev/null || continue
+        [ "$comm" != buzz-acp ] || {
+            SWEEP_SHARED_WHY="a harness is running (pid ${p#/proc/})"
+            return 1
+        }
+    done
+    return 0
 }
 
 # A process stands in some checkout, or anywhere under the slot root. Before
@@ -1916,10 +1958,12 @@ cmd_sweep() {
     if [ "$before_start" = 1 ]; then
         # The launcher's foreground call, before the harness exists. A start
         # must not wait on housekeeping, so this is two `df` calls and an exit
-        # unless a disk is under its floor -- and then the pressure pass alone,
-        # with the shared caches eligible (see sweep_list_shared_caches).
+        # unless a disk is under its floor -- and then the pressure pass alone.
+        # The shared caches are eligible only when this really is that call:
+        # from anyone else the flag buys nothing a plain sweep would not do.
         sweep_under_floor || return 0
-        SWEEP_PRESSURE_ONLY=1 SWEEP_SHARED=1
+        SWEEP_PRESSURE_ONLY=1
+        if sweep_before_harness; then SWEEP_SHARED=1; fi
     elif [ "$if_due" = 1 ] && [ -e "$SWEEP_DIR/last-ok" ]; then
         local age
         age=$(($(date +%s) - $(mtime_of "$SWEEP_DIR/last-ok")))
@@ -1964,6 +2008,7 @@ cmd_sweep() {
     if [ "$SWEEP_DRY" = 1 ]; then
         sweep_log "dry run: nothing below was changed"
     fi
+    [ -z "$SWEEP_SHARED_WHY" ] || sweep_log "shared caches kept: $SWEEP_SHARED_WHY"
 
     # Clones are independent: one that fails (a corrupt repository, a
     # command the substrate lacks) is logged and the rest are still swept.

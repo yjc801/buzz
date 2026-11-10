@@ -137,8 +137,15 @@ setsid "$BUZZ/keepawake.sh" </dev/null >/dev/null 2>&1 9>&- &
 # no build takes a lock of ours, so the only time they can be purged is now,
 # while there is no agent to start one. `--before-start` is two `df` calls and
 # an exit unless a disk is under its floor, and it is bounded either way: a
-# start must not wait on housekeeping. Off the election lock, best effort.
-timeout 20 nice -n 19 "$BUZZ/bin/buzz-workspace" sweep --before-start >>"$BUZZ/workspace-sweep.log" 2>&1 9>&- || true
+# start must not wait on housekeeping. Best effort.
+#
+# The flag is not what permits the purge -- an agent could pass it too. The
+# election lock is: it is handed over on fd 7 (workspace.sh uses 8 and 9 for
+# its own locks), and the sweep purges a shared cache only while it holds
+# that lock AND no harness is alive, which is true of this call alone. It is
+# a foreground call that `timeout` ends with its whole process group, so the
+# descriptor cannot outlive it the way the background sweep's could.
+timeout 20 nice -n 19 "$BUZZ/bin/buzz-workspace" sweep --before-start >>"$BUZZ/workspace-sweep.log" 2>&1 7<&9 9>&- || true
 
 (
     exec 9>&-

@@ -52,8 +52,10 @@
 #     floor gives up only the caches that are on it, and a disk that falls
 #     under its floor between daily sweeps gets a pressure-only pass, backed
 #     off; the caches every checkout shares are never purged by a sweep that
-#     runs beside the harness -- only by `sweep --before-start`, last, and
-#     not while a process still stands in a checkout;
+#     runs beside the harness, whatever flag it is given -- only by the
+#     `sweep --before-start` that holds the launcher's agent lock while no
+#     harness is alive (Linux only: the evidence is flock and /proc), last,
+#     and not while a process still stands in a checkout;
 #   * a slot lost with the local disk is re-created cold at the same path and
 #     reported, its commits still in the clone -- and a slot that is still
 #     there and dirty is never re-created over.
@@ -734,33 +736,86 @@ exists "and the cargo cache, and so does the pressure pass" "$CARGO/registry/blo
 # What may purge them is the pass the launcher runs BEFORE the harness exists,
 # when there is no agent to start a build. Above the floor it is a no-op...
 W_BEFORE="$R/wt-before"; wt "$W_BEFORE" "$BASE"; age "$W_BEFORE" "$OLD"
+BEGUN=$(grep -c ' begin' "$LOG")
 bash "$WS" sweep --before-start >/dev/null 2>&1
 exists "--before-start above the floor purges nothing" "$STORE/files/blob"
-check "and does not even begin a pass" "$(grep -qF "before the harness starts" "$LOG"; [ $? -ne 0 ]; echo $?)"
-# ...and a process still standing in a checkout -- a build an earlier
-# generation left running -- keeps them, on either disk. The evidence is
-# /proc, so this half only means anything on Linux.
-if [ -d /proc ]; then
+check "and does not even begin a pass" "$([ "$(grep -c ' begin' "$LOG")" = "$BEGUN" ]; echo $?)"
+# ...and under it, the flag alone buys nothing: it is what an agent would get
+# by running the documented command from a live turn. It is the pressure pass
+# and no more.
+: >"$T/gh/calls.log"
+FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start >/dev/null 2>&1
+exists "--before-start from anyone but the launcher keeps the pnpm store" "$STORE/files/blob"
+exists "and the cargo cache" "$CARGO/registry/blob"
+logged "shared caches kept: "
+exists "it is the pressure pass alone: a reclaimable checkout is not touched" "$W_BEFORE"
+check "and no GitHub read is made, so a start never waits on the network" "$([ ! -s "$T/gh/calls.log" ]; echo $?)"
+# What does permit the purge is what a live harness cannot supply: the
+# launcher's hold on the agent lock, handed over on fd 7, while no process on
+# the machine is a harness. Both are Linux evidence (flock, /proc); anywhere
+# else the caches are simply kept, which the checks above already saw.
+if [ -d /proc ] && command -v flock >/dev/null 2>&1; then
+  # The call exactly as launcher.sh makes it, from a process that won the
+  # election and has not exec'd.
+  as_launcher() {
+    (
+      exec 9>"$HOME/.buzz/agent.lock"
+      flock -n 9 || exit 9
+      FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start 7<&9 9>&-
+    )
+  }
+  kept() { exists "$1: the pnpm store is kept" "$STORE/files/blob"; exists "$1: the cargo cache is kept" "$CARGO/registry/blob"; }
+  # A descriptor on fd 7 that is not the agent lock is not the launcher's.
+  FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start 7>"$T/not-the-lock" >/dev/null 2>&1
+  kept "fd 7 on some other file"
+  logged "not called by the launcher"
+  # Nor is the lock's path enough when someone else holds the lock.
+  ( exec 9>"$HOME/.buzz/agent.lock"; flock -n 9 && exec sleep 60 ) &
+  HOLDER=$!
+  sleep 1
+  FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start 7>>"$HOME/.buzz/agent.lock" >/dev/null 2>&1
+  kept "fd 7 on the lock while another process holds it"
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+  # A live harness: a process whose comm is buzz-acp, as the launcher's exec
+  # through the symlink makes it. A turn under it can inherit the lock's
+  # descriptor, so the hold alone must not be enough.
+  ln -s "$(command -v bash)" "$T/buzz-acp"
+  "$T/buzz-acp" -c 'kill -STOP $$' &
+  HARNESS=$!
+  sleep 1
+  as_launcher >/dev/null 2>&1
+  kept "the lock held, but a harness alive"
+  logged "shared caches kept: a harness is running (pid $HARNESS)"
+  kill -KILL "$HARNESS" 2>/dev/null; wait "$HARNESS" 2>/dev/null
+  # A process still standing in a checkout -- a build an earlier generation
+  # left running -- keeps them too, on either disk.
   ( cd "$C2" && exec sleep 60 ) &
   STRAY=$!
   sleep 1
-  FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start >/dev/null 2>&1
-  exists "--before-start keeps the store while a process stands in a home-disk checkout" "$STORE/files/blob"
-  exists "and the cargo cache" "$CARGO/registry/blob"
-  logged "a process is still working in a checkout"
+  as_launcher >/dev/null 2>&1
+  LIVE=$(for p in /proc/[0-9]*/comm; do { read -r c <"$p"; } 2>/dev/null && [ "$c" = buzz-acp ] && echo "${p%/comm}"; done | head -n 1)
+  kept "a process standing in a home-disk checkout"
+  [ -n "$LIVE" ] || logged "a process is still working in a checkout"
   kill "$STRAY" 2>/dev/null; wait "$STRAY" 2>/dev/null
+  if [ -n "$LIVE" ]; then
+    # This host runs a real harness ($LIVE): an agent's own Sprite. The shared
+    # caches must survive even the launcher's exact call here, and the purge
+    # itself can only be seen on a host without one (CI).
+    as_launcher >/dev/null 2>&1
+    kept "a real harness on this host (${LIVE#/proc/})"
+    echo "note: the shared-cache purge itself was not exercised: a harness is alive on this host"
+  else
+    OUT=$(as_launcher 2>/dev/null)
+    gone "the launcher's call, under the floor: the shared pnpm store is purged" "$STORE"
+    gone "the launcher's call, under the floor: the shared cargo cache is purged" "$CARGO"
+    exists "the store's parent directory is never the thing removed" "$LOCAL/.pnpm-store"
+    store_line=$(grep -n "purged build cache $STORE " "$LOG" | tail -n 1 | cut -d: -f1)
+    cargo_line=$(grep -n "purged build cache $CARGO " "$LOG" | tail -n 1 | cut -d: -f1)
+    check "the store goes before the cargo cache (store at line ${store_line:-none}, cargo at ${cargo_line:-none})" \
+      "$([ -n "$store_line" ] && [ -n "$cargo_line" ] && [ "$store_line" -lt "$cargo_line" ]; echo $?)"
+    logged "before the harness starts"
+  fi
 fi
-: >"$T/gh/calls.log"
-OUT=$(FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start 2>/dev/null)
-gone "--before-start under the floor: the shared pnpm store is purged" "$STORE"
-gone "--before-start under the floor: the shared cargo cache is purged" "$CARGO"
-exists "the store's parent directory is never the thing removed" "$LOCAL/.pnpm-store"
-store_line=$(grep -n "purged build cache $STORE " "$LOG" | tail -n 1 | cut -d: -f1)
-cargo_line=$(grep -n "purged build cache $CARGO " "$LOG" | tail -n 1 | cut -d: -f1)
-check "the store goes before the cargo cache (store at line ${store_line:-none}, cargo at ${cargo_line:-none})" \
-  "$([ -n "$store_line" ] && [ -n "$cargo_line" ] && [ "$store_line" -lt "$cargo_line" ]; echo $?)"
-exists "it is the pressure pass alone: a reclaimable checkout is not touched" "$W_BEFORE"
-check "and no GitHub read is made, so a start never waits on the network" "$([ ! -s "$T/gh/calls.log" ]; echo $?)"
 exists "and the home disk, above its floor, still has its caches" "$CLONE/target/artifact"
 
 # Only the HOME disk under its floor: the mirror image.

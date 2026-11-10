@@ -119,12 +119,22 @@ therefore holds that disk to its own floor — see the knobs below.
 The caches every checkout shares are the exception to "the sweep runs beside
 the agent". Any install or build may be reading the pnpm store or the cargo
 cache, and none of them takes a lock of ours, so there is no check after which
-purging them beside a live harness is safe. They are purged only by
-`buzz-workspace sweep --before-start`, which the launcher runs in the
-foreground before it execs the harness (two `df` calls unless a disk is under
-its floor, bounded at 20 seconds), and not while a process left over from an
-earlier generation still stands in a checkout. Between starts they are not
-bounded; what is bounded while the agent lives is the per-checkout caches.
+purging them beside a live harness is safe. They are purged only by the
+`buzz-workspace sweep --before-start` the launcher runs in the foreground
+before it execs the harness (two `df` calls unless a disk is under its floor,
+bounded at 20 seconds), and not while a process left over from an earlier
+generation still stands in a checkout. Between starts they are not bounded;
+what is bounded while the agent lives is the per-checkout caches.
+
+The flag does not permit that purge by itself, because an agent can pass it
+too. The sweep purges a shared cache only when both hold: it has the agent
+lock, on the descriptor the launcher hands it (fd 7), and no `buzz-acp`
+process is alive on the machine. The launcher takes that lock before anything
+else and keeps it across its exec, so while the sweep holds it the only thing
+that can become the harness is the launcher waiting on that call; and a turn
+under a live harness, which may have inherited the descriptor, cannot make its
+own harness not exist. Anyone else passing `--before-start` gets the ordinary
+pressure pass and a log line saying why the shared caches were kept.
 
 ## Workspace hygiene
 

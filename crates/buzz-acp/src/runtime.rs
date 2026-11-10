@@ -57,6 +57,8 @@ pub(crate) struct PoolStartup {
     pub(crate) model: Option<String>,
     pub(crate) effort_level: Option<String>,
     pub(crate) observer: Option<observer::ObserverHandle>,
+    /// Bound on one agent's `initialize` while the pool starts.
+    pub(crate) init_timeout: Duration,
 }
 
 impl PoolStartup {
@@ -70,6 +72,7 @@ impl PoolStartup {
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
+            init_timeout: Duration::from_secs(60),
         }
     }
 }

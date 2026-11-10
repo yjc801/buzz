@@ -13,6 +13,8 @@ mod isolated_execution;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+#[cfg(all(test, unix))]
+mod pool_wake_test;
 mod prompt_framing;
 mod prompt_project;
 mod queue;
@@ -2894,7 +2896,7 @@ async fn run_harness(
     let mut pool = if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
-        initialize_agent_pool(&runtime.startup(observer.clone()), None).await?
+        initialize_agent_pool(&runtime.startup(observer.clone()), None, PoolFill::All).await?
     };
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
@@ -3255,7 +3257,20 @@ async fn run_harness(
         Recovery(recovery_wake::RecoveryWake),
     }
 
+    // Set when the lazy pool gives up waking; returned after the normal
+    // shutdown path so the process exits non-zero with the reason.
+    let mut fatal_error: Option<String> = None;
+
     loop {
+        // Consecutive wake failures exhausted the retry budget. Exit like the
+        // eager path does when no agent starts, so the supervisor sees a dead
+        // harness instead of one that stays online and never takes a turn.
+        if let Some(error) = pool_lifecycle.exhausted_error() {
+            tracing::error!("{error}");
+            fatal_error = Some(error);
+            break;
+        }
+
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3279,9 +3294,12 @@ async fn run_harness(
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
                 wake_tasks.spawn(async move {
-                    let result = initialize_agent_pool(&startup, Some(wake_shutdown))
-                        .await
-                        .map_err(|error| error.to_string());
+                    // Hand the pool over at the first ready agent: the wake arm
+                    // below fills the remaining slots in the background.
+                    let result =
+                        initialize_agent_pool(&startup, Some(wake_shutdown), PoolFill::FirstLive)
+                            .await
+                            .map_err(|error| error.to_string());
                     if let Err(error) = wake_tx.send((attempt, result)).await {
                         let (_attempt, result) = error.0;
                         if let Ok(mut abandoned_pool) = result {
@@ -4256,6 +4274,13 @@ async fn run_harness(
                             .take_ready()
                             .expect("successful wake stores a ready pool");
                         pool_ready = true;
+                        spawn_pool_fill(
+                            &pool,
+                            &mut crash_history,
+                            runtime.startup(observer.clone()),
+                            &respawn_tx,
+                            &mut respawn_tasks,
+                        );
                         emit_runtime_lifecycle(
                             observer.as_ref(),
                             &runtime_start_nonce,
@@ -4276,6 +4301,7 @@ async fn run_harness(
                     }
                     Err(error) => {
                         debug_assert_eq!(pool_lifecycle.failed_error(), Some(error.as_str()));
+                        tracing::warn!(attempt, "pool wake failed: {error}");
                         emit_runtime_lifecycle(
                             observer.as_ref(),
                             &runtime_start_nonce,
@@ -4427,7 +4453,10 @@ async fn run_harness(
     relay.shutdown().await;
 
     tracing::info!("buzz-acp stopped");
-    Ok(())
+    match fatal_error {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(()),
+    }
 }
 
 #[derive(PartialEq)]
@@ -6072,14 +6101,75 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
     }
 }
 
+/// How much of the pool [`initialize_agent_pool`] starts before returning.
+#[derive(Clone, Copy, PartialEq)]
+enum PoolFill {
+    /// Every slot, one after another (eager startup).
+    All,
+    /// Stop at the first agent that initializes and leave the later slots
+    /// empty for [`spawn_pool_fill`]. A lazy wake uses this so the first turn
+    /// waits for one agent start, not for all of them.
+    FirstLive,
+}
+
+/// Start the still-empty slots of a freshly woken pool in the background.
+///
+/// Slots start one at a time, as eager startup does: agent startup can be
+/// bound by a shared disk, where concurrent starts contend. Each result
+/// travels the respawn channel, so a slot counts as "respawn in flight" until
+/// it lands. That one flag keeps maintenance from starting the slot twice,
+/// defers idle pool sleep, and stops the "all agents dead" exit while the
+/// pool is still filling. A slot that fails opens its circuit and is retried
+/// by maintenance after the cooldown.
+fn spawn_pool_fill(
+    pool: &AgentPool,
+    crash_history: &mut [SlotCircuit],
+    startup: PoolStartup,
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+) {
+    let mut guards = Vec::new();
+    for (idx, slot) in crash_history.iter_mut().enumerate() {
+        if !pool.slot_alive(idx) && !slot.respawn_in_flight {
+            slot.respawn_in_flight = true;
+            guards.push(RespawnGuard::new(idx, respawn_tx.clone()));
+        }
+    }
+    if guards.is_empty() {
+        return;
+    }
+    tracing::info!(
+        slots = guards.len(),
+        "pool fill: starting remaining agents in background"
+    );
+    respawn_tasks.spawn(async move {
+        for guard in guards {
+            let result = spawn_and_init(
+                &startup.command,
+                &startup.args,
+                &startup.extra_env,
+                startup.has_generated_codex_config,
+                guard.index,
+                startup.observer.clone(),
+            )
+            .await;
+            guard.send(result);
+        }
+    });
+}
+
 async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
+    fill: PoolFill,
 ) -> Result<AgentPool> {
     // One agent failing to start must not kill the whole pool.
-    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
+    // Attempt each spawn under `init_timeout`; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
+        if fill == PoolFill::FirstLive && agent_slots.iter().any(Option::is_some) {
+            break;
+        }
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
@@ -6090,7 +6180,7 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
-                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize = tokio::time::timeout(startup.init_timeout, acp.initialize());
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
                         biased;
@@ -6148,7 +6238,11 @@ async fn initialize_agent_pool(
                         agent_slots.push(None);
                     }
                     Err(_) => {
-                        tracing::error!(agent = i, "agent timed out during init (60s)");
+                        tracing::error!(
+                            agent = i,
+                            "agent timed out during init ({:?})",
+                            startup.init_timeout
+                        );
                         acp.shutdown().await;
                         agent_slots.push(None);
                     }
@@ -6167,7 +6261,9 @@ async fn initialize_agent_pool(
             startup.agents
         ));
     }
-    if live_count < startup.agents as usize {
+    // Slots a first-live wake has not attempted stay empty for the fill.
+    agent_slots.resize_with(startup.agents as usize, || None);
+    if fill == PoolFill::All && live_count < startup.agents as usize {
         tracing::warn!(
             "started {}/{} agents — continuing with reduced pool",
             live_count,

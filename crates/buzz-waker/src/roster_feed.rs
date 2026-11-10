@@ -698,7 +698,7 @@ pub async fn run_roster_tap(
             }
         }
 
-        let connect = NostrWsConnection::connect_authenticated(relay_url, waker_keys, auth_tag);
+        let connect = crate::relay_feed::connect_authenticated(relay_url, waker_keys, auth_tag);
         let mut connection = tokio::select! {
             result = connect => match result {
                 Ok(connection) => connection,

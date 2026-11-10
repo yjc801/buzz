@@ -154,16 +154,21 @@ impl<E: std::fmt::Display> std::fmt::Display for SetupError<E> {
 }
 
 /// Await one setup step, bounded by `deadline` when the reconnect has one.
+/// `None` if `cancel` fires first.
+///
+/// Setup holds the agent's cursor, and the supervisor starts this agent's next
+/// wake loop only once this one has returned, so a cancelled setup must not run
+/// on to its end: paced subscriptions alone take up to [`MAX_SUBSCRIBE_PACING`].
 async fn within<T, E>(
+    cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
     step: impl std::future::Future<Output = Result<T, E>>,
-) -> Result<T, SetupError<E>> {
-    match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline, step).await {
-            Ok(result) => result.map_err(SetupError::Step),
-            Err(_) => Err(SetupError::Overran),
-        },
-        None => step.await.map_err(SetupError::Step),
+) -> Option<Result<T, SetupError<E>>> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        result = step => Some(result.map_err(SetupError::Step)),
+        () = sleep_until_some(deadline) => Some(Err(SetupError::Overran)),
     }
 }
 
@@ -404,9 +409,9 @@ pub const WAKE_LOOP_SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 /// once, outliving every individual connection attempt, and closes it (via
 /// `Drop`) only when this function returns.
 ///
-/// That is later than `cancel` firing: a connection setup in progress runs to
-/// its end first (it does not observe the token), and then in-flight attempts
-/// get [`WAKE_LOOP_SHUTDOWN_DRAIN`]. The cursor's file lock is held throughout,
+/// That is later than `cancel` firing: connection setup stops at the token,
+/// but in-flight attempts then get [`WAKE_LOOP_SHUTDOWN_DRAIN`] to settle
+/// their claims. The cursor's file lock is held throughout,
 /// so a second `run_wake_loop` for the same agent fails to open it until this
 /// call has returned — the caller must not start one before then.
 ///
@@ -479,7 +484,17 @@ pub async fn run_wake_loop(
         );
         let setup_deadline = std::mem::take(&mut refreshing)
             .then(|| tokio::time::Instant::now() + config.refresh_setup_deadline);
-        if let Err(error) = within(setup_deadline, transport.connect()).await {
+        // One setup step's result, or out of the loop by the main loop's own
+        // exit if cancelled meanwhile: a cancel is not a failed step.
+        macro_rules! step {
+            ($step:expr) => {{
+                let Some(result) = within(&cancel, setup_deadline, $step).await else {
+                    break 'reconnect;
+                };
+                result
+            }};
+        }
+        if let Err(error) = step!(transport.connect()) {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: mention feed connect failed");
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
@@ -510,8 +525,7 @@ pub async fn run_wake_loop(
         // discovered channel — all before the first subscribe_backfill call,
         // or a mention published in the gap is lost for good. Every one of
         // these calls carries the same `since`, never connect time.
-        let discovered_channels = match within(setup_deadline, transport.discover_channels()).await
-        {
+        let discovered_channels = match step!(transport.discover_channels()) {
             Ok(channels) => channels,
             Err(error) => {
                 tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: channel discovery failed");
@@ -526,12 +540,7 @@ pub async fn run_wake_loop(
         // open: a probe failure means subscribe to everything, because a
         // wasted subscription is cheap and a wrongly skipped live channel
         // loses every wake in it.
-        let archived = match within(
-            setup_deadline,
-            transport.archived_channels(&discovered_channels),
-        )
-        .await
-        {
+        let archived = match step!(transport.archived_channels(&discovered_channels)) {
             Ok(archived) => archived,
             Err(SetupError::Overran) => {
                 tracing::warn!(
@@ -576,7 +585,7 @@ pub async fn run_wake_loop(
         }
         watched = Some(discovered_set);
 
-        if let Err(error) = within(setup_deadline, transport.subscribe_membership(since)).await {
+        if let Err(error) = step!(transport.subscribe_membership(since)) {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: membership watch subscribe failed");
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
@@ -587,12 +596,7 @@ pub async fn run_wake_loop(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            if let Err(error) = within(
-                setup_deadline,
-                transport.subscribe_channel_live(channel_id, since),
-            )
-            .await
-            {
+            if let Err(error) = step!(transport.subscribe_channel_live(channel_id, since)) {
                 tracing::warn!(
                     agent = %agent_pubkey, %channel_id, %error,
                     "buzz-waker: channel live subscribe failed"
@@ -601,8 +605,7 @@ pub async fn run_wake_loop(
                 continue 'reconnect;
             }
         }
-        if let Err(error) = within(setup_deadline, transport.subscribe_backfill(since, None)).await
-        {
+        if let Err(error) = step!(transport.subscribe_backfill(since, None)) {
             tracing::warn!(agent = %agent_pubkey, %error, "buzz-waker: backfill subscribe failed");
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue 'reconnect;
@@ -1480,6 +1483,10 @@ fn spawn_attempt(
         }
     });
 }
+
+#[cfg(test)]
+#[path = "tests/setup_bounds_tests.rs"]
+mod setup_bounds_tests;
 
 #[cfg(test)]
 mod tests {

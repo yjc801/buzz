@@ -74,6 +74,48 @@ diagnostics database (`~/.codex/logs_<n>.sqlite`); the launcher drops one over
 256 MiB before starting the harness, since a 1 GB one added a minute to every
 Codex start and pushed requests past the harness's 60-second timeout.
 
+## Where build work lives
+
+A sprite has two disks. Everything outside `/tmp` is an overlay on a network
+block device that is synced to object storage and captured by checkpoints;
+`/tmp` is a local 20 GB ext4 disk that is neither. Measured on a fresh sprite
+(2026-11-10), `/tmp` ran a checkout, `pnpm install`, a Vite build, a cargo
+build and Playwright screenshots 1.2–1.8x faster end to end and up to 3x faster
+on the I/O-bound steps, and the network disk's fsync latency rose about
+fourfold over ten minutes of builds while `/tmp` did not move. A build on the
+network disk also slows every other writer on it, the harness included.
+
+So `buzz-workspace` hands out its slots on the local disk and keeps only what
+must outlive it on the home disk:
+
+| what | where | if `/tmp` is lost |
+|---|---|---|
+| slots (`<slot root><clone path>-slots/N`) and their `target/`, `node_modules/` | `/tmp/buzz-workspace/slots` | re-created cold at the same path on the next hand-out, which reports the loss; uncommitted changes are gone |
+| shared cargo cache | `/tmp/buzz-workspace/cache` | re-seeded or re-downloaded |
+| pnpm store for a slot | `/tmp/.pnpm-store` (pnpm's own per-filesystem default) | re-downloaded |
+| the clone: objects, branches, every commit made in a slot | `~/.buzz/REPOS` | — |
+| slot stamps and claims | `~/.buzz/.workspace-slots` | — |
+
+`/tmp` survives a suspend and resume. It also survives a checkpoint restore,
+which rewinds only the home disk (both measured). It is not checkpointed, and
+nothing promises that it follows the sprite to another machine. A restore
+therefore leaves the two disks out of step: a slot made after the checkpoint
+is still on `/tmp` but the clone no longer knows it. `buzz-workspace` never
+re-creates over such a directory — it may hold work — and names it instead, so
+move it away to get the slot back.
+
+pnpm keeps one store per filesystem when none is configured, so a slot
+hard-links from a store on its own disk with no setting. The store is
+deliberately not forced onto `/tmp` for every checkout: an install in a
+home-disk checkout would then copy instead of link, and measured 46.6 s
+against 5–11.5 s. Set `pnpm_config_store_dir` (pnpm 11) or
+`npm_config_store_dir` (earlier) per agent only once it no longer works in
+home-disk checkouts.
+
+`/tmp` is small and not all of it is ours: the platform keeps its write cache
+for the network disk there (about 5.6 GB that `du` does not show). The sweep
+therefore holds that disk to its own floor — see the knobs below.
+
 ## Workspace hygiene
 
 Agents mint checkouts faster than they retire them: before this existed the
@@ -90,11 +132,12 @@ What it reclaims, and the evidence it needs first:
 | checkout | when | action |
 |---|---|---|
 | linked worktree | every associated PR closed or merged, or the commit is on `origin/<default>` | `git worktree remove` (build caches go with it) |
-| slot (`<repo>-slots/N`) | same, and the claim has expired | claim released; the checkout and its build cache stay (that cache is the pool's purpose) |
+| slot | same, and the claim has expired | claim released; the checkout and its build cache stay (that cache is the pool's purpose) |
 | standalone clone | — | **never deleted and never switched** outside `~/.scratch`; only its idle caches are reclaimable, under disk pressure |
 | local branch | on `origin/<default>`, or the head of a closed PR and on some remote ref | deleted |
 | anything under `~/.scratch` | idle past the TTL | removed — disposable by the Nest contract, dirty or not |
-| idle rebuildable caches (`target/`, `node_modules/`) | free disk under the floor | purged, unclaimed slots first, until the floor is met |
+| idle rebuildable caches (`target/`, `node_modules/`) | the disk they are on is under its floor | purged, unclaimed slots first, until the floor is met |
+| shared caches (the slot disk's pnpm store, then the cargo cache) | same, and no checkout is in use | purged last |
 
 A pull request is tied to a checkout by evidence, never by a directory name
 alone: the exact `refs/pull/N/head` sha from one `git ls-remote`, the branch
@@ -113,7 +156,11 @@ Knobs, read from the agent's environment (set them per agent in Buzz Desktop):
 | `BUZZ_WORKSPACE_SWEEP_INTERVAL` | 86400 | seconds between sweeps while the harness lives (`--if-due`) |
 | `BUZZ_WORKSPACE_SWEEP_HOLD_MIN` | 180 | a checkout touched this recently is in use |
 | `BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS` | 7 | idle days before a `~/.scratch` checkout is removed |
-| `BUZZ_WORKSPACE_MIN_FREE_GB` | 10 | free-space floor that triggers the build-cache purge |
+| `BUZZ_WORKSPACE_MIN_FREE_GB` | 10 | free-space floor on the home disk that triggers the build-cache purge |
+| `BUZZ_WORKSPACE_LOCAL_MIN_FREE_GB` | 8 | the same floor for the disk the slots are on |
+| `BUZZ_WORKSPACE_PRESSURE_INTERVAL` | 600 | a disk under its floor between sweeps gets a pressure-only pass (no network, no checkout touched) at most this often, in seconds |
+| `BUZZ_WORKSPACE_SLOT_ROOT` | `/tmp/buzz-workspace/slots` | where slots are created. Keep it stable: cargo keys a build on the checkout's absolute path |
+| `BUZZ_WORKSPACE_CACHE` | `/tmp/buzz-workspace/cache` | the shared cargo cache |
 | `BUZZ_WORKSPACE_SWEEP_API_BUDGET` | 40 | GitHub reads per sweep; an unauthenticated sprite has 60 an hour |
 | `GH_TOKEN` / `GITHUB_TOKEN` | unset | authenticates the sweep's GitHub reads and its `git fetch`/`ls-remote` against github.com. **Required for a private repository**: the launcher's environment carries none of the credentials an agent session sets up for itself, so without a token a private origin fails its fetch (logged) and every decision that needed GitHub stays `unknown`. A fine-grained token with `contents: read` and `pull_requests: read` is enough; it also lifts the unauthenticated rate limit |
 | `BUZZ_WORKSPACE_FENCE_WAIT` | 30 | seconds to wait for the reclaim fence before keeping the checkout instead |

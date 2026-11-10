@@ -530,6 +530,31 @@ mod tests {
         }
     }
 
+    /// Build work goes on the sprite's local disk; only what must outlive
+    /// that disk stays in `$HOME`. A default that drifts back under `$HOME`
+    /// puts every build on the network disk again, and slot records that
+    /// follow the slots onto `/tmp` make a lost slot look like one that was
+    /// never handed out. The pnpm store is deliberately NOT forced onto
+    /// `/tmp` for every checkout: pnpm already keeps a store per filesystem,
+    /// and a forced one makes a home-disk install copy instead of link.
+    #[test]
+    fn build_work_defaults_to_the_local_disk_and_its_records_to_home() {
+        for default in [
+            r#"SLOT_ROOT="${BUZZ_WORKSPACE_SLOT_ROOT:-/tmp/buzz-workspace/slots}""#,
+            r#"CACHE_ROOT="${BUZZ_WORKSPACE_CACHE:-/tmp/buzz-workspace/cache}""#,
+            r#"STATE_ROOT="$BUZZ/.workspace-slots""#,
+        ] {
+            assert!(
+                WORKSPACE_SH.contains(default),
+                "workspace.sh no longer defaults to {default}"
+            );
+        }
+        assert!(
+            !LAUNCHER_SH.contains("store_dir"),
+            "the launcher forces a pnpm store on every checkout again"
+        );
+    }
+
     /// The launcher must exec the harness personality (comm "buzz-acp") and
     /// end in exactly one exec — the signal-path argument depends on both.
     #[test]

@@ -46,7 +46,16 @@
 #     the floor, nothing is;
 #   * a held reclaim fence keeps everything and refuses a hand-out, and a
 #     process standing in a reclaimable worktree keeps it (Linux only: the
-#     cwd evidence is /proc).
+#     cwd evidence is /proc);
+#   * slots are handed out on the LOCAL disk (the slot root), keyed by the
+#     clone's whole path, with their bookkeeping in $HOME; a disk under its
+#     floor gives up only the caches that are on it, the caches every
+#     checkout shares go last and only once no checkout is in use, and a disk
+#     that falls under its floor between daily sweeps gets a pressure-only
+#     pass, backed off;
+#   * a slot lost with the local disk is re-created cold at the same path and
+#     reported, its commits still in the clone -- and a slot that is still
+#     there and dirty is never re-created over.
 #
 # The `df` stub is pinned ABOVE the floor for every section but the
 # disk-pressure one. Inheriting the host's real free space made this suite
@@ -78,6 +87,11 @@ journal_has() { [ -s "$JOURNAL" ] && cut -d'|' -f2 "$JOURNAL" | grep -qxF -- "$1
 T=$(mktemp -d "${TMPDIR:-/tmp}/ws-sweep.XXXXXX")
 T=$(cd "$T" && pwd -P)
 if [ -z "${WSTEST_KEEP:-}" ]; then trap 'rm -rf "$T"' EXIT; else echo "keeping $T"; fi
+# Everything below names its repository explicitly, and a name that comes back
+# empty from a failed step turns `git -C ""` into "the current directory".
+# Stand somewhere that is not a repository, so that can never be the checkout
+# this suite was started from.
+cd "$T" || exit 2
 REAL_DF=$(command -v df)
 
 export HOME="$T/home"
@@ -86,7 +100,12 @@ export GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid
 export GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 unset GH_TOKEN GITHUB_TOKEN BUZZ_WORKSPACE_CLAIM BUZZ_WORKSPACE_SWEEP_DISABLED
-mkdir -p "$HOME/.buzz/REPOS" "$HOME/.scratch" "$T/stubs" "$T/gh"
+unset pnpm_config_store_dir npm_config_store_dir
+# The sprite's local disk: where slots and shared caches go. Never the real
+# /tmp/buzz-workspace -- the suite must not reach outside its own directory.
+LOCAL="$T/local"
+export BUZZ_WORKSPACE_SLOT_ROOT="$LOCAL/slots" BUZZ_WORKSPACE_CACHE="$LOCAL/cache"
+mkdir -p "$HOME/.buzz/REPOS" "$HOME/.scratch" "$T/stubs" "$T/gh" "$LOCAL"
 LOG="$HOME/.buzz/workspace-sweep.log"
 JOURNAL="$HOME/.buzz/.workspace-sweep/branch-journal"
 
@@ -131,13 +150,16 @@ esac
 [ -z "\$out" ] || printf '%s' "\$body" >"\$out"
 printf '%s' "\$code"
 STUB
+# Two filesystems, as on a sprite: everything under $LOCAL is one (mounted at
+# $LOCAL), the rest is the home disk. The local one reports its own free space
+# when FAKE_DF_LOCAL_FREE_KB is set and the home disk's otherwise.
 cat >"$T/stubs/df" <<STUB
 #!/usr/bin/env bash
-if [ -n "\${FAKE_DF_FREE_KB:-}" ]; then
-  printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfake 1 1 %s 1%% /\n' "\$FAKE_DF_FREE_KB"
-else
-  exec "$REAL_DF" "\$@"
-fi
+[ -n "\${FAKE_DF_FREE_KB:-}" ] || exec "$REAL_DF" "\$@"
+for path in "\$@"; do :; done
+free="\$FAKE_DF_FREE_KB" mount="$T"
+case "\$path" in "$LOCAL" | "$LOCAL"/*) free="\${FAKE_DF_LOCAL_FREE_KB:-\$free}" mount="$LOCAL" ;; esac
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfake 1 1 %s 1%% %s\n' "\$free" "\$mount"
 STUB
 chmod +x "$T/stubs/curl" "$T/stubs/df"
 export PATH="$T/stubs:$PATH"
@@ -151,6 +173,7 @@ git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
 git config --global url."$ORIGIN".insteadOf "https://github.com/acme/buzz.git"
 git config --global init.defaultBranch main
 commit() { # commit <checkout> <message> <file> → sha
+  [ -n "$1" ] && [ -e "$1/.git" ] || { echo "commit: not a checkout: '$1'" >&2; return 1; }
   echo "$2 $RANDOM" >>"$1/$3"
   git -C "$1" add -A
   git -C "$1" commit -q -m "$2"
@@ -233,9 +256,30 @@ git -C "$CLONE" branch -q agent/w/open "$PR13"
 # Slots through the production hand-out path.
 S1=$(BUZZ_WORKSPACE_CLAIM=tok1 bash "$WS" pr/12 2>/dev/null)
 S2=$(BUZZ_WORKSPACE_CLAIM=tok2 bash "$WS" pr/13 2>/dev/null)
-SLOTS="$R/buzz-slots"
+SLOTS="$LOCAL/slots$CLONE-slots"
+STATE="$HOME/.buzz/.workspace-slots$SLOTS"
 check "slot 1 handed out" "$([ -n "$S1" ] && [ -e "$S1/.git" ]; echo $?)"
 check "slot 2 handed out" "$([ -n "$S2" ] && [ -e "$S2/.git" ]; echo $?)"
+# Where they went is the point: the local disk, at the clone's own path
+# re-rooted, with nothing left beside the clone -- and the bookkeeping, which
+# has to outlive that disk, in $HOME.
+check "slot 1 is on the local disk, under the slot root: $S1" "$([ "$S1" = "$SLOTS/1" ]; echo $?)"
+check "no slots directory is made beside the clone" "$([ ! -e "$R/buzz-slots" ]; echo $?)"
+check "the clone registers the slot as its worktree" \
+  "$(git -C "$CLONE" worktree list --porcelain | grep -qxF "worktree $S1"; echo $?)"
+check "slot bookkeeping is in \$HOME, not on the local disk" \
+  "$([ -s "$STATE/1.claim" ] && [ ! -e "$SLOTS/.state" ]; echo $?)"
+check "the shared cargo cache is on the local disk" \
+  "$([ "$(readlink "$S1/.hermit/rust")" = "$LOCAL/cache/buzz/cargo" ]; echo $?)"
+# Two clones that share a NAME must not share slots: a hand-out against one
+# would otherwise be given a worktree of the other and commit into it.
+mkdir -p "$T/elsewhere"
+TWIN="$T/elsewhere/buzz"
+git clone -q https://github.com/acme/buzz.git "$TWIN"
+ST=$(BUZZ_WORKSPACE_REPO="$TWIN" BUZZ_WORKSPACE_CLAIM=twin bash "$WS" main 2>/dev/null)
+check "a same-named clone gets its own slots: $ST" "$([ "$ST" = "$LOCAL/slots$TWIN-slots/1" ]; echo $?)"
+check "and its slot is a worktree of that clone" \
+  "$([ "$(cd "$(git -C "$ST" rev-parse --git-common-dir)" && pwd -P)" = "$TWIN/.git" ]; echo $?)"
 mkdir -p "$S1/target" "$CLONE/target"
 echo x >"$S1/target/artifact"
 echo y >"$CLONE/target/artifact"
@@ -276,8 +320,8 @@ for p in "$CLONE" "$W_MERGED" "$W_ONMAIN" "$W_CLOSED" "$W_OPEN" "$W_DIRTY" "$W_N
   age "$p" "$OLD"
 done
 age "$S_NEW" "$THREE_DAYS_AGO"
-touch -t "$OLD" "$SLOTS/.state/1"        # slot 1's hold has expired
-touch "$SLOTS/.state/2"                  # slot 2's claim is live
+touch -t "$OLD" "$STATE/1"               # slot 1's hold has expired
+touch "$STATE/2"                         # slot 2's claim is live
 
 # ── dry run: reports, changes nothing ───────────────────────────────────────
 echo "--- dry run"
@@ -288,7 +332,7 @@ exists "dry run: scratch clone" "$S_OLD"
 check "dry run names the merged worktree" "$(grep -qF "would remove worktree $W_MERGED" "$T/dry.err"; echo $?)"
 check "dry run names the branch" "$(grep -qF "would delete branch old-main" "$T/dry.err"; echo $?)"
 check "dry run records no completion" "$([ ! -e "$HOME/.buzz/.workspace-sweep/last-ok" ]; echo $?)"
-check "dry run leaves slot 1's claim" "$([ -s "$SLOTS/.state/1.claim" ]; echo $?)"
+check "dry run leaves slot 1's claim" "$([ -s "$STATE/1.claim" ]; echo $?)"
 check "dry run leaves the second clone on its branch" \
   "$([ "$(git -C "$C2" rev-parse --abbrev-ref HEAD)" = agent/w/closed ]; echo $?)"
 
@@ -325,10 +369,10 @@ check "branch agent/w/open kept" "$(has_branch "$CLONE" agent/w/open; echo $?)"
 check "branch agent/w/nopr kept (checked out, unpushed)" "$(has_branch "$CLONE" agent/w/nopr; echo $?)"
 check "branch agent/w/closed-ahead kept (unpushed)" "$(has_branch "$CLONE" agent/w/closed-ahead; echo $?)"
 check "canonical clone untouched, on main" "$([ -e "$CLONE/.git" ] && [ "$(git -C "$CLONE" rev-parse --abbrev-ref HEAD)" = main ]; echo $?)"
-check "slot 1 released (expired claim on a closed PR)" "$([ ! -e "$SLOTS/.state/1.claim" ]; echo $?)"
+check "slot 1 released (expired claim on a closed PR)" "$([ ! -e "$STATE/1.claim" ]; echo $?)"
 exists "slot 1 checkout kept" "$S1/.git"
 exists "slot 1 build cache kept above the floor" "$S1/target/artifact"
-check "slot 2 kept its live claim" "$([ -s "$SLOTS/.state/2.claim" ]; echo $?)"
+check "slot 2 kept its live claim" "$([ -s "$STATE/2.claim" ]; echo $?)"
 exists "slot 2 checkout kept" "$S2/.git"
 # A branch switch rewrites the tree in place at a path an agent may have just
 # walked into, and it cannot be undone without discarding that turn's edits.
@@ -382,8 +426,14 @@ W_DOWN2="$R/wt-down2"; wt "$W_DOWN2" "$PR11"; age "$W_DOWN2" "$OLD"
 OUT=$(BUZZ_WORKSPACE_SWEEP_API_BUDGET=1 bash "$WS" sweep 2>/dev/null)
 c=$(wc -l <"$T/gh/calls.log" | tr -d ' ')
 check "budget of 1 makes exactly one request (made $c)" "$([ "$c" -eq 1 ]; echo $?)"
-check "budget of 1 reclaims one of the two and keeps the other" \
-  "$({ [ -e "$W_DOWN" ] && [ ! -e "$W_DOWN2" ]; } || { [ ! -e "$W_DOWN" ] && [ -e "$W_DOWN2" ]; }; echo $?)"
+# Which read the one request went to depends on the order git lists the
+# worktrees in, so the expectation is derived from the request that was made:
+# the pull request it asked about is the only one that may be reclaimed.
+case "$(sed -n 's|.*/pulls/\([0-9]*\)$|\1|p' "$T/gh/calls.log")" in
+  12) check "budget of 1 reclaims the one it asked about and keeps the other" "$([ ! -e "$W_DOWN" ] && [ -e "$W_DOWN2" ]; echo $?)" ;;
+  11) check "budget of 1 reclaims the one it asked about and keeps the other" "$([ -e "$W_DOWN" ] && [ ! -e "$W_DOWN2" ]; echo $?)" ;;
+  *) check "budget of 1 spent elsewhere keeps both" "$([ -e "$W_DOWN" ] && [ -e "$W_DOWN2" ]; echo $?)" ;;
+esac
 check "over budget is reported as unknown, never closed: $OUT" "$(printf '%s' "$OUT" | grep -qE 'kept [0-9]+ dirty, [0-9]+ in use, [0-9]+ open, [1-9][0-9]* unknown'; echo $?)"
 OUT=$(bash "$WS" sweep 2>/dev/null)
 gone "with GitHub back, both closed-PR worktrees go" "$W_DOWN"
@@ -633,23 +683,86 @@ done
 : >"$JOURNAL"
 
 # ── disk pressure ────────────────────────────────────────────────────────────
+# Two disks, two floors. The local one is small and shared with the platform,
+# so what is pinned here is that a disk under its floor gives up the caches ON
+# IT and nothing else, in priority order, with the caches every checkout
+# shares last and only once nothing is in use.
 echo "--- disk pressure"
 # Keep the clone reading as idle: the pressure pass skips anything in use.
 age "$C2" "$OLD"
+# A hand-made worktree on the local disk (an agent's own /tmp checkout), on an
+# open pull request so the sweep keeps it and only its cache is in question.
+W_LOCAL="$LOCAL/hand/wt-local"; mkdir -p "$LOCAL/hand"; wt "$W_LOCAL" "$PR13"
+mkdir -p "$W_LOCAL/target"; echo z >"$W_LOCAL/target/artifact"; age "$W_LOCAL" "$OLD"
+# The shared caches: pnpm's own per-disk store (nothing configures one, so it
+# is `<mount point>/.pnpm-store`) and the cargo cache the hand-outs linked.
+STORE="$LOCAL/.pnpm-store/v11"; mkdir -p "$STORE/files"; echo pkg >"$STORE/files/blob"
+CARGO="$LOCAL/cache/buzz/cargo"; mkdir -p "$CARGO/registry"; echo crate >"$CARGO/registry/blob"
+age_tree() { find "$1" -exec touch -t "$OLD" {} + 2>/dev/null; }
+age_tree "$LOCAL/.pnpm-store"; age_tree "$CARGO"
 exists "above the floor: slot build cache kept" "$S1/target/artifact"
 exists "above the floor: clone build cache kept" "$CLONE/target/artifact"
 exists "above the floor: retained clone's node_modules kept" "$C2/node_modules/pkg/index.js"
-OUT=$(FAKE_DF_FREE_KB=1 bash "$WS" sweep 2>/dev/null)
-gone "under the floor: released slot's build cache purged" "$S1/target"
-gone "under the floor: idle clone's build cache purged" "$CLONE/target"
-gone "under the floor: retained clone's node_modules purged" "$C2/node_modules"
-exists "under the floor: the slot checkout itself stays" "$S1/.git"
-exists "under the floor: the retained clone itself stays" "$C2/.git"
+
+# Only the LOCAL disk under its floor. Slot 2 is still claimed and one
+# worktree is inside the hold window, so checkouts are in use.
+OUT=$(FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep 2>/dev/null)
+gone "local disk under its floor: released slot's build cache purged" "$S1/target"
+gone "local disk under its floor: a hand-made local worktree's build cache purged" "$W_LOCAL/target"
+exists "local disk under its floor: the slot checkout itself stays" "$S1/.git"
+exists "local disk under its floor: a cache on the HOME disk is not touched" "$CLONE/target/artifact"
+exists "local disk under its floor: nor the retained clone's node_modules" "$C2/node_modules/pkg/index.js"
+exists "shared pnpm store kept while a checkout is in use" "$STORE/files/blob"
+exists "shared cargo cache kept while a checkout is in use" "$CARGO/registry/blob"
+logged "disk: $LOCAL has 0 GB free, floor is 8 GB"
 slot_line=$(grep -n "purged build cache $S1/target" "$LOG" | tail -n 1 | cut -d: -f1)
-clone_line=$(grep -n "purged build cache $CLONE/target" "$LOG" | tail -n 1 | cut -d: -f1)
-check "the slot's cache goes before the clone's (slot at line ${slot_line:-none}, clone at ${clone_line:-none})" \
-  "$([ -n "$slot_line" ] && [ -n "$clone_line" ] && [ "$slot_line" -lt "$clone_line" ]; echo $?)"
+hand_line=$(grep -n "purged build cache $W_LOCAL/target" "$LOG" | tail -n 1 | cut -d: -f1)
+check "the slot's cache goes before a plain worktree's (slot at line ${slot_line:-none}, worktree at ${hand_line:-none})" \
+  "$([ -n "$slot_line" ] && [ -n "$hand_line" ] && [ "$slot_line" -lt "$hand_line" ]; echo $?)"
 check "the purge is counted: $OUT" "$(printf '%s' "$OUT" | grep -qE 'purged [0-9]+ MB'; echo $?)"
+
+# With every checkout idle and unclaimed, the shared caches are what is left
+# to give: the store first, then the cargo cache -- the versioned store pnpm
+# made, never the directory it was configured (or defaulted) into.
+touch -t "$OLD" "$STATE/2"
+for p in "$R"/* "$SLOTS"/[0-9]* "$W_LOCAL"; do [ ! -e "$p/.git" ] || age "$p" "$OLD"; done
+OUT=$(FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep 2>/dev/null)
+gone "nothing in use: the shared pnpm store is purged" "$STORE"
+gone "nothing in use: the shared cargo cache is purged" "$CARGO"
+exists "the store's parent directory is never the thing removed" "$LOCAL/.pnpm-store"
+store_line=$(grep -n "purged build cache $STORE " "$LOG" | tail -n 1 | cut -d: -f1)
+cargo_line=$(grep -n "purged build cache $CARGO " "$LOG" | tail -n 1 | cut -d: -f1)
+check "the store goes before the cargo cache (store at line ${store_line:-none}, cargo at ${cargo_line:-none})" \
+  "$([ -n "$store_line" ] && [ -n "$cargo_line" ] && [ "$store_line" -lt "$cargo_line" ]; echo $?)"
+exists "and the home disk, above its floor, still has its caches" "$CLONE/target/artifact"
+
+# Only the HOME disk under its floor: the mirror image.
+mkdir -p "$S1/target"; echo x >"$S1/target/artifact"; age "$S1" "$OLD"
+OUT=$(FAKE_DF_FREE_KB=1 FAKE_DF_LOCAL_FREE_KB=999999999 bash "$WS" sweep 2>/dev/null)
+gone "home disk under its floor: idle clone's build cache purged" "$CLONE/target"
+gone "home disk under its floor: retained clone's node_modules purged" "$C2/node_modules"
+exists "home disk under its floor: the retained clone itself stays" "$C2/.git"
+exists "home disk under its floor: a cache on the local disk is not touched" "$S1/target/artifact"
+
+# Between daily sweeps. `--if-due` inside the interval is a no-op (pinned
+# above) -- except for a disk under its floor, which cannot wait a day on a
+# 20 GB disk one build can fill. That earns the pressure pass alone: no
+# GitHub read, no checkout or branch touched, and backed off so an unmet
+# floor cannot turn the launcher's once-a-minute call into a sweep a minute.
+W_PRESS="$R/wt-pressure"; wt "$W_PRESS" "$BASE"; age "$W_PRESS" "$OLD"
+: >"$T/gh/calls.log"
+FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --if-due >/dev/null 2>&1
+gone "--if-due with the local disk under its floor purges at once" "$S1/target"
+exists "and that pass reclaims no checkout, even a reclaimable one" "$W_PRESS"
+check "nor makes any GitHub read" "$([ ! -s "$T/gh/calls.log" ]; echo $?)"
+logged "begin (disk pressure only)"
+mkdir -p "$S1/target"; echo x >"$S1/target/artifact"; age "$S1" "$OLD"
+FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --if-due >/dev/null 2>&1
+exists "a second pressure pass inside the back-off does nothing" "$S1/target/artifact"
+FAKE_DF_LOCAL_FREE_KB=1 BUZZ_WORKSPACE_PRESSURE_INTERVAL=0 bash "$WS" sweep --if-due >/dev/null 2>&1
+gone "past the back-off it runs again" "$S1/target"
+bash "$WS" sweep >/dev/null 2>&1
+gone "and the full sweep still reclaims what the pressure pass left" "$W_PRESS"
 
 # ── lock and switch ──────────────────────────────────────────────────────────
 echo "--- lock, disable"
@@ -718,6 +831,63 @@ if [ -d /proc ]; then
   bash "$WS" sweep >/dev/null 2>&1
   gone "once nothing stands in it, the same worktree goes" "$W_CWD"
 fi
+
+# ── the local disk is lost ──────────────────────────────────────────────────
+# /tmp does not survive a recreated sprite, and a checkpoint restore does not
+# bring it back. What a slot keeps through that is what was committed -- the
+# objects are in the clone, on the home disk -- and what it must not do is
+# come back silently: nobody can know afterwards whether it held uncommitted
+# work, so the hand-out that finds it gone says so and the log keeps it.
+# One slot, so which slot is which is not in question.
+echo "--- local disk lost"
+export BUZZ_WORKSPACE_REPO="$C2" BUZZ_WORKSPACE_SLOTS=1
+LOST=$(BUZZ_WORKSPACE_CLAIM=mine bash "$WS" pr/13 2>/dev/null)
+check "a slot is handed out on the local disk: $LOST" "$([ "$LOST" = "$LOCAL/slots$C2-slots/1" ]; echo $?)"
+SAVED=$(commit "$LOST" "work committed in the slot" slotwork)
+echo "never committed" >"$LOST/uncommitted.txt"
+rm -rf "$LOCAL"
+BACK=$(BUZZ_WORKSPACE_CLAIM=mine bash "$WS" pr/13 2>"$T/lost.err"); RC=$?
+check "the next hand-out succeeds (rc=$RC): $(cat "$T/lost.err")" "$([ "$RC" -eq 0 ]; echo $?)"
+check "at the same path, so its build cache keys still match: $BACK" "$([ "$BACK" = "$LOST" ]; echo $?)"
+check "re-created at the commit that was asked for" "$([ "$(git -C "$BACK" rev-parse HEAD 2>/dev/null)" = "$PR13" ]; echo $?)"
+check "the commit made in the lost slot is still in the clone" "$(git -C "$C2" cat-file -e "$SAVED^{commit}" 2>/dev/null; echo $?)"
+check "the loss is reported to the caller: $(cat "$T/lost.err")" \
+  "$(grep -qF "WARNING: slot $LOST (last handed out for 'pr/13') is gone: the local disk was reset" "$T/lost.err"; echo $?)"
+check "and says what could not be saved" "$(grep -qF "uncommitted changes in it, if any, are lost" "$T/lost.err"; echo $?)"
+logged "slot $LOST (last handed out for 'pr/13') is gone"
+BUZZ_WORKSPACE_CLAIM=mine bash "$WS" pr/13 >/dev/null 2>"$T/lost2.err"
+check "a slot that is back is not reported again" "$(grep -qF "is gone" "$T/lost2.err"; [ $? -ne 0 ]; echo $?)"
+# The other half: only a directory that is GONE is treated as lost. One that
+# is still there and dirty is never re-created over, by anyone.
+echo "still here" >"$BACK/uncommitted.txt"
+OUT=$(BUZZ_WORKSPACE_CLAIM=other bash "$WS" main 2>&1); RC=$?
+check "a dirty slot that still exists is refused, not re-created (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+check "and its uncommitted file is untouched" "$([ "$(cat "$BACK/uncommitted.txt" 2>/dev/null)" = "still here" ]; echo $?)"
+check "with no loss reported for it: $OUT" "$(printf '%s' "$OUT" | grep -qF "is gone"; [ $? -ne 0 ]; echo $?)"
+
+# The opposite loss: a checkpoint restore rewinds the home disk and leaves the
+# local one as it was (measured), so a slot made after the checkpoint is still
+# there with no registration in the clone. git cannot check anything out into
+# it, and its files may be the only copy of the work in them -- so it is
+# passed over and named, never re-created, and the pool goes on without it.
+echo "--- clone restored under a slot"
+ADMIN=$(git -C "$BACK" rev-parse --path-format=absolute --git-dir 2>/dev/null)
+IS_ADMIN=1; [ "${ADMIN#"$C2/.git/worktrees/"}" = "$ADMIN" ] || IS_ADMIN=0
+check "the slot has an administrative directory in the clone: $ADMIN" "$IS_ADMIN"
+[ "$IS_ADMIN" -ne 0 ] || rm -rf "$ADMIN"
+OUT=$(BUZZ_WORKSPACE_CLAIM=mine bash "$WS" pr/13 --force 2>&1); RC=$?
+check "a slot the clone no longer knows is not handed out, even with --force (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+check "and the refusal names it: $OUT" "$(printf '%s' "$OUT" | grep -qF "$BACK is not a checkout of $C2 any more"; echo $?)"
+check "its files are left exactly as they were" "$([ "$(cat "$BACK/uncommitted.txt" 2>/dev/null)" = "still here" ]; echo $?)"
+NEXT=$(BUZZ_WORKSPACE_SLOTS=2 BUZZ_WORKSPACE_CLAIM=mine bash "$WS" pr/13 2>/dev/null)
+check "the pool goes on with the next slot: $NEXT" "$([ "$NEXT" = "$LOCAL/slots$C2-slots/2" ] && [ -e "$NEXT/.git" ]; echo $?)"
+# ...and keeps going once every slot exists: the orphan has the oldest record,
+# so a recycle that still considered it would pick it and die on it forever.
+AGAIN=$(BUZZ_WORKSPACE_SLOTS=2 BUZZ_WORKSPACE_CLAIM=mine bash "$WS" main 2>/dev/null); RC=$?
+check "a later hand-out recycles a working slot instead of the orphan (rc=$RC): $AGAIN" \
+  "$([ "$RC" -eq 0 ] && [ "$AGAIN" = "$NEXT" ] && [ "$(git -C "$NEXT" rev-parse HEAD 2>/dev/null)" = "$MAIN" ]; echo $?)"
+exists "and the orphaned one is still not touched" "$BACK/uncommitted.txt"
+unset BUZZ_WORKSPACE_REPO BUZZ_WORKSPACE_SLOTS
 
 echo "$PASS passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

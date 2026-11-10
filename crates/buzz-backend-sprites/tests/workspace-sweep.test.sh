@@ -49,10 +49,11 @@
 #     cwd evidence is /proc);
 #   * slots are handed out on the LOCAL disk (the slot root), keyed by the
 #     clone's whole path, with their bookkeeping in $HOME; a disk under its
-#     floor gives up only the caches that are on it, the caches every
-#     checkout shares go last and only once no checkout is in use, and a disk
-#     that falls under its floor between daily sweeps gets a pressure-only
-#     pass, backed off;
+#     floor gives up only the caches that are on it, and a disk that falls
+#     under its floor between daily sweeps gets a pressure-only pass, backed
+#     off; the caches every checkout shares are never purged by a sweep that
+#     runs beside the harness -- only by `sweep --before-start`, last, and
+#     not while a process still stands in a checkout;
 #   * a slot lost with the local disk is re-created cold at the same path and
 #     reported, its commits still in the clone -- and a slot that is still
 #     there and dirty is never re-created over.
@@ -685,8 +686,8 @@ done
 # ── disk pressure ────────────────────────────────────────────────────────────
 # Two disks, two floors. The local one is small and shared with the platform,
 # so what is pinned here is that a disk under its floor gives up the caches ON
-# IT and nothing else, in priority order, with the caches every checkout
-# shares last and only once nothing is in use.
+# IT and nothing else, in priority order -- and that the caches every checkout
+# shares are out of reach of any sweep that can run beside the harness.
 echo "--- disk pressure"
 # Keep the clone reading as idle: the pressure pass skips anything in use.
 age "$C2" "$OLD"
@@ -704,16 +705,15 @@ exists "above the floor: slot build cache kept" "$S1/target/artifact"
 exists "above the floor: clone build cache kept" "$CLONE/target/artifact"
 exists "above the floor: retained clone's node_modules kept" "$C2/node_modules/pkg/index.js"
 
-# Only the LOCAL disk under its floor. Slot 2 is still claimed and one
-# worktree is inside the hold window, so checkouts are in use.
+# Only the LOCAL disk under its floor.
 OUT=$(FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep 2>/dev/null)
 gone "local disk under its floor: released slot's build cache purged" "$S1/target"
 gone "local disk under its floor: a hand-made local worktree's build cache purged" "$W_LOCAL/target"
 exists "local disk under its floor: the slot checkout itself stays" "$S1/.git"
 exists "local disk under its floor: a cache on the HOME disk is not touched" "$CLONE/target/artifact"
 exists "local disk under its floor: nor the retained clone's node_modules" "$C2/node_modules/pkg/index.js"
-exists "shared pnpm store kept while a checkout is in use" "$STORE/files/blob"
-exists "shared cargo cache kept while a checkout is in use" "$CARGO/registry/blob"
+exists "a sweep beside the harness leaves the shared pnpm store" "$STORE/files/blob"
+exists "a sweep beside the harness leaves the shared cargo cache" "$CARGO/registry/blob"
 logged "disk: $LOCAL has 0 GB free, floor is 8 GB"
 slot_line=$(grep -n "purged build cache $S1/target" "$LOG" | tail -n 1 | cut -d: -f1)
 hand_line=$(grep -n "purged build cache $W_LOCAL/target" "$LOG" | tail -n 1 | cut -d: -f1)
@@ -721,19 +721,46 @@ check "the slot's cache goes before a plain worktree's (slot at line ${slot_line
   "$([ -n "$slot_line" ] && [ -n "$hand_line" ] && [ "$slot_line" -lt "$hand_line" ]; echo $?)"
 check "the purge is counted: $OUT" "$(printf '%s' "$OUT" | grep -qE 'purged [0-9]+ MB'; echo $?)"
 
-# With every checkout idle and unclaimed, the shared caches are what is left
-# to give: the store first, then the cargo cache -- the versioned store pnpm
-# made, never the directory it was configured (or defaulted) into.
+# The shared caches. Any install or build may be reading them and none takes
+# a lock of ours, so no amount of "nothing looks busy" makes a purge beside the
+# harness safe: with every checkout idle and unclaimed and the disk still
+# under its floor, the full sweep and the pressure pass both leave them.
 touch -t "$OLD" "$STATE/2"
 for p in "$R"/* "$SLOTS"/[0-9]* "$W_LOCAL"; do [ ! -e "$p/.git" ] || age "$p" "$OLD"; done
-OUT=$(FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep 2>/dev/null)
-gone "nothing in use: the shared pnpm store is purged" "$STORE"
-gone "nothing in use: the shared cargo cache is purged" "$CARGO"
+FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep >/dev/null 2>&1
+FAKE_DF_LOCAL_FREE_KB=1 BUZZ_WORKSPACE_PRESSURE_INTERVAL=0 bash "$WS" sweep --if-due >/dev/null 2>&1
+exists "everything idle, disk under its floor: the full sweep still leaves the pnpm store" "$STORE/files/blob"
+exists "and the cargo cache, and so does the pressure pass" "$CARGO/registry/blob"
+# What may purge them is the pass the launcher runs BEFORE the harness exists,
+# when there is no agent to start a build. Above the floor it is a no-op...
+W_BEFORE="$R/wt-before"; wt "$W_BEFORE" "$BASE"; age "$W_BEFORE" "$OLD"
+bash "$WS" sweep --before-start >/dev/null 2>&1
+exists "--before-start above the floor purges nothing" "$STORE/files/blob"
+check "and does not even begin a pass" "$(grep -qF "before the harness starts" "$LOG"; [ $? -ne 0 ]; echo $?)"
+# ...and a process still standing in a checkout -- a build an earlier
+# generation left running -- keeps them, on either disk. The evidence is
+# /proc, so this half only means anything on Linux.
+if [ -d /proc ]; then
+  ( cd "$C2" && exec sleep 60 ) &
+  STRAY=$!
+  sleep 1
+  FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start >/dev/null 2>&1
+  exists "--before-start keeps the store while a process stands in a home-disk checkout" "$STORE/files/blob"
+  exists "and the cargo cache" "$CARGO/registry/blob"
+  logged "a process is still working in a checkout"
+  kill "$STRAY" 2>/dev/null; wait "$STRAY" 2>/dev/null
+fi
+: >"$T/gh/calls.log"
+OUT=$(FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --before-start 2>/dev/null)
+gone "--before-start under the floor: the shared pnpm store is purged" "$STORE"
+gone "--before-start under the floor: the shared cargo cache is purged" "$CARGO"
 exists "the store's parent directory is never the thing removed" "$LOCAL/.pnpm-store"
 store_line=$(grep -n "purged build cache $STORE " "$LOG" | tail -n 1 | cut -d: -f1)
 cargo_line=$(grep -n "purged build cache $CARGO " "$LOG" | tail -n 1 | cut -d: -f1)
 check "the store goes before the cargo cache (store at line ${store_line:-none}, cargo at ${cargo_line:-none})" \
   "$([ -n "$store_line" ] && [ -n "$cargo_line" ] && [ "$store_line" -lt "$cargo_line" ]; echo $?)"
+exists "it is the pressure pass alone: a reclaimable checkout is not touched" "$W_BEFORE"
+check "and no GitHub read is made, so a start never waits on the network" "$([ ! -s "$T/gh/calls.log" ]; echo $?)"
 exists "and the home disk, above its floor, still has its caches" "$CLONE/target/artifact"
 
 # Only the HOME disk under its floor: the mirror image.
@@ -750,6 +777,7 @@ exists "home disk under its floor: a cache on the local disk is not touched" "$S
 # GitHub read, no checkout or branch touched, and backed off so an unmet
 # floor cannot turn the launcher's once-a-minute call into a sweep a minute.
 W_PRESS="$R/wt-pressure"; wt "$W_PRESS" "$BASE"; age "$W_PRESS" "$OLD"
+rm -f "$HOME/.buzz/.workspace-sweep/last-pressure"   # no pressure pass has run yet
 : >"$T/gh/calls.log"
 FAKE_DF_LOCAL_FREE_KB=1 bash "$WS" sweep --if-due >/dev/null 2>&1
 gone "--if-due with the local disk under its floor purges at once" "$S1/target"
@@ -852,18 +880,18 @@ check "at the same path, so its build cache keys still match: $BACK" "$([ "$BACK
 check "re-created at the commit that was asked for" "$([ "$(git -C "$BACK" rev-parse HEAD 2>/dev/null)" = "$PR13" ]; echo $?)"
 check "the commit made in the lost slot is still in the clone" "$(git -C "$C2" cat-file -e "$SAVED^{commit}" 2>/dev/null; echo $?)"
 check "the loss is reported to the caller: $(cat "$T/lost.err")" \
-  "$(grep -qF "WARNING: slot $LOST (last handed out for 'pr/13') is gone: the local disk was reset" "$T/lost.err"; echo $?)"
+  "$(grep -qF "WARNING: slot $LOST (last handed out for 'pr/13') no longer exists" "$T/lost.err"; echo $?)"
 check "and says what could not be saved" "$(grep -qF "uncommitted changes in it, if any, are lost" "$T/lost.err"; echo $?)"
-logged "slot $LOST (last handed out for 'pr/13') is gone"
+logged "slot $LOST (last handed out for 'pr/13') no longer exists"
 BUZZ_WORKSPACE_CLAIM=mine bash "$WS" pr/13 >/dev/null 2>"$T/lost2.err"
-check "a slot that is back is not reported again" "$(grep -qF "is gone" "$T/lost2.err"; [ $? -ne 0 ]; echo $?)"
+check "a slot that is back is not reported again" "$(grep -qF "no longer exists" "$T/lost2.err"; [ $? -ne 0 ]; echo $?)"
 # The other half: only a directory that is GONE is treated as lost. One that
 # is still there and dirty is never re-created over, by anyone.
 echo "still here" >"$BACK/uncommitted.txt"
 OUT=$(BUZZ_WORKSPACE_CLAIM=other bash "$WS" main 2>&1); RC=$?
 check "a dirty slot that still exists is refused, not re-created (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
 check "and its uncommitted file is untouched" "$([ "$(cat "$BACK/uncommitted.txt" 2>/dev/null)" = "still here" ]; echo $?)"
-check "with no loss reported for it: $OUT" "$(printf '%s' "$OUT" | grep -qF "is gone"; [ $? -ne 0 ]; echo $?)"
+check "with no loss reported for it: $OUT" "$(printf '%s' "$OUT" | grep -qF "no longer exists"; [ $? -ne 0 ]; echo $?)"
 
 # The opposite loss: a checkpoint restore rewinds the home disk and leaves the
 # local one as it was (measured), so a slot made after the checkpoint is still

@@ -116,6 +116,16 @@ home-disk checkouts.
 for the network disk there (about 5.6 GB that `du` does not show). The sweep
 therefore holds that disk to its own floor — see the knobs below.
 
+The caches every checkout shares are the exception to "the sweep runs beside
+the agent". Any install or build may be reading the pnpm store or the cargo
+cache, and none of them takes a lock of ours, so there is no check after which
+purging them beside a live harness is safe. They are purged only by
+`buzz-workspace sweep --before-start`, which the launcher runs in the
+foreground before it execs the harness (two `df` calls unless a disk is under
+its floor, bounded at 20 seconds), and not while a process left over from an
+earlier generation still stands in a checkout. Between starts they are not
+bounded; what is bounded while the agent lives is the per-checkout caches.
+
 ## Workspace hygiene
 
 Agents mint checkouts faster than they retire them: before this existed the
@@ -137,7 +147,7 @@ What it reclaims, and the evidence it needs first:
 | local branch | on `origin/<default>`, or the head of a closed PR and on some remote ref | deleted |
 | anything under `~/.scratch` | idle past the TTL | removed — disposable by the Nest contract, dirty or not |
 | idle rebuildable caches (`target/`, `node_modules/`) | the disk they are on is under its floor | purged, unclaimed slots first, until the floor is met |
-| shared caches (the slot disk's pnpm store, then the cargo cache) | same, and no checkout is in use | purged last |
+| shared caches (the slot disk's pnpm store, then the cargo cache) | same, **and only in the pass the launcher runs before the harness starts** | purged last |
 
 A pull request is tied to a checkout by evidence, never by a directory name
 alone: the exact `refs/pull/N/head` sha from one `git ls-remote`, the branch

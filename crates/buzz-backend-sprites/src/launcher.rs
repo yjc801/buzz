@@ -555,6 +555,49 @@ mod tests {
         );
     }
 
+    /// The pnpm store and the cargo cache are read by any build in any
+    /// checkout, and no build takes a lock of ours, so a purge beside a live
+    /// harness can pull them out from under an install however carefully it
+    /// looks first. The one time nothing can start a build is before the
+    /// harness exists: the launcher runs that pass in the foreground, bounded
+    /// and off the election lock, and no other pass may list those caches.
+    #[test]
+    fn shared_caches_are_purged_only_before_the_harness_exists() {
+        let call = LAUNCHER_SH
+            .find(r#""$BUZZ/bin/buzz-workspace" sweep --before-start"#)
+            .expect("the launcher no longer runs the pre-start pressure pass");
+        let start = LAUNCHER_SH[..call].rfind('\n').map_or(0, |i| i + 1);
+        let end = LAUNCHER_SH[call..]
+            .find('\n')
+            .map_or(LAUNCHER_SH.len(), |i| call + i);
+        let line = &LAUNCHER_SH[start..end];
+        assert!(
+            line.starts_with("timeout "),
+            "the pre-start pass is unbounded: {line}"
+        );
+        assert!(
+            line.contains("9>&-") && line.ends_with("|| true"),
+            "the pre-start pass can hold the election lock or fail the start: {line}"
+        );
+        let exec = LAUNCHER_SH
+            .find(r#"exec "$BUZZ/bin/buzz-acp""#)
+            .expect("the launcher no longer execs the harness");
+        assert!(
+            call < exec,
+            "the pre-start pass runs after the harness exists"
+        );
+        assert!(
+            sweep_fn_body("sweep_list_shared_caches")
+                .contains(r#"[ "$SWEEP_SHARED" = 1 ] || return 0"#),
+            "the shared caches are listed by a sweep that runs beside the harness"
+        );
+        assert_eq!(
+            WORKSPACE_SH.matches("SWEEP_SHARED=1").count(),
+            1,
+            "something other than --before-start makes the shared caches purgeable"
+        );
+    }
+
     /// The launcher must exec the harness personality (comm "buzz-acp") and
     /// end in exactly one exec — the signal-path argument depends on both.
     #[test]

@@ -131,6 +131,15 @@ setsid "$BUZZ/keepawake.sh" </dev/null >/dev/null 2>&1 9>&- &
 # workspace.sh, not here: every destructive step takes the reclaim fence, is
 # revalidated under it, and detaches a directory with an atomic rename before
 # deleting it. Do not turn this into a foreground call to make it "safe".
+#
+# One part of it cannot run beside the harness: the caches every checkout
+# shares (the pnpm store, the cargo cache). Any build may be reading them and
+# no build takes a lock of ours, so the only time they can be purged is now,
+# while there is no agent to start one. `--before-start` is two `df` calls and
+# an exit unless a disk is under its floor, and it is bounded either way: a
+# start must not wait on housekeeping. Off the election lock, best effort.
+timeout 20 nice -n 19 "$BUZZ/bin/buzz-workspace" sweep --before-start >>"$BUZZ/workspace-sweep.log" 2>&1 9>&- || true
+
 (
     exec 9>&-
     sweep() {

@@ -74,7 +74,8 @@ usage: buzz-workspace <ref> [repo] [--claim TOKEN]   print the path to a warm ch
        buzz-workspace list [repo]                    show every slot, its ref, and its build cache
        buzz-workspace gc [repo]                       prune worktrees whose directory is gone
        buzz-workspace release <ref> [repo] [--claim TOKEN]   give up a held slot early
-       buzz-workspace sweep [--dry-run] [--if-due]   reclaim checkouts, branches, slots and build
+       buzz-workspace sweep [--dry-run] [--if-due | --before-start]
+                                                     reclaim checkouts, branches, slots and build
                                                      caches that closed pull requests left behind
 
 <ref> may be a branch, tag, sha, or a pull request as `pr/19`, `#19`, or `19`.
@@ -108,10 +109,12 @@ the Nest contract and is removed after BUZZ_WORKSPACE_SWEEP_SCRATCH_DAYS idle
 days (default 7) regardless. When free disk falls under
 BUZZ_WORKSPACE_MIN_FREE_GB (default 10; BUZZ_WORKSPACE_LOCAL_MIN_FREE_GB,
 default 8, for the disk the slots are on) it also purges idle rebuildable
-caches on that disk -- target/ and node_modules/, unclaimed slots first, then
-the shared pnpm store and cargo cache once no checkout is in use. The launcher
-runs it at every start and daily while the agent lives, and within a minute of
-a disk falling under its floor; every destructive step
+caches on that disk -- target/ and node_modules/, unclaimed slots first. The
+launcher runs it at every start and daily while the agent lives, and within a
+minute of a disk falling under its floor (then at most every ten). The shared
+pnpm store and cargo cache are purged only by `sweep --before-start`, which
+the launcher runs before the agent exists: any build may be reading them, and
+no build takes a lock of ours. Every destructive step
 is serialized against a hand-out by the reclaim fence, and a directory is
 always moved aside with one rename before it is deleted, so nothing is ever
 pulled out from under a live turn. --dry-run reports without acting, --if-due exits at once
@@ -362,8 +365,9 @@ claim_file() {
     printf '%s%s/%s.claim' "$STATE_ROOT" "$1" "$2"
 }
 
-# A slot that was handed out and whose directory is gone: the local disk was
-# reset under it (it did not follow the sprite, or /tmp was cleared).
+# A slot that was handed out and whose directory is gone: the local disk did
+# not follow the sprite, /tmp was cleared, or somebody removed it -- a missing
+# directory does not say which, and the report does not pretend to.
 # Its commits are in the clone; anything uncommitted is not recoverable, and
 # nothing here can know whether there was any -- so it is never passed over in
 # silence. The caller is told, the log keeps it, and only then is the record
@@ -371,7 +375,7 @@ claim_file() {
 report_lost_slot() {
     local canon="$1" slots="$2" i="$3" was line
     was=$(cat "$(stamp "$slots" "$i")" 2>/dev/null || true)
-    line="slot $slots/$i (last handed out for '${was:-?}') is gone: the local disk was reset. Commits made in it are in $canon; uncommitted changes in it, if any, are lost. Re-creating it cold."
+    line="slot $slots/$i (last handed out for '${was:-?}') no longer exists: the local disk was reset, or the directory was removed. Commits made in it are in $canon; uncommitted changes in it, if any, are lost. Re-creating it cold."
     note "WARNING: $line"
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >>"$BUZZ/workspace-sweep.log" 2>/dev/null || true
     rm -f "$(stamp "$slots" "$i")" "$(claim_file "$slots" "$i")"
@@ -681,6 +685,9 @@ SWEEP_MIN_FREE_GB="${BUZZ_WORKSPACE_MIN_FREE_GB:-10}"
 SWEEP_LOCAL_MIN_FREE_GB="${BUZZ_WORKSPACE_LOCAL_MIN_FREE_GB:-8}"
 SWEEP_PRESSURE_INTERVAL="${BUZZ_WORKSPACE_PRESSURE_INTERVAL:-600}"
 SWEEP_PRESSURE_ONLY=0
+# Set only by `sweep --before-start`: the one pass in which the caches every
+# checkout shares may be purged. See sweep_list_shared_caches.
+SWEEP_SHARED=0
 SWEEP_API_BUDGET="${BUZZ_WORKSPACE_SWEEP_API_BUDGET:-40}"
 SWEEP_ROOTS="${BUZZ_WORKSPACE_SWEEP_ROOTS:-$HOME}"
 SWEEP_DEPTH="${BUZZ_WORKSPACE_SWEEP_DEPTH:-6}"
@@ -1692,9 +1699,9 @@ sweep_clone() {
 sweep_list_caches() {
     local records="$1" slots="$2" path rp sha branch locked gitdir i
     # Unclaimed idle slots first (priority 1), then idle clones and worktrees
-    # (2). Only checkouts nothing is using right now are candidates at all;
-    # the rest are recorded as busy, which is what keeps the caches every
-    # checkout shares out of the pass (see sweep_list_shared_caches).
+    # (2). Only checkouts nothing is using right now are candidates at all.
+    # Every checkout is recorded, whatever its state: sweep_checkout_occupied
+    # reads the list.
     #
     # Both kinds count. `target/` is the obvious one, but a standalone clone
     # outside ~/.scratch is deliberately never deleted and never switched, so
@@ -1709,16 +1716,13 @@ sweep_list_caches() {
         [ -e "$path" ] || continue
         rp=$(sweep_realpath "$path") || continue
         gitdir=$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || continue
-        if sweep_in_use "$path" "$gitdir"; then
-            printf '%s\n' "$rp" >>"$SWEEP_TMP/busy"
-            continue
-        fi
+        printf '%s\n' "$rp" >>"$SWEEP_TMP/checkouts"
+        sweep_in_use "$path" "$gitdir" && continue
         local prio=2 slot_i="-" d
         case "$rp" in
             "$slots"/[0-9]*)
                 i=$(basename "$rp")
                 if [ -s "$(claim_file "$slots" "$i")" ] && [ "$(hold_age "$slots" "$i" "$(date +%s)")" -lt "$HOLD_SECONDS" ]; then
-                    printf '%s\n' "$rp" >>"$SWEEP_TMP/busy"
                     continue
                 fi
                 prio=1 slot_i="$i"
@@ -1743,13 +1747,23 @@ sweep_list_caches() {
 }
 
 # The caches every checkout shares: the pnpm store (priority 3), then each
-# repository's cargo cache (4). They cost a download to rebuild and any
-# checkout may be linking from them, so they are candidates only in a sweep
-# that found NO checkout in use, and only as what pnpm and this script made:
-# a versioned store under the configured directory, never that directory.
+# repository's cargo cache (4).
+#
+# These are candidates in ONE pass only: `sweep --before-start`, which the
+# launcher runs in the foreground before it execs the harness. Any install or
+# build, in any checkout on either disk, may be reading them, and none of
+# those takes the reclaim fence or any other lock of ours. Reading /proc
+# before the rename is not a fence either -- a build can start between the
+# read and the rename, and then loses its store mid-command. What does hold
+# is that with no harness there is no agent to start one. So a sweep that
+# runs beside the harness never lists them, whatever it reads, and between
+# starts they are simply not bounded.
+#
+# They are listed only as what pnpm and this script made: a versioned store
+# under the configured directory, never that directory.
 sweep_list_shared_caches() {
     local d prio store="$PNPM_STORE"
-    [ ! -s "$SWEEP_TMP/busy" ] || return 0
+    [ "$SWEEP_SHARED" = 1 ] || return 0
     if [ -z "$store" ]; then
         store=$(sweep_df "$SLOT_ROOT")
         [ -n "$store" ] || return 0
@@ -1764,6 +1778,18 @@ sweep_list_shared_caches() {
         d=$(sweep_realpath "$d") || continue
         printf '%s %s - - %s %s\n' "$prio" "$(mtime_of "$d")" "$d" "$d" >>"$SWEEP_TMP/builddirs"
     done
+}
+
+# A process stands in some checkout, or anywhere under the slot root. Before
+# the harness starts nothing should: this is what catches a build a previous
+# generation left running (Linux /proc only, like sweep_cwd_inside).
+sweep_checkout_occupied() {
+    local c
+    sweep_cwd_inside "$SLOT_ROOT" && return 0
+    while IFS= read -r c; do
+        sweep_cwd_inside "$c" && return 0
+    done <"$SWEEP_TMP/checkouts"
+    return 1
 }
 
 # `<available KB> <mount point>` of the filesystem holding $1.
@@ -1804,18 +1830,18 @@ sweep_purge_cache() {
         return 1
     fi
     gitdir=$(git -C "$rp" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)
-    if sweep_in_use "$rp" "$gitdir"; then
+    # A shared cache has no checkout of its own, and how recently it was
+    # written says nothing: what keeps it is a process standing in ANY
+    # checkout, left over from an earlier generation.
+    if [ "$prio" -ge 3 ]; then
+        if sweep_checkout_occupied; then
+            fence_drop
+            sweep_log "kept shared cache $d: a process is still working in a checkout"
+            return 1
+        fi
+    elif sweep_in_use "$rp" "$gitdir"; then
         fence_drop
         sweep_log "kept build cache $d: its checkout is in use"
-        return 1
-    fi
-    # A shared cache was listed because no checkout was in use. The fence
-    # keeps a hand-out away; an agent that walked into a slot by itself since
-    # then is read here. This narrows the window and does not close it: an
-    # install that starts after this line fails once and succeeds when re-run.
-    if [ "$prio" -ge 3 ] && sweep_cwd_inside "$SLOT_ROOT"; then
-        fence_drop
-        sweep_log "kept shared cache $d: a process is working under $SLOT_ROOT"
         return 1
     fi
     if [ "$prio" = 1 ] && ! (
@@ -1880,14 +1906,21 @@ sweep_disk_pressure() {
 }
 
 cmd_sweep() {
-    local if_due="$1"
+    local if_due="$1" before_start="$2"
     if [ "${BUZZ_WORKSPACE_SWEEP_DISABLED:-0}" = 1 ]; then
         [ "$if_due" = 1 ] || note "sweep is disabled (BUZZ_WORKSPACE_SWEEP_DISABLED=1)"
         return 0
     fi
     mkdir -p "$SWEEP_DIR"
     mkdir -p "$SLOT_ROOT" 2>/dev/null || true
-    if [ "$if_due" = 1 ] && [ -e "$SWEEP_DIR/last-ok" ]; then
+    if [ "$before_start" = 1 ]; then
+        # The launcher's foreground call, before the harness exists. A start
+        # must not wait on housekeeping, so this is two `df` calls and an exit
+        # unless a disk is under its floor -- and then the pressure pass alone,
+        # with the shared caches eligible (see sweep_list_shared_caches).
+        sweep_under_floor || return 0
+        SWEEP_PRESSURE_ONLY=1 SWEEP_SHARED=1
+    elif [ "$if_due" = 1 ] && [ -e "$SWEEP_DIR/last-ok" ]; then
         local age
         age=$(($(date +%s) - $(mtime_of "$SWEEP_DIR/last-ok")))
         if [ "$age" -lt "$SWEEP_INTERVAL" ]; then
@@ -1920,12 +1953,13 @@ cmd_sweep() {
     SWEEP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/buzz-sweep.XXXXXX")
     : >"$SWEEP_TMP/builddirs"
     : >"$SWEEP_TMP/detached"
-    : >"$SWEEP_TMP/busy"
+    : >"$SWEEP_TMP/checkouts"
     [ "$SWEEP_PRESSURE_ONLY" != 1 ] || touch "$SWEEP_DIR/last-pressure"
     sweep_rotate_log
     local mode=""
     [ "$SWEEP_DRY" = 1 ] && mode=" (dry run)"
     [ "$SWEEP_PRESSURE_ONLY" != 1 ] || mode=" (disk pressure only)"
+    [ "$SWEEP_SHARED" != 1 ] || mode=" (disk pressure only, before the harness starts)"
     sweep_log "begin$mode: roots $SWEEP_ROOTS, hold ${SWEEP_HOLD_MIN}m, scratch ttl ${SWEEP_SCRATCH_DAYS}d, floor ${SWEEP_MIN_FREE_GB} GB, ${SWEEP_LOCAL_MIN_FREE_GB} GB on the slot disk"
     if [ "$SWEEP_DRY" = 1 ]; then
         sweep_log "dry run: nothing below was changed"
@@ -1996,7 +2030,7 @@ on_exit() {
 
 main() {
     trap on_exit EXIT
-    local force=0 claim="${BUZZ_WORKSPACE_CLAIM:-}" args=() if_due=0
+    local force=0 claim="${BUZZ_WORKSPACE_CLAIM:-}" args=() if_due=0 before_start=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --force) force=1 ;;
@@ -2011,6 +2045,7 @@ main() {
                 ;;
             --verbose) SWEEP_VERBOSE=1 ;;
             --if-due) if_due=1 ;;
+            --before-start) before_start=1 ;;
             -h | --help) usage ;;
             *) args+=("$1") ;;
         esac
@@ -2022,7 +2057,7 @@ main() {
         list) cmd_list "${args[1]:-buzz}" ;;
         gc) cmd_gc "${args[1]:-buzz}" ;;
         release) cmd_release "${args[1]:-}" "${args[2]:-buzz}" "$claim" "$force" ;;
-        sweep) cmd_sweep "$if_due" ;;
+        sweep) cmd_sweep "$if_due" "$before_start" ;;
         *) cmd_path "${args[0]}" "${args[1]:-buzz}" "$force" "$claim" ;;
     esac
 }

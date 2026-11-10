@@ -49,6 +49,33 @@ const DISCOVER_CHANNELS_SUBSCRIPTION_ID: &str = "buzz-waker-discover";
 /// missing feature.
 const DISCOVER_CHANNELS_TIMEOUT_SECS: u64 = 20;
 
+/// The longest one relay connect may take, from dialling to the relay's answer
+/// to NIP-42 AUTH.
+///
+/// `buzz-ws-client` bounds its two AUTH waits (21s each) but not the TCP, TLS
+/// and upgrade handshake before them. A relay that accepts the socket and then
+/// says nothing would hold a tap, or a wake loop's first connection with the
+/// agent's cursor locked, for good and without a log line. Longer than both
+/// AUTH waits together, so their own errors are reported first.
+pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// [`NostrWsConnection::connect_authenticated`], given up after
+/// [`RELAY_CONNECT_TIMEOUT`]. Every connection this daemon opens goes through
+/// here.
+///
+/// # Errors
+/// The connect's own error, or [`WsClientError::Timeout`] at the bound.
+pub async fn connect_authenticated(
+    relay_url: &str,
+    keys: &Keys,
+    auth_tag: Option<&Tag>,
+) -> Result<NostrWsConnection, WsClientError> {
+    let connect = NostrWsConnection::connect_authenticated(relay_url, keys, auth_tag);
+    tokio::time::timeout(RELAY_CONNECT_TIMEOUT, connect)
+        .await
+        .unwrap_or(Err(WsClientError::Timeout))
+}
+
 /// Subscription id for the archived-channel probe. Runs in the same
 /// pre-subscribe window as discovery, so no other subscription is open.
 const ARCHIVED_CHANNELS_SUBSCRIPTION_ID: &str = "buzz-waker-archived";
@@ -175,14 +202,8 @@ impl FeedTransport for RelayFeed {
         // second authenticated connection for this pubkey open on the relay,
         // and presence is cleared only when the *last* one goes.
         self.connection = None;
-        self.connection = Some(
-            NostrWsConnection::connect_authenticated(
-                &self.relay_url,
-                &self.keys,
-                self.auth_tag.as_ref(),
-            )
-            .await?,
-        );
+        self.connection =
+            Some(connect_authenticated(&self.relay_url, &self.keys, self.auth_tag.as_ref()).await?);
         Ok(())
     }
 

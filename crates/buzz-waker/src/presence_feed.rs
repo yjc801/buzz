@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use buzz_core::kind::KIND_PRESENCE_UPDATE;
 use buzz_core::PresenceStatus;
-use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
+use buzz_ws_client::{RelayMessage, WsClientError};
 use nostr::{Keys, Tag};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -332,7 +332,7 @@ pub async fn run_presence_tap(
             }
         }
 
-        let connect = NostrWsConnection::connect_authenticated(relay_url, keys, auth_tag);
+        let connect = crate::relay_feed::connect_authenticated(relay_url, keys, auth_tag);
         let mut connection = tokio::select! {
             result = connect => match result {
                 Ok(connection) => connection,

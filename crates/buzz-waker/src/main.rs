@@ -361,11 +361,9 @@ fn report_unwatched(supervised: &mut HashMap<String, SupervisedAgent>, now: Inst
 }
 
 /// How long a pending agent may wait for its previous wake loop to return
-/// before [`reconcile_roster`] reports the wait as abnormal: the setup budget
-/// a refresh is held to plus the shutdown drain, which is more than a
-/// cancelled wake loop should need.
-const CURSOR_HANDOFF_WARN_AFTER: Duration =
-    REFRESH_SETUP_DEADLINE.saturating_add(WAKE_LOOP_SHUTDOWN_DRAIN);
+/// before [`reconcile_roster`] reports the wait as abnormal: three times the
+/// shutdown drain, which is all a cancelled wake loop waits for.
+const CURSOR_HANDOFF_WARN_AFTER: Duration = WAKE_LOOP_SHUTDOWN_DRAIN.saturating_mul(3);
 
 /// Which pubkeys have a wake loop that has not returned yet, and so still
 /// owns that agent's `cursor.json`.

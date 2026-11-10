@@ -5,7 +5,7 @@
 //! waiting for a credential was a silent state.
 
 use super::*;
-use buzz_waker::enrolment::{CredentialBody, RosterBody};
+use buzz_waker::enrolment::CredentialBody;
 
 const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const AGENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -28,18 +28,14 @@ fn credential(credential_version: u64) -> CredentialBody {
 #[tokio::test]
 async fn a_listed_agent_left_waiting_for_its_credential_is_reported() {
     let state_dir = tempfile::tempdir().expect("tempdir");
-    let roster_state = RosterState::new();
-    roster_state.update_if_newer(
-        OWNER,
-        RosterBody {
-            entries: vec![RosterEntry {
-                agent_pubkey: AGENT.to_string(),
-                credential_version: 7,
-            }],
-            roster_version: 1,
-            issued_at: 0,
-        },
-    );
+    let rosters = [(
+        OWNER.to_string(),
+        vec![RosterEntry {
+            agent_pubkey: AGENT.to_string(),
+            credential_version: 7,
+        }],
+    )];
+    let cursor_holders = CursorHolders::default();
     let waker_keys = Keys::generate();
     let cancel = CancellationToken::new();
     let watch_list = WatchList::new();
@@ -54,10 +50,11 @@ async fn a_listed_agent_left_waiting_for_its_credential_is_reported() {
             &waker_keys,
             None,
             8,
-            &roster_state,
+            &rosters,
             supervised,
             &watch_list,
             &cancel,
+            &cursor_holders,
             &mut tasks,
         );
     };

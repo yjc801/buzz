@@ -322,7 +322,7 @@ impl RosterState {
     /// `roster_version` rather than trusting delivery order is what makes
     /// this correct either way, the same reasoning
     /// [`crate::floors::FloorStore::admit`] applies to a bundle version.
-    pub fn update_if_newer(&self, owner_pubkey: &str, body: RosterBody) -> bool {
+    fn update_if_newer(&self, owner_pubkey: &str, body: RosterBody) -> bool {
         let owner_pubkey = normalize_pubkey(owner_pubkey);
         let mut map = self.lock();
         let should_apply = match map.get(&owner_pubkey) {

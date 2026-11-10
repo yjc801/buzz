@@ -58,6 +58,8 @@ tracing-subscriber = { workspace = true }
 anyhow      = { workspace = true }
 
 [dev-dependencies]
+# Paused time, for the connect-timeout test.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # For relay_feed's mock-relay transport test: a real (local, in-process)
 # WebSocket peer to drive `RelayFeed` against, the same server-side halves

@@ -46,6 +46,7 @@ use crate::decide::normalize_pubkey;
 use crate::enrolment::{CredentialBody, SignedCredential};
 use crate::feed::reconnect_delay_ms;
 use crate::floors::FloorStore;
+use crate::relay_feed::PageCursor;
 
 /// Subscription id for one agent's credential-delivery tap. Fixed, like every
 /// other tap's own id — a reconnect replaces the old subscription rather than
@@ -59,8 +60,12 @@ pub const CREDENTIAL_TAP_SUBSCRIPTION_ID: &str = "buzz-waker-credential";
 /// never as a liveness ping.
 pub const CREDENTIAL_TAP_IDLE_TIMEOUT_SECS: u64 = 300;
 
-/// How many envelopes to ask for on subscribe. Same value and reasoning as
-/// [`crate::bundle_feed::BUNDLE_QUERY_LIMIT`] / [`crate::roster_feed::ROSTER_QUERY_LIMIT`].
+/// How many envelopes to ask for on subscribe.
+///
+/// Not sixteen of this agent's. The relay applies `limit` before it matches
+/// `#d`, so these are the owner's sixteen newest envelopes to this waker, for
+/// every agent and the roster together; [`CatchUp`] covers an agent whose
+/// credential is older than those.
 const CREDENTIAL_QUERY_LIMIT: u32 = 16;
 
 /// The REQ filter for one agent's credential tap: global, `authors` pinned to
@@ -85,6 +90,178 @@ pub fn credential_req(owner_pubkey: &str, waker_pubkey: &str, agent_pubkey: &str
         CREDENTIAL_TAP_SUBSCRIPTION_ID,
         credential_filter(owner_pubkey, waker_pubkey, agent_pubkey)
     ])
+}
+
+/// Subscription id for the catch-up query — see [`CatchUp`].
+pub const CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID: &str = "buzz-waker-credential-catch-up";
+
+/// Envelopes asked for per catch-up page. Sent explicitly, below the relay's
+/// row cap: a page that comes back this full is the only evidence of more.
+const CREDENTIAL_CATCH_UP_PAGE_LIMIT: usize = 200;
+
+/// Ceiling on catch-up pages per connection — 12,800 envelopes — so a relay
+/// that keeps answering full pages cannot hold the search open forever.
+const MAX_CREDENTIAL_CATCH_UP_PAGES: u32 = 64;
+
+/// How long the relay may go quiet while this tap is still reading stored
+/// credentials. Past it the connection is failed and retried on the ladder; a
+/// relay that never answers must not leave an agent waiting in silence.
+const CREDENTIAL_REPLAY_TIMEOUT_SECS: u64 = 20;
+
+/// One connection's search for this agent's newest credential, for when the
+/// tap's own query did not serve one.
+///
+/// The envelope is not parameterized-replaceable, so the relay matches `#d`
+/// only *after* it has cut the owner's envelopes to this waker down to
+/// `limit` rows. [`credential_filter`] therefore answers out of the newest
+/// [`CREDENTIAL_QUERY_LIMIT`] envelopes for **every** agent and the roster
+/// together: once other agents' reissues push this agent's credential out of
+/// that window the relay serves nothing for it, and a restarted daemon, which
+/// holds no credential in memory, never starts the agent.
+///
+/// The catch-up query drops `#d`, so every row the relay reads is visible
+/// here, and pages back through them until one is this agent's.
+#[derive(Debug, Default)]
+struct CatchUp {
+    /// Nothing older can be newer than a credential this tap already read.
+    since: Option<u64>,
+    /// The oldest row of the pages read so far: where the next one starts.
+    cursor: Option<PageCursor>,
+    /// The current page's row count and its oldest row.
+    rows: usize,
+    oldest: Option<PageCursor>,
+    pages: u32,
+}
+
+/// What the end of a catch-up page means.
+#[derive(Debug, PartialEq, Eq)]
+enum PageEnd {
+    /// The page was full and the cursor moved: ask for the next one.
+    More,
+    /// A short page: the relay holds nothing older.
+    Exhausted,
+    /// The page budget is spent, or a full page left the cursor where it was.
+    GaveUp,
+}
+
+impl CatchUp {
+    /// The REQ for the next page.
+    fn req(&self, owner_pubkey: &str, waker_pubkey: &str) -> Value {
+        let mut filter = json!({
+            "kinds": [KIND_WAKER_BUNDLE_ENVELOPE],
+            "authors": [owner_pubkey],
+            "#p": [waker_pubkey],
+            "limit": CREDENTIAL_CATCH_UP_PAGE_LIMIT,
+        });
+        if let Some(since) = self.since {
+            filter["since"] = json!(since);
+        }
+        if let Some(cursor) = &self.cursor {
+            filter["until"] = json!(cursor.created_at);
+            filter["before_id"] = json!(cursor.id);
+        }
+        json!(["REQ", CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID, filter])
+    }
+
+    /// Count one row of the current page, whichever agent it is for.
+    fn row(&mut self, event: &nostr::Event) {
+        self.rows += 1;
+        let row = PageCursor {
+            created_at: event.created_at.as_secs(),
+            id: event.id.to_hex(),
+        };
+        self.oldest = Some(match self.oldest.take() {
+            Some(oldest) => oldest.older(row),
+            None => row,
+        });
+    }
+
+    /// Close the current page and say whether another is worth asking for.
+    fn end_page(&mut self) -> PageEnd {
+        let rows = std::mem::take(&mut self.rows);
+        let oldest = self.oldest.take();
+        self.pages += 1;
+        if rows < CREDENTIAL_CATCH_UP_PAGE_LIMIT {
+            return PageEnd::Exhausted;
+        }
+        if oldest.is_none() || oldest == self.cursor || self.pages >= MAX_CREDENTIAL_CATCH_UP_PAGES
+        {
+            return PageEnd::GaveUp;
+        }
+        self.cursor = oldest;
+        PageEnd::More
+    }
+}
+
+/// Where one connection is in reading the credentials the relay has stored.
+#[derive(Debug)]
+enum Replay {
+    /// Waiting for the tap's own subscription to finish its stored events.
+    Stored,
+    /// That served nothing for this agent; paging back for its credential.
+    CatchingUp(CatchUp),
+    /// Finished. The tap is only waiting for a reissue.
+    Done,
+}
+
+/// What an end-of-stored-events frame asks of the tap.
+#[derive(Debug, Default, PartialEq)]
+struct Advance {
+    /// A frame to send: the next page's REQ, or the finished catch-up's CLOSE.
+    send: Option<Value>,
+    /// The replay ended on this frame.
+    done: bool,
+    /// It ended with envelopes still unread — see [`PageEnd::GaveUp`].
+    gave_up: bool,
+}
+
+impl Replay {
+    /// Move past an EOSE: a catch-up page's (`page`), or the tap's own.
+    ///
+    /// `served` is whether this connection has read an envelope for the agent.
+    /// The relay serves newest first, so the first one read is the current
+    /// one and nothing older needs looking for.
+    fn advance(
+        &mut self,
+        page: bool,
+        served: bool,
+        since: Option<u64>,
+        owner_pubkey: &str,
+        waker_pubkey: &str,
+    ) -> Advance {
+        let end = match self {
+            Self::Stored if !page && served => {
+                *self = Self::Done;
+                return Advance {
+                    done: true,
+                    ..Advance::default()
+                };
+            }
+            Self::Stored if !page => {
+                *self = Self::CatchingUp(CatchUp {
+                    since,
+                    ..CatchUp::default()
+                });
+                PageEnd::More
+            }
+            Self::CatchingUp(_) if page && served => PageEnd::Exhausted,
+            Self::CatchingUp(catch_up) if page => catch_up.end_page(),
+            // An EOSE this connection is not waiting on.
+            _ => return Advance::default(),
+        };
+        if let (Self::CatchingUp(catch_up), PageEnd::More) = (&*self, &end) {
+            return Advance {
+                send: Some(catch_up.req(owner_pubkey, waker_pubkey)),
+                ..Advance::default()
+            };
+        }
+        *self = Self::Done;
+        Advance {
+            send: Some(json!(["CLOSE", CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID])),
+            done: true,
+            gave_up: end == PageEnd::GaveUp,
+        }
+    }
 }
 
 /// Shared, thread-safe cache of one agent's current admitted credential.
@@ -139,11 +316,18 @@ impl CredentialState {
 enum CredentialFrame {
     /// A verified envelope delivery, authored by the pinned owner and tagged
     /// for the target agent, carrying its raw (still-encrypted) content.
-    Delivered { ciphertext: String },
+    Delivered { ciphertext: String, created_at: u64 },
     /// An event on this subscription that failed signature verification.
     Rejected { event_id: String, reason: String },
     /// This subscription was closed by the relay.
     Closed { message: String },
+    /// The catch-up subscription was closed. The relay answers every client
+    /// `CLOSE` with a `CLOSED` frame, so once the tap has closed a finished
+    /// catch-up this is only the acknowledgement; during one it is a refusal.
+    CatchUpClosed { message: String },
+    /// The relay has served every stored event for the tap's subscription,
+    /// or (`page`) for one catch-up page.
+    Eose { page: bool },
     /// A frame for a subscription this tap did not open, an event whose
     /// kind/`#d`/author doesn't match (should be excluded by the filter
     /// already — checked again here as defense in depth), or a message type
@@ -169,7 +353,9 @@ fn credential_frame(
         RelayMessage::Event {
             subscription_id,
             event,
-        } if subscription_id == CREDENTIAL_TAP_SUBSCRIPTION_ID => {
+        } if subscription_id == CREDENTIAL_TAP_SUBSCRIPTION_ID
+            || subscription_id == CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID =>
+        {
             if let Err(error) = buzz_core::verify_event(&event) {
                 return CredentialFrame::Rejected {
                     event_id: event.id.to_hex(),
@@ -188,6 +374,7 @@ fn credential_frame(
             }
             CredentialFrame::Delivered {
                 ciphertext: event.content.clone(),
+                created_at: event.created_at.as_secs(),
             }
         }
         RelayMessage::Closed {
@@ -195,6 +382,22 @@ fn credential_frame(
             message,
         } if subscription_id == CREDENTIAL_TAP_SUBSCRIPTION_ID => {
             CredentialFrame::Closed { message }
+        }
+        RelayMessage::Closed {
+            subscription_id,
+            message,
+        } if subscription_id == CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID => {
+            CredentialFrame::CatchUpClosed { message }
+        }
+        RelayMessage::Eose { subscription_id }
+            if subscription_id == CREDENTIAL_TAP_SUBSCRIPTION_ID =>
+        {
+            CredentialFrame::Eose { page: false }
+        }
+        RelayMessage::Eose { subscription_id }
+            if subscription_id == CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID =>
+        {
+            CredentialFrame::Eose { page: true }
         }
         _ => CredentialFrame::Ignored,
     }
@@ -334,6 +537,9 @@ pub async fn run_credential_tap(
     let owner_pubkey = normalize_pubkey(owner_pubkey);
     let agent_pubkey = normalize_pubkey(agent_pubkey);
     let mut consecutive_failures = 0u32;
+    // `created_at` of the newest envelope for this agent this tap has read,
+    // on any connection: a later catch-up need not look further back.
+    let mut newest_read: Option<u64> = None;
 
     while !cancel.is_cancelled() {
         if consecutive_failures > 0 {
@@ -365,24 +571,54 @@ pub async fn run_credential_tap(
             consecutive_failures = consecutive_failures.saturating_add(1);
             continue;
         }
-        consecutive_failures = 0;
+        // Reset only once the stored credentials are read (`Replay::Done`), so
+        // a relay that keeps failing that read backs off instead of retrying
+        // at the base delay forever.
+        let mut replay = Replay::Stored;
+        // Whether this connection has read an envelope for this agent. The
+        // relay serves newest first, so the first one is the current one.
+        let mut served = false;
 
         loop {
+            let idle_secs = match replay {
+                Replay::Done => CREDENTIAL_TAP_IDLE_TIMEOUT_SECS,
+                Replay::Stored | Replay::CatchingUp(_) => CREDENTIAL_REPLAY_TIMEOUT_SECS,
+            };
             let next = tokio::select! {
-                result = connection.next_event(Duration::from_secs(CREDENTIAL_TAP_IDLE_TIMEOUT_SECS)) => result,
+                result = connection.next_event(Duration::from_secs(idle_secs)) => result,
                 () = cancel.cancelled() => return,
             };
+            if let (
+                Replay::CatchingUp(catch_up),
+                Ok(RelayMessage::Event {
+                    subscription_id,
+                    event,
+                }),
+            ) = (&mut replay, &next)
+            {
+                if subscription_id == CREDENTIAL_CATCH_UP_SUBSCRIPTION_ID {
+                    catch_up.row(event);
+                }
+            }
 
             match next {
                 Ok(message) => match credential_frame(&owner_pubkey, &agent_pubkey, message) {
-                    CredentialFrame::Delivered { ciphertext } => {
-                        match decrypt_verify_and_admit(
+                    CredentialFrame::Delivered {
+                        ciphertext,
+                        created_at,
+                    } => {
+                        let outcome = decrypt_verify_and_admit(
                             waker_keys,
                             &owner_pubkey,
                             &agent_pubkey,
                             &ciphertext,
                             floor_store,
-                        ) {
+                        );
+                        if outcome.is_ok() {
+                            served = true;
+                            newest_read = newest_read.max(Some(created_at));
+                        }
+                        match outcome {
                             Ok(CredentialOutcome::Delivered(body)) => {
                                 tracing::info!(
                                     agent = %agent_pubkey,
@@ -430,10 +666,59 @@ pub async fn run_credential_tap(
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         break;
                     }
+                    // Not catching up: the relay acknowledging the CLOSE this
+                    // tap sent when its catch-up finished.
+                    CredentialFrame::CatchUpClosed { .. }
+                        if !matches!(replay, Replay::CatchingUp(_)) => {}
+                    CredentialFrame::CatchUpClosed { message } => {
+                        tracing::warn!(
+                            agent = %agent_pubkey,
+                            reason = %message,
+                            "credential catch-up closed by relay; reconnecting"
+                        );
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        break;
+                    }
+                    CredentialFrame::Eose { page } => {
+                        let advance =
+                            replay.advance(page, served, newest_read, &owner_pubkey, &waker_pubkey);
+                        if let Some(frame) = &advance.send {
+                            if let Err(error) = connection.send_raw(frame).await {
+                                tracing::warn!(agent = %agent_pubkey, %error, "credential catch-up request failed; reconnecting");
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                break;
+                            }
+                        }
+                        if advance.done {
+                            consecutive_failures = 0;
+                        }
+                        if advance.gave_up {
+                            tracing::error!(
+                                agent = %agent_pubkey,
+                                "credential catch-up stopped before the relay ran out of envelopes; \
+                                 an older credential for this agent may exist unread"
+                            );
+                        }
+                        if advance.done && !served && state.current().is_none() {
+                            tracing::warn!(
+                                agent = %agent_pubkey,
+                                "the relay holds no credential this daemon can admit for this \
+                                 agent; it stays unwatched until its owner reissues one"
+                            );
+                        }
+                    }
                     CredentialFrame::Ignored => {}
                 },
-                Err(WsClientError::Timeout) => {
+                Err(WsClientError::Timeout) if matches!(replay, Replay::Done) => {
                     // A quiet tap is the normal case — see CREDENTIAL_TAP_IDLE_TIMEOUT_SECS.
+                }
+                Err(WsClientError::Timeout) => {
+                    tracing::warn!(
+                        agent = %agent_pubkey,
+                        "the relay stopped answering while replaying stored credentials; reconnecting"
+                    );
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    break;
                 }
                 Err(error) => {
                     tracing::warn!(agent = %agent_pubkey, %error, "credential tap connection lost; reconnecting");
@@ -499,6 +784,7 @@ mod tests {
         let owner_pubkey = normalize_pubkey(&owner.public_key().to_hex());
         let agent_pubkey = "a".repeat(64);
         let event = credential_event(&owner, "ciphertext-bytes", &agent_pubkey);
+        let created_at = event.created_at.as_secs();
 
         let frame = credential_frame(
             &owner_pubkey,
@@ -511,7 +797,8 @@ mod tests {
         assert_eq!(
             frame,
             CredentialFrame::Delivered {
-                ciphertext: "ciphertext-bytes".to_string()
+                ciphertext: "ciphertext-bytes".to_string(),
+                created_at,
             }
         );
     }
@@ -744,3 +1031,7 @@ mod tests {
         assert_eq!(floor_store.snapshot().highest_accepted_version, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/credential_catch_up_tests.rs"]
+mod catch_up_tests;

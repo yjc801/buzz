@@ -74,9 +74,9 @@ const MAX_DISCOVER_CHANNELS_PAGES: u32 = 64;
 /// The relay's composite page cursor: the last row served, in its
 /// `created_at DESC, id ASC` order. Sent back as `until` + `before_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PageCursor {
-    created_at: u64,
-    id: String,
+pub(crate) struct PageCursor {
+    pub(crate) created_at: u64,
+    pub(crate) id: String,
 }
 
 impl PageCursor {
@@ -88,7 +88,7 @@ impl PageCursor {
     }
 
     /// Whichever of the two sorts later in the relay's page order.
-    fn older(self, other: Self) -> Self {
+    pub(crate) fn older(self, other: Self) -> Self {
         if (other.created_at, std::cmp::Reverse(&other.id))
             < (self.created_at, std::cmp::Reverse(&self.id))
         {

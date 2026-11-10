@@ -64,7 +64,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nostr::{Keys, Tag};
 use serde::Deserialize;
@@ -285,11 +285,77 @@ struct SupervisedAgent {
     /// [`AgentSource::Config`], which has no roster-published version at
     /// all.
     expected_credential_version: Option<u64>,
+    /// When this entry was adopted: the start of the wait
+    /// [`report_unwatched`] measures.
+    adopted_at: Instant,
+    /// When [`report_unwatched`] last reported this agent as unwatched.
+    unwatched_reported_at: Option<Instant>,
     /// Whether this agent's presence/bundle/wake tasks have been spawned.
     /// `true` immediately for [`AgentSource::Config`]. `false` for a
     /// [`AgentSource::Roster`] agent until its credential (at the expected
     /// version) arrives and [`spawn_agent_watch`] succeeds.
     running: bool,
+}
+
+/// How long a roster-listed agent may go without a wake loop before
+/// [`report_unwatched`] says so.
+const UNWATCHED_REPORT_AFTER: Duration = Duration::from_secs(60);
+
+/// How often [`report_unwatched`] repeats itself while that lasts: often
+/// enough to appear in any short window of the daemon's log.
+const UNWATCHED_REPORT_EVERY: Duration = Duration::from_secs(600);
+
+/// Why a roster-listed agent has no wake loop.
+#[derive(Debug, PartialEq, Eq)]
+enum Unwatched {
+    /// The relay has delivered no credential for it.
+    NoCredential,
+    /// The relay delivered one, at a version other than the roster's.
+    VersionMismatch { delivered: u64 },
+}
+
+/// Why `agent` is not being watched. `None` if it is, or if its credential is
+/// at the roster's version: [`reconcile_roster`] starts that one itself, or
+/// says why it cannot.
+fn unwatched_reason(agent: &SupervisedAgent) -> Option<Unwatched> {
+    if agent.running {
+        return None;
+    }
+    match agent.credential_state.as_ref()?.current() {
+        None => Some(Unwatched::NoCredential),
+        Some(body) if Some(body.credential_version) == agent.expected_credential_version => None,
+        Some(body) => Some(Unwatched::VersionMismatch {
+            delivered: body.credential_version,
+        }),
+    }
+}
+
+/// Log each agent the roster lists that still has no wake loop. Waiting for a
+/// credential is otherwise silent, and for as long as it lasts a mention of
+/// that agent wakes nothing.
+fn report_unwatched(supervised: &mut HashMap<String, SupervisedAgent>, now: Instant) {
+    for (pubkey, agent) in supervised.iter_mut() {
+        let Some(reason) = unwatched_reason(agent) else {
+            continue;
+        };
+        let waited = now.saturating_duration_since(agent.adopted_at);
+        let due = match agent.unwatched_reported_at {
+            None => waited >= UNWATCHED_REPORT_AFTER,
+            Some(last) => now.saturating_duration_since(last) >= UNWATCHED_REPORT_EVERY,
+        };
+        if !due {
+            continue;
+        }
+        agent.unwatched_reported_at = Some(now);
+        tracing::error!(
+            agent = %pubkey,
+            waited_secs = waited.as_secs(),
+            expected_credential_version = ?agent.expected_credential_version,
+            ?reason,
+            "buzz-waker: the roster lists this agent but it has no wake loop; mentions of it \
+             wake nothing until a credential at the roster's version arrives"
+        );
+    }
 }
 
 /// Why one of this daemon's tasks finished, for the join-handling loop in
@@ -734,6 +800,8 @@ fn tear_down_roster_agent(
 ///    expected to be at: promote a pending agent whose delivery now
 ///    matches exactly, tear down a running agent whose credential was
 ///    revoked (the tap's state going from `Some` to `None`).
+/// 5. Report every listed agent that still has no wake loop
+///    ([`report_unwatched`]).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_roster(
     relay_url: &str,
@@ -909,6 +977,8 @@ fn reconcile_roster(
                 owner_pubkey: desired_agent.owner_pubkey.clone(),
                 credential_state: Some(credential_state),
                 expected_credential_version: Some(desired_agent.credential_version),
+                adopted_at: Instant::now(),
+                unwatched_reported_at: None,
                 running: false,
             },
         );
@@ -1016,6 +1086,10 @@ fn reconcile_roster(
             }
         }
     }
+
+    // Pass 5: an agent still waiting after all of that is not being watched,
+    // and nothing above says so.
+    report_unwatched(supervised, Instant::now());
 }
 
 #[tokio::main]
@@ -1147,6 +1221,8 @@ async fn main() -> anyhow::Result<()> {
                 owner_pubkey,
                 credential_state: None,
                 expected_credential_version: None,
+                adopted_at: Instant::now(),
+                unwatched_reported_at: None,
                 running: true,
             },
         );
@@ -1630,4 +1706,7 @@ mod tests {
             ExitDisposition::TearDownAgent
         );
     }
+
+    #[path = "unwatched_report_tests.rs"]
+    mod unwatched_report;
 }

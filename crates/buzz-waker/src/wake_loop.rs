@@ -394,11 +394,21 @@ fn claim_start_request(
     })
 }
 
+/// How long [`run_wake_loop`] waits, once it has seen its cancellation, for
+/// in-flight wake attempts to settle their cursor claims before it returns.
+pub const WAKE_LOOP_SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
+
 /// Run one agent's wake loop until `cancel` fires.
 ///
 /// Owns the agent's [`CursorStore`] for the lifetime of the call: opens it
 /// once, outliving every individual connection attempt, and closes it (via
 /// `Drop`) only when this function returns.
+///
+/// That is later than `cancel` firing: a connection setup in progress runs to
+/// its end first (it does not observe the token), and then in-flight attempts
+/// get [`WAKE_LOOP_SHUTDOWN_DRAIN`]. The cursor's file lock is held throughout,
+/// so a second `run_wake_loop` for the same agent fails to open it until this
+/// call has returned — the caller must not start one before then.
 ///
 /// `start_requests` carries owner start requests the bundle tap admitted
 /// ([`crate::start_request`]). Each is claimed in the same cursor and run as
@@ -1096,8 +1106,7 @@ pub async fn run_wake_loop(
     // cursor's file lock — goes away. Anything still running past the bound
     // is abandoned in memory only; the durable claim stays held and the next
     // restart retries it, per the cursor's own crash-safety contract.
-    let shutdown_drain = Duration::from_secs(10);
-    let drain_deadline = tokio::time::Instant::now() + shutdown_drain;
+    let drain_deadline = tokio::time::Instant::now() + WAKE_LOOP_SHUTDOWN_DRAIN;
     while !attempts.is_empty() {
         let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

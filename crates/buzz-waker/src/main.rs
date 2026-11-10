@@ -60,11 +60,12 @@
 //! `buzz_provider_deploy`'s own module doc, The child's environment
 //! section, for exactly what that baseline is and why.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use nostr::{Keys, Tag};
 use serde::Deserialize;
@@ -81,6 +82,7 @@ use buzz_waker::presence_feed::{run_presence_tap, PresenceState};
 use buzz_waker::roster_feed::{run_roster_tap, Admission, RosterState};
 use buzz_waker::wake_loop::{
     run_wake_loop, WakeLoopConfig, CHANNEL_REFRESH_INTERVAL, REFRESH_SETUP_DEADLINE,
+    WAKE_LOOP_SHUTDOWN_DRAIN,
 };
 use buzz_waker::watch_list::WatchList;
 
@@ -290,6 +292,71 @@ struct SupervisedAgent {
     /// [`AgentSource::Roster`] agent until its credential (at the expected
     /// version) arrives and [`spawn_agent_watch`] succeeds.
     running: bool,
+}
+
+/// How long a pending agent may wait for its previous wake loop to return
+/// before [`reconcile_roster`] reports the wait as abnormal: the setup budget
+/// a refresh is held to plus the shutdown drain, which is more than a
+/// cancelled wake loop should need.
+const CURSOR_HANDOFF_WARN_AFTER: Duration =
+    REFRESH_SETUP_DEADLINE.saturating_add(WAKE_LOOP_SHUTDOWN_DRAIN);
+
+/// Which pubkeys have a wake loop that has not returned yet, and so still
+/// owns that agent's `cursor.json`.
+///
+/// Cancelling an agent does not release its cursor: [`run_wake_loop`] keeps
+/// the file locked until it returns. A successor started before then fails
+/// with `CursorError::Locked`, is torn down as an unexpected exit, and has to
+/// be adopted from scratch — twice in a row, in the incident this exists for.
+/// So a cancelled token is not evidence the cursor is free. The wake loop's
+/// task ending is, and that is what drops the [`CursorHold`] recorded here.
+///
+/// Each value is when [`reconcile_roster`] first found a successor waiting on
+/// that wake loop, once one has.
+#[derive(Clone, Default)]
+struct CursorHolders(Arc<Mutex<HashMap<String, Option<Instant>>>>);
+
+impl CursorHolders {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Option<Instant>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Claim `pubkey`'s cursor for a wake loop about to be spawned, or `None`
+    /// if an earlier wake loop for it has not returned.
+    fn claim(&self, pubkey: &str) -> Option<CursorHold> {
+        match self.lock().entry(pubkey.to_string()) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                slot.insert(None);
+                Some(CursorHold {
+                    holders: self.clone(),
+                    pubkey: pubkey.to_string(),
+                })
+            }
+        }
+    }
+
+    /// How long a successor has been waiting on `pubkey`'s wake loop as of
+    /// `now` — zero the first time this is asked — or `None` if no wake loop
+    /// holds that cursor.
+    fn waited(&self, pubkey: &str, now: Instant) -> Option<Duration> {
+        let since = *self.lock().get_mut(pubkey)?.get_or_insert(now);
+        Some(now.saturating_duration_since(since))
+    }
+}
+
+/// One wake loop's claim on its agent's cursor, released on drop. The wake
+/// loop's own task owns it, so it is released when that task ends and not
+/// before, however the task ends.
+struct CursorHold {
+    holders: CursorHolders,
+    pubkey: String,
+}
+
+impl Drop for CursorHold {
+    fn drop(&mut self) {
+        self.holders.lock().remove(&self.pubkey);
+    }
 }
 
 /// Why one of this daemon's tasks finished, for the join-handling loop in
@@ -580,7 +647,8 @@ fn open_pinned_floor_store(path: &Path, owner_pubkey: &str) -> anyhow::Result<Fl
 /// # Errors
 /// The agent's state directory or bundle [`FloorStore`] cannot be
 /// created/opened, or the store's pinned owner disagrees with
-/// `owner_pubkey` — see [`open_pinned_floor_store`].
+/// `owner_pubkey` — see [`open_pinned_floor_store`]. Or an earlier wake loop
+/// for this pubkey has not returned ([`CursorHolders`]); nothing is spawned.
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_watch(
     relay_url: &str,
@@ -591,9 +659,15 @@ fn spawn_agent_watch(
     provider_env: Option<Arc<HashMap<String, String>>>,
     watch_list: &WatchList,
     cancel: CancellationToken,
+    cursor_holders: &CursorHolders,
     tasks: &mut JoinSet<TaskExit>,
 ) -> anyhow::Result<()> {
     let pubkey = normalize_pubkey(&keys.public_key().to_hex());
+    let Some(cursor_hold) = cursor_holders.claim(&pubkey) else {
+        anyhow::bail!(
+            "agent {pubkey}'s previous wake loop has not returned and still owns its cursor"
+        );
+    };
     let agent_dir = state_dir.join(&pubkey);
     std::fs::create_dir_all(&agent_dir)
         .map_err(|e| anyhow::anyhow!("could not create state dir {}: {e}", agent_dir.display()))?;
@@ -679,6 +753,9 @@ fn spawn_agent_watch(
         let generation = cancel.clone();
         let pubkey = pubkey.clone();
         tasks.spawn(async move {
+            // Bound first so it is dropped last, after the wake loop and the
+            // cursor it owns are gone.
+            let _cursor_hold = cursor_hold;
             run_wake_loop(config, start_request_rx, cancel).await;
             TaskExit::Agent {
                 pubkey,
@@ -733,7 +810,12 @@ fn tear_down_roster_agent(
 ///    re-check its credential tap's live state against the version it is
 ///    expected to be at: promote a pending agent whose delivery now
 ///    matches exactly, tear down a running agent whose credential was
-///    revoked (the tap's state going from `Some` to `None`).
+///    revoked (the tap's state going from `Some` to `None`). A promotion
+///    waits, with the agent left pending, while `cursor_holders` says a
+///    previous generation's wake loop has not returned.
+///
+/// `rosters` is `(owner_pubkey, entries)` for every owner whose roster is
+/// tracked — [`RosterState::tracked`], read at the call site.
 #[allow(clippy::too_many_arguments)]
 fn reconcile_roster(
     relay_url: &str,
@@ -745,26 +827,18 @@ fn reconcile_roster(
     // credential and is passed to `spawn_agent_watch` instead.
     waker_auth_tag: Option<&Tag>,
     max_agents: usize,
-    roster_state: &RosterState,
+    rosters: &[(String, Vec<RosterEntry>)],
     supervised: &mut HashMap<String, SupervisedAgent>,
     watch_list: &WatchList,
     cancel: &CancellationToken,
+    cursor_holders: &CursorHolders,
     tasks: &mut JoinSet<TaskExit>,
 ) {
-    // Whatever the tap actually admitted, not a configured list: under open
-    // admission there is no configured list, and everything in this map has
-    // already passed the same owner authorization the closed path applies.
-    let rosters: Vec<(String, Vec<RosterEntry>)> = roster_state
-        .tracked()
-        .into_iter()
-        .map(|(owner, body)| (owner, body.entries.clone()))
-        .collect();
-
     let existing_sources: HashMap<String, AgentSource> = supervised
         .iter()
         .map(|(pubkey, agent)| (pubkey.clone(), agent.source))
         .collect();
-    let (desired, conflicts) = compute_desired_roster_agents(&rosters, &existing_sources);
+    let (desired, conflicts) = compute_desired_roster_agents(rosters, &existing_sources);
     for pubkey in conflicts {
         tracing::warn!(
             agent = %pubkey,
@@ -950,6 +1024,27 @@ fn reconcile_roster(
                 if running {
                     continue; // already running this exact version
                 }
+                // A previous generation's wake loop — cancelled, not yet
+                // returned — still owns the cursor. Starting this one now
+                // would only fail at that lock, so leave the agent pending,
+                // credential and all, and look again next tick.
+                if let Some(waited) = cursor_holders.waited(&pubkey, Instant::now()) {
+                    if waited.is_zero() {
+                        tracing::info!(
+                            agent = %pubkey,
+                            "buzz-waker: this agent's previous wake loop still owns its cursor; \
+                             watching it once that loop has returned"
+                        );
+                    } else if waited > CURSOR_HANDOFF_WARN_AFTER {
+                        tracing::warn!(
+                            agent = %pubkey,
+                            waited_secs = waited.as_secs(),
+                            "buzz-waker: this agent's previous wake loop has still not returned; \
+                             the agent stays unwatched until it does"
+                        );
+                    }
+                    continue;
+                }
                 let keys = match Keys::parse(&body.nsec) {
                     Ok(keys) => keys,
                     Err(error) => {
@@ -988,6 +1083,7 @@ fn reconcile_roster(
                     provider_env,
                     watch_list,
                     agent_cancel,
+                    cursor_holders,
                     tasks,
                 ) {
                     Ok(()) => {
@@ -1124,6 +1220,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks: JoinSet<TaskExit> = JoinSet::new();
     let watch_list = WatchList::new();
     let mut supervised: HashMap<String, SupervisedAgent> = HashMap::new();
+    let cursor_holders = CursorHolders::default();
 
     for (keys, auth_tag, owner_pubkey) in keys_by_agent {
         let pubkey = normalize_pubkey(&keys.public_key().to_hex());
@@ -1137,6 +1234,7 @@ async fn main() -> anyhow::Result<()> {
             None,
             &watch_list,
             agent_cancel.clone(),
+            &cursor_holders,
             &mut tasks,
         )?;
         supervised.insert(
@@ -1199,16 +1297,26 @@ async fn main() -> anyhow::Result<()> {
                 let (Some(waker_keys), Some(roster_state)) = (&waker_keys, &roster_state) else {
                     unreachable!("ticker only fires when roster_state is Some, which only happens alongside waker_keys");
                 };
+                // Whatever the tap actually admitted, not a configured list:
+                // under open admission there is no configured list, and
+                // everything tracked has already passed the same owner
+                // authorization the closed path applies.
+                let rosters: Vec<(String, Vec<RosterEntry>)> = roster_state
+                    .tracked()
+                    .into_iter()
+                    .map(|(owner, body)| (owner, body.entries.clone()))
+                    .collect();
                 reconcile_roster(
                     &relay_url,
                     &state_dir,
                     waker_keys,
                     waker_auth_tag.as_ref(),
                     max_agents,
-                    roster_state,
+                    &rosters,
                     &mut supervised,
                     &watch_list,
                     &cancel,
+                    &cursor_holders,
                     &mut tasks,
                 );
             }
@@ -1298,6 +1406,9 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "cursor_handoff_tests.rs"]
+    mod cursor_handoff;
 
     /// Absence and `closed` are the same thing, and closed-with-nothing is
     /// still disabled — the fail-closed contract survives adding open mode,

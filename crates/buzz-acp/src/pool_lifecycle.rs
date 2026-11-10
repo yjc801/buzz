@@ -2,13 +2,18 @@
 //!
 //! Relay connection, subscription, and event buffering live outside this
 //! module. This state machine owns only whether a deferred pool has not started,
-//! is waking, is ready, or is waiting to retry after a failed wake.
+//! is waking, is ready, is waiting to retry after a failed wake, or has given
+//! up after [`MAX_WAKE_ATTEMPTS`] consecutive failures.
 
 use std::time::Duration;
 use tokio::time::Instant;
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+/// Consecutive failed wakes before the lifecycle stops retrying. One wake
+/// already tries every slot, so a persistent failure (a degraded disk, a
+/// missing binary) would otherwise repeat the whole startup sequence forever.
+pub(crate) const MAX_WAKE_ATTEMPTS: u32 = 5;
 
 #[derive(Debug)]
 pub(crate) enum PoolLifecycle<P> {
@@ -20,6 +25,12 @@ pub(crate) enum PoolLifecycle<P> {
     Failed {
         attempt: u32,
         retry_at: Instant,
+        error: String,
+    },
+    /// Terminal: the retry budget is spent. Nothing leaves this state; the
+    /// harness reports [`PoolLifecycle::exhausted_error`] once and exits.
+    Exhausted {
+        attempts: u32,
         error: String,
     },
 }
@@ -48,7 +59,9 @@ impl<P> PoolLifecycle<P> {
             Self::Failed {
                 attempt, retry_at, ..
             } if now >= *retry_at => Some(attempt.saturating_add(1)),
-            Self::Waking { .. } | Self::Ready(_) | Self::Failed { .. } => None,
+            Self::Waking { .. } | Self::Ready(_) | Self::Failed { .. } | Self::Exhausted { .. } => {
+                None
+            }
         };
 
         if let Some(attempt) = next_attempt {
@@ -83,7 +96,18 @@ impl<P> PoolLifecycle<P> {
 
     pub(crate) fn failed_error(&self) -> Option<&str> {
         match self {
-            Self::Failed { error, .. } => Some(error),
+            Self::Failed { error, .. } | Self::Exhausted { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// The error to exit with once consecutive wake failures have spent the
+    /// retry budget; `None` in every other state.
+    pub(crate) fn exhausted_error(&self) -> Option<String> {
+        match self {
+            Self::Exhausted { attempts, error } => Some(format!(
+                "agent pool failed to start {attempts} times in a row — giving up: {error}"
+            )),
             _ => None,
         }
     }
@@ -94,8 +118,10 @@ impl<P> PoolLifecycle<P> {
 
     /// Complete the matching in-flight wake attempt.
     ///
-    /// A failure remains retryable. A result returned outside `Waking`, or from
-    /// an older attempt, is rejected: accepting it could replace a newer pool.
+    /// A failure remains retryable until [`MAX_WAKE_ATTEMPTS`] consecutive
+    /// failures, then becomes terminal. A result returned outside `Waking`, or
+    /// from an older attempt, is rejected: accepting it could replace a newer
+    /// pool.
     pub(crate) fn complete_wake(
         &mut self,
         completed_attempt: u32,
@@ -110,6 +136,10 @@ impl<P> PoolLifecycle<P> {
 
         *self = match result {
             Ok(pool) => Self::Ready(pool),
+            Err(error) if attempt >= MAX_WAKE_ATTEMPTS => Self::Exhausted {
+                attempts: attempt,
+                error,
+            },
             Err(error) => Self::Failed {
                 attempt,
                 retry_at: now + retry_delay(attempt),
@@ -175,7 +205,7 @@ mod tests {
         let mut now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
 
-        for attempt in 1..=9 {
+        for attempt in 1..MAX_WAKE_ATTEMPTS {
             assert_eq!(lifecycle.start_wake_if_due(true, now), Some(attempt));
             assert!(matches!(
                 lifecycle,
@@ -308,5 +338,65 @@ mod tests {
             }
             _ => panic!("expected Failed"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_gives_up_after_max_consecutive_failures() {
+        let mut now = Instant::now();
+        let mut lifecycle = PoolLifecycle::<()>::listening();
+
+        for attempt in 1..=MAX_WAKE_ATTEMPTS {
+            assert_eq!(lifecycle.exhausted_error(), None);
+            assert_eq!(lifecycle.start_wake_if_due(true, now), Some(attempt));
+            lifecycle
+                .complete_wake(attempt, Err("all 10 agents failed to start".into()), now)
+                .unwrap();
+            now += MAX_RETRY_DELAY;
+        }
+
+        // Terminal: no retry deadline, no further wake however long work waits.
+        assert_eq!(
+            lifecycle.exhausted_error().as_deref(),
+            Some(
+                "agent pool failed to start 5 times in a row — giving up: \
+                 all 10 agents failed to start"
+            )
+        );
+        assert_eq!(lifecycle.retry_at(), None);
+        assert_eq!(
+            lifecycle.start_wake_if_due(true, now + Duration::from_secs(86_400)),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_wake_resets_the_failure_budget() {
+        let mut now = Instant::now();
+        let mut lifecycle = PoolLifecycle::listening();
+
+        // Fail up to the last retryable attempt, then succeed.
+        for attempt in 1..MAX_WAKE_ATTEMPTS {
+            assert_eq!(lifecycle.start_wake_if_due(true, now), Some(attempt));
+            lifecycle
+                .complete_wake(attempt, Err("slow disk".into()), now)
+                .unwrap();
+            now += MAX_RETRY_DELAY;
+        }
+        assert_eq!(
+            lifecycle.start_wake_if_due(true, now),
+            Some(MAX_WAKE_ATTEMPTS)
+        );
+        lifecycle
+            .complete_wake(MAX_WAKE_ATTEMPTS, Ok("pool"), now)
+            .unwrap();
+        assert_eq!(lifecycle.take_ready(), Some("pool"));
+
+        // After an idle sleep the next wake counts from one again.
+        assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
+        lifecycle
+            .complete_wake(1, Err("slow disk".into()), now)
+            .unwrap();
+        assert_eq!(lifecycle.exhausted_error(), None);
+        assert!(lifecycle.retry_at().is_some());
     }
 }

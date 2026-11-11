@@ -100,7 +100,9 @@ The shared cargo cache reaches a slot as a `.hermit/rust` link, and only in a
 repository that ignores `.hermit/`. Anywhere else the link would be an
 untracked file: the slot would read as dirty, a dirty slot is never recycled,
 and the pool would run dry after one round. A hand-out there makes no link,
-says so, and removes one an earlier version left behind.
+says so, and removes one an earlier version left behind: from the slots it
+could pick, before it judges them dirty, and never from a slot another session
+holds.
 
 `/tmp` survives a suspend and resume. It also survives a checkpoint restore,
 which rewinds only the home disk (both measured). It is not checkpointed, and

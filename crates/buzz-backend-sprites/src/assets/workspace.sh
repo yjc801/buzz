@@ -15,6 +15,8 @@
 #   1. A SHARED CARGO_HOME, symlinked into each slot's `.hermit/rust`. Kills the
 #      re-download. Safe to share concurrently — cargo takes a package-cache lock
 #      in CARGO_HOME, so parallel builds queue rather than corrupt.
+#      Only in a checkout that ignores `.hermit/`: anywhere else the link
+#      would be an untracked file, and the slot would read as dirty for ever.
 #
 #   2. STABLE PATHS. This is the one that is easy to miss: cargo derives a local
 #      package's `-C metadata` from its absolute path, so a checkout at a new
@@ -319,10 +321,36 @@ seed_cache() {
     cp -an "$donor/." "$shared/" 2>/dev/null || true
 }
 
+# Take back the link an earlier version of this script made in a checkout that
+# does not ignore it. Only that link: a symlink to this very cache. Anything
+# else at that path, and anything beside it, is not this script's to remove.
+# Called twice in a hand-out, because the link is what makes such a slot dirty:
+# before a slot is judged dirty, or a pool that version filled could never
+# hand out a new ref; and after the checkout, for a ref that stopped ignoring
+# the path.
+drop_unignored_link() {
+    local slot="$1" shared="$2" link="$1/.hermit/rust"
+    [ -L "$link" ] && [ "$(readlink "$link")" = "$shared" ] || return 0
+    git -C "$slot" check-ignore -q .hermit/rust 2>/dev/null && return 0
+    rm -f "$link"
+    rmdir "$slot/.hermit" 2>/dev/null || true
+}
+
+# The link is an untracked path inside the checkout, so it is made only where
+# the repository ignores it -- a Hermit environment ignores `.hermit/`. Where
+# it does not, the link would make `git status` report the slot dirty for
+# ever, and "dirty" is what keeps a slot from being recycled: the pool would
+# run dry after one round, and `git add -A` would commit the link. Such a
+# checkout has no Hermit CARGO_HOME to share anyway. It gets no link, and the
+# caller is told by the exit status.
 link_cache() {
     local slot="$1" shared="$2"
-    mkdir -p "$slot/.hermit"
     local link="$slot/.hermit/rust"
+    if ! git -C "$slot" check-ignore -q .hermit/rust 2>/dev/null; then
+        drop_unignored_link "$slot" "$shared"
+        return 1
+    fi
+    mkdir -p "$slot/.hermit"
     if [ -L "$link" ]; then
         [ "$(readlink "$link")" = "$shared" ] || ln -sfn "$shared" "$link"
         return
@@ -479,10 +507,13 @@ cmd_path() {
                 note "WARNING: $slot is not a checkout of $canon any more (was the clone restored to an earlier checkpoint?). It is left untouched because it may hold work; move it away to get the slot back."
                 continue
             fi
-            if [ "$force" != "1" ] && slot_is_dirty "$slot"; then
+            # The claim before anything is touched: a checkout another
+            # session holds is left exactly as it is.
+            if [ "$force" != "1" ] && foreign_claim "$slots" "$i" "$now" "$claim_arg"; then
                 continue
             fi
-            if [ "$force" != "1" ] && foreign_claim "$slots" "$i" "$now" "$claim_arg"; then
+            drop_unignored_link "$slot" "$shared"
+            if [ "$force" != "1" ] && slot_is_dirty "$slot"; then
                 continue
             fi
             local at
@@ -529,7 +560,9 @@ cmd_path() {
         git -C "$chosen" checkout --quiet --detach --force "$sha"
     fi
 
-    link_cache "$chosen" "$shared"
+    local cache_note="cargo cache $shared"
+    link_cache "$chosen" "$shared" ||
+        cache_note="no shared cargo cache: this repository does not ignore .hermit/"
     printf '%s' "$ref" >"$(stamp "$slots" "$chosen_i")"
 
     # Honor a caller-supplied token unconditionally -- selection above already
@@ -540,7 +573,7 @@ cmd_path() {
     [ -n "$my_claim" ] || my_claim=$(new_claim_token)
     printf '%s' "$my_claim" >"$(claim_file "$slots" "$chosen_i")"
 
-    note "$(basename "$chosen") -> ${sha:0:9} ($reused); cargo cache $shared"
+    note "$(basename "$chosen") -> ${sha:0:9} ($reused); $cache_note"
     note "claim $my_claim -- set BUZZ_WORKSPACE_CLAIM=$my_claim (or pass --claim $my_claim) so your own later calls reuse this slot"
     if [ -d "$chosen/target" ] || [ -d "$chosen/desktop/src-tauri/target" ]; then
         note "build cache preserved — expect an incremental build, not a cold one"

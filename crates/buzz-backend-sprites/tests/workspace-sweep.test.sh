@@ -58,7 +58,11 @@
 #     and not while a process still stands in a checkout;
 #   * a slot lost with the local disk is re-created cold at the same path and
 #     reported, its commits still in the clone -- and a slot that is still
-#     there and dirty is never re-created over.
+#     there and dirty is never re-created over;
+#   * a hand-out never makes a checkout dirty: in a repository that does not
+#     ignore `.hermit/` there is no cargo-cache link, so the pool goes on
+#     recycling, and a link an earlier version left there is taken back --
+#     that link only.
 #
 # The `df` stub is pinned ABOVE the floor for every section but the
 # disk-pressure one. Inheriting the host's real free space made this suite
@@ -971,6 +975,66 @@ check "a later hand-out recycles a working slot instead of the orphan (rc=$RC): 
   "$([ "$RC" -eq 0 ] && [ "$AGAIN" = "$NEXT" ] && [ "$(git -C "$NEXT" rev-parse HEAD 2>/dev/null)" = "$MAIN" ]; echo $?)"
 exists "and the orphaned one is still not touched" "$BACK/uncommitted.txt"
 unset BUZZ_WORKSPACE_REPO BUZZ_WORKSPACE_SLOTS
+
+# ── a repository that does not ignore .hermit/ ──────────────────────────────
+# The cargo-cache link is an untracked path inside the checkout. Every other
+# section runs against a repository that ignores `.hermit/`, as a Hermit
+# environment does. One that does not -- any repository without Hermit -- saw
+# `?? .hermit/` in every slot from the moment it was handed out: the slot was
+# dirty for ever, a dirty slot is never recycled, and the fourth hand-out of a
+# three-slot pool died. `git add -A` staged the link, too.
+echo "--- a repository that does not ignore .hermit/"
+PLAIN_ORIGIN="$T/plain.git"
+git init -q --bare "$PLAIN_ORIGIN"
+git -C "$PLAIN_ORIGIN" symbolic-ref HEAD refs/heads/main
+PSEED="$T/plain-seed"
+git init -q "$PSEED"
+git -C "$PSEED" checkout -q -b main
+git -C "$PSEED" remote add origin "$PLAIN_ORIGIN"
+commit "$PSEED" base f >/dev/null
+git -C "$PSEED" push -q origin main
+for b in one two three; do
+  commit "$PSEED" "$b" f >/dev/null
+  git -C "$PSEED" push -q origin "HEAD:refs/heads/$b"
+done
+PLAIN="$HOME/.buzz/plain"
+git clone -q "$PLAIN_ORIGIN" "$PLAIN"
+# Claims lapse at once, so recycling is decided by the dirty check alone.
+export BUZZ_WORKSPACE_REPO="$PLAIN" BUZZ_WORKSPACE_SLOTS=2 BUZZ_WORKSPACE_HOLD=0
+P1=$(BUZZ_WORKSPACE_CLAIM=a bash "$WS" one 2>"$T/plain.err")
+check "a slot is handed out: $P1" "$([ -n "$P1" ] && [ -e "$P1/.git" ]; echo $?)"
+check "the hand-out leaves it clean: $(git -C "$P1" status --porcelain 2>&1)" \
+  "$([ -z "$(git -C "$P1" status --porcelain 2>&1)" ]; echo $?)"
+check "with no .hermit in it" "$([ ! -e "$P1/.hermit" ] && [ ! -L "$P1/.hermit/rust" ]; echo $?)"
+git -C "$P1" add -A
+check "so git add -A stages nothing" "$(git -C "$P1" diff --cached --quiet; echo $?)"
+check "and the caller is told there is no shared cargo cache: $(cat "$T/plain.err")" \
+  "$(grep -qF "no shared cargo cache: this repository does not ignore .hermit/" "$T/plain.err"; echo $?)"
+P2=$(BUZZ_WORKSPACE_CLAIM=b bash "$WS" two 2>/dev/null)
+P3=$(BUZZ_WORKSPACE_CLAIM=c bash "$WS" three 2>"$T/plain3.err"); RC=$?
+check "a third ref in a pool of two recycles a slot (rc=$RC): $(cat "$T/plain3.err")" \
+  "$([ "$RC" -eq 0 ] && [ "$P3" = "$P1" ] && [ "$P2" != "$P1" ]; echo $?)"
+# What an earlier version left in a slot that already exists: taken back, and
+# nothing else in that directory with it.
+mkdir -p "$P2/.hermit"
+ln -s "$LOCAL/cache/buzz/cargo" "$P2/.hermit/rust"
+check "(fixture) the old link makes the slot dirty" "$([ -n "$(git -C "$P2" status --porcelain)" ]; echo $?)"
+BUZZ_WORKSPACE_CLAIM=b bash "$WS" two >/dev/null 2>&1
+check "a link an earlier version left is removed on the next hand-out" \
+  "$([ ! -e "$P2/.hermit" ] && [ ! -L "$P2/.hermit/rust" ] && [ -z "$(git -C "$P2" status --porcelain)" ]; echo $?)"
+mkdir -p "$P2/.hermit"
+ln -s "$LOCAL/cache/buzz/cargo" "$P2/.hermit/rust"
+echo mine >"$P2/.hermit/notes"
+BUZZ_WORKSPACE_CLAIM=b bash "$WS" two >/dev/null 2>&1
+check "only that link: a file beside it is the agent's, and stays" \
+  "$([ ! -L "$P2/.hermit/rust" ] && [ "$(cat "$P2/.hermit/notes" 2>/dev/null)" = mine ]; echo $?)"
+rm -rf "$P2/.hermit"
+mkdir -p "$P3/.hermit"
+ln -s "$T/somewhere-else" "$P3/.hermit/rust"
+BUZZ_WORKSPACE_CLAIM=c bash "$WS" three >/dev/null 2>&1
+check "and a link to anywhere else is not this script's to remove" \
+  "$([ "$(readlink "$P3/.hermit/rust" 2>/dev/null)" = "$T/somewhere-else" ]; echo $?)"
+unset BUZZ_WORKSPACE_REPO BUZZ_WORKSPACE_SLOTS BUZZ_WORKSPACE_HOLD
 
 echo "$PASS passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

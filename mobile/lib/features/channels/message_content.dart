@@ -42,6 +42,7 @@ import 'local_send_bubble_surface.dart';
 import 'media_viewer_page.dart';
 import 'native_photo_zoom_preview.dart';
 import 'native_video_files.dart';
+import 'video_poster.dart';
 import 'message_content/link_normalizer.dart';
 import 'message_content/markdown_escapes.dart';
 import 'message_content/preview_text.dart';
@@ -117,6 +118,9 @@ class MessageContent extends HookConsumerWidget {
 
   /// Paint conversation text bubbles while keeping attachments on the page.
   final bool bubble;
+
+  /// Space reclaimed from an omitted sender avatar and its gutter.
+  final double additionalTextWidth;
 
   /// Distinguishes messages authored by the signed-in identity.
   final bool ownMessage;
@@ -198,6 +202,7 @@ class MessageContent extends HookConsumerWidget {
     super.key,
     required this.content,
     this.bubble = false,
+    this.additionalTextWidth = 0,
     this.ownMessage = false,
     this.trimTrailingSpacing = false,
     this.bubbleEnd = true,
@@ -527,7 +532,8 @@ class MessageContent extends HookConsumerWidget {
                       constraints: BoxConstraints(
                         maxWidth:
                             MediaQuery.sizeOf(context).width *
-                            messageTextMaxWidthFraction,
+                                messageTextMaxWidthFraction +
+                            additionalTextWidth,
                       ),
                       child: MessageReplyDragTarget(
                         child: LocalSendBubbleSurface(

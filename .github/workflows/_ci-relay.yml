@@ -699,6 +699,7 @@ jobs:
           # job runs only the filters named here, so a test no filter matches
           # never runs at all.
           cargo test -p buzz-test-client --test e2e_relay read_only -- --ignored --nocapture
+          cargo test -p buzz-test-client --test e2e_relay nip_ia_archive_snapshots_are_rejected -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip29_departure_wire -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip29_batch_put_user_wire -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip29_announce_channel_wire -- --ignored --nocapture

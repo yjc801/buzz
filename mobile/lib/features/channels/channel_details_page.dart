@@ -108,6 +108,8 @@ class ChannelDetailsPage extends HookConsumerWidget {
     final members = membersAsync.asData?.value ?? const <ChannelMember>[];
     final agentOwnersAsync = ref.watch(agentOwnersProvider);
     final sectionState = ref.watch(channelSectionsProvider);
+    // Desktop's unified workspaces are read-only here.
+    final canFile = !personalChat && sectionState.editable;
     final resolvedCurrentPubkey =
         currentPubkey?.toLowerCase() ??
         ref.watch(currentPubkeyProvider)?.toLowerCase();
@@ -396,13 +398,12 @@ class ChannelDetailsPage extends HookConsumerWidget {
             ),
           SheetActionSection(
             children: [
-              if (!personalChat)
+              if (canFile)
                 action(
                   'Move to section…',
                   BuzzIcons.folderInput,
                   () => _showMoveSectionSheet(
                     context,
-                    ref,
                     channel: resolvedChannel,
                     sectionId: currentSectionId,
                   ),
@@ -677,7 +678,7 @@ class ChannelDetailsPage extends HookConsumerWidget {
           key: const ValueKey('channel-details-channel-card'),
           verticalPadding: _channelDetailsSectionPadding,
           children: [
-            if (!personalChat)
+            if (canFile)
               AppListRow(
                 icon: BuzzIcons.folderInput,
                 title: 'Move to section…',
@@ -685,7 +686,6 @@ class ChannelDetailsPage extends HookConsumerWidget {
                 onTap: () async {
                   await _showMoveSectionSheet(
                     context,
-                    ref,
                     channel: resolvedChannel,
                     sectionId: currentSectionId,
                   );

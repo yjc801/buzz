@@ -218,7 +218,7 @@ class ChannelActions {
           ],
         );
       } catch (error) {
-        failures[pubkey] = _relayErrorMessage(error);
+        failures[pubkey] = relayErrorText(error);
       }
     }
     _ensureCommunityValid();
@@ -231,7 +231,7 @@ class ChannelActions {
 
   void _ensureCommunityValid() {
     if (_isCommunityValid?.call() == false) {
-      throw StateError(
+      throw ActiveCommunityChangedError(
         'Channel action cancelled because the active community changed',
       );
     }
@@ -308,17 +308,22 @@ class ChannelActions {
     if (!shown) throw const ChannelJoinUnconfirmed();
   }
 
-  Future<void> leaveChannel(String channelId) async {
+  Future<void> leaveChannel(
+    String channelId, {
+    Future<bool> Function()? mayPublish,
+  }) async {
     _ensureCommunityValid();
+    final scope = _ref.read(savedMessageScopeProvider);
     await _signedEventRelay.submit(
       kind: 9022,
       content: '',
       tags: [
         ['h', channelId],
       ],
+      mayPublish: mayPublish,
     );
     _ensureCommunityValid();
-    await _refreshChannelState(channelId);
+    await _finishConfirmedRemoval(channelId, scope);
   }
 
   /// Updates the user-editable channel metadata and refreshes cached details.
@@ -366,12 +371,29 @@ class ChannelActions {
   /// Deletes the channel and refreshes its cached state.
   Future<void> deleteChannel(String channelId) async {
     _ensureCommunityValid();
+    final scope = _ref.read(savedMessageScopeProvider);
     await _signedEventRelay.submit(
       kind: 9008,
       content: '',
       tags: buildDeleteChannelTags(channelId),
     );
     _ensureCommunityValid();
+    await _finishConfirmedRemoval(channelId, scope);
+  }
+
+  Future<void> _finishConfirmedRemoval(
+    String channelId,
+    SavedMessageScope? scope,
+  ) async {
+    if (scope != null) {
+      final recorded = _ref
+          .read(savedMessageStoreProvider)
+          .removeChannel(scope, channelId, deferDisk: true);
+      _ref.invalidate(savedChannelPreviewProvider(channelId));
+      await recorded;
+    }
+    _ensureCommunityValid();
+    _ref.read(channelsProvider.notifier).noteConfirmedRemoval(channelId);
     await _refreshChannelState(channelId);
   }
 
